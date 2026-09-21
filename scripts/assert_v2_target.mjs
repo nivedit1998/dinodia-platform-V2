@@ -42,22 +42,40 @@ function projectRefFromHost(hostname) {
   return direct?.[1] || '';
 }
 
-function isApprovedDatabaseHost(hostname) {
-  return Array.isArray(target.supabaseDatabaseHosts)
-    ? target.supabaseDatabaseHosts.includes(hostname)
-    : projectRefFromHost(hostname) === target.supabaseProjectRef;
+function projectRefFromUrl(url) {
+  const directRef = projectRefFromHost(url.hostname);
+  if (directRef) return directRef;
+  if (/\.pooler\.supabase\.com$/i.test(url.hostname)) {
+    const username = decodeURIComponent(url.username || '');
+    const match = username.match(/^(?:postgres\.)?([a-z0-9]{20})$/i);
+    return match?.[1] || '';
+  }
+  return '';
+}
+
+function databaseNameFromUrl(url, name) {
+  const databaseName = decodeURIComponent(url.pathname.replace(/^\/+/, ''));
+  if (!databaseName) fail(`${name} does not include a database name`);
+  return databaseName;
+}
+
+function isApprovedRemoteHost(url) {
+  return target.supabaseDatabaseHosts.some((host) => host.toLowerCase() === url.hostname.toLowerCase());
 }
 
 function assertLocalTarget(url, name) {
   const isLoopback = ['127.0.0.1', 'localhost', '::1'].includes(url.hostname);
-  const isApprovedV2 = isApprovedDatabaseHost(url.hostname);
+  const isApprovedV2 = projectRefFromUrl(url) === target.supabaseProjectRef;
   if (!isLoopback && !isApprovedV2) {
     fail(`${name} does not point to localhost or the approved V2 Supabase project`);
   }
 }
 
 function assertRemoteTarget(url, name) {
-  if (!isApprovedDatabaseHost(url.hostname)) {
+  if (!isApprovedRemoteHost(url)) {
+    fail(`${name} does not use an approved V2 Supabase database host`);
+  }
+  if (projectRefFromUrl(url) !== target.supabaseProjectRef) {
     fail(`${name} does not point to the approved V2 Supabase project`);
   }
 }
@@ -74,13 +92,28 @@ function assertVercelLink() {
 if (!mode || !['local', 'test', 'rc', 'production'].includes(mode)) {
   fail('V2_ENVIRONMENT must be local, test, rc or production');
 }
+if (mode === 'production') {
+  fail('production mode is not allowed by the guarded RC command');
+}
+if (process.env.NODE_ENV === 'production') {
+  fail('NODE_ENV=production is not allowed by the guarded RC command');
+}
 
 const remoteMigration = ['rc', 'production'].includes(mode) || process.argv.includes('--remote-migration');
 
 const databaseUrl = parseDatabaseUrl('DATABASE_URL');
 const directUrl = parseDatabaseUrl('DIRECT_URL');
-if (databaseUrl.hostname !== directUrl.hostname) {
-  fail('DATABASE_URL and DIRECT_URL must resolve to the same approved host');
+if (mode === 'local' || mode === 'test') {
+  const databaseName = databaseUrl.pathname.replace(/^\//, '');
+  const directName = directUrl.pathname.replace(/^\//, '');
+  if (databaseName !== directName) fail('DATABASE_URL and DIRECT_URL must use the same database name');
+} else {
+  if (projectRefFromUrl(databaseUrl) !== projectRefFromUrl(directUrl)) {
+    fail('DATABASE_URL and DIRECT_URL must resolve to the same Supabase project');
+  }
+  if (databaseNameFromUrl(databaseUrl, 'DATABASE_URL') !== databaseNameFromUrl(directUrl, 'DIRECT_URL')) {
+    fail('DATABASE_URL and DIRECT_URL must resolve to the same database');
+  }
 }
 
 if (mode === 'local' || mode === 'test') {
@@ -98,9 +131,15 @@ const explicitRef = value('SUPABASE_PROJECT_REF');
 if (explicitRef && explicitRef !== target.supabaseProjectRef) {
   fail('SUPABASE_PROJECT_REF does not match the approved V2 project');
 }
+if (remoteMigration && explicitRef !== target.supabaseProjectRef) {
+  fail('SUPABASE_PROJECT_REF must explicitly identify the approved V2 project for remote work');
+}
 
 if (value('VERCEL_PROJECT_ID') && value('VERCEL_PROJECT_ID') !== target.vercelProjectId) {
   fail('VERCEL_PROJECT_ID does not match the approved V2 project');
+}
+if (remoteMigration && value('VERCEL_PROJECT_ID') !== target.vercelProjectId) {
+  fail('VERCEL_PROJECT_ID must explicitly identify the approved V2 project for remote work');
 }
 
 if (['rc', 'production'].includes(mode) || value('VERCEL_PROJECT_ID')) {

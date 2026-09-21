@@ -4,758 +4,131 @@ generator client {
 
 datasource db {
   provider  = "postgresql"
-  url       = env("DATABASE_URL")
-  directUrl = env("DIRECT_URL")
+  // Runtime clients and guarded migration scripts inject the actual URL.
+  // This non-secret local default keeps clean source snapshots reproducible.
+  url       = "postgresql://127.0.0.1:5432/dinodia_v2_local"
 }
 
-enum Role {
-  ADMIN
-  INSTALLER
-  SENIOR_OPERATIONS_MANAGER
-  SENIOR_CUSTOMER_SUPPORT
+enum CustomerStatus {
+  ACTIVE
+  SUSPENDED
+  DELETION_PENDING
+  DELETED
+}
+
+enum EmployeeRole {
   CXO
-  TENANT
+  SENIOR_OPERATIONS_MANAGER
+  INSTALLER
+  SENIOR_CUSTOMER_SUPPORT
 }
 
-enum AlexaLinkScope {
-  TENANT
-  HOMEOWNER
+enum EmployeeStatus {
+  ACTIVE
+  REVOKED
 }
 
-enum AlexaNativeConnectionStatus {
-  DISCONNECTED
-  CONNECTING
-  LINKED
-  ERROR
-}
-
-enum AlexaProjectionSource {
-  HA_LEGACY
-  DINODIA_OS_NATIVE
-}
-
-enum HomeStatus {
+enum HomeLifecycle {
+  INSTALLING
+  CLAIMABLE
+  CLAIM_RESERVED
+  PENDING_INSTALLATION
   ACTIVE
   TRANSFER_PENDING
-  UNCLAIMED
+  UNOWNED
+  DEREGISTRATION_PENDING
+  WAITING_FOR_HUB_CLEANUP
+  MAINTENANCE
 }
 
-enum MatterCommissioningStatus {
-  CREATED
+enum AddressStatus {
+  NOT_PROVIDED
+  PENDING_CLAIM
+  VERIFIED
+  STAFF_CORRECTED
+}
+
+enum InstallationStatus {
+  DRAFT
   IN_PROGRESS
-  NEEDS_INPUT
-  SUCCEEDED
-  FAILED
-  CANCELED
+  COMPLETE
+  REOPENED
 }
 
-enum CommissioningKind {
-  MATTER
-  DISCOVERY
-}
-
-enum AuditEventType {
-  SELL_INITIATED
-  CLAIM_CODE_GENERATED
-  HOME_CLAIM_ATTEMPTED
-  HOME_RESET
-  OWNER_TRANSFERRED
-  TENANT_DELETED
-  HOME_CLAIMED
-  AUTOMATION_CREATED
-  AUTOMATION_UPDATED
-  AUTOMATION_DELETED
-  HOMEOWNER_POLICY_ACCEPTED
-  HOMEOWNER_POLICY_EMAIL_RESEND_REQUESTED
-  SUPPORT_REQUEST_CREATED
-  SUPPORT_REQUEST_APPROVED
-  SUPPORT_REQUEST_REVOKED
-  SUPPORT_CREDENTIALS_VIEWED
-  SUPPORT_IMPERSONATION_STARTED
-  SUPPORT_IMPERSONATION_STOPPED
-  SUPPORT_HA_CODE_ISSUED
-  SUPPORT_HA_CODE_CONSUMED
-  SUPPORT_HA_SESSION_STARTED
-  SUPPORT_HA_SESSION_FAILED
-  SUPPORT_HA_SESSION_EXPIRED
-  ROOM_ACCESS_REQUESTED
-  ROOM_ACCESS_APPROVED
-  ROOM_ACCESS_REJECTED
-  PROPERTY_MANAGER_UPDATED
-  ROOM_QR_REKEYED
-  ROOM_HA_AREA_RESYNCED
-  OS_OPERATOR_SESSION_LAUNCHED
-  OS_OPERATOR_CREDENTIAL_ROTATION_REQUESTED
-  OS_OPERATOR_CREDENTIAL_REVOKED
-  OS_PROVISIONING_PAIRING_REDEEMED
-  SUPPORT_V2_ACCESS_REDEEMED
-  SUPPORT_V2_CODE_ISSUED
-  SUPPORT_V2_ACCESS_CLOSED
-  SUPPORT_V2_REVOCATION_ACKNOWLEDGED
-}
-
-enum HomeownerPolicyNotificationRecipientType {
-  HOMEOWNER
-  INSTALLER
-}
-
-enum HomeownerPolicyNotificationDeliveryStatus {
-  PENDING
-  SENT
-  FAILED
-}
-
-enum PolicyKind {
-  PRIVACY_NOTICE
-  TERMS
-}
-
-enum HomeContactType {
+enum MembershipRole {
+  OWNER
   PROPERTY_MANAGER
+  TENANT
 }
 
-enum RoomStatus {
+enum MembershipStatus {
   ACTIVE
-  REKEYED
+  REMOVAL_PENDING
+  REMOVED
+}
+
+enum AreaStatus {
+  ACTIVE
+  RETIRED
+}
+
+enum DeviceManagementClass {
+  PROPERTY_DEVICE
+  TENANT_DEVICE
+}
+
+enum DeviceAnalyticsCategory {
+  NONE
+  LIGHT
+  BOILER
+  RADIATOR
+}
+
+enum DeviceOnlineState {
+  ONLINE
+  OFFLINE
+  UNKNOWN
+}
+
+enum DeviceLifecycleState {
+  DISCOVERED
+  INSTALLED
+  VIEW_ONLY
+  RETIRED
+  REMOVAL_PENDING
+  REMOVED
+}
+
+enum CompanyWorkKind {
+  INITIAL_HUB_INSTALLATION
+  PHYSICAL_CONFIGURATION_CORRECTION
+  HUB_RECOVERY
+}
+
+enum CompanyWorkState {
+  ASSIGNED
+  IN_PROGRESS
+  COMPLETED
+  CANCELLED
+  REOPENED
+}
+
+enum HubIdentityStatus {
+  ACTIVE
   REVOKED
 }
 
-enum RoomAccessRequestStatus {
-  PENDING
-  APPROVED
-  REJECTED
-  EXPIRED
-  CANCELED
-}
-
-enum RoomAccessApprovalKind {
-  APPROVE
-  REJECT
-}
-
-enum HomeownerOnboardingFlowType {
-  SETUP_QR
-  CLAIM_CODE
-}
-
-enum AuthChallengePurpose {
-  ADMIN_EMAIL_VERIFY
-  TENANT_ENABLE_2FA
-  LOGIN_NEW_DEVICE
-  REMOTE_ACCESS_SETUP
-  PASSWORD_RESET
-  SUPPORT_HOME_ACCESS
-  SUPPORT_USER_REMOTE_SUPPORT
-}
-
-enum DeviceStatus {
+enum HubLifecycleState {
+  PAIRING
+  PROVISIONED
+  MAINTENANCE
+  DEREGISTRATION_PENDING
+  WAITING_FOR_CLEANUP
   ACTIVE
-  STOLEN
-  BLOCKED
-}
-
-enum StepUpPurpose {
-  REMOTE_ACCESS_SETUP
-  SENSITIVE_OPERATION
-}
-
-enum SupportRequestKind {
-  HOME_ACCESS
-  USER_REMOTE_ACCESS
-}
-
-enum SupportAccessScope {
-  VIEW_HOME_STATUS
-  VIEW_CREDENTIALS
-  CONNECT_HA_BACKEND
-  IMPERSONATE_USER
-}
-
-enum SupportApprovalRecipientType {
-  HOMEOWNER
-  PROPERTY_MANAGER
-}
-
-enum HomeAutomationSource {
-  DINODIA_UI
-}
-
-enum TenantDeviceCleanupStatus {
-  ACTIVE
-  PENDING_DEVICE_CLEANUP
-  CLEANED_UP
-}
-
-enum TenantDeviceCleanupReason {
-  TENANT_DELETED
-  AREA_ACCESS_REMOVED
-  DEVICE_MOVE_FAILED
-  MANUAL_RETRY
-}
-
-model Home {
-  id                                    Int                                   @id @default(autoincrement())
-  status                                HomeStatus                            @default(ACTIVE)
-  addressLine1                          String
-  addressLine2                          String?
-  city                                  String
-  state                                 String?
-  postcode                              String
-  country                               String
-  timeZone                              String                                @default("Europe/London")
-  haConnection                          HaConnection                          @relation(fields: [haConnectionId], references: [id])
-  haConnectionId                        Int                                   @unique
-  claimCodeHash                         String?                               @unique
-  claimCodeIssuedAt                     DateTime?
-  claimCodeConsumedAt                   DateTime?
-  auditEvents                           AuditEvent[]
-  homeownerPolicyAcceptances            HomeownerPolicyAcceptance[]
-  homeownerPolicyNotificationDeliveries HomeownerPolicyNotificationDelivery[]
-  pendingHomeownerOnboardings           PendingHomeownerOnboarding[]
-  stepUpApprovals                       StepUpApproval[]
-  homeContacts                          HomeContact[]
-  users                                 User[]
-  memberships                           HomeMembership[]
-  automationOwnerships                  AutomationOwnership[]
-  homeAutomations                       HomeAutomation[]
-  hubIncidents                          HubIncident[]
-  hubInstall                            HubInstall?                           @relation("HomeHubInstall")
-  alexaHomeConnection                   AlexaHomeConnection?
-  alexaSkillLinks                       AlexaSkillUserLink[]                  @relation("AlexaSkillHomeLinks")
-  nativeAutomations                     NativeAutomation[]                    @relation("NativeAutomationHome")
-  nativeAutomationExecutions            NativeAutomationExecution[]           @relation("NativeAutomationExecutionHome")
-  nativeAutomationRequests              NativeAutomationRequest[]             @relation("NativeAutomationRequestHome")
-  createdAt                             DateTime                              @default(now())
-  updatedAt                             DateTime                              @updatedAt
-}
-
-model AuditEvent {
-  id          String         @id @default(uuid())
-  type        AuditEventType
-  metadata    Json?
-  home        Home           @relation(fields: [homeId], references: [id])
-  homeId      Int
-  actorUser   User?          @relation("AuditEventActor", fields: [actorUserId], references: [id])
-  actorUserId Int?
-  createdAt   DateTime       @default(now())
-
-  @@index([homeId])
-  @@index([actorUserId])
-}
-
-model AuditEventArchive {
-  id          String         @id @default(uuid())
-  type        AuditEventType
-  metadata    Json?
-  homeId      Int?
-  actorUserId Int?
-  createdAt   DateTime
-  archivedAt  DateTime       @default(now())
-}
-
-model User {
-  id                             Int                             @id @default(autoincrement())
-  username                       String                          @unique
-  passwordHash                   String
-  mustChangePassword             Boolean                         @default(false)
-  passwordChangedAt              DateTime?
-  email                          String?
-  emailPending                   String?
-  emailVerifiedAt                DateTime?
-  phoneNumber                    String?
-  homeownerPolicyAcceptedVersion String?
-  homeownerPolicyAcceptedAt      DateTime?
-  email2faEnabled                Boolean                         @default(false)
-  isActive                       Boolean                         @default(true)
-  role                           Role                            @default(TENANT)
-  home                           Home?                           @relation(fields: [homeId], references: [id])
-  homeId                         Int?
-  haConnection                   HaConnection?                   @relation("AssignedHaConnection", fields: [haConnectionId], references: [id])
-  haConnectionId                 Int?
-  ownedHaConnection              HaConnection?                   @relation("OwnedHaConnection")
-  accessRules                    AccessRule[]
-  alexaAuthCodes                 AlexaAuthCode[]
-  alexaRefreshTokens             AlexaRefreshToken[]
-  alexaEventToken                AlexaEventToken?
-  alexaSkillUserLinks            AlexaSkillUserLink[]
-  alexaHomeConnectionsLinked     AlexaHomeConnection[]           @relation("AlexaHomeConnectionLinkedBy")
-  nativeAutomations              NativeAutomation[]              @relation("NativeAutomationOwner")
-  nativeAutomationRequests       NativeAutomationRequest[]
-  newDeviceCommissioningSessions NewDeviceCommissioningSession[]
-  createdAreaDisplayOverrides    AreaDisplayOverride[]           @relation("UserCreatedAreaDisplayOverrides")
-  createdLabelDisplayOverrides   LabelDisplayOverride[]          @relation("UserCreatedLabelDisplayOverrides")
-  tenantVirtualAreas             TenantVirtualArea[]             @relation("UserTenantVirtualAreas")
-  tenantDeviceDisplayOverrides   TenantDeviceDisplayOverride[]   @relation("UserTenantDeviceDisplayOverrides")
-  automationOwnerships           AutomationOwnership[]
-  homeAutomationsCreated         HomeAutomation[]                @relation("HomeAutomationCreatedBy")
-  trustedDevices                 TrustedDevice[]
-  authChallenges                 AuthChallenge[]
-  policyAcceptances              PolicyAcceptance[]
-  loginIntents                   LoginIntent[]
-  stepUpApprovals                StepUpApproval[]
-  remoteAccessLeases             RemoteAccessLease[]
-  homeownerPolicyAcceptances     HomeownerPolicyAcceptance[]
-  pendingHomeownerOnboardings    PendingHomeownerOnboarding[]
-  actedAuditEvents               AuditEvent[]                    @relation("AuditEventActor")
-  approvedSupportRequests        SupportRequest[]                @relation("SupportRequestApprovedBy")
-  revokedSupportRequests         SupportRequest[]                @relation("SupportRequestRevokedBy")
-  createdAt                      DateTime                        @default(now())
-  updatedAt                      DateTime                        @updatedAt
-  roomAccessRequests             RoomAccessRequest[]
-  memberships                    HomeMembership[]                @relation("UserHomeMemberships")
-  employeePrincipal              CompanyEmployeePrincipal?
-  stage1ClaimAudits              Stage1ClaimAudit[]
-
-  @@index([homeId])
-}
-
-// Employee identity is deliberately separate from customer membership
-// authority. A portal employee may be represented by an existing login during
-// the transition, but native hub authority must be derived from this record
-// and an approved workflow, never from a customer HomeMembership.
-model CompanyEmployeePrincipal {
-  id           String    @id @default(uuid())
-  user         User      @relation(fields: [userId], references: [id], onDelete: Cascade)
-  userId       Int       @unique
-  role         Role
-  active       Boolean   @default(true)
-  recentAuthAt DateTime?
-  revokedAt    DateTime?
-  createdAt    DateTime  @default(now())
-  updatedAt    DateTime  @updatedAt
-
-  @@index([role, active])
-}
-
-model HomeMembership {
-  id             String                    @id @default(cuid())
-  user           User                      @relation("UserHomeMemberships", fields: [userId], references: [id], onDelete: Cascade)
-  userId         Int
-  home           Home                      @relation(fields: [homeId], references: [id], onDelete: Cascade)
-  homeId         Int
-  role           HomeMembershipRole
-  status         HomeMembershipStatus      @default(ACTIVE)
-  policyRevision Int                       @default(1)
-  removedAt      DateTime?
-  createdAt      DateTime                  @default(now())
-  updatedAt      DateTime                  @updatedAt
-  areaGrants     HomeMembershipAreaGrant[]
-
-  @@unique([userId, homeId])
-  @@index([homeId, status, role])
-  @@index([userId, status])
-}
-
-model HomeMembershipAreaGrant {
-  id             String         @id @default(cuid())
-  membership     HomeMembership @relation(fields: [membershipId], references: [id], onDelete: Cascade)
-  membershipId   String
-  areaId         String
-  policyRevision Int            @default(1)
-  revokedAt      DateTime?
-  createdAt      DateTime       @default(now())
-  updatedAt      DateTime       @updatedAt
-
-  @@unique([membershipId, areaId])
-  @@index([areaId, revokedAt])
-}
-
-model PolicyAcceptance {
-  id                    String     @id @default(uuid())
-  user                  User       @relation(fields: [userId], references: [id], onDelete: Cascade)
-  userId                Int
-  policyKind            PolicyKind
-  policyVersion         String
-  acceptedAt            DateTime   @default(now())
-  ipHash                String?
-  deviceFingerprintHash String?
-
-  @@unique([userId, policyKind, policyVersion])
-  @@index([acceptedAt])
-}
-
-model LoginIntent {
-  id          String    @id @default(cuid())
-  user        User      @relation(fields: [userId], references: [id], onDelete: Cascade)
-  userId      Int
-  username    String
-  role        Role
-  deviceId    String
-  deviceLabel String?
-  expiresAt   DateTime
-  consumedAt  DateTime?
-  revokedAt   DateTime?
-  createdAt   DateTime  @default(now())
-  updatedAt   DateTime  @updatedAt
-
-  @@index([userId])
-  @@index([expiresAt])
-  @@index([revokedAt])
-}
-
-model TrustedDevice {
-  id             String    @id @default(uuid())
-  user           User      @relation(fields: [userId], references: [id], onDelete: Cascade)
-  userId         Int
-  deviceId       String
-  label          String?
-  firstSeenAt    DateTime  @default(now())
-  lastSeenAt     DateTime  @default(now())
-  revokedAt      DateTime?
-  sessionVersion Int       @default(0)
-
-  @@unique([userId, deviceId])
-  @@index([userId])
-  @@index([deviceId])
-}
-
-model DeviceRegistry {
-  deviceId    String       @id
-  status      DeviceStatus @default(ACTIVE)
-  label       String?
-  firstSeenAt DateTime     @default(now())
-  lastSeenAt  DateTime     @default(now())
-  updatedAt   DateTime     @updatedAt
-}
-
-model AuthChallenge {
-  id                    String               @id @default(uuid())
-  user                  User                 @relation(fields: [userId], references: [id])
-  userId                Int
-  purpose               AuthChallengePurpose
-  email                 String
-  deviceId              String?
-  tokenHash             String               @unique
-  supersededTokenHashes String[]             @default([])
-  expiresAt             DateTime
-  approvedAt            DateTime?
-  consumedAt            DateTime?
-  createdAt             DateTime             @default(now())
-
-  @@index([userId])
-  @@index([expiresAt])
-  @@index([approvedAt])
-}
-
-model StepUpApproval {
-  id               String        @id @default(uuid())
-  user             User          @relation(fields: [userId], references: [id], onDelete: Cascade)
-  userId           Int
-  deviceId         String?
-  purpose          StepUpPurpose
-  operationKind    String?
-  operationDigest  String?
-  trustedSessionId String?
-  membershipId     String?
-  hubInstallId     String?
-  targetIds        Json?
-  homeId           Int?
-  home             Home?         @relation(fields: [homeId], references: [id], onDelete: Cascade)
-  expiresAt        DateTime?
-  approvedAt       DateTime      @default(now())
-  usedAt           DateTime?
-  createdAt        DateTime      @default(now())
-
-  @@index([userId, deviceId, purpose])
-  @@index([deviceId])
-  @@index([homeId, operationDigest, expiresAt])
-}
-
-model RemoteAccessLease {
-  id        String        @id @default(uuid())
-  user      User          @relation(fields: [userId], references: [id], onDelete: Cascade)
-  userId    Int
-  deviceId  String
-  purpose   StepUpPurpose
-  tokenHash String        @unique
-  expiresAt DateTime
-  revokedAt DateTime?
-  createdAt DateTime      @default(now())
-
-  @@index([userId, deviceId, purpose])
-  @@index([expiresAt])
-  @@index([deviceId])
-}
-
-model HaConnection {
-  id                       Int     @id @default(autoincrement())
-  baseUrl                  String // e.g. https://xxxx.ui.nabu.casa or http://homeassistant.local:8123
-  cloudUrl                 String? // optional HA Cloud URL shared across admin + tenants
-  haUsername               String?
-  haUsernameCiphertext     String?
-  haPassword               String?
-  haPasswordCiphertext     String?
-  longLivedToken           String?
-  longLivedTokenCiphertext String?
-  longLivedTokenHash       String? @unique
-  devicesVersion           Int     @default(0)
-
-  owner   User? @relation("OwnedHaConnection", fields: [ownerId], references: [id])
-  ownerId Int?  @unique
-
-  home                           Home?
-  users                          User[]                          @relation("AssignedHaConnection")
-  devices                        Device[]
-  monitoringReadings             MonitoringReading[]
-  boilerTemperatureReadings      BoilerTemperatureReading[]
-  boilerUsageAccumulators        BoilerUsageAccumulator[]
-  radiatorUsageAccumulators      RadiatorUsageAccumulator[]
-  electricUsageAccumulators      ElectricUsageAccumulator[]
-  electricUsageReadings          ElectricUsageReading[]
-  electricUsageDailyRollups      ElectricUsageDailyRollup[]
-  newDeviceCommissioningSessions NewDeviceCommissioningSession[]
-  areaDisplayOverrides           AreaDisplayOverride[]           @relation("HaConnectionAreaDisplayOverrides")
-  labelDisplayOverrides          LabelDisplayOverride[]          @relation("HaConnectionLabelDisplayOverrides")
-  tenantVirtualAreas             TenantVirtualArea[]             @relation("HaConnectionTenantVirtualAreas")
-  tenantDeviceDisplayOverrides   TenantDeviceDisplayOverride[]   @relation("HaConnectionTenantDeviceDisplayOverrides")
-  createdAt                      DateTime                        @default(now())
-  updatedAt                      DateTime                        @updatedAt
-
-  // Transitional client name retained only until native hub projections are
-  // wired in later stages. The V2 database must not create an HA-era table.
-  @@map("NativeHubConnection")
-}
-
-model HubInstall {
-  id                                 String                       @id @default(uuid())
-  serial                             String                       @unique
-  bootstrapSecretCiphertext          String
-  syncSecretCiphertext               String?
-  platformSyncEnabled                Boolean                      @default(true)
-  platformSyncIntervalMinutes        Int                          @default(2)
-  rotateEveryMinutes                 Int                          @default(60) // minutes
-  graceMinutes                       Int                          @default(20) // minutes
-  publishedHubTokenVersion           Int                          @default(0)
-  lastAckedHubTokenVersion           Int                          @default(0)
-  publishedOperatorCredentialVersion Int                          @default(0)
-  deliveredOperatorCredentialVersion Int                          @default(0)
-  lastAckedOperatorCredentialVersion Int                          @default(0)
-  activeOperatorCredentialVersion    Int                          @default(0)
-  operatorRotateEveryMinutes         Int                          @default(60)
-  operatorGraceMinutes               Int                          @default(20)
-  accessPolicyRevision               Int                          @default(1)
-  manufacturingIdentityId            String?                      @unique
-  provisioningOperatorId             Int?
-  provisioningWorkflowStatus         String?
-  heatingUsageResetRequestedAt       DateTime?
-  heatingUsageResetCompletedAt       DateTime?
-  lastReportedLanBaseUrl             String?
-  lastReportedLanBaseUrlAt           DateTime?
-  lastReportedCloudUrl               String?
-  lastReportedCloudUrlAt             DateTime?
-  cloudUrlVerifiedAt                 DateTime?
-  lastReportedHaAreas                Json?
-  lastReportedHaAreasAt              DateTime?
-  runtimeKind                        String?
-  runtimeVersion                     String?
-  runtimeCapabilities                Json?
-  runtimeCapabilitiesReportedAt      DateTime?
-  lastSeenAt                         DateTime?
-  home                               Home?                        @relation("HomeHubInstall", fields: [homeId], references: [id], onDelete: SetNull)
-  manufacturingIdentity              HubManufacturingIdentity?    @relation(fields: [manufacturingIdentityId], references: [id], onDelete: SetNull)
-  homeId                             Int?                         @unique
-  pendingHomeownerOnboardings        PendingHomeownerOnboarding[]
-  stage1ClaimReservations             Stage1ClaimReservation[]
-  hubTokens                          HubToken[]
-  operatorCredentials                HubOperatorCredential[]
-  rooms                              Room[]
-  roomAccessRequests                 RoomAccessRequest[]
-  hubIncidents                       HubIncident[]
-  alexaHomeConnection                AlexaHomeConnection?
-  nativeAutomationDeliveries         NativeAutomationDelivery[]
-  createdAt                          DateTime                     @default(now())
-  updatedAt                          DateTime                     @updatedAt
-}
-
-model HubManufacturingIdentity {
-  id                   String                   @id @default(uuid())
-  serial               String                   @unique
-  signingPublicKey     String
-  encryptionPublicKey  String?
-  publicKeyFingerprint String                   @unique
-  encryptionKeyFingerprint String?              @unique
-  identityGeneration   Int                      @default(1)
-  status               String                   @default("ACTIVE")
-  revokedAt            DateTime?
-  registeredAt         DateTime                 @default(now())
-  updatedAt            DateTime                 @updatedAt
-  hubInstall           HubInstall?
-  provisioningAttempts HubProvisioningAttempt[]
-
-  @@index([status, revokedAt])
-}
-
-model HubProvisioningAttempt {
-  id                           String                   @id @default(uuid())
-  attemptId                    String                   @unique
-  identity                     HubManufacturingIdentity @relation(fields: [identityId], references: [id], onDelete: Cascade)
-  identityId                   String
-  serial                       String
-  baseUrl                      String
-  codeHash                     String                   @unique
-  state                        String                   @default("PENDING")
-  provisioningOperatorId       Int?
-  provisioningWorkflowId      String?
-  operatorBoundAt              DateTime?
-  cloudUrl                    String?
-  cloudUrlReportedAt          DateTime?
-  cloudUrlVerifiedAt          DateTime?
-  challengeHash                String?                  @unique
-  challengeCiphertext          String?
-  challengeExpiresAt           DateTime?
-  hubProofAt                   DateTime?
-  machineCredentialVersion     Int?
-  machineCredentialHash        String?                  @unique
-  machineCredentialCiphertext  String?
-  machineCredentialEnvelope   Json?
-  machineCredentialDeliveredAt DateTime?
-  machineCredentialAcknowledgedAt DateTime?
-  expiresAt                    DateTime
-  redeemedAt                   DateTime?
-  challengeIssuedAt            DateTime?
-  acknowledgedAt               DateTime?
-  installationCompletedAt      DateTime?
-  revokedAt                    DateTime?
-  failureCount                 Int                      @default(0)
-  homeQrReference              String?
-  createdAt                    DateTime                 @default(now())
-  updatedAt                    DateTime                 @updatedAt
-
-  @@index([serial, state, expiresAt])
-  @@index([identityId, createdAt])
-  @@index([provisioningOperatorId, provisioningWorkflowId, state])
-}
-
-model OsOperatorWorkflow {
-  id                 String    @id @default(uuid())
-  homeId             Int
-  hubInstallId       String
-  workflowType       String
-  status             String
-  assignedEmployeeId Int
-  approvedAt         DateTime?
-  expiresAt          DateTime?
-  revokedAt          DateTime?
-  createdAt          DateTime  @default(now())
-  updatedAt          DateTime  @updatedAt
-
-  @@index([homeId, workflowType, status])
-  @@index([hubInstallId, assignedEmployeeId, status])
-}
-
-model HubIncident {
-  id              String     @id @default(uuid())
-  hubInstall      HubInstall @relation(fields: [hubInstallId], references: [id], onDelete: Cascade)
-  hubInstallId    String
-  home            Home       @relation(fields: [homeId], references: [id], onDelete: Cascade)
-  homeId          Int
-  incidentId      String
-  revision        Int
-  kind            String
-  severity        String
-  state           String
-  summary         String
-  detail          String?
-  deviceId        String?
-  deviceName      String?
-  deviceProtocol  String?
-  deviceModel     String?
-  areaName        String?
-  labels          Json?
-  details         Json?
-  firstObservedAt DateTime
-  lastObservedAt  DateTime
-  openedAt        DateTime?
-  resolvedAt      DateTime?
-  createdAt       DateTime   @default(now())
-  updatedAt       DateTime   @updatedAt
-
-  @@unique([hubInstallId, incidentId])
-  @@index([homeId, state, lastObservedAt])
-  @@index([hubInstallId, lastObservedAt])
-}
-
-model HomeownerPolicyAcceptance {
-  id                      String                                @id @default(uuid())
-  home                    Home                                  @relation(fields: [homeId], references: [id], onDelete: Cascade)
-  homeId                  Int
-  homeownerUser           User                                  @relation(fields: [homeownerUserId], references: [id], onDelete: Cascade)
-  homeownerUserId         Int
-  policyVersion           String
-  acceptedAt              DateTime                              @default(now())
-  signatureName           String
-  acceptedStatements      Json
-  addressReference        String
-  approvedSupportContacts Json?
-  notificationPreference  String?
-  ipHash                  String?
-  deviceFingerprintHash   String?
-  notifications           HomeownerPolicyNotificationDelivery[]
-  createdAt               DateTime                              @default(now())
-  updatedAt               DateTime                              @updatedAt
-
-  @@unique([homeownerUserId, policyVersion])
-  @@index([homeId])
-}
-
-model HomeownerPolicyNotificationDelivery {
-  id             String                                    @id @default(uuid())
-  acceptance     HomeownerPolicyAcceptance                 @relation(fields: [acceptanceId], references: [id], onDelete: Cascade)
-  acceptanceId   String
-  home           Home                                      @relation(fields: [homeId], references: [id], onDelete: Cascade)
-  homeId         Int
-  recipientType  HomeownerPolicyNotificationRecipientType
-  recipientEmail String
-  status         HomeownerPolicyNotificationDeliveryStatus @default(PENDING)
-  attemptCount   Int                                       @default(0)
-  lastAttemptAt  DateTime?
-  sentAt         DateTime?
-  lastError      String?
-  createdAt      DateTime                                  @default(now())
-  updatedAt      DateTime                                  @updatedAt
-
-  @@unique([acceptanceId, recipientType])
-  @@index([homeId, status])
-}
-
-model PendingHomeownerOnboarding {
-  id                    String                      @id @default(cuid())
-  flowType              HomeownerOnboardingFlowType
-  policyVersionRequired String                      @default("2026-V1")
-  claimCodeHash         String?
-  hubInstall            HubInstall?                 @relation(fields: [hubInstallId], references: [id], onDelete: SetNull)
-  hubInstallId          String?
-  home                  Home?                       @relation(fields: [homeId], references: [id], onDelete: SetNull)
-  homeId                Int?
-  user                  User?                       @relation(fields: [userId], references: [id], onDelete: SetNull)
-  userId                Int?
-  proposedUsername      String
-  proposedPasswordHash  String
-  proposedEmail         String
-  deviceId              String
-  deviceLabel           String?
-  emailVerifiedAt       DateTime?
-  policyAcceptedAt      DateTime?
-  expiresAt             DateTime
-  createdAt             DateTime                    @default(now())
-  updatedAt             DateTime                    @updatedAt
-
-  @@index([flowType])
-  @@index([expiresAt])
-  @@index([homeId])
-  @@index([userId])
-  @@index([hubInstallId])
-  @@index([claimCodeHash])
-}
-
-enum HubTokenStatus {
-  PENDING
-  ACTIVE
-  GRACE
   REVOKED
 }
 
-enum HubOperatorCredentialStatus {
+enum HubCredentialState {
   PENDING
   DELIVERED
   ACKNOWLEDGED
@@ -764,905 +137,867 @@ enum HubOperatorCredentialStatus {
   REVOKED
 }
 
-enum HomeMembershipRole {
-  OWNER
+enum ProvisioningState {
+  CREATED
+  PRESENTED
+  REDEEMED
+  CHALLENGE_PENDING
+  PROOF_RECEIVED
+  CREDENTIAL_DELIVERED
+  ACKNOWLEDGED
+  COMPLETED
+  EXPIRED
+  REVOKED
+  FAILED
+}
+
+enum InvitationRole {
   PROPERTY_MANAGER
   TENANT
 }
 
-enum HomeMembershipStatus {
+enum InvitationState {
+  PENDING
+  ACCEPTED
+  DECLINED
+  EXPIRED
+  REVOKED
+  REPLACED
+}
+
+enum AreaQrStatus {
   ACTIVE
-  REMOVED
+  DISABLED
+  REPLACED
 }
 
-model HubOperatorCredential {
-  id                String                      @id @default(uuid())
-  hubInstall        HubInstall                  @relation(fields: [hubInstallId], references: [id], onDelete: Cascade)
-  hubInstallId      String
-  version           Int
-  status            HubOperatorCredentialStatus
-  tokenHash         String                      @unique
-  tokenCiphertext   String
-  issuedAt          DateTime                    @default(now())
-  deliveredAt       DateTime?
-  acknowledgedAt    DateTime?
-  activatedAt       DateTime?
-  graceUntil        DateTime?
-  revokedAt         DateTime?
-  revokedReason     String?
-  deliveryAttempts  Int                         @default(0)
-  lastDeliveryError String?
-
-  @@unique([hubInstallId, version])
-  @@index([hubInstallId, status])
+enum AreaAccessRequestStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  EXPIRED
+  CANCELLED
 }
 
-model OperatorSessionHandoff {
-  id           String    @id @default(uuid())
-  tokenHash    String    @unique
-  employeeId   Int
-  homeId       Int
-  hubInstallId String
-  workflow     String
-  workflowId   String
-  expiresAt    DateTime
-  consumedAt   DateTime?
-  createdAt    DateTime  @default(now())
-
-  @@index([employeeId, homeId, expiresAt])
-  @@index([hubInstallId, workflowId])
+enum ClaimPurpose {
+  INITIAL_OWNER
+  OWNERSHIP_TRANSFER
 }
 
-model HubToken {
-  id              String         @id @default(uuid())
-  hubInstall      HubInstall     @relation(fields: [hubInstallId], references: [id], onDelete: Cascade)
-  hubInstallId    String
-  version         Int
-  status          HubTokenStatus
-  tokenHash       String
-  tokenCiphertext String
-  publishedAt     DateTime?
-  graceUntil      DateTime?
-  createdAt       DateTime       @default(now())
-  updatedAt       DateTime       @updatedAt
-
-  @@unique([hubInstallId, version])
-  @@unique([hubInstallId, tokenHash])
-  @@index([hubInstallId, status])
-  @@index([tokenHash])
+enum ClaimState {
+  AVAILABLE
+  RESERVED
+  PENDING_INSTALLATION
+  CONSUMED
+  CANCELLED
+  REPLACED
+  REVOKED
+  INVALIDATED
 }
 
-model HubAgentNonce {
-  id        Int      @id @default(autoincrement())
-  serial    String
-  nonce     String
-  ts        BigInt
-  createdAt DateTime @default(now())
-
-  @@unique([serial, nonce])
-  @@index([createdAt])
+enum ClaimReservationState {
+  ACTIVE
+  CONVERTED_TO_PENDING_INSTALLATION
+  EXPIRED
+  MANUALLY_RELEASED
+  CANCELLED
 }
 
-model AccessRule {
-  id        Int      @id @default(autoincrement())
-  user      User     @relation(fields: [userId], references: [id])
-  userId    Int
-  // Tenants are now associated to an AREA only
-  area      String
-  createdAt DateTime @default(now())
+enum PendingHomeSetupState {
+  PROFILE_REQUIRED
+  ADDRESS_REQUIRED
+  POLICY_REQUIRED
+  PENDING_INSTALLATION
+  READY_TO_ACTIVATE
+  EXPIRED
+  CANCELLED
+  ACTIVATED
 }
 
-model HomeContact {
-  id         String          @id @default(uuid())
-  home       Home            @relation(fields: [homeId], references: [id], onDelete: Cascade)
-  homeId     Int
-  type       HomeContactType
-  email      String
-  verifiedAt DateTime?
-  createdAt  DateTime        @default(now())
-  updatedAt  DateTime        @updatedAt
-
-  @@unique([homeId, type])
-  @@index([homeId])
+enum HomeDocumentKind {
+  FLOORPLAN
+  AREA_PRESENTATION
 }
 
-model Room {
-  id                 String              @id @default(uuid())
-  hubInstall         HubInstall          @relation(fields: [hubInstallId], references: [id], onDelete: Cascade)
-  hubInstallId       String
-  displayName        String
-  haAreaName         String
-  haAreaNameOriginal String
-  qrKeyVersion       Int                 @default(1)
-  qrSecretHash       String
-  qrSecretCiphertext String
-  status             RoomStatus          @default(ACTIVE)
-  accessRequests     RoomAccessRequest[]
-  createdAt          DateTime            @default(now())
-  updatedAt          DateTime            @updatedAt
-
-  @@unique([hubInstallId, haAreaName])
-  @@index([hubInstallId])
+enum MemberPreferenceKind {
+  DASHBOARD_LAYOUT
+  FILTER_STATE
+  QUIET_HOURS
 }
 
-model RoomAccessRequest {
-  id                   String                    @id @default(uuid())
-  hubInstall           HubInstall                @relation(fields: [hubInstallId], references: [id], onDelete: Cascade)
-  hubInstallId         String
-  room                 Room                      @relation(fields: [roomId], references: [id], onDelete: Cascade)
-  roomId               String
-  homeIdSnapshot       Int?
-  requestedName        String
-  requestedEmail       String
-  requestedPhoneNumber String?
-  tenantUser           User?                     @relation(fields: [tenantUserId], references: [id], onDelete: SetNull)
-  tenantUserId         Int?
-  status               RoomAccessRequestStatus   @default(PENDING)
-  resolvedAt           DateTime?
-  approvalTokens       RoomAccessApprovalToken[]
-  createdAt            DateTime                  @default(now())
-  updatedAt            DateTime                  @updatedAt
+enum AuditActorType {
+  CUSTOMER
+  EMPLOYEE
+  HUB
+  SYSTEM
+}
 
-  @@index([hubInstallId])
-  @@index([roomId])
+enum AuditCategory {
+  MANAGEMENT
+  SECURITY
+  INSTALLATION
+  ACCESS
+}
+
+model CustomerAccount {
+  id                     String         @id @default(uuid()) @db.Uuid
+  displayName            String         @db.VarChar(160)
+  username               String         @db.VarChar(80)
+  usernameNormalized     String         @unique @db.VarChar(80)
+  email                  String         @db.VarChar(320)
+  emailNormalized        String         @unique @db.VarChar(320)
+  emailVerifiedAt        DateTime?
+  pendingEmail           String?        @db.VarChar(320)
+  pendingEmailNormalized String?        @db.VarChar(320)
+  phoneNumber            String?        @db.VarChar(40)
+  passwordHash           String         @db.VarChar(255)
+  mustChangePassword     Boolean        @default(false)
+  passwordChangedAt      DateTime?
+  status                 CustomerStatus @default(ACTIVE)
+  securityVersion        Int            @default(1)
+  lastUsedHomeId         String?        @db.Uuid
+  deletedAt              DateTime?
+  createdAt              DateTime       @default(now())
+  updatedAt              DateTime       @updatedAt
+
+  lastUsedHome         Home?                  @relation("CustomerLastUsedHome", fields: [lastUsedHomeId], references: [id], onDelete: SetNull)
+  memberships          HomeMembership[]
+  trustedDevices       TrustedDevice[]
+  sessions             CustomerSession[]
+  policyAcceptances    PolicyAcceptance[]
+  authChallenges       AuthChallenge[]
+  stepUpAuthorizations StepUpAuthorization[]
+  invitationsReceived  MembershipInvitation[] @relation("InvitationTarget")
+  areaAccessRequests   AreaAccessRequest[]
+  claimReservations    HomeClaimReservation[]
+  pendingHomeSetups    PendingHomeSetup[]
+  createdHomeDocuments HomeDocument[]         @relation("HomeDocumentCreator")
+  homeClaimReferences  HomeClaimReference[]
+
   @@index([status])
+  @@index([lastUsedHomeId])
 }
 
-model RoomAccessApprovalToken {
-  id             String                 @id @default(uuid())
-  request        RoomAccessRequest      @relation(fields: [requestId], references: [id], onDelete: Cascade)
-  requestId      String
-  kind           RoomAccessApprovalKind
-  recipientEmail String
-  tokenHash      String                 @unique
-  expiresAt      DateTime
-  consumedAt     DateTime?
-  createdAt      DateTime               @default(now())
-  updatedAt      DateTime               @updatedAt
+model CompanyEmployeeAccount {
+  id                     String         @id @default(uuid()) @db.Uuid
+  displayName            String         @db.VarChar(160)
+  email                  String         @db.VarChar(320)
+  emailNormalized        String         @unique @db.VarChar(320)
+  emailVerifiedAt        DateTime?
+  passwordHash           String         @db.VarChar(255)
+  role                   EmployeeRole
+  status                 EmployeeStatus @default(ACTIVE)
+  securityVersion        Int            @default(1)
+  recentAuthenticationAt DateTime?
+  createdAt              DateTime       @default(now())
+  updatedAt              DateTime       @updatedAt
 
-  @@index([requestId])
-  @@index([expiresAt])
+  assignedWork         CompanyOperationalWorkItem[] @relation("AssignedWork")
+  createdWork          CompanyOperationalWorkItem[] @relation("CreatedWork")
+  redeemedAttempts     HubProvisioningAttempt[]     @relation("ProvisioningRedeemer")
+  releasedReservations HomeClaimReservation[]       @relation("ReservationReleaser")
 }
 
-model Device {
-  id             Int          @id @default(autoincrement())
-  haConnection   HaConnection @relation(fields: [haConnectionId], references: [id])
-  haConnectionId Int
+model TrustedDevice {
+  id                   String    @id @default(uuid()) @db.Uuid
+  customerAccountId    String    @db.Uuid
+  deviceInstallationId String    @db.VarChar(160)
+  publicKey            String    @db.Text
+  publicKeyThumbprint  String    @db.VarChar(128)
+  deviceName           String    @db.VarChar(160)
+  model                String?   @db.VarChar(160)
+  osFamily             String?   @db.VarChar(80)
+  osVersion            String?   @db.VarChar(80)
+  firstSeenAt          DateTime  @default(now())
+  lastUsedAt           DateTime  @default(now())
+  revokedAt            DateTime?
+  sessionVersion       Int       @default(1)
+  createdAt            DateTime  @default(now())
+  updatedAt            DateTime  @updatedAt
 
-  entityId             String
-  name                 String
-  area                 String?
-  label                String?
-  blindTravelSeconds   Int?
-  boilerPowerKw        Float?
-  heatingPricePerKwh   Float?
-  boilerEfficiencyBand String?
+  customerAccount CustomerAccount       @relation(fields: [customerAccountId], references: [id], onDelete: Cascade)
+  sessions        CustomerSession[]
+  stepUps         StepUpAuthorization[]
+  claimChallenges HomeClaimChallenge[]
 
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  @@unique([haConnectionId, entityId])
+  @@unique([customerAccountId, deviceInstallationId])
+  @@index([customerAccountId, revokedAt])
+  @@index([publicKeyThumbprint])
 }
 
-model MonitoringReading {
-  id                     Int          @id @default(autoincrement())
-  haConnection           HaConnection @relation(fields: [haConnectionId], references: [id])
-  haConnectionId         Int
-  entityId               String
-  state                  String
-  numericValue           Float?
-  unit                   String?
-  hubOnline              Boolean?
-  hubOfflineGraceSeconds Int?
-  hubStatusSource        String?
-  capturedAt             DateTime     @default(now())
+model CustomerSession {
+  id                String    @id @default(uuid()) @db.Uuid
+  customerAccountId String    @db.Uuid
+  trustedDeviceId   String    @db.Uuid
+  refreshTokenHash  String    @unique @db.VarChar(128)
+  securityVersion   Int
+  issuedAt          DateTime  @default(now())
+  expiresAt         DateTime
+  lastUsedAt        DateTime  @default(now())
+  revokedAt         DateTime?
+  revokeReason      String?   @db.VarChar(160)
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
 
-  @@index([haConnectionId, entityId, capturedAt])
-  @@index([haConnectionId, capturedAt], map: "MonitoringReading_haConnectionId_capturedAt_valid_idx")
+  customerAccount CustomerAccount @relation(fields: [customerAccountId], references: [id], onDelete: Cascade)
+  trustedDevice   TrustedDevice   @relation(fields: [trustedDeviceId], references: [id], onDelete: Cascade)
+
+  @@index([customerAccountId, revokedAt, expiresAt])
+  @@index([trustedDeviceId, revokedAt])
 }
 
-model BoilerTemperatureReading {
-  id                       Int          @id @default(autoincrement())
-  haConnection             HaConnection @relation(fields: [haConnectionId], references: [id])
-  haConnectionId           Int
-  entityId                 String
-  numericValue             Float
-  currentTemperature       Float
-  targetTemperature        Float?
-  onForSeconds             Int?
-  offForSeconds            Int?
-  unknownForSeconds        Int?
-  averageEfficiencyPercent Float?
-  kwhOnEstimated           Float?
-  unit                     String       @default("°C")
-  capturedAt               DateTime     @default(now())
+model PolicyAcceptance {
+  id                String   @id @default(uuid()) @db.Uuid
+  customerAccountId String   @db.Uuid
+  policyKind        String   @db.VarChar(80)
+  policyVersion     String   @db.VarChar(80)
+  acceptedAt        DateTime @default(now())
+  deviceHash        String?  @db.VarChar(128)
+  redactedIpHash    String?  @db.VarChar(128)
+  createdAt         DateTime @default(now())
 
-  @@index([haConnectionId, entityId, capturedAt])
-  @@index([haConnectionId, capturedAt])
+  customerAccount CustomerAccount @relation(fields: [customerAccountId], references: [id], onDelete: Cascade)
+
+  @@unique([customerAccountId, policyKind, policyVersion])
 }
 
-model BoilerUsageAccumulator {
-  id                                      Int          @id @default(autoincrement())
-  haConnection                            HaConnection @relation(fields: [haConnectionId], references: [id])
-  haConnectionId                          Int
-  entityId                                String
-  onSeconds                               Int          @default(0)
-  offSeconds                              Int          @default(0)
-  unknownSeconds                          Int          @default(0)
-  efficiencyWeightedOnSeconds             Float        @default(0)
-  efficiencyOnSeconds                     Int          @default(0)
-  lastSeenAt                              DateTime?
-  lastWasOn                               Boolean?
-  lastWasKnown                            Boolean?
-  lastSnapshotOnSeconds                   Int?
-  lastSnapshotOffSeconds                  Int?
-  lastSnapshotUnknownSeconds              Int?
-  lastSnapshotEfficiencyWeightedOnSeconds Float?
-  lastSnapshotEfficiencyOnSeconds         Int?
-  lastSnapshotAt                          DateTime?
-  createdAt                               DateTime     @default(now())
-  updatedAt                               DateTime     @updatedAt
+model AuthChallenge {
+  id                String    @id @default(uuid()) @db.Uuid
+  customerAccountId String?   @db.Uuid
+  purpose           String    @db.VarChar(80)
+  targetEmail       String?   @db.VarChar(320)
+  tokenHash         String    @unique @db.VarChar(128)
+  expiresAt         DateTime
+  approvedAt        DateTime?
+  consumedAt        DateTime?
+  revokedAt         DateTime?
+  attemptCount      Int       @default(0)
+  supersededById    String?   @db.Uuid
+  createdAt         DateTime  @default(now())
 
-  @@unique([haConnectionId, entityId])
-  @@index([haConnectionId])
+  customerAccount CustomerAccount? @relation(fields: [customerAccountId], references: [id], onDelete: Cascade)
+
+  @@index([customerAccountId, purpose, expiresAt])
 }
 
-model RadiatorUsageAccumulator {
-  id                         Int          @id @default(autoincrement())
-  haConnection               HaConnection @relation(fields: [haConnectionId], references: [id])
-  haConnectionId             Int
-  entityId                   String
-  onSeconds                  Int          @default(0)
-  offSeconds                 Int          @default(0)
-  unknownSeconds             Int          @default(0)
-  lastSeenAt                 DateTime?
-  lastWasOn                  Boolean?
-  lastWasKnown               Boolean?
-  lastSnapshotOnSeconds      Int?
-  lastSnapshotOffSeconds     Int?
-  lastSnapshotUnknownSeconds Int?
-  lastSnapshotAt             DateTime?
-  createdAt                  DateTime     @default(now())
-  updatedAt                  DateTime     @updatedAt
+model StepUpAuthorization {
+  id                    String    @id @default(uuid()) @db.Uuid
+  customerAccountId     String    @db.Uuid
+  customerSessionId     String?   @db.Uuid
+  trustedDeviceId       String?   @db.Uuid
+  homeId                String?   @db.Uuid
+  membershipId          String?   @db.Uuid
+  operationKind         String    @db.VarChar(120)
+  targetDigest          String    @db.VarChar(128)
+  normalizedValueDigest String    @db.VarChar(128)
+  policyRevision        Int
+  nonceHash             String    @db.VarChar(128)
+  issuedAt              DateTime  @default(now())
+  expiresAt             DateTime
+  consumedAt            DateTime?
+  revokedAt             DateTime?
 
-  @@unique([haConnectionId, entityId])
-  @@index([haConnectionId])
+  customerAccount CustomerAccount @relation(fields: [customerAccountId], references: [id], onDelete: Cascade)
+  trustedDevice   TrustedDevice?  @relation(fields: [trustedDeviceId], references: [id], onDelete: SetNull)
+
+  @@unique([customerAccountId, nonceHash])
+  @@index([customerAccountId, expiresAt, consumedAt])
+  @@index([homeId, membershipId])
 }
 
-model ElectricUsageAccumulator {
-  id                         Int          @id @default(autoincrement())
-  haConnection               HaConnection @relation(fields: [haConnectionId], references: [id])
-  haConnectionId             Int
-  entityId                   String
-  entityName                 String?
-  trackingStartedAt          DateTime?
-  trackingEpoch              String
-  assignmentStartedAt        DateTime?
-  assignmentEpoch            String
-  sourceAreaId               String?
-  sourceAreaName             String?
-  onSeconds                  Int          @default(0)
-  offSeconds                 Int          @default(0)
-  unknownSeconds             Int          @default(0)
-  lastSeenAt                 DateTime?
-  lastWasOn                  Boolean?
-  lastWasKnown               Boolean?
-  retiredAt                  DateTime?
-  lastSnapshotOnSeconds      Int?
-  lastSnapshotOffSeconds     Int?
-  lastSnapshotUnknownSeconds Int?
-  lastSnapshotAt             DateTime?
-  createdAt                  DateTime     @default(now())
-  updatedAt                  DateTime     @updatedAt
+model Home {
+  id                      String             @id @default(uuid()) @db.Uuid
+  addressLine1            String?            @db.VarChar(200)
+  addressLine2            String?            @db.VarChar(200)
+  city                    String?            @db.VarChar(120)
+  region                  String?            @db.VarChar(120)
+  postcode                String?            @db.VarChar(32)
+  country                 String?            @db.VarChar(2)
+  timezone                String?            @db.VarChar(80)
+  addressStatus           AddressStatus      @default(NOT_PROVIDED)
+  lifecycle               HomeLifecycle      @default(INSTALLING)
+  installationStatus      InstallationStatus @default(DRAFT)
+  installationCompletedAt DateTime?
+  authorityGeneration     Int                @default(1)
+  customerDataGeneration  Int                @default(1)
+  managementRevision      Int                @default(1)
+  createdAt               DateTime           @default(now())
+  updatedAt               DateTime           @updatedAt
 
-  @@unique([haConnectionId, entityId])
-  @@index([haConnectionId])
-  @@index([haConnectionId, updatedAt])
+  lastUsedBy      CustomerAccount[]            @relation("CustomerLastUsedHome")
+  memberships     HomeMembership[]
+  areas           Area[]
+  devices         NativeDevice[]
+  hubInstallation HubInstallation?
+  workItems       CompanyOperationalWorkItem[]
+  invitations     MembershipInvitation[]
+  claims          HomeClaimReference[]
+  homeDocuments   HomeDocument[]
+  auditEvents     AuditEvent[]
+
+  @@index([lifecycle, installationStatus])
+  @@index([postcode])
 }
 
-model ElectricUsageReading {
-  id                  Int          @id @default(autoincrement())
-  haConnection        HaConnection @relation(fields: [haConnectionId], references: [id])
-  haConnectionId      Int
-  entityId            String
-  entityName          String?
-  trackingEpoch       String
-  assignmentEpoch     String
-  sourceAreaId        String?
-  sourceAreaName      String?
-  windowStartedAt     DateTime
-  windowEndedAt       DateTime
-  onForSeconds        Int          @default(0)
-  offForSeconds       Int          @default(0)
-  unknownForSeconds   Int          @default(0)
-  averageWattsApplied Float?
-  electricPricePerKwh Float?
-  estimatedKwh        Float?
-  estimatedCostGbp    Float?
-  capturedAt          DateTime     @default(now())
+model HomeMembership {
+  id                String           @id @default(uuid()) @db.Uuid
+  customerAccountId String           @db.Uuid
+  homeId            String           @db.Uuid
+  role              MembershipRole
+  status            MembershipStatus @default(ACTIVE)
+  accessRevision    Int              @default(1)
+  activatedAt       DateTime         @default(now())
+  removedAt         DateTime?
+  removalReason     String?          @db.VarChar(160)
+  createdAt         DateTime         @default(now())
+  updatedAt         DateTime         @updatedAt
 
-  @@unique([haConnectionId, entityId, windowStartedAt, assignmentEpoch])
-  @@index([haConnectionId, entityId, capturedAt])
-  @@index([haConnectionId, capturedAt])
-  @@index([haConnectionId, sourceAreaId, capturedAt])
+  customerAccount  CustomerAccount            @relation(fields: [customerAccountId], references: [id], onDelete: Cascade)
+  home             Home                       @relation(fields: [homeId], references: [id], onDelete: Cascade)
+  tenantAreaGrants TenantAreaGrant[]
+  ownedDevices     NativeDevice[]
+  preferences      MemberPreferenceDocument[]
+  invitationsSent  MembershipInvitation[]     @relation("InvitationInviter")
+
+  @@unique([customerAccountId, homeId])
+  @@unique([id, homeId])
+  @@index([homeId, role, status])
+  @@index([customerAccountId, status])
 }
 
-model ElectricUsageDailyRollup {
-  id                  Int          @id @default(autoincrement())
-  haConnection        HaConnection @relation(fields: [haConnectionId], references: [id])
-  haConnectionId      Int
-  entityId            String
-  entityName          String?
-  trackingEpoch       String
-  assignmentEpoch     String
-  sourceAreaId        String?
-  sourceAreaName      String?
-  localDate           String
-  timeZone            String
-  onForSeconds        Int          @default(0)
-  offForSeconds       Int          @default(0)
-  unknownForSeconds   Int          @default(0)
-  estimatedKwh        Float?
-  estimatedCostGbp    Float?
-  averageWattsApplied Float?
-  electricPricePerKwh Float?
-  configurationMixed  Boolean      @default(false)
-  createdAt           DateTime     @default(now())
-  updatedAt           DateTime     @updatedAt
+model Area {
+  id           String     @id @default(uuid()) @db.Uuid
+  homeId       String     @db.Uuid
+  osAreaId     String     @db.VarChar(160)
+  originalName String     @db.VarChar(160)
+  overrideName String?    @db.VarChar(160)
+  status       AreaStatus @default(ACTIVE)
+  retiredAt    DateTime?
+  revision     Int        @default(1)
+  createdAt    DateTime   @default(now())
+  updatedAt    DateTime   @updatedAt
 
-  @@unique([haConnectionId, entityId, localDate, assignmentEpoch])
-  @@index([haConnectionId, localDate])
-  @@index([haConnectionId, sourceAreaId, localDate])
-}
+  home                      Home                       @relation(fields: [homeId], references: [id], onDelete: Cascade)
+  tenantGrants              TenantAreaGrant[]
+  assignments               DeviceAreaAssignment[]
+  qrCredentials             AreaQrCredential[]
+  accessRequests            AreaAccessRequest[]
+  membershipInvitationAreas MembershipInvitationArea[]
 
-model AlexaAuthCode {
-  id          Int      @id @default(autoincrement())
-  code        String   @unique
-  user        User     @relation(fields: [userId], references: [id])
-  userId      Int
-  clientId    String
-  redirectUri String
-  expiresAt   DateTime
-  used        Boolean  @default(false)
-  createdAt   DateTime @default(now())
-}
-
-// Native Dinodia OS automation history. This baseline was already present in
-// the production database; it is represented here so future migrations have a
-// complete, reproducible history before the native Alexa migration runs.
-model NativeAutomation {
-  id              String                      @id
-  homeId          Int
-  ownerUserId     Int
-  name            String
-  enabled         Boolean                     @default(true)
-  revision        Int                         @default(1)
-  status          String                      @default("pending_delivery")
-  definitionError Json?
-  deletedAt       DateTime?
-  createdAt       DateTime                    @default(now())
-  updatedAt       DateTime                    @updatedAt
-  home            Home                        @relation("NativeAutomationHome", fields: [homeId], references: [id], onDelete: Cascade)
-  owner           User                        @relation("NativeAutomationOwner", fields: [ownerUserId], references: [id], onDelete: Cascade)
-  actions         NativeAutomationAction[]
-  deliveries      NativeAutomationDelivery[]
-  executions      NativeAutomationExecution[]
-  triggers        NativeAutomationTrigger[]
-
-  @@index([homeId, ownerUserId])
+  @@unique([homeId, osAreaId])
+  @@unique([id, homeId])
   @@index([homeId, status])
 }
 
-model NativeAutomationAction {
-  id           String           @id
-  automationId String
-  deviceId     String
-  controlId    String
-  targetValue  Json
-  sortOrder    Int
-  automation   NativeAutomation @relation(fields: [automationId], references: [id], onDelete: Cascade)
+model TenantAreaGrant {
+  id             String    @id @default(uuid()) @db.Uuid
+  membershipId   String    @db.Uuid
+  areaId         String    @db.Uuid
+  homeId         String    @db.Uuid
+  policyRevision Int       @default(1)
+  grantedAt      DateTime  @default(now())
+  revokedAt      DateTime?
+  revokeReason   String?   @db.VarChar(160)
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
 
-  @@unique([automationId, deviceId, controlId])
-  @@unique([automationId, sortOrder])
-  @@index([deviceId, controlId])
+  membership HomeMembership @relation(fields: [membershipId], references: [id], onDelete: Cascade)
+  area       Area           @relation(fields: [areaId], references: [id], onDelete: Cascade)
+
+  @@unique([membershipId, areaId])
+  @@index([areaId, revokedAt])
 }
 
-model NativeAutomationDelivery {
-  id             String           @id
-  automationId   String
-  hubInstallId   String
-  revision       Int
-  bundleRevision Int
-  checksum       String
-  status         String
-  error          Json?
-  queuedAt       DateTime         @default(now())
-  appliedAt      DateTime?
-  automation     NativeAutomation @relation(fields: [automationId], references: [id], onDelete: Cascade)
-  hubInstall     HubInstall       @relation(fields: [hubInstallId], references: [id], onDelete: Cascade)
+model NativeDevice {
+  id                  String                  @id @default(uuid()) @db.Uuid
+  homeId              String                  @db.Uuid
+  hubInstallationId   String                  @db.Uuid
+  osDeviceId          String                  @db.VarChar(160)
+  originalName        String                  @db.VarChar(160)
+  overrideName        String?                 @db.VarChar(160)
+  technicalLabel      String                  @db.VarChar(80)
+  customerLabel       String?                 @db.VarChar(80)
+  analyticsCategory   DeviceAnalyticsCategory @default(NONE)
+  managementClass     DeviceManagementClass
+  ownerMembershipId   String?                 @db.Uuid
+  deviceType          String                  @db.VarChar(120)
+  manufacturer        String?                 @db.VarChar(160)
+  model               String?                 @db.VarChar(160)
+  protocol            String?                 @db.VarChar(80)
+  capabilitySummary   Json?
+  descriptorRevision  Int                     @default(1)
+  descriptorDigest    String?                 @db.VarChar(128)
+  onlineState         DeviceOnlineState       @default(UNKNOWN)
+  lastSeenAt          DateTime?
+  radiatorTemperature Decimal?                @db.Decimal(6, 2)
+  radiatorReadingAt   DateTime?
+  lifecycle           DeviceLifecycleState    @default(DISCOVERED)
+  installedAt         DateTime?
+  retiredAt           DateTime?
+  cleanupDeadlineAt   DateTime?
+  inventoryRevision   Int                     @default(1)
+  createdAt           DateTime                @default(now())
+  updatedAt           DateTime                @updatedAt
 
-  @@unique([automationId, hubInstallId, revision])
-  @@index([hubInstallId, bundleRevision])
+  home            Home                   @relation(fields: [homeId], references: [id], onDelete: Cascade)
+  hubInstallation HubInstallation        @relation(fields: [hubInstallationId], references: [id], onDelete: Cascade)
+  ownerMembership HomeMembership?        @relation(fields: [ownerMembershipId], references: [id], onDelete: SetNull)
+  assignments     DeviceAreaAssignment[]
+
+  @@unique([hubInstallationId, osDeviceId])
+  @@unique([id, homeId])
+  @@index([homeId, managementClass, lifecycle])
+  @@index([ownerMembershipId, lifecycle])
 }
 
-model NativeAutomationExecution {
-  id                 String           @id
-  automationId       String
-  homeId             Int
-  definitionRevision Int
-  occurrenceId       String
-  status             String
-  triggeredAt        DateTime
-  completedAt        DateTime?
-  summary            Json
-  receivedAt         DateTime         @default(now())
-  automation         NativeAutomation @relation(fields: [automationId], references: [id], onDelete: Cascade)
-  home               Home             @relation("NativeAutomationExecutionHome", fields: [homeId], references: [id], onDelete: Cascade)
-
-  @@unique([homeId, occurrenceId])
-  @@index([automationId, triggeredAt])
-}
-
-model NativeAutomationRequest {
-  id             String   @id
-  homeId         Int
-  userId         Int
-  idempotencyKey String
-  response       Json
-  createdAt      DateTime @default(now())
-  home           Home     @relation("NativeAutomationRequestHome", fields: [homeId], references: [id], onDelete: Cascade)
-  user           User     @relation(fields: [userId], references: [id], onDelete: Cascade)
-
-  @@unique([homeId, userId, idempotencyKey])
-  @@index([createdAt])
-}
-
-model NativeAutomationTrigger {
-  id            String           @id
-  automationId  String
-  type          String
-  configuration Json
-  sortOrder     Int
-  automation    NativeAutomation @relation(fields: [automationId], references: [id], onDelete: Cascade)
-
-  @@unique([automationId, sortOrder])
-}
-
-model AlexaRefreshToken {
-  id         Int       @id @default(autoincrement())
-  tokenHash  String    @unique
-  user       User      @relation(fields: [userId], references: [id])
-  userId     Int
-  clientId   String
-  revoked    Boolean   @default(false)
-  revokedAt  DateTime?
-  lastUsedAt DateTime  @default(now())
+model DeviceAreaAssignment {
+  id         String    @id @default(uuid()) @db.Uuid
+  deviceId   String    @db.Uuid
+  areaId     String    @db.Uuid
+  homeId     String    @db.Uuid
+  validFrom  DateTime  @default(now())
+  validUntil DateTime?
+  source     String    @db.VarChar(80)
+  actorType  String?   @db.VarChar(32)
+  actorId    String?   @db.Uuid
   createdAt  DateTime  @default(now())
+
+  device NativeDevice @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+  area   Area         @relation(fields: [areaId], references: [id], onDelete: Cascade)
+
+  @@index([deviceId, validUntil])
+  @@index([areaId, validFrom, validUntil])
+  @@index([homeId, deviceId, validUntil])
 }
 
-model AlexaSkillUserLink {
-  id                 Int            @id @default(autoincrement())
-  alexaUserId        String         @unique
-  user               User           @relation(fields: [userId], references: [id])
-  userId             Int
-  home               Home?          @relation("AlexaSkillHomeLinks", fields: [homeId], references: [id], onDelete: SetNull)
-  homeId             Int?
-  scope              AlexaLinkScope @default(TENANT)
-  skillId            String?
-  marketplace        String?
-  locale             String?
-  linkedAt           DateTime       @default(now())
-  disabledAt         DateTime?
-  disabledReason     String?
-  lastEventAt        DateTime?
-  lastEventRequestId String?
-  createdAt          DateTime       @default(now())
-  updatedAt          DateTime       @updatedAt
+model HubManufacturingIdentity {
+  id                       String            @id @default(uuid()) @db.Uuid
+  serialNumber             String            @db.VarChar(120)
+  signingPublicKey         String            @db.Text
+  encryptionPublicKey      String            @db.Text
+  signingKeyFingerprint    String            @unique @db.VarChar(128)
+  encryptionKeyFingerprint String            @unique @db.VarChar(128)
+  identityGeneration       Int               @default(1)
+  certificate              String?           @db.Text
+  status                   HubIdentityStatus @default(ACTIVE)
+  revokedAt                DateTime?
+  createdAt                DateTime          @default(now())
+  updatedAt                DateTime          @updatedAt
 
-  @@index([userId])
-  @@index([homeId, scope])
+  hubInstallation      HubInstallation?
+  provisioningAttempts HubProvisioningAttempt[]
+
+  @@unique([serialNumber, identityGeneration])
 }
 
-model AlexaHomeConnection {
-  id               String                          @id @default(uuid())
-  home             Home                            @relation(fields: [homeId], references: [id], onDelete: Cascade)
-  homeId           Int                             @unique
-  hubInstall       HubInstall?                     @relation(fields: [hubInstallId], references: [id], onDelete: SetNull)
-  hubInstallId     String?                         @unique
-  status           AlexaNativeConnectionStatus     @default(DISCONNECTED)
-  projectionSource AlexaProjectionSource           @default(HA_LEGACY)
-  linkedByUser     User?                           @relation("AlexaHomeConnectionLinkedBy", fields: [linkedByUserId], references: [id], onDelete: SetNull)
-  linkedByUserId   Int?
-  catalogRevision  String?
-  catalogUpdatedAt DateTime?
-  stateUpdatedAt   DateTime?
-  lastErrorCode    String?
-  lastErrorAt      DateTime?
-  createdAt        DateTime                        @default(now())
-  updatedAt        DateTime                        @updatedAt
-  endpoints        AlexaNativeEndpointProjection[]
-  connectIntents   AlexaConnectIntent[]
+model CompanyOperationalWorkItem {
+  id                    String           @id @default(uuid()) @db.Uuid
+  publicReference       String           @unique @db.VarChar(32)
+  kind                  CompanyWorkKind
+  state                 CompanyWorkState @default(ASSIGNED)
+  homeId                String?          @db.Uuid
+  hubInstallationId     String?          @db.Uuid
+  certifiedSerialNumber String?          @db.VarChar(120)
+  assignedEmployeeId    String           @db.Uuid
+  createdByEmployeeId   String           @db.Uuid
+  reason                String           @db.VarChar(500)
+  notes                 String?          @db.VarChar(2000)
+  workRevision          Int              @default(1)
+  checklistRevision     Int?
+  startedAt             DateTime?
+  completedAt           DateTime?
+  reopenedAt            DateTime?
+  cancelledAt           DateTime?
+  createdAt             DateTime         @default(now())
+  updatedAt             DateTime         @updatedAt
 
-  @@index([status, updatedAt])
-  @@index([linkedByUserId])
+  home                 Home?                    @relation(fields: [homeId], references: [id], onDelete: SetNull)
+  hubInstallation      HubInstallation?         @relation(fields: [hubInstallationId], references: [id], onDelete: SetNull)
+  assignedEmployee     CompanyEmployeeAccount   @relation("AssignedWork", fields: [assignedEmployeeId], references: [id], onDelete: Restrict)
+  createdBy            CompanyEmployeeAccount   @relation("CreatedWork", fields: [createdByEmployeeId], references: [id], onDelete: Restrict)
+  provisioningAttempts HubProvisioningAttempt[]
+
+  @@index([assignedEmployeeId, state])
+  @@index([homeId, state])
+  @@index([hubInstallationId, state])
 }
 
-model AlexaNativeEndpointProjection {
-  id                 String              @id @default(uuid())
-  connection         AlexaHomeConnection @relation(fields: [connectionId], references: [id], onDelete: Cascade)
-  connectionId       String
-  endpointId         String
-  deviceId           String
-  channelId          String
-  originalDeviceName String
-  originalAreaName   String
-  areaId             String
-  manufacturerName   String
-  modelName          String?
-  description        String
-  displayCategories  Json
-  controlBindings    Json
-  capabilities       Json
-  state              Json
-  available          Boolean             @default(true)
-  sourceUpdatedAt    DateTime
-  catalogRevision    String?
-  retiredAt          DateTime?
-  createdAt          DateTime            @default(now())
-  updatedAt          DateTime            @updatedAt
+model HubInstallation {
+  id                          String            @id @default(uuid()) @db.Uuid
+  homeId                      String            @unique @db.Uuid
+  manufacturingIdentityId     String            @unique @db.Uuid
+  serialNumberSnapshot        String            @unique @db.VarChar(120)
+  state                       HubLifecycleState @default(PAIRING)
+  provisioningRevision        Int               @default(1)
+  baseUrl                     String?           @db.VarChar(500)
+  cloudUrl                    String?           @db.VarChar(500)
+  cloudUrlVerifiedAt          DateTime?
+  cloudflareTunnelId          String?           @db.VarChar(200)
+  cloudflareTunnelName        String?           @db.VarChar(200)
+  reservedHostname            String?           @db.VarChar(255)
+  remoteChallengeAt           DateTime?
+  remoteVerificationAt        DateTime?
+  currentCredentialVersion    Int?
+  accessPolicyRevision        Int               @default(1)
+  lastSeenAt                  DateTime?
+  onlineStateEvaluatedAt      DateTime?
+  runtimeVersion              String?           @db.VarChar(120)
+  capabilitySummary           Json?
+  cleanupState                String?           @db.VarChar(80)
+  cleanupGeneration           Int               @default(0)
+  permanentResolverHash       String?           @unique @db.VarChar(128)
+  permanentResolverGeneration Int               @default(1)
+  permanentResolverStatus     String            @default("ACTIVE") @db.VarChar(32)
+  resolverIssuedAt            DateTime?
+  resolverReplacedAt          DateTime?
+  resolverRevokedAt           DateTime?
+  createdAt                   DateTime          @default(now())
+  updatedAt                   DateTime          @updatedAt
 
-  @@unique([connectionId, endpointId])
-  @@index([endpointId])
-  @@index([connectionId, areaId])
-  @@index([connectionId, deviceId])
-  @@index([connectionId, retiredAt])
+  home                  Home                         @relation(fields: [homeId], references: [id], onDelete: Restrict)
+  manufacturingIdentity HubManufacturingIdentity     @relation(fields: [manufacturingIdentityId], references: [id], onDelete: Restrict)
+  devices               NativeDevice[]
+  credentialVersions    HubCredentialVersion[]
+  provisioningAttempts  HubProvisioningAttempt[]
+  workItems             CompanyOperationalWorkItem[]
+  homeClaimReferences   HomeClaimReference[]
+  homeClaimChallenges   HomeClaimChallenge[]
+
+  @@index([state, lastSeenAt])
+  @@unique([id, homeId])
+  @@unique([id, manufacturingIdentityId])
 }
 
-model AlexaConnectIntent {
-  id           String              @id @default(uuid())
-  connection   AlexaHomeConnection @relation(fields: [connectionId], references: [id], onDelete: Cascade)
-  connectionId String
-  hubInstallId String
-  tokenHash    String              @unique
-  expiresAt    DateTime
-  consumedAt   DateTime?
-  completedAt  DateTime?
-  createdAt    DateTime            @default(now())
+model HubCredentialVersion {
+  id                        String             @id @default(uuid()) @db.Uuid
+  hubInstallationId         String             @db.Uuid
+  version                   Int
+  state                     HubCredentialState @default(PENDING)
+  tokenHash                 String             @db.VarChar(128)
+  encryptedDeliveryEnvelope Json?
+  issuedAt                  DateTime           @default(now())
+  deliveredAt               DateTime?
+  acknowledgedAt            DateTime?
+  activatedAt               DateTime?
+  graceUntil                DateTime?
+  revokedAt                 DateTime?
+  createdAt                 DateTime           @default(now())
 
-  @@index([connectionId, expiresAt])
+  hubInstallation HubInstallation @relation(fields: [hubInstallationId], references: [id], onDelete: Cascade)
+
+  @@unique([hubInstallationId, version])
+  @@index([hubInstallationId, state])
 }
 
-model AlexaDirectiveReceipt {
-  id            String   @id @default(uuid())
-  messageIdHash String   @unique
-  userId        Int
-  homeId        Int
-  endpointId    String
-  status        String
-  response      Json?
-  expiresAt     DateTime
-  createdAt     DateTime @default(now())
+model HubProvisioningAttempt {
+  id                          String            @id @default(uuid()) @db.Uuid
+  attemptId                   String            @unique @db.VarChar(160)
+  manufacturingIdentityId     String            @db.Uuid
+  hubInstallationId           String?           @db.Uuid
+  companyWorkItemId           String            @db.Uuid
+  redeemerEmployeeId          String?           @db.Uuid
+  state                       ProvisioningState @default(CREATED)
+  codeHash                    String            @db.VarChar(128)
+  baseUrlPresentation         String            @db.VarChar(500)
+  challengeHash               String?           @db.VarChar(128)
+  challengeExpiresAt          DateTime?
+  hubProofAt                  DateTime?
+  encryptedCredentialEnvelope Json?
+  deliveredAt                 DateTime?
+  acknowledgedAt              DateTime?
+  expiresAt                   DateTime
+  failureCount                Int               @default(0)
+  idempotencyKeyHash          String            @db.VarChar(128)
+  createdAt                   DateTime          @default(now())
+  updatedAt                   DateTime          @updatedAt
 
-  @@index([expiresAt])
-  @@index([homeId, createdAt])
+  manufacturingIdentity HubManufacturingIdentity   @relation(fields: [manufacturingIdentityId], references: [id], onDelete: Restrict)
+  hubInstallation       HubInstallation?           @relation(fields: [hubInstallationId], references: [id], onDelete: SetNull)
+  companyWorkItem       CompanyOperationalWorkItem @relation(fields: [companyWorkItemId], references: [id], onDelete: Restrict)
+  redeemerEmployee      CompanyEmployeeAccount?    @relation("ProvisioningRedeemer", fields: [redeemerEmployeeId], references: [id], onDelete: SetNull)
+
+  @@unique([manufacturingIdentityId, idempotencyKeyHash])
+  @@index([manufacturingIdentityId, state, expiresAt])
+  @@index([companyWorkItemId, state])
 }
 
-model AlexaEventToken {
-  id           Int      @id @default(autoincrement())
-  user         User     @relation(fields: [userId], references: [id])
-  userId       Int      @unique
-  accessToken  String
-  refreshToken String
-  expiresAt    DateTime
-  createdAt    DateTime @default(now())
-  updatedAt    DateTime @updatedAt
+model MembershipInvitation {
+  id                      String          @id @default(uuid()) @db.Uuid
+  homeId                  String          @db.Uuid
+  inviterMembershipId     String          @db.Uuid
+  targetAccountId         String?         @db.Uuid
+  targetEmail             String          @db.VarChar(320)
+  targetEmailNormalized   String          @db.VarChar(320)
+  role                    InvitationRole
+  state                   InvitationState @default(PENDING)
+  tokenHash               String          @unique @db.VarChar(128)
+  temporaryCredentialHash String?         @db.VarChar(128)
+  expiresAt               DateTime
+  acceptedAt              DateTime?
+  declinedAt              DateTime?
+  revokedAt               DateTime?
+  replacementOfId         String?         @db.Uuid
+  createdAt               DateTime        @default(now())
+  updatedAt               DateTime        @updatedAt
+
+  home          Home                       @relation(fields: [homeId], references: [id], onDelete: Cascade)
+  inviter       HomeMembership             @relation("InvitationInviter", fields: [inviterMembershipId], references: [id], onDelete: Restrict)
+  targetAccount CustomerAccount?           @relation("InvitationTarget", fields: [targetAccountId], references: [id], onDelete: SetNull)
+  areas         MembershipInvitationArea[]
+
+  @@index([targetEmailNormalized, state, expiresAt])
+  @@index([homeId, state, expiresAt])
+  @@index([inviterMembershipId, state])
+  @@unique([id, homeId])
 }
 
-model NewDeviceCommissioningSession {
-  id                          String                    @id @default(uuid())
-  user                        User                      @relation(fields: [userId], references: [id])
-  userId                      Int
-  haConnection                HaConnection              @relation(fields: [haConnectionId], references: [id])
-  haConnectionId              Int
-  requestedArea               String
-  requestedName               String?
-  requestedDinodiaType        String?
-  requestedHaLabelId          String?
-  requestedDisplayLabel       String?
-  requestedDisplayLabelKey    String?
-  requestedParentHaAreaId     String?
-  requestedVirtualAreaId      String?
-  requestedNewVirtualAreaName String?
-  haTechnicalName             String?
-  cleanupStatus               TenantDeviceCleanupStatus @default(ACTIVE)
-  cleanupLastError            String?
-  setupPayloadHash            String?
-  manualPairingCodeHash       String?
-  haFlowId                    String?
-  status                      MatterCommissioningStatus @default(CREATED)
-  kind                        CommissioningKind         @default(MATTER)
-  error                       String?
-  lastHaStep                  Json?
-  beforeDeviceIds             Json?
-  beforeEntityIds             Json?
-  afterDeviceIds              Json?
-  afterEntityIds              Json?
-  createdAt                   DateTime                  @default(now())
-  updatedAt                   DateTime                  @updatedAt
+model MembershipInvitationArea {
+  id           String @id @default(uuid()) @db.Uuid
+  invitationId String @db.Uuid
+  areaId       String @db.Uuid
+  homeId       String @db.Uuid
 
-  @@index([userId])
-  @@index([haConnectionId])
-  @@index([haFlowId])
-  @@index([kind])
+  invitation MembershipInvitation @relation(fields: [invitationId], references: [id], onDelete: Cascade)
+  area       Area                 @relation(fields: [areaId], references: [id], onDelete: Cascade)
+
+  @@unique([invitationId, areaId])
 }
 
-model AreaDisplayOverride {
-  id              String       @id @default(uuid())
-  haConnection    HaConnection @relation("HaConnectionAreaDisplayOverrides", fields: [haConnectionId], references: [id], onDelete: Cascade)
-  haConnectionId  Int
-  haAreaId        String?
-  haAreaName      String
-  displayName     String
-  displayKey      String
-  createdByUser   User?        @relation("UserCreatedAreaDisplayOverrides", fields: [createdByUserId], references: [id], onDelete: SetNull)
-  createdByUserId Int?
-  createdAt       DateTime     @default(now())
-  updatedAt       DateTime     @updatedAt
+model AreaQrCredential {
+  id                        String       @id @default(uuid()) @db.Uuid
+  areaId                    String       @db.Uuid
+  generation                Int          @default(1)
+  resolverHash              String       @unique @db.VarChar(128)
+  encryptedPrintablePayload Json?
+  status                    AreaQrStatus @default(ACTIVE)
+  issuedAt                  DateTime     @default(now())
+  replacedAt                DateTime?
+  disabledAt                DateTime?
 
-  @@unique([haConnectionId, haAreaName])
-  @@index([haConnectionId, displayKey])
+  area           Area                @relation(fields: [areaId], references: [id], onDelete: Cascade)
+  accessRequests AreaAccessRequest[]
+
+  @@unique([areaId, generation])
+  @@unique([id, areaId])
+  @@index([areaId, status])
 }
 
-model LabelDisplayOverride {
-  id                   String       @id @default(uuid())
-  haConnection         HaConnection @relation("HaConnectionLabelDisplayOverrides", fields: [haConnectionId], references: [id], onDelete: Cascade)
-  haConnectionId       Int
-  sourceTechnicalLabel String
-  canonicalLabel       String
-  displayName          String
-  displayKey           String
-  createdByUser        User?        @relation("UserCreatedLabelDisplayOverrides", fields: [createdByUserId], references: [id], onDelete: SetNull)
-  createdByUserId      Int?
-  createdAt            DateTime     @default(now())
-  updatedAt            DateTime     @updatedAt
+model AreaAccessRequest {
+  id                     String                  @id @default(uuid()) @db.Uuid
+  areaQrCredentialId     String                  @db.Uuid
+  areaId                 String                  @db.Uuid
+  homeId                 String                  @db.Uuid
+  requesterAccountId     String                  @db.Uuid
+  status                 AreaAccessRequestStatus @default(PENDING)
+  expiresAt              DateTime
+  approvedByMembershipId String?                 @db.Uuid
+  decidedAt              DateTime?
+  cancelledAt            DateTime?
+  createdAt              DateTime                @default(now())
+  updatedAt              DateTime                @updatedAt
 
-  @@unique([haConnectionId, sourceTechnicalLabel])
-  @@index([haConnectionId, displayKey])
+  qrCredential AreaQrCredential @relation(fields: [areaQrCredentialId], references: [id], onDelete: Restrict)
+  area         Area             @relation(fields: [areaId], references: [id], onDelete: Restrict)
+  requester    CustomerAccount  @relation(fields: [requesterAccountId], references: [id], onDelete: Cascade)
+
+  @@index([requesterAccountId, status, expiresAt])
+  @@index([areaId, status, expiresAt])
+  @@index([areaQrCredentialId, status])
 }
 
-model TenantVirtualArea {
-  id                        String       @id @default(uuid())
-  tenantUser                User         @relation("UserTenantVirtualAreas", fields: [tenantUserId], references: [id], onDelete: Cascade)
-  tenantUserId              Int
-  haConnection              HaConnection @relation("HaConnectionTenantVirtualAreas", fields: [haConnectionId], references: [id], onDelete: Cascade)
-  haConnectionId            Int
-  parentHaAreaId            String?
-  parentHaAreaName          String
-  parentAreaDisplaySnapshot String
-  displayName               String
-  displayKey                String
+model HomeClaimReference {
+  id                        String       @id @default(uuid()) @db.Uuid
+  homeId                    String       @db.Uuid
+  hubInstallationId         String       @db.Uuid
+  purpose                   ClaimPurpose
+  generation                Int          @default(1)
+  state                     ClaimState   @default(AVAILABLE)
+  companyQrReferenceHash    String       @db.VarChar(128)
+  transferCodeHash          String?      @db.VarChar(128)
+  resolverGeneration        Int
+  outgoingOwnerMembershipId String?      @db.Uuid
+  claimedAccountId          String?      @db.Uuid
+  issuedAt                  DateTime     @default(now())
+  reservedAt                DateTime?
+  consumedAt                DateTime?
+  cancelledAt               DateTime?
+  replacedAt                DateTime?
+  revokedAt                 DateTime?
+  invalidatedAt             DateTime?
+  auditReference            String?      @db.VarChar(160)
   createdAt                 DateTime     @default(now())
   updatedAt                 DateTime     @updatedAt
 
-  tenantDeviceOverrides TenantDeviceDisplayOverride[]
+  home            Home                   @relation(fields: [homeId], references: [id], onDelete: Restrict)
+  hubInstallation HubInstallation        @relation(fields: [hubInstallationId], references: [id], onDelete: Restrict)
+  claimedAccount  CustomerAccount?       @relation(fields: [claimedAccountId], references: [id], onDelete: SetNull)
+  reservations    HomeClaimReservation[]
+  challenges      HomeClaimChallenge[]
+  pendingSetups   PendingHomeSetup[]
 
-  @@unique([tenantUserId, haConnectionId, parentHaAreaName, displayKey])
-  @@index([tenantUserId, haConnectionId])
-  @@index([haConnectionId, parentHaAreaName])
+  @@unique([hubInstallationId, generation])
+  @@unique([id, homeId, hubInstallationId])
+  @@unique([companyQrReferenceHash])
+  @@index([hubInstallationId, purpose, state])
 }
 
-model TenantDeviceDisplayOverride {
-  id                        String                     @id @default(uuid())
-  tenantUser                User                       @relation("UserTenantDeviceDisplayOverrides", fields: [tenantUserId], references: [id], onDelete: Cascade)
-  tenantUserId              Int
-  tenantUserIdKey           String
-  haConnection              HaConnection               @relation("HaConnectionTenantDeviceDisplayOverrides", fields: [haConnectionId], references: [id], onDelete: Cascade)
-  haConnectionId            Int
-  haDeviceId                String?
-  entityId                  String?
-  displayName               String
-  displayNameKey            String
-  haTechnicalName           String
-  displayLabel              String
-  displayLabelKey           String
-  canonicalLabel            String?
-  parentHaAreaId            String?
-  parentHaAreaName          String
-  parentAreaDisplaySnapshot String
-  tenantVirtualArea         TenantVirtualArea?         @relation(fields: [tenantVirtualAreaId], references: [id], onDelete: SetNull)
-  tenantVirtualAreaId       String?
-  cleanupStatus             TenantDeviceCleanupStatus  @default(ACTIVE)
-  cleanupReason             TenantDeviceCleanupReason?
-  cleanupAttemptCount       Int                        @default(0)
-  cleanupLastAttemptAt      DateTime?
-  cleanupLastError          String?
-  createdAt                 DateTime                   @default(now())
-  updatedAt                 DateTime                   @updatedAt
+model HomeClaimChallenge {
+  id                   String    @id @default(uuid()) @db.Uuid
+  claimReferenceId     String    @db.Uuid
+  hubInstallationId    String    @db.Uuid
+  trustedDeviceId      String?   @db.Uuid
+  resolverGeneration   Int
+  nonceHash            String    @db.VarChar(128)
+  challengeDigest      String    @db.VarChar(128)
+  signedResponseDigest String?   @db.VarChar(128)
+  issuedAt             DateTime  @default(now())
+  expiresAt            DateTime
+  consumedAt           DateTime?
+  revokedAt            DateTime?
 
-  @@unique([tenantUserId, haConnectionId, displayNameKey])
-  @@index([tenantUserId, haConnectionId])
-  @@index([haConnectionId, haDeviceId])
-  @@index([haConnectionId, entityId])
-  @@index([haConnectionId, cleanupStatus])
+  claimReference  HomeClaimReference @relation(fields: [claimReferenceId], references: [id], onDelete: Cascade)
+  hubInstallation HubInstallation    @relation(fields: [hubInstallationId], references: [id], onDelete: Restrict)
+  trustedDevice   TrustedDevice?     @relation(fields: [trustedDeviceId], references: [id], onDelete: SetNull)
+
+  @@unique([claimReferenceId, nonceHash])
+  @@index([hubInstallationId, expiresAt, consumedAt])
 }
 
-model AutomationOwnership {
-  id           Int      @id @default(autoincrement())
-  home         Home     @relation(fields: [homeId], references: [id])
-  homeId       Int
-  user         User     @relation(fields: [userId], references: [id])
-  userId       Int
-  automationId String
-  createdAt    DateTime @default(now())
+model HomeClaimReservation {
+  id                       String                @id @default(uuid()) @db.Uuid
+  claimReferenceId         String                @db.Uuid
+  customerAccountId        String                @db.Uuid
+  state                    ClaimReservationState @default(ACTIVE)
+  expiresAt                DateTime
+  setupRevision            Int                   @default(0)
+  lastQualifyingMutationAt DateTime?
+  releasedByEmployeeId     String?               @db.Uuid
+  releaseReason            String?               @db.VarChar(500)
+  createdAt                DateTime              @default(now())
+  updatedAt                DateTime              @updatedAt
 
-  @@unique([automationId, homeId])
-  @@index([homeId])
-  @@index([userId])
-  @@index([automationId])
+  claimReference  HomeClaimReference      @relation(fields: [claimReferenceId], references: [id], onDelete: Cascade)
+  customerAccount CustomerAccount         @relation(fields: [customerAccountId], references: [id], onDelete: Cascade)
+  releasedBy      CompanyEmployeeAccount? @relation("ReservationReleaser", fields: [releasedByEmployeeId], references: [id], onDelete: SetNull)
+  pendingSetup    PendingHomeSetup?
+
+  @@index([claimReferenceId, state, expiresAt])
+  @@index([customerAccountId, state])
 }
 
-model HomeAutomation {
-  home            Home                 @relation(fields: [homeId], references: [id], onDelete: Cascade)
-  homeId          Int
-  automationId    String
-  createdByUser   User?                @relation("HomeAutomationCreatedBy", fields: [createdByUserId], references: [id], onDelete: SetNull)
-  createdByUserId Int?
-  source          HomeAutomationSource @default(DINODIA_UI)
-  createdAt       DateTime             @default(now())
-  updatedAt       DateTime             @updatedAt
+model PendingHomeSetup {
+  id                       String                @id @default(uuid()) @db.Uuid
+  claimReferenceId         String                @db.Uuid
+  reservationId            String                @unique @db.Uuid
+  customerAccountId        String                @db.Uuid
+  state                    PendingHomeSetupState @default(PROFILE_REQUIRED)
+  addressLine1             String?               @db.VarChar(200)
+  addressLine2             String?               @db.VarChar(200)
+  city                     String?               @db.VarChar(120)
+  region                   String?               @db.VarChar(120)
+  postcode                 String?               @db.VarChar(32)
+  country                  String?               @db.VarChar(2)
+  proposedTimezone         String?               @db.VarChar(80)
+  requiredStep             String                @db.VarChar(80)
+  setupRevision            Int                   @default(0)
+  resumeTokenHash          String?               @db.VarChar(128)
+  lastQualifyingMutationAt DateTime?
+  completedAt              DateTime?
+  expiredAt                DateTime?
+  createdAt                DateTime              @default(now())
+  updatedAt                DateTime              @updatedAt
 
-  @@id([homeId, automationId])
-  @@index([homeId])
-  @@index([createdByUserId])
+  claimReference  HomeClaimReference   @relation(fields: [claimReferenceId], references: [id], onDelete: Cascade)
+  reservation     HomeClaimReservation @relation(fields: [reservationId], references: [id], onDelete: Cascade)
+  customerAccount CustomerAccount      @relation(fields: [customerAccountId], references: [id], onDelete: Cascade)
+
+  @@index([claimReferenceId, state])
+  @@index([customerAccountId, state])
 }
 
-model SupportRequest {
-  id                          String                        @id @default(uuid())
-  kind                        SupportRequestKind
-  homeId                      Int
-  targetUserId                Int?
-  installerUserId             Int
-  authChallengeId             String?                       @unique
-  reason                      String?
-  scope                       SupportAccessScope?
-  approvedByUserId            Int?
-  approvedBy                  User?                         @relation("SupportRequestApprovedBy", fields: [approvedByUserId], references: [id], onDelete: SetNull)
-  approvedAt                  DateTime?
-  approvalValidUntil          DateTime?
-  approvalRecipientType       SupportApprovalRecipientType?
-  approvalRecipientEmail      String?
-  approvalRecipientName       String?
-  revokedAt                   DateTime?
-  revokedByUserId             Int?
-  revokedBy                   User?                         @relation("SupportRequestRevokedBy", fields: [revokedByUserId], references: [id], onDelete: SetNull)
-  consumedAt                  DateTime?
-  haSecurityCodeHash          String?
-  haSecurityCodeIssuedAt      DateTime?
-  haSecurityCodeExpiresAt     DateTime?
-  haSecurityCodeConsumedAt    DateTime?
-  connectButtonClickedAt      DateTime?
-  haSessionStartedAt          DateTime?
-  haSessionExpiresAt          DateTime?
-  haSessionEndedAt            DateTime?
-  haSessionFailureAt          DateTime?
-  haSessionFailureCode        String?
-  haSessionRevokedAt          DateTime?
-  notificationSentAt          DateTime?
-  notificationFailedAt        DateTime?
-  notificationFailureReason   String?
-  supportGatewayHostname      String?
-  launchTicketHash            String?                       @unique
-  launchTicketExpiresAt       DateTime?
-  gatewaySessionHash          String?                       @unique
-  gatewaySessionBoundAt       DateTime?
-  gatewaySessionUserAgentHash String?
-  approvalTokens              SupportRequestApprovalToken[]
-  accessSessions              SupportAccessSession[]
-  createdAt                   DateTime                      @default(now())
+model HomeDocument {
+  id                 String           @id @default(uuid()) @db.Uuid
+  homeId             String           @db.Uuid
+  kind               HomeDocumentKind
+  document           Json
+  revision           Int              @default(1)
+  createdByAccountId String?          @db.Uuid
+  updatedAt          DateTime         @updatedAt
+  createdAt          DateTime         @default(now())
 
-  @@index([homeId])
-  @@index([targetUserId])
-  @@index([installerUserId])
-  @@index([approvedByUserId])
-  @@index([revokedByUserId])
-  @@index([approvalValidUntil])
-  @@index([haSessionExpiresAt])
-  @@index([supportGatewayHostname])
+  home      Home             @relation(fields: [homeId], references: [id], onDelete: Cascade)
+  createdBy CustomerAccount? @relation("HomeDocumentCreator", fields: [createdByAccountId], references: [id], onDelete: SetNull)
+
+  @@unique([homeId, kind])
 }
 
-model SupportAccessSession {
-  id                    String         @id @default(uuid())
-  supportRequest        SupportRequest @relation(fields: [supportRequestId], references: [id], onDelete: Cascade)
-  supportRequestId      String
-  assignedEmployeeId    Int
-  assignedEmployeePrincipalId String?
-  homeId                Int
-  targetUserId          Int?
-  scope                 String
-  areaIds               Json
-  includesTenantDevices Boolean        @default(false)
-  codeHash              String?        @unique
-  codeIssuedAt          DateTime?
-  codeExpiresAt         DateTime?
-  codeAttemptCount      Int            @default(0)
-  status                String         @default("PENDING")
-  approvedAt            DateTime?
-  approvedByUserId      Int?
-  expiresAt             DateTime?
-  redeemedAt            DateTime?
-  endedAt               DateTime?
-  codeRevealedAt        DateTime?
-  employeeProofHash     String?        @unique
-  employeeProofExpiresAt DateTime?
-  hubLeaseTokenHash     String?        @unique
-  hubLeaseExpiresAt     DateTime?
-  hubRevokePending      Boolean        @default(false)
-  hubRevocationDesiredAt DateTime?
-  hubRevocationAcknowledgedAt DateTime?
-  hubRevokedAt          DateTime?
-  createdAt             DateTime       @default(now())
-  updatedAt             DateTime       @updatedAt
+model MemberPreferenceDocument {
+  id           String               @id @default(uuid()) @db.Uuid
+  membershipId String               @db.Uuid
+  kind         MemberPreferenceKind
+  document     Json
+  revision     Int                  @default(1)
+  updatedAt    DateTime             @updatedAt
+  createdAt    DateTime             @default(now())
 
-  @@index([supportRequestId, status])
-  @@index([assignedEmployeeId, status])
-  @@index([homeId, status])
+  membership HomeMembership @relation(fields: [membershipId], references: [id], onDelete: Cascade)
+
+  @@unique([membershipId, kind])
+}
+
+model AuditEvent {
+  id         String         @id @default(uuid()) @db.Uuid
+  homeId     String?        @db.Uuid
+  actorType  AuditActorType
+  actorId    String?        @db.Uuid
+  category   AuditCategory
+  action     String         @db.VarChar(160)
+  targetType String?        @db.VarChar(120)
+  targetId   String?        @db.Uuid
+  metadata   Json?
+  occurredAt DateTime       @default(now())
+  purgeAt    DateTime
+
+  home Home? @relation(fields: [homeId], references: [id], onDelete: SetNull)
+
+  @@index([homeId, occurredAt])
+  @@index([actorType, actorId, occurredAt])
+  @@index([purgeAt])
+}
+
+model DeletionSecurityReceipt {
+  id                 String   @id @default(uuid()) @db.Uuid
+  anonymousReference String   @unique @db.VarChar(80)
+  actionType         String   @db.VarChar(120)
+  actionAt           DateTime @default(now())
+  purgeAt            DateTime
+}
+
+model IdempotencyRecord {
+  id             String   @id @default(uuid()) @db.Uuid
+  namespace      String   @db.VarChar(120)
+  keyHash        String   @db.VarChar(128)
+  actorId        String?  @db.Uuid
+  homeId         String?  @db.Uuid
+  requestHash    String   @db.VarChar(128)
+  responseStatus Int
+  responseDigest String?  @db.VarChar(128)
+  expiresAt      DateTime
+  createdAt      DateTime @default(now())
+
+  @@unique([namespace, keyHash])
+  @@index([homeId, expiresAt])
+}
+
+model ReplayNonce {
+  id            String   @id @default(uuid()) @db.Uuid
+  principalKind String   @db.VarChar(80)
+  principalId   String   @db.Uuid
+  nonceHash     String   @db.VarChar(128)
+  requestDigest String   @db.VarChar(128)
+  issuedAt      DateTime @default(now())
+  expiresAt     DateTime
+
+  @@unique([principalKind, principalId, nonceHash])
   @@index([expiresAt])
-  @@index([approvedByUserId])
-  @@index([assignedEmployeePrincipalId, status])
-  @@index([hubLeaseExpiresAt])
-}
-
-model Stage1ClaimReservation {
-  id                    String    @id @default(uuid())
-  hubInstall            HubInstall @relation(fields: [hubInstallId], references: [id], onDelete: Cascade)
-  hubInstallId          String
-  hubLabelReferenceHash String    @unique
-  reservationTokenHash  String?   @unique
-  verifiedAccountId     Int?
-  state                 String    @default("AVAILABLE")
-  reservedAt            DateTime?
-  reservationExpiresAt  DateTime?
-  releasedAt            DateTime?
-  claimedAt             DateTime?
-  setupCheckpoint       Json?
-  audits                Stage1ClaimAudit[]
-  createdAt             DateTime  @default(now())
-  updatedAt             DateTime  @updatedAt
-
-  @@index([hubInstallId, state])
-  @@index([reservationExpiresAt])
-}
-
-model Stage1ClaimAudit {
-  id            String                 @id @default(uuid())
-  reservation   Stage1ClaimReservation @relation(fields: [reservationId], references: [id], onDelete: Cascade)
-  reservationId String
-  actorUser     User?                  @relation(fields: [actorUserId], references: [id], onDelete: SetNull)
-  actorUserId   Int?
-  action        String
-  metadata      Json?
-  createdAt     DateTime               @default(now())
-
-  @@index([reservationId, createdAt])
-  @@index([actorUserId, createdAt])
-}
-
-model SupportRequestApprovalToken {
-  id               String                       @id @default(uuid())
-  supportRequest   SupportRequest               @relation(fields: [supportRequestId], references: [id], onDelete: Cascade)
-  supportRequestId String
-  recipientType    SupportApprovalRecipientType
-  recipientUserId  Int?
-  recipientEmail   String
-  recipientName    String?
-  tokenHash        String                       @unique
-  expiresAt        DateTime
-  approvedAt       DateTime?
-  consumedAt       DateTime?
-  createdAt        DateTime                     @default(now())
-  updatedAt        DateTime                     @updatedAt
-
-  @@index([supportRequestId])
-  @@index([expiresAt])
-  @@index([recipientUserId])
 }

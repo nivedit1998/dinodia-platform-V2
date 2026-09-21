@@ -16,7 +16,7 @@ The V2 backend uses a fresh Vercel project and a fresh Supabase project. The old
 - `dinodia-platform` is frozen reference source.
 - `dinodia-edge-worker` is frozen reference source.
 - `dinodia-alexa-skill` is frozen reference source.
-- `dinodia-platform-aws` is being retired and is not a runtime dependency.
+- There is no `dinodia-platform-aws` backend in the Native V2 system. AWS is not a runtime dependency or fallback.
 
 ## Database rule
 
@@ -24,4 +24,4 @@ The standard schema-changing command must run through the V2 target guard. It mu
 
 ## Current boundary
 
-This foundation establishes repository/cloud/database isolation. It does not claim that Stage 1 security, native device transport, homeowner/tenant live data or Alexa behavior is complete.
+This foundation exposes only the status shell, `/api/health` and `/api/readiness`. It does not claim that Stage 1 security, native device transport, homeowner/tenant live data, support, automations, analytics or Alexa behavior is complete. Those features are added by numbered Native V2 plans against the schema authority map. The corrected foundation must pass the Docker, clean-source and Preview gates before it is safe to commit.

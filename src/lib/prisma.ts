@@ -1,12 +1,9 @@
-// Architecture: Shared platform helper src/lib/prisma.ts; centralizes reusable domain, integration, validation or data-access behavior for route and UI callers. Keep exports and error semantics aligned with their consumers.
 import { PrismaClient } from '@prisma/client';
+import { runtimeDatabaseUrl } from './runtimeDatabaseUrl';
 
-const globalForPrisma = globalThis as unknown as { prisma: PrismaClient | undefined };
-
-export const prisma =
-  globalForPrisma.prisma ??
-  new PrismaClient({
-    log: ['warn', 'error'],
-  });
-
+const globalForPrisma = globalThis as unknown as { prisma?: PrismaClient };
+export const prisma = globalForPrisma.prisma ?? new PrismaClient({
+  datasourceUrl: runtimeDatabaseUrl(),
+  log: process.env.NODE_ENV === 'development' ? ['error', 'warn'] : ['error'],
+});
 if (process.env.NODE_ENV !== 'production') globalForPrisma.prisma = prisma;

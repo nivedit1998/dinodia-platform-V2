@@ -11,6 +11,8 @@ This document is a value-free contract. Secret values belong only in the new Ver
 | `VERCEL_PROJECT_ID` | Platform | No | rc/production | Prevents deployment to the old Vercel project |
 | `DATABASE_URL` | Platform | Yes | local/test/rc/production | Prisma pooled/direct runtime connection |
 | `DIRECT_URL` | Platform | Yes | local/test/rc/production | Prisma migration connection |
+| `NEXT_PUBLIC_SUPABASE_URL` | Platform | No | local/test/rc/production | Safe Supabase project URL metadata; must identify V2 |
+| `NEXT_PUBLIC_APP_URL` | Platform | No | local/test/rc/production | Browser/application origin |
 
 ## Native security values
 
@@ -23,6 +25,15 @@ This document is a value-free contract. Secret values belong only in the new Ver
 | `CRON_SECRET` | Platform | Yes | Shared dispatcher stage | Provider rotation |
 | `SUPABASE_SERVICE_ROLE_KEY` | Platform | Yes | Server-only integration | Supabase rotation |
 | `SUPABASE_ANON_KEY` | Platform | Yes in server config | Client/server integration | Supabase rotation |
+| `VERCEL_AUTOMATION_BYPASS_SECRET` | Vercel | Yes | rc only when required | Vercel protection rotation |
+
+## Deployment metadata
+
+| Variable | Owner | Secret | Environments | Purpose |
+|---|---|---:|---|---|
+| `FOUNDATION_SCHEMA_FINGERPRINT` | Platform | No | rc/production | Expected reviewed schema object fingerprint |
+| `FOUNDATION_MIGRATION_CHECKSUM` | Platform | No | rc/production | Exact SHA-256 checksum of the deployed native baseline migration |
+| `FOUNDATION_SOURCE_FINGERPRINT` | Platform | No | rc/production | Safe fingerprint of the intended source snapshot; health exposes only its short prefix |
 
 ## Rules
 

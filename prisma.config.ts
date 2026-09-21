@@ -4,7 +4,14 @@
 // npm install --save-dev prisma dotenv
 //jnwe
 import "dotenv/config";
-import { defineConfig, env } from "prisma/config";
+import { defineConfig } from "prisma/config";
+
+// Prisma CLI generation/validation must work from a clean source snapshot.
+// All database-connected scripts run through scripts/assert_v2_target.mjs and
+// provide an explicit, target-validated URL before opening a connection.
+const localFallbackUrl = "postgresql://127.0.0.1:5432/dinodia_v2_local";
+const configuredDatabaseUrl = process.env.DATABASE_URL ?? localFallbackUrl;
+const configuredDirectUrl = process.env.DIRECT_URL ?? configuredDatabaseUrl;
 
 export default defineConfig({
   schema: "prisma/schema.prisma",
@@ -13,7 +20,10 @@ export default defineConfig({
   },
   engine: "classic",
   datasource: {
-    url: env("DATABASE_URL"),
-    directUrl: env("DIRECT_URL"),
+    // Prisma Client generation and schema validation do not need a live
+    // database. Guarded migration scripts validate these values before any
+    // database connection is opened.
+    url: configuredDatabaseUrl,
+    directUrl: configuredDirectUrl,
   },
 });
