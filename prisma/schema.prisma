@@ -510,6 +510,10 @@ model HaConnection {
   tenantDeviceDisplayOverrides   TenantDeviceDisplayOverride[]   @relation("HaConnectionTenantDeviceDisplayOverrides")
   createdAt                      DateTime                        @default(now())
   updatedAt                      DateTime                        @updatedAt
+
+  // Transitional client name retained only until native hub projections are
+  // wired in later stages. The V2 database must not create an HA-era table.
+  @@map("NativeHubConnection")
 }
 
 model HubInstall {

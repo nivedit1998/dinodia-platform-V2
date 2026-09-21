@@ -11,7 +11,6 @@ const mode = process.argv.includes('--mode')
   ? process.argv[process.argv.indexOf('--mode') + 1]
   : process.env.V2_ENVIRONMENT;
 const runPrisma = process.argv.includes('--run-prisma');
-const remoteMigration = process.argv.includes('--remote-migration');
 const remoteConfirmation = 'I_UNDERSTAND_NEW_V2_DATABASE';
 
 function fail(message) {
@@ -43,16 +42,22 @@ function projectRefFromHost(hostname) {
   return direct?.[1] || '';
 }
 
+function isApprovedDatabaseHost(hostname) {
+  return Array.isArray(target.supabaseDatabaseHosts)
+    ? target.supabaseDatabaseHosts.includes(hostname)
+    : projectRefFromHost(hostname) === target.supabaseProjectRef;
+}
+
 function assertLocalTarget(url, name) {
   const isLoopback = ['127.0.0.1', 'localhost', '::1'].includes(url.hostname);
-  const isApprovedV2 = projectRefFromHost(url.hostname) === target.supabaseProjectRef;
+  const isApprovedV2 = isApprovedDatabaseHost(url.hostname);
   if (!isLoopback && !isApprovedV2) {
     fail(`${name} does not point to localhost or the approved V2 Supabase project`);
   }
 }
 
 function assertRemoteTarget(url, name) {
-  if (projectRefFromHost(url.hostname) !== target.supabaseProjectRef) {
+  if (!isApprovedDatabaseHost(url.hostname)) {
     fail(`${name} does not point to the approved V2 Supabase project`);
   }
 }
@@ -69,6 +74,8 @@ function assertVercelLink() {
 if (!mode || !['local', 'test', 'rc', 'production'].includes(mode)) {
   fail('V2_ENVIRONMENT must be local, test, rc or production');
 }
+
+const remoteMigration = ['rc', 'production'].includes(mode) || process.argv.includes('--remote-migration');
 
 const databaseUrl = parseDatabaseUrl('DATABASE_URL');
 const directUrl = parseDatabaseUrl('DIRECT_URL');

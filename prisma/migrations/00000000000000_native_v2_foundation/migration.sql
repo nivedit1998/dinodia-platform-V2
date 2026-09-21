@@ -309,7 +309,7 @@ CREATE TABLE "RemoteAccessLease" (
 );
 
 -- CreateTable
-CREATE TABLE "HaConnection" (
+CREATE TABLE "NativeHubConnection" (
     "id" SERIAL NOT NULL,
     "baseUrl" TEXT NOT NULL,
     "cloudUrl" TEXT,
@@ -325,7 +325,7 @@ CREATE TABLE "HaConnection" (
     "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "updatedAt" TIMESTAMP(3) NOT NULL,
 
-    CONSTRAINT "HaConnection_pkey" PRIMARY KEY ("id")
+    CONSTRAINT "NativeHubConnection_pkey" PRIMARY KEY ("id")
 );
 
 -- CreateTable
@@ -1428,10 +1428,10 @@ CREATE INDEX "RemoteAccessLease_expiresAt_idx" ON "RemoteAccessLease"("expiresAt
 CREATE INDEX "RemoteAccessLease_deviceId_idx" ON "RemoteAccessLease"("deviceId");
 
 -- CreateIndex
-CREATE UNIQUE INDEX "HaConnection_longLivedTokenHash_key" ON "HaConnection"("longLivedTokenHash");
+CREATE UNIQUE INDEX "NativeHubConnection_longLivedTokenHash_key" ON "NativeHubConnection"("longLivedTokenHash");
 
 -- CreateIndex
-CREATE UNIQUE INDEX "HaConnection_ownerId_key" ON "HaConnection"("ownerId");
+CREATE UNIQUE INDEX "NativeHubConnection_ownerId_key" ON "NativeHubConnection"("ownerId");
 
 -- CreateIndex
 CREATE UNIQUE INDEX "HubInstall_serial_key" ON "HubInstall"("serial");
@@ -1899,7 +1899,7 @@ CREATE INDEX "SupportRequestApprovalToken_expiresAt_idx" ON "SupportRequestAppro
 CREATE INDEX "SupportRequestApprovalToken_recipientUserId_idx" ON "SupportRequestApprovalToken"("recipientUserId");
 
 -- AddForeignKey
-ALTER TABLE "Home" ADD CONSTRAINT "Home_haConnectionId_fkey" FOREIGN KEY ("haConnectionId") REFERENCES "HaConnection"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+ALTER TABLE "Home" ADD CONSTRAINT "Home_haConnectionId_fkey" FOREIGN KEY ("haConnectionId") REFERENCES "NativeHubConnection"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
 
 -- AddForeignKey
 ALTER TABLE "AuditEvent" ADD CONSTRAINT "AuditEvent_homeId_fkey" FOREIGN KEY ("homeId") REFERENCES "Home"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
@@ -1911,7 +1911,7 @@ ALTER TABLE "AuditEvent" ADD CONSTRAINT "AuditEvent_actorUserId_fkey" FOREIGN KE
 ALTER TABLE "User" ADD CONSTRAINT "User_homeId_fkey" FOREIGN KEY ("homeId") REFERENCES "Home"("id") ON DELETE SET NULL ON UPDATE CASCADE;
 
 -- AddForeignKey
-ALTER TABLE "User" ADD CONSTRAINT "User_haConnectionId_fkey" FOREIGN KEY ("haConnectionId") REFERENCES "HaConnection"("id") ON DELETE SET NULL ON UPDATE CASCADE;
+ALTER TABLE "User" ADD CONSTRAINT "User_haConnectionId_fkey" FOREIGN KEY ("haConnectionId") REFERENCES "NativeHubConnection"("id") ON DELETE SET NULL ON UPDATE CASCADE;
 
 -- AddForeignKey
 ALTER TABLE "CompanyEmployeePrincipal" ADD CONSTRAINT "CompanyEmployeePrincipal_userId_fkey" FOREIGN KEY ("userId") REFERENCES "User"("id") ON DELETE CASCADE ON UPDATE CASCADE;
@@ -1947,7 +1947,7 @@ ALTER TABLE "StepUpApproval" ADD CONSTRAINT "StepUpApproval_homeId_fkey" FOREIGN
 ALTER TABLE "RemoteAccessLease" ADD CONSTRAINT "RemoteAccessLease_userId_fkey" FOREIGN KEY ("userId") REFERENCES "User"("id") ON DELETE CASCADE ON UPDATE CASCADE;
 
 -- AddForeignKey
-ALTER TABLE "HaConnection" ADD CONSTRAINT "HaConnection_ownerId_fkey" FOREIGN KEY ("ownerId") REFERENCES "User"("id") ON DELETE SET NULL ON UPDATE CASCADE;
+ALTER TABLE "NativeHubConnection" ADD CONSTRAINT "NativeHubConnection_ownerId_fkey" FOREIGN KEY ("ownerId") REFERENCES "User"("id") ON DELETE SET NULL ON UPDATE CASCADE;
 
 -- AddForeignKey
 ALTER TABLE "HubInstall" ADD CONSTRAINT "HubInstall_homeId_fkey" FOREIGN KEY ("homeId") REFERENCES "Home"("id") ON DELETE SET NULL ON UPDATE CASCADE;
@@ -2013,28 +2013,28 @@ ALTER TABLE "RoomAccessRequest" ADD CONSTRAINT "RoomAccessRequest_tenantUserId_f
 ALTER TABLE "RoomAccessApprovalToken" ADD CONSTRAINT "RoomAccessApprovalToken_requestId_fkey" FOREIGN KEY ("requestId") REFERENCES "RoomAccessRequest"("id") ON DELETE CASCADE ON UPDATE CASCADE;
 
 -- AddForeignKey
-ALTER TABLE "Device" ADD CONSTRAINT "Device_haConnectionId_fkey" FOREIGN KEY ("haConnectionId") REFERENCES "HaConnection"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+ALTER TABLE "Device" ADD CONSTRAINT "Device_haConnectionId_fkey" FOREIGN KEY ("haConnectionId") REFERENCES "NativeHubConnection"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
 
 -- AddForeignKey
-ALTER TABLE "MonitoringReading" ADD CONSTRAINT "MonitoringReading_haConnectionId_fkey" FOREIGN KEY ("haConnectionId") REFERENCES "HaConnection"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+ALTER TABLE "MonitoringReading" ADD CONSTRAINT "MonitoringReading_haConnectionId_fkey" FOREIGN KEY ("haConnectionId") REFERENCES "NativeHubConnection"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
 
 -- AddForeignKey
-ALTER TABLE "BoilerTemperatureReading" ADD CONSTRAINT "BoilerTemperatureReading_haConnectionId_fkey" FOREIGN KEY ("haConnectionId") REFERENCES "HaConnection"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+ALTER TABLE "BoilerTemperatureReading" ADD CONSTRAINT "BoilerTemperatureReading_haConnectionId_fkey" FOREIGN KEY ("haConnectionId") REFERENCES "NativeHubConnection"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
 
 -- AddForeignKey
-ALTER TABLE "BoilerUsageAccumulator" ADD CONSTRAINT "BoilerUsageAccumulator_haConnectionId_fkey" FOREIGN KEY ("haConnectionId") REFERENCES "HaConnection"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+ALTER TABLE "BoilerUsageAccumulator" ADD CONSTRAINT "BoilerUsageAccumulator_haConnectionId_fkey" FOREIGN KEY ("haConnectionId") REFERENCES "NativeHubConnection"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
 
 -- AddForeignKey
-ALTER TABLE "RadiatorUsageAccumulator" ADD CONSTRAINT "RadiatorUsageAccumulator_haConnectionId_fkey" FOREIGN KEY ("haConnectionId") REFERENCES "HaConnection"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+ALTER TABLE "RadiatorUsageAccumulator" ADD CONSTRAINT "RadiatorUsageAccumulator_haConnectionId_fkey" FOREIGN KEY ("haConnectionId") REFERENCES "NativeHubConnection"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
 
 -- AddForeignKey
-ALTER TABLE "ElectricUsageAccumulator" ADD CONSTRAINT "ElectricUsageAccumulator_haConnectionId_fkey" FOREIGN KEY ("haConnectionId") REFERENCES "HaConnection"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+ALTER TABLE "ElectricUsageAccumulator" ADD CONSTRAINT "ElectricUsageAccumulator_haConnectionId_fkey" FOREIGN KEY ("haConnectionId") REFERENCES "NativeHubConnection"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
 
 -- AddForeignKey
-ALTER TABLE "ElectricUsageReading" ADD CONSTRAINT "ElectricUsageReading_haConnectionId_fkey" FOREIGN KEY ("haConnectionId") REFERENCES "HaConnection"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+ALTER TABLE "ElectricUsageReading" ADD CONSTRAINT "ElectricUsageReading_haConnectionId_fkey" FOREIGN KEY ("haConnectionId") REFERENCES "NativeHubConnection"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
 
 -- AddForeignKey
-ALTER TABLE "ElectricUsageDailyRollup" ADD CONSTRAINT "ElectricUsageDailyRollup_haConnectionId_fkey" FOREIGN KEY ("haConnectionId") REFERENCES "HaConnection"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+ALTER TABLE "ElectricUsageDailyRollup" ADD CONSTRAINT "ElectricUsageDailyRollup_haConnectionId_fkey" FOREIGN KEY ("haConnectionId") REFERENCES "NativeHubConnection"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
 
 -- AddForeignKey
 ALTER TABLE "AlexaAuthCode" ADD CONSTRAINT "AlexaAuthCode_userId_fkey" FOREIGN KEY ("userId") REFERENCES "User"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
@@ -2100,16 +2100,16 @@ ALTER TABLE "AlexaEventToken" ADD CONSTRAINT "AlexaEventToken_userId_fkey" FOREI
 ALTER TABLE "NewDeviceCommissioningSession" ADD CONSTRAINT "NewDeviceCommissioningSession_userId_fkey" FOREIGN KEY ("userId") REFERENCES "User"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
 
 -- AddForeignKey
-ALTER TABLE "NewDeviceCommissioningSession" ADD CONSTRAINT "NewDeviceCommissioningSession_haConnectionId_fkey" FOREIGN KEY ("haConnectionId") REFERENCES "HaConnection"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+ALTER TABLE "NewDeviceCommissioningSession" ADD CONSTRAINT "NewDeviceCommissioningSession_haConnectionId_fkey" FOREIGN KEY ("haConnectionId") REFERENCES "NativeHubConnection"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
 
 -- AddForeignKey
-ALTER TABLE "AreaDisplayOverride" ADD CONSTRAINT "AreaDisplayOverride_haConnectionId_fkey" FOREIGN KEY ("haConnectionId") REFERENCES "HaConnection"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+ALTER TABLE "AreaDisplayOverride" ADD CONSTRAINT "AreaDisplayOverride_haConnectionId_fkey" FOREIGN KEY ("haConnectionId") REFERENCES "NativeHubConnection"("id") ON DELETE CASCADE ON UPDATE CASCADE;
 
 -- AddForeignKey
 ALTER TABLE "AreaDisplayOverride" ADD CONSTRAINT "AreaDisplayOverride_createdByUserId_fkey" FOREIGN KEY ("createdByUserId") REFERENCES "User"("id") ON DELETE SET NULL ON UPDATE CASCADE;
 
 -- AddForeignKey
-ALTER TABLE "LabelDisplayOverride" ADD CONSTRAINT "LabelDisplayOverride_haConnectionId_fkey" FOREIGN KEY ("haConnectionId") REFERENCES "HaConnection"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+ALTER TABLE "LabelDisplayOverride" ADD CONSTRAINT "LabelDisplayOverride_haConnectionId_fkey" FOREIGN KEY ("haConnectionId") REFERENCES "NativeHubConnection"("id") ON DELETE CASCADE ON UPDATE CASCADE;
 
 -- AddForeignKey
 ALTER TABLE "LabelDisplayOverride" ADD CONSTRAINT "LabelDisplayOverride_createdByUserId_fkey" FOREIGN KEY ("createdByUserId") REFERENCES "User"("id") ON DELETE SET NULL ON UPDATE CASCADE;
@@ -2118,13 +2118,13 @@ ALTER TABLE "LabelDisplayOverride" ADD CONSTRAINT "LabelDisplayOverride_createdB
 ALTER TABLE "TenantVirtualArea" ADD CONSTRAINT "TenantVirtualArea_tenantUserId_fkey" FOREIGN KEY ("tenantUserId") REFERENCES "User"("id") ON DELETE CASCADE ON UPDATE CASCADE;
 
 -- AddForeignKey
-ALTER TABLE "TenantVirtualArea" ADD CONSTRAINT "TenantVirtualArea_haConnectionId_fkey" FOREIGN KEY ("haConnectionId") REFERENCES "HaConnection"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+ALTER TABLE "TenantVirtualArea" ADD CONSTRAINT "TenantVirtualArea_haConnectionId_fkey" FOREIGN KEY ("haConnectionId") REFERENCES "NativeHubConnection"("id") ON DELETE CASCADE ON UPDATE CASCADE;
 
 -- AddForeignKey
 ALTER TABLE "TenantDeviceDisplayOverride" ADD CONSTRAINT "TenantDeviceDisplayOverride_tenantUserId_fkey" FOREIGN KEY ("tenantUserId") REFERENCES "User"("id") ON DELETE CASCADE ON UPDATE CASCADE;
 
 -- AddForeignKey
-ALTER TABLE "TenantDeviceDisplayOverride" ADD CONSTRAINT "TenantDeviceDisplayOverride_haConnectionId_fkey" FOREIGN KEY ("haConnectionId") REFERENCES "HaConnection"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+ALTER TABLE "TenantDeviceDisplayOverride" ADD CONSTRAINT "TenantDeviceDisplayOverride_haConnectionId_fkey" FOREIGN KEY ("haConnectionId") REFERENCES "NativeHubConnection"("id") ON DELETE CASCADE ON UPDATE CASCADE;
 
 -- AddForeignKey
 ALTER TABLE "TenantDeviceDisplayOverride" ADD CONSTRAINT "TenantDeviceDisplayOverride_tenantVirtualAreaId_fkey" FOREIGN KEY ("tenantVirtualAreaId") REFERENCES "TenantVirtualArea"("id") ON DELETE SET NULL ON UPDATE CASCADE;
