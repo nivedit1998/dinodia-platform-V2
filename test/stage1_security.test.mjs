@@ -256,11 +256,15 @@ test('R4 production paths use opaque browser-bound handoffs, committed claim cle
 
 test('installer UI can reserve the durable Cloudflare endpoint before secure OS launch', () => {
   const installer = read('src/app/installer/page.tsx');
+  const launch = read('src/app/api/installer/home-support/homes/[homeId]/os-access/launch/route.ts');
   assert.match(installer, /cloudflare\/reserve/);
   assert.match(installer, /Reserve secure endpoint/);
   assert.match(installer, /!work\.hubInstallation\?\.cloudUrl/);
   assert.match(installer, /work\.hubInstallation\?\.cloudUrl &&/);
   assert.match(installer, /Open secure Dinodia OS/);
+  assert.match(launch, /baseUrl: true/);
+  assert.match(launch, /!hub\.cloudUrl && !hub\.baseUrl/);
+  assert.match(launch, /handoff\.cloudUrl \|\| handoff\.baseUrl/);
 });
 
 test('R3 tenant-device and device step-up paths use current membership and descriptor authority', () => {
