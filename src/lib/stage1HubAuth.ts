@@ -65,6 +65,15 @@ export function canonicalCloudUrlBody(input: { serial: string; identityGeneratio
   return JSON.stringify({ version: 1, ...input });
 }
 
+/** Byte-stable signed CloudURL response shared with Dinodia OS and identityd. */
+export function canonicalCloudUrlChallenge(input: { version?: number; serial: string; cloudUrl: string; challenge: string; tunnelId: string; tunnelName: string; timestamp: number; bodyHash: string; identityFingerprint: string; identityGeneration: number }): string {
+  return JSON.stringify({ version: 1, serial: String(input.serial), cloudUrl: String(input.cloudUrl), challenge: String(input.challenge), tunnelId: String(input.tunnelId), tunnelName: String(input.tunnelName), timestamp: Number(input.timestamp), bodyHash: String(input.bodyHash), identityFingerprint: String(input.identityFingerprint), identityGeneration: Number(input.identityGeneration) });
+}
+
+export function canonicalCloudUrlUnsignedBody(input: { serial: string; cloudUrl: string; challenge: string; tunnelId: string; tunnelName: string; timestamp: number; identityFingerprint: string; identityGeneration: number }): string {
+  return JSON.stringify({ version: 1, serial: String(input.serial), cloudUrl: String(input.cloudUrl), challenge: String(input.challenge), tunnelId: String(input.tunnelId), tunnelName: String(input.tunnelName), timestamp: Number(input.timestamp), identityFingerprint: String(input.identityFingerprint), identityGeneration: Number(input.identityGeneration) });
+}
+
 /** Byte-stable payload signed by Dinodia OS before a trusted-phone challenge. */
 export function canonicalStepUpDescriptor(input: Record<string, unknown>): string {
   return JSON.stringify({

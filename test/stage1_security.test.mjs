@@ -160,6 +160,23 @@ test('Platform and Dinodia OS use the same support proof-of-possession vector', 
   assert.equal(osProof.supportProofOfPossessionDigest(input), expected);
 });
 
+test('Platform and Dinodia OS use the same ten-field CloudURL challenge vector', () => {
+  const nodeCrypto = createRequire(import.meta.url)('node:crypto');
+  const { canonicalCloudUrlChallenge, canonicalCloudUrlUnsignedBody } = loadTypeScriptModule('src/lib/stage1HubAuth.ts', {
+    './prisma': { prisma: {} },
+    './stage1Auth': { Stage1AuthError: class Stage1AuthError extends Error {} },
+    './stage1Crypto': { canonicalHubRequest: () => '', sha256: (value) => nodeCrypto.createHash('sha256').update(String(value), 'utf8').digest('hex'), verifyHubSignature: () => false },
+    './manufacturingEnrollment': { manufacturingIdentityPayload: () => '' },
+  });
+  const osIdentity = requireOsModule('src/auth/identityBroker.js');
+  const input = { version: 1, serial: 'din-home-001', cloudUrl: 'https://dinodia-din-home-001.dinodiasmartliving.com', challenge: 'challenge-012345678901234567890', tunnelId: '11111111-1111-4111-8111-111111111111', tunnelName: 'dinodia-din-home-001', timestamp: 1790000000000, identityFingerprint: 'a'.repeat(64), identityGeneration: 1 };
+  const platformUnsigned = canonicalCloudUrlUnsignedBody(input);
+  const bodyHash = nodeCrypto.createHash('sha256').update(platformUnsigned, 'utf8').digest('hex');
+  const complete = { ...input, bodyHash };
+  assert.equal(canonicalCloudUrlChallenge(complete), osIdentity.canonicalCloudChallenge(complete));
+  assert.equal(canonicalCloudUrlUnsignedBody(input), osIdentity.canonicalCloudChallengeUnsigned(input));
+});
+
 test('manufacturing certificates sign only stable identity material and use separate key types', () => {
   const crypto = createRequire(import.meta.url)('node:crypto');
   const { publicKey: rootPublicKey, privateKey: rootPrivateKey } = crypto.generateKeyPairSync('ed25519');
