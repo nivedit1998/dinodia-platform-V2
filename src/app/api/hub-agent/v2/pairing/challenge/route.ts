@@ -16,7 +16,7 @@ export async function POST(request: Request) {
     const challenge = randomSecret(32);
     const row = await prisma.$transaction(async (tx) => {
       const attempt = await tx.hubProvisioningAttempt.findUnique({ where: { attemptId }, select: { id: true, hubInstallationId: true, manufacturingIdentityId: true, state: true, expiresAt: true } });
-      if (!attempt || attempt.hubInstallationId !== hub.installation.id || attempt.expiresAt <= now || !['EMPLOYEE_APPROVED', 'CHALLENGE_ISSUED'].includes(attempt.state)) throw new Stage1AuthError(403, 'pairing_challenge_denied', 'The provisioning attempt is not approved');
+      if (!attempt || attempt.hubInstallationId !== hub.installation.id || attempt.expiresAt <= now || !['EMPLOYEE_APPROVED', 'CHALLENGE_PENDING', 'CHALLENGE_ISSUED'].includes(attempt.state)) throw new Stage1AuthError(403, 'pairing_challenge_denied', 'The provisioning attempt is not approved');
       return tx.hubProvisioningAttempt.update({ where: { id: attempt.id }, data: { state: 'CHALLENGE_ISSUED', challengeHash: sha256(challenge), challengeExpiresAt: new Date(now.getTime() + 5 * 60 * 1000) }, select: { attemptId: true, state: true, challengeExpiresAt: true } });
     });
     return NextResponse.json({ ok: true, attemptId: row.attemptId, state: row.state, challenge, expiresAt: row.challengeExpiresAt }, { headers: { 'Cache-Control': 'no-store', Pragma: 'no-cache' } });

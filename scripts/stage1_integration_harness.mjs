@@ -99,6 +99,7 @@ function keyPair() {
     publicKey: pair.publicKey.export({ type: 'spki', format: 'pem' }).toString(),
   };
 }
+const harnessManufacturingRoot = keyPair();
 function x25519KeyPair() {
   const pair = crypto.generateKeyPairSync('x25519');
   return {
@@ -109,6 +110,26 @@ function x25519KeyPair() {
 function publicKeyFingerprint(pem) {
   return crypto.createHash('sha256').update(crypto.createPublicKey(pem).export({ type: 'spki', format: 'der' })).digest('hex');
 }
+const harnessProvisioningSigning = keyPair();
+const harnessProvisioningEncryption = x25519KeyPair();
+const harnessProvisioningSerial = 'din-home-harness-001';
+const harnessProvisioningIdentity = {
+  serial: harnessProvisioningSerial,
+  generation: 1,
+  signingPublicKeyPem: harnessProvisioningSigning.publicKey,
+  encryptionPublicKeyPem: harnessProvisioningEncryption.publicKey,
+  publicKeyFingerprint: publicKeyFingerprint(harnessProvisioningSigning.publicKey),
+  encryptionKeyFingerprint: publicKeyFingerprint(harnessProvisioningEncryption.publicKey),
+};
+const harnessManufacturingCertificate = JSON.stringify({
+  serial: harnessProvisioningIdentity.serial,
+  identityGeneration: harnessProvisioningIdentity.generation,
+  publicKeyPem: harnessProvisioningIdentity.signingPublicKeyPem,
+  encryptionPublicKeyPem: harnessProvisioningIdentity.encryptionPublicKeyPem,
+  publicKeyFingerprint: harnessProvisioningIdentity.publicKeyFingerprint,
+  encryptionKeyFingerprint: harnessProvisioningIdentity.encryptionKeyFingerprint,
+});
+const harnessManufacturingSignature = crypto.sign(null, Buffer.from(harnessManufacturingCertificate, 'utf8'), crypto.createPrivateKey(harnessManufacturingRoot.privateKey)).toString('base64url');
 function decryptHubEnvelope(envelope, privateKeyPem, purpose, version) {
   if (!envelope || envelope.algorithm !== 'x25519-hkdf-sha256/aes-256-gcm' || envelope.purpose !== purpose || Number(envelope.version) !== Number(version)) throw new Error('test identity broker rejected an envelope outside its fixed purpose');
   const ephemeralPublicKey = crypto.createPublicKey(String(envelope.ephemeralPublicKeyPem || ''));
@@ -176,7 +197,6 @@ function baseEnv() {
   const company = keyPair();
   const app = keyPair();
   const operator = keyPair();
-  const manufacturing = keyPair();
   return {
     ...safeProcessEnvironment(),
     CI: '1', NODE_ENV: 'production', V2_ENVIRONMENT: 'test',
@@ -194,7 +214,7 @@ function baseEnv() {
     CRON_SECRET: crypto.randomBytes(32).toString('base64url'), STAGE1_CONTRACT_SECRET: crypto.randomBytes(32).toString('base64url'),
     COMPANY_PORTAL_SESSION_PRIVATE_KEY: company.privateKey, COMPANY_PORTAL_SESSION_PUBLIC_KEYS: company.publicKey,
     DINODIA_APP_SESSION_PRIVATE_KEY: app.privateKey, DINODIA_APP_PUBLIC_KEYS: app.publicKey,
-    OPERATOR_SESSION_PRIVATE_KEY: operator.privateKey, MANUFACTURING_ROOT_PUBLIC_KEYS: manufacturing.publicKey,
+    OPERATOR_SESSION_PRIVATE_KEY: operator.privateKey, MANUFACTURING_ROOT_PUBLIC_KEYS: harnessManufacturingRoot.publicKey,
     MANUFACTURING_ENROLLMENT_OPERATOR_PUBLIC_KEYS: company.publicKey, COMPANY_PORTAL_INITIAL_CXO_BOOTSTRAP_SECRET: crypto.randomBytes(32).toString('base64url'),
   };
 }
@@ -311,9 +331,22 @@ async function platformChecks() {
   const pendingCount = spawnSync('docker', ['exec', dockerName, 'psql', '-U', 'postgres', '-d', 'dinodia_stage1', '-At', '-c', pendingCountSql], { encoding: 'utf8' }).stdout.trim();
   if (pendingCount !== '0/0') fail(`Bootstrap created durable rows before delivery configuration (${pendingCount})`);
 
-  // Prove the assignment route through the actual Company Portal login
-  // route and its real HttpOnly cookie. The harness must never manufacture a
-  // signed employee token and then rewrite a database hash to make it pass.
+  // Generate the pairing code through the actual locked Dinodia OS setup page.
+  // The successful path must not manufacture HubProvisioningAttempt or use its
+  // internal attemptId as browser authority.
+  const hubPort = hub.server.address().port;
+  const hubBase = `http://127.0.0.1:${hubPort}`;
+  const setupJar = {};
+  const setupPage = await fetch(`${hubBase}/setup`);
+  updateCookieJar(setupJar, setupPage);
+  const setupPairing = await fetchJson(`${hubBase}/_dinodia/setup/pairing`, { method: 'POST', headers: { 'content-type': 'application/json', origin: hubBase, host: `127.0.0.1:${hubPort}`, cookie: cookieHeader(setupJar), 'x-dinodia-setup-csrf': cookieValue(setupJar, 'dinodia_setup_csrf') }, body: '{}' });
+  if (setupPairing.response.status !== 201 || typeof setupPairing.body.code !== 'string' || !setupPairing.body.code.startsWith('DNO-')) fail(`Real locked setup did not produce a pairing code (${setupPairing.response.status}/${setupPairing.body.errorCode || 'missing-code'})`);
+  if (setupPairing.body.id !== undefined || setupPairing.body.attemptId !== undefined) fail('Locked setup returned the internal provisioning attempt identifier');
+  if (setupPairing.body.qrPayload !== `dinodia-pairing-v1:${setupPairing.body.code}`) fail('Locked setup QR payload contains authority beyond the pairing code');
+  const pairingCode = setupPairing.body.code;
+  // Prove the assignment route through the actual Company Portal login route
+  // and its real HttpOnly cookie. The harness must never manufacture a signed
+  // employee token and then rewrite a database hash to make it pass.
   const employeePassword = `harness-cxo-password-${crypto.randomUUID()}`;
   const employeeEmail = `harness-${crypto.randomUUID()}@invalid.test`;
   const employee = await prisma.companyEmployeeAccount.create({ data: { displayName: 'Harness CXO', email: employeeEmail, emailNormalized: employeeEmail, role: 'CXO', status: 'ACTIVE', passwordHash: hashPassword(employeePassword) } });
@@ -321,28 +354,32 @@ async function platformChecks() {
   if (wrongPassword.response.status !== 401) fail(`Wrong employee password was accepted (${wrongPassword.response.status})`);
   const employeeLogin = await loginEmployee(base, employee, employeePassword);
   const session = employeeLogin.session;
+  const token = employeeLogin.token;
+  const wrongCode = await fetchJson(`${base}/api/installer/workflows`, { method: 'POST', headers: { 'content-type': 'application/json', cookie: cookieHeader(employeeLogin.jar), 'idempotency-key': crypto.randomUUID() }, body: JSON.stringify({ pairingCode: 'DNO-invalid-pairing-code', assignedEmployeeId: employee.id, reason: 'wrong-code denial' }) });
+  if (wrongCode.response.status !== 409) fail(`Wrong pairing code did not fail closed (${wrongCode.response.status})`);
   const malformedEmployeeToken = await fetchJson(`${base}/api/installer/workflows`, { headers: { 'x-dinodia-employee-session': 'not-a-session-token' } });
   if (malformedEmployeeToken.response.status !== 401) fail(`Malformed employee session was not denied (${malformedEmployeeToken.response.status})`);
-  const signatureOffset = employeeLogin.token.lastIndexOf('.') + 1;
-  const signatureByte = employeeLogin.token[signatureOffset];
-  const tamperedEmployeeToken = `${employeeLogin.token.slice(0, signatureOffset)}${signatureByte === 'a' ? 'b' : 'a'}${employeeLogin.token.slice(signatureOffset + 1)}`;
+  const signatureOffset = token.lastIndexOf('.') + 1;
+  const signatureByte = token[signatureOffset];
+  const tamperedEmployeeToken = `${token.slice(0, signatureOffset)}${signatureByte === 'a' ? 'b' : 'a'}${token.slice(signatureOffset + 1)}`;
   const wrongSignature = await fetchJson(`${base}/api/installer/workflows`, { headers: { 'x-dinodia-employee-session': tamperedEmployeeToken } });
   if (wrongSignature.response.status !== 401) fail(`Wrong-signature employee session was not denied (${wrongSignature.response.status})`);
-  const identity = await prisma.hubManufacturingIdentity.create({ data: { serialNumber: `harness-${crypto.randomUUID()}`, signingPublicKey: 'harness-signing-public-key', encryptionPublicKey: 'harness-encryption-public-key', signingKeyFingerprint: crypto.randomUUID(), encryptionKeyFingerprint: crypto.randomUUID(), status: 'ACTIVE' } });
-  const attemptId = `harness-attempt-${crypto.randomUUID()}`;
-  const presentation = `harness-presentation-${crypto.randomUUID()}`;
-  const attempt = await prisma.hubProvisioningAttempt.create({ data: { attemptId, manufacturingIdentityId: identity.id, state: 'PRESENTED', codeHash: sha256(presentation), baseUrlPresentation: 'http://dinodia-harness.local:8099', expiresAt: new Date(Date.now() + 15 * 60 * 1000), idempotencyKeyHash: sha256(`harness-${attemptId}`) } });
-  const token = employeeLogin.token;
+  const identity = await prisma.hubManufacturingIdentity.findFirstOrThrow({ where: { serialNumber: harnessProvisioningIdentity.serial }, select: { id: true, serialNumber: true } });
+  const tokenJar = employeeLogin.jar;
+  const internalIdSubmission = await fetchJson(`${base}/api/installer/workflows`, { method: 'POST', headers: { 'content-type': 'application/json', cookie: cookieHeader(tokenJar), 'idempotency-key': crypto.randomUUID() }, body: JSON.stringify({ attemptId: 'internal-attempt-id-is-not-a-pairing-code', assignedEmployeeId: employee.id, reason: 'internal id denial' }) });
+  if (internalIdSubmission.response.status !== 400 || internalIdSubmission.body.errorCode !== 'pairing_code_required') fail(`Internal attempt ID was accepted as browser authority (${internalIdSubmission.response.status}/${internalIdSubmission.body.errorCode})`);
   const assignmentKey = `harness-assignment-${crypto.randomUUID()}`;
-  const assignment = await fetchJson(`${base}/api/installer/workflows`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-employee-session': token, 'idempotency-key': assignmentKey }, body: JSON.stringify({ attemptId, assignedEmployeeId: employee.id, kind: 'INITIAL_HUB_INSTALLATION', reason: 'Disposable Stage 1 authenticated route test' }) });
+  const assignment = await fetchJson(`${base}/api/installer/workflows`, { method: 'POST', headers: { 'content-type': 'application/json', cookie: cookieHeader(tokenJar), 'idempotency-key': assignmentKey }, body: JSON.stringify({ pairingCode, assignedEmployeeId: employee.id, reason: 'Disposable Stage 1 authenticated route test' }) });
   if (assignment.response.status !== 201 || assignment.body.work?.certifiedSerialNumber !== identity.serialNumber) fail(`Authenticated work assignment failed (${assignment.response.status}/${assignment.body.errorCode})`);
-  const provision = await fetchJson(`${base}/api/installer/hubs/provision`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-employee-session': token, 'idempotency-key': `harness-provision-${crypto.randomUUID()}` }, body: JSON.stringify({ workflowId: assignment.body.work.id, attemptId, presentation }) });
+  const provision = await fetchJson(`${base}/api/installer/hubs/provision`, { method: 'POST', headers: { 'content-type': 'application/json', cookie: cookieHeader(tokenJar), 'idempotency-key': `harness-provision-${crypto.randomUUID()}` }, body: JSON.stringify({ workflowId: assignment.body.work.id, pairingCode }) });
   if (provision.response.status !== 200 || !provision.body.homeId || !provision.body.hubInstallationId || provision.body.homeClaimPresentation == null) fail(`Assigned provisioning did not bind a Home and HubInstallation (${provision.response.status}/${provision.body.errorCode || 'unknown'})`);
+  if (provision.body.attemptId !== undefined) fail('Provisioning response returned the internal provisioning attempt identifier');
   const boundWork = await prisma.companyOperationalWorkItem.findUnique({ where: { id: assignment.body.work.id }, select: { homeId: true, hubInstallationId: true, state: true } });
   if (boundWork?.homeId !== provision.body.homeId || boundWork?.hubInstallationId !== provision.body.hubInstallationId || boundWork.state !== 'IN_PROGRESS') fail('Provisioning did not durably bind the assigned work to the created Home and HubInstallation');
-  const boundAttempt = await prisma.hubProvisioningAttempt.findUnique({ where: { attemptId }, select: { hubInstallationId: true } });
+  const boundAttempt = await prisma.hubProvisioningAttempt.findFirst({ where: { codeHash: sha256(pairingCode) }, select: { id: true, hubInstallationId: true, state: true } });
   if (boundAttempt?.hubInstallationId !== provision.body.hubInstallationId) fail('Provisioning attempt and HubInstallation binding is inconsistent');
-  const replay = await fetchJson(`${base}/api/installer/workflows`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-employee-session': token, 'idempotency-key': assignmentKey }, body: JSON.stringify({ attemptId, assignedEmployeeId: employee.id, kind: 'INITIAL_HUB_INSTALLATION', reason: 'Disposable Stage 1 authenticated route test' }) });
+  if (boundAttempt?.state !== 'CHALLENGE_PENDING') fail(`Provisioning did not advance the durable attempt to challenge-pending (${boundAttempt?.state || 'missing'})`);
+  const replay = await fetchJson(`${base}/api/installer/workflows`, { method: 'POST', headers: { 'content-type': 'application/json', cookie: cookieHeader(tokenJar), 'idempotency-key': assignmentKey }, body: JSON.stringify({ pairingCode, assignedEmployeeId: employee.id, reason: 'Disposable Stage 1 authenticated route test' }) });
   if (replay.response.status !== 200 || replay.body.work?.id !== assignment.body.work?.id || replay.body.work?.idempotentReplay !== true) fail(`Authenticated work assignment replay was not idempotent (${replay.response.status})`);
   const assigned = await fetchJson(`${base}/api/installer/workflows`, { headers: { cookie: cookieHeader(employeeLogin.jar) } });
   if (assigned.response.status !== 200 || !assigned.body.workflows?.some((work) => work.id === assignment.body.work.id)) fail(`Assigned work was not returned to the authenticated employee (${assigned.response.status})`);
@@ -350,7 +387,7 @@ async function platformChecks() {
   if (logout.response.status !== 204) fail(`Real employee logout failed (${logout.response.status})`);
   const afterLogout = await fetchJson(`${base}/api/installer/workflows`, { headers: { cookie: cookieHeader(employeeLogin.jar) } });
   if (afterLogout.response.status !== 401) fail(`Revoked real employee cookie remained usable (${afterLogout.response.status})`);
-  seededWork = { employeeId: employee.id, employeeSessionId: session.id, workId: assignment.body.work.id, attemptId: attempt.id, identityId: identity.id, homeId: provision.body.homeId, hubInstallationId: provision.body.hubInstallationId };
+  seededWork = { employeeId: employee.id, employeeSessionId: session.id, workId: assignment.body.work.id, attemptId: boundAttempt.id, identityId: identity.id, homeId: provision.body.homeId, hubInstallationId: provision.body.hubInstallationId };
   await prisma.homeClaimChallenge.deleteMany({ where: { hubInstallationId: seededWork.hubInstallationId } });
   await prisma.homeClaimReference.deleteMany({ where: { hubInstallationId: seededWork.hubInstallationId } });
   await prisma.hubInstallation.delete({ where: { id: seededWork.hubInstallationId } });
@@ -1033,15 +1070,41 @@ try {
   if (!fs.existsSync(path.join(osRoot, 'node_modules', 'ws'))) {
     run('npm', ['ci', '--ignore-scripts'], { cwd: osRoot, env: { ...safeProcessEnvironment(), CI: '1', NODE_ENV: 'test' } });
   }
+  await prisma.hubManufacturingIdentity.create({ data: {
+    serialNumber: harnessProvisioningIdentity.serial,
+    identityGeneration: harnessProvisioningIdentity.generation,
+    signingPublicKey: harnessProvisioningIdentity.signingPublicKeyPem,
+    encryptionPublicKey: harnessProvisioningIdentity.encryptionPublicKeyPem,
+    signingKeyFingerprint: harnessProvisioningIdentity.publicKeyFingerprint,
+    encryptionKeyFingerprint: harnessProvisioningIdentity.encryptionKeyFingerprint,
+    status: 'ACTIVE',
+  } });
   const operator = keyPair();
+  const harnessIdentityBroker = {
+    async getPublicIdentity() {
+      return { serial: harnessProvisioningIdentity.serial, signingPublicKeyPem: harnessProvisioningIdentity.signingPublicKeyPem, encryptionPublicKeyPem: harnessProvisioningIdentity.encryptionPublicKeyPem, publicKeyFingerprint: harnessProvisioningIdentity.publicKeyFingerprint, encryptionKeyFingerprint: harnessProvisioningIdentity.encryptionKeyFingerprint, manufacturingSignature: harnessManufacturingSignature, generation: harnessProvisioningIdentity.generation };
+    },
+    async signProvisioningEnvelope({ payload }) {
+      return { signature: crypto.sign(null, Buffer.from(JSON.stringify(payload), 'utf8'), crypto.createPrivateKey(harnessProvisioningSigning.privateKey)).toString('base64url') };
+    },
+    async signPlatformRequest({ method = 'POST', path: requestPath, timestamp, nonce, bodyHash }) {
+      return { signature: crypto.sign(null, Buffer.from([String(method), String(requestPath), String(timestamp), String(nonce), String(bodyHash)].join('\n'), 'utf8'), crypto.createPrivateKey(harnessProvisioningSigning.privateKey)).toString('base64url') };
+    },
+    async signCloudChallenge({ payload }) {
+      const canonical = JSON.stringify({ version: 1, serial: String(payload.serial), cloudUrl: String(payload.cloudUrl), challenge: String(payload.challenge), tunnelId: String(payload.tunnelId), tunnelName: String(payload.tunnelName), timestamp: Number(payload.timestamp), bodyHash: String(payload.bodyHash), identityFingerprint: String(payload.identityFingerprint), identityGeneration: Number(payload.identityGeneration) });
+      return { signature: crypto.sign(null, Buffer.from(canonical, 'utf8'), crypto.createPrivateKey(harnessProvisioningSigning.privateKey)).toString('base64url') };
+    },
+  };
   const { createHub } = await import(pathToFileURL(path.join(osRoot, 'src/server.js')).href);
   hub = createHub({
-    config: { nodeEnv: 'production', hubId: harnessHubInstallationId, haPort: 0, hubAgentPort: 0, dataDir, dataFile: path.join(dataDir, 'dinodia.json'), backupDir: path.join(dataDir, 'backups'), staticDir: path.join(osRoot, 'public'), operatorPublicKey: operator.publicKey, appPublicKeys: env.DINODIA_APP_PUBLIC_KEYS, platformApiUrl: 'https://dinodia-platform-v2.vercel.app', nativeAutomationsMode: 'off', hiveEnabled: false, googleNestEnabled: false, cloudflarePublicHostname: '' },
+    config: { nodeEnv: 'production', v2Environment: 'test', hubId: harnessHubInstallationId, haPort: 0, hubAgentPort: 0, dataDir, dataFile: path.join(dataDir, 'dinodia.json'), backupDir: path.join(dataDir, 'backups'), staticDir: path.join(osRoot, 'public'), operatorPublicKey: operator.publicKey, appPublicKeys: env.DINODIA_APP_PUBLIC_KEYS, platformApiUrl: 'https://dinodia-platform-v2.vercel.app', nativeAutomationsMode: 'off', hiveEnabled: false, googleNestEnabled: false, cloudflarePublicHostname: '' },
+    identityBroker: harnessIdentityBroker,
     logger: { error() {}, warn() {}, log() {} },
     mqttBridge: { start() {}, close() {}, status() { return { configured: false, connected: false }; }, async command() { fakePhysicalCommandCount += 1; } },
     platformSync: { start() {}, stop() {}, status() { return { configured: false }; } },
     cloudflareTunnel: { start() {}, async stop() {}, status() { return { configured: false, connected: false, hostname: '' }; } },
   });
+  hub.pairing.apiUrl = `http://127.0.0.1:${appPort}`;
   await new Promise((resolve) => hub.server.listen(0, '127.0.0.1', resolve));
   await platformChecks();
   await stopPlatform();
