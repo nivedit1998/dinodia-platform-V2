@@ -4,7 +4,7 @@ import { assertCustomerCanCommand, requireCustomer, Stage1AuthError, authErrorRe
 import { ALLOWED_OPERATIONS, descriptorBoundValue, operationDigest, targetDigest } from '@/lib/sensitiveOperationStepUp';
 import { prisma } from '@/lib/prisma';
 import { canonicalStepUpDescriptor } from '@/lib/stage1HubAuth';
-import { sha256 } from '@/lib/stage1Crypto';
+import { canonicalHubRequest, sha256 } from '@/lib/stage1Crypto';
 
 export const dynamic = 'force-dynamic';
 
@@ -33,7 +33,9 @@ export async function POST(request: Request) {
       const bodyWithoutSignature = { ...attestation };
       const signature = String(bodyWithoutSignature.hubSignature || '');
       delete bodyWithoutSignature.hubSignature;
-      if (!signature || !crypto.verify(null, Buffer.from(canonicalStepUpDescriptor(bodyWithoutSignature), 'utf8'), crypto.createPublicKey(hub.manufacturingIdentity.signingPublicKey), Buffer.from(signature, 'base64url'))) throw new Stage1AuthError(403, 'step_up_descriptor_signature_invalid', 'The hub descriptor attestation is not authentic');
+      const descriptorBodyHash = sha256(canonicalStepUpDescriptor(bodyWithoutSignature));
+      const signedRequest = canonicalHubRequest({ method: 'POST', path: '/api/step-up/descriptor-challenge', timestamp: Number(bodyWithoutSignature.issuedAt), nonce: String(bodyWithoutSignature.nonce), bodyHash: descriptorBodyHash });
+      if (!signature || !crypto.verify(null, Buffer.from(signedRequest, 'utf8'), crypto.createPublicKey(hub.manufacturingIdentity.signingPublicKey), Buffer.from(signature, 'base64url'))) throw new Stage1AuthError(403, 'step_up_descriptor_signature_invalid', 'The hub descriptor attestation is not authentic');
       const descriptorDigests: Record<string, string | null> = { [targetIds[0]]: attestation.descriptorDigest == null ? null : String(attestation.descriptorDigest) };
       const attestedValue = value && typeof value === 'object' && !Array.isArray(value) ? { ...(value as Record<string, unknown>), controlId: String(attestation.controlId) } : { value, controlId: String(attestation.controlId) };
       operationValue = descriptorBoundValue(attestedValue, descriptorDigests);
@@ -58,6 +60,15 @@ export async function POST(request: Request) {
       const ticket = accessRequest ? await prisma.supportTicket.findUnique({ where: { id: accessRequest.ticketId }, select: { id: true, homeId: true, status: true } }) : null;
       if (!accessRequest || !ticket || ticket.id !== ticketId || accessRequest.requestedScope !== 'PROPERTY_SCOPE' || accessRequest.status !== 'REQUESTED' || ticket.status !== 'OPEN' || ticket.homeId !== customer.homeId) throw new Stage1AuthError(403, 'support_approval_denied', 'This property support request is not available for the selected home');
       if (String(value) !== 'I approve this support access for my property') throw new Stage1AuthError(400, 'support_confirmation_required', 'Type the exact support confirmation before approving property diagnostics');
+    }
+    if (operationKind === 'support_access_revoke') {
+      if (customer.role !== 'OWNER' && customer.role !== 'PROPERTY_MANAGER') throw new Stage1AuthError(403, 'support_revoke_denied', 'Only a homeowner or permitted property manager can revoke property support');
+      if (targetIds.length !== 2) throw new Stage1AuthError(400, 'step_up_target_invalid', 'A support ticket and access request are required');
+      const [ticketId, requestId] = targetIds;
+      const accessRequest = await prisma.supportAccessRequest.findUnique({ where: { id: requestId }, select: { id: true, ticketId: true, homeId: true, requestedScope: true, approvedByMembershipId: true, status: true } });
+      const ticket = accessRequest ? await prisma.supportTicket.findUnique({ where: { id: accessRequest.ticketId }, select: { id: true, homeId: true, status: true } }) : null;
+      if (!accessRequest || !ticket || ticket.id !== ticketId || accessRequest.requestedScope !== 'PROPERTY_SCOPE' || accessRequest.approvedByMembershipId !== customer.membershipId || !['APPROVED', 'ISSUED', 'REDEEMED'].includes(accessRequest.status) || ticket.status !== 'OPEN' || ticket.homeId !== customer.homeId) throw new Stage1AuthError(403, 'support_revoke_denied', 'This property support request is not available for the selected approving membership');
+      if (String(value) !== 'I revoke this support access for my property') throw new Stage1AuthError(400, 'support_confirmation_required', 'Type the exact support confirmation before revoking property diagnostics');
     }
     const digest = operationDigest({ customerAccountId: customer.id, customerSessionId: customer.sessionId, trustedDeviceId: customer.trustedDeviceId, homeId: customer.homeId, membershipId: customer.membershipId, hubInstallationId: customer.hubInstallationId, operationKind, targetIds, value: operationValue });
     const nonce = crypto.randomBytes(32).toString('base64url');

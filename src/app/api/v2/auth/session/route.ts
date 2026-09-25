@@ -41,7 +41,7 @@ export async function POST(request: Request) {
         update: { publicKey, publicKeyThumbprint: thumbprint, deviceName, lastUsedAt: new Date(), revokedAt: null, sessionVersion: { increment: 1 } },
         select: { id: true, sessionVersion: true },
       });
-      const created = await tx.customerSession.create({ data: { customerAccountId: account.id, trustedDeviceId: trusted.id, refreshTokenHash: sha256(rawSession), securityVersion: account.securityVersion, expiresAt: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000) }, select: { id: true, expiresAt: true } });
+      const created = await tx.customerSession.create({ data: { customerAccountId: account.id, trustedDeviceId: trusted.id, refreshTokenHash: sha256(rawSession), securityVersion: account.securityVersion, trustedDeviceSessionVersion: trusted.sessionVersion, expiresAt: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000) }, select: { id: true, expiresAt: true } });
       await tx.auditEvent.create({ data: { actorType: 'CUSTOMER', actorId: account.id, category: 'SECURITY', action: 'customer_login_succeeded', targetType: 'CustomerSession', targetId: created.id, metadata: { trustedDeviceId: trusted.id, outcome: 'succeeded' }, purgeAt: new Date(Date.now() + 365 * 24 * 60 * 60 * 1000) } });
       return { ...created, trustedDeviceId: trusted.id };
     });

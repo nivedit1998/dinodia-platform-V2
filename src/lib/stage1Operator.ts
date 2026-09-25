@@ -3,13 +3,30 @@ import { encryptToHubKey } from './hubOperatorCredentials';
 
 function encode(value: unknown): string { return Buffer.from(JSON.stringify(value), 'utf8').toString('base64url'); }
 
-export function supportRedeemDigest(input: { serial: string; ticketId: string; requestId: string; code: string; identityGeneration: number }): string {
+export function supportRedeemDigest(input: { serial: string; ticketId: string; requestId: string; codeHash: string; identityGeneration: number }): string {
   return crypto.createHash('sha256').update(JSON.stringify({
     version: 1,
     serial: String(input.serial),
     ticketId: String(input.ticketId),
     requestId: String(input.requestId),
-    code: String(input.code),
+    codeHash: String(input.codeHash),
+    identityGeneration: Number(input.identityGeneration),
+  }), 'utf8').digest('hex');
+}
+
+/**
+ * The hub proves possession of the decrypted employee grant without sending
+ * that grant back to Platform. Platform recomputes this value from the
+ * durable grant hash and the exact redemption request.
+ */
+export function supportProofOfPossessionDigest(input: { employeeProofHash: string; serial: string; ticketId: string; requestId: string; codeHash: string; identityGeneration: number }): string {
+  return crypto.createHash('sha256').update(JSON.stringify({
+    version: 1,
+    employeeProofHash: String(input.employeeProofHash),
+    serial: String(input.serial),
+    ticketId: String(input.ticketId),
+    requestId: String(input.requestId),
+    codeHash: String(input.codeHash),
     identityGeneration: Number(input.identityGeneration),
   }), 'utf8').digest('hex');
 }

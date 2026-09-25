@@ -59,8 +59,8 @@ test('Stage 1 database migration includes durable privacy and authority objects'
 
 test('readiness requires the completed Stage 1 migration rather than only the baseline', () => {
   assert.match(read('src/app/api/readiness/route.ts'), /REQUIRED_MIGRATION/);
-  assert.match(read('src/lib/foundation.ts'), /20260925010000_r6_browser_attempt_binding/);
-  assert.match(read('src/lib/foundation.ts'), /REQUIRED_MODEL_COUNT = 43/);
+  assert.match(read('src/lib/foundation.ts'), /20260925040000_r7_support_notifications/);
+  assert.match(read('src/lib/foundation.ts'), /REQUIRED_MODEL_COUNT = 44/);
 });
 
 test('normal hub routes require the acknowledged machine credential', () => {
@@ -112,6 +112,21 @@ test('step-up target digests use one canonical representation for issue and cons
   assert.notEqual(targetDigest(['device-1']), targetDigest(['device-2']));
 });
 
+test('every real step-up consumer remains bound to the selected hub installation', () => {
+  const primitive = read('src/lib/sensitiveOperationStepUp.ts');
+  assert.match(primitive, /hubInstallationId: string/);
+  for (const route of [
+    'src/app/api/v2/support/tickets/[ticketId]/route.ts',
+    'src/app/api/v2/support/tickets/[ticketId]/access-requests/[requestId]/approve/route.ts',
+    'src/app/api/v2/trusted-devices/[trustedDeviceId]/route.ts',
+    'src/app/api/v2/security/step-up/consume/route.ts',
+  ]) {
+    const source = read(route);
+    assert.match(source, /consumeStepUp\(/);
+    assert.match(source, /hubInstallationId:\s*customer\.hubInstallationId/);
+  }
+});
+
 test('Platform step-up operation digest matches the published cross-runtime vector', () => {
   const { operationDigest, descriptorBoundValue } = loadTypeScriptModule('src/lib/sensitiveOperationStepUp.ts', {
     './prisma': { prisma: {} },
@@ -125,6 +140,24 @@ test('Platform step-up operation digest matches the published cross-runtime vect
   assert.equal(digest, '0b7b31bd4b18558b5650808cc96c4127bff9ef43c3a2982083fb2c0402603997');
   const osVerifier = requireOsModule('src/auth/stepUpProofVerifier.js');
   assert.equal(osVerifier.digestOperation({ actorId: 'account-1', trustedDeviceId: 'phone-1', trustedSessionId: 'session-1', homeId: 'home-1', membershipId: 'membership-1', hubInstallId: 'hub-1', operation: 'device_sensitive_command', targetIds: ['device-1'], value: osVerifier.descriptorBoundValue({ controlId: 'control-1', temperature: 21 }, { 'device-1': 'descriptor-7' }) }), digest);
+});
+
+test('Platform and Dinodia OS use the same support proof-of-possession vector', () => {
+  const { supportProofOfPossessionDigest } = loadTypeScriptModule('src/lib/stage1Operator.ts', {
+    './hubOperatorCredentials': { encryptToHubKey: () => ({}) },
+  });
+  const input = {
+    employeeProofHash: 'a'.repeat(64),
+    serial: 'din-home-001',
+    ticketId: '11111111-1111-4111-8111-111111111111',
+    requestId: '22222222-2222-4222-8222-222222222222',
+    codeHash: 'b'.repeat(64),
+    identityGeneration: 1,
+  };
+  const expected = '1b02c8aca1f3d4c91ef1af9ec2e2de38a2fb72dcc249d094314b86e3b8673139';
+  assert.equal(supportProofOfPossessionDigest(input), expected);
+  const osProof = requireOsModule('src/auth/supportProofOfPossession.js');
+  assert.equal(osProof.supportProofOfPossessionDigest(input), expected);
 });
 
 test('manufacturing certificates sign only stable identity material and use separate key types', () => {
@@ -184,12 +217,18 @@ test('R4 production paths use opaque browser-bound handoffs, committed claim cle
   assert.match(supportProof, /requestId/);
   assert.match(supportProof, /identityGeneration/);
   assert.doesNotMatch(supportProof, /employeeProofHash/);
-  assert.match(support, /employeeProof/);
-  assert.match(support, /verifyHubBoundOperatorGrant/);
-  assert.doesNotMatch(support, /employeeProofHash/);
+  assert.match(support, /employeeProofOfPossession/);
+  assert.match(support, /supportProofOfPossessionDigest/);
+  assert.doesNotMatch(support, /employeeProof\s*:/);
+  assert.doesNotMatch(support, /verifyHubBoundOperatorGrant/);
+  assert.match(support, /employeeHandoffHash/);
+  assert.match(support, /employeeProofHash: String\(row\.employeeHandoffHash/);
   assert.match(supportIssue, /employeeHandoffEnvelope/);
   assert.doesNotMatch(supportIssue, /NextResponse\.json\(\{[^\n]*employeeProofEnvelope/);
   assert.doesNotMatch(supportPortal, /employeeProofEnvelope/);
+  assert.doesNotMatch(supportPortal, /issuedCode|body\.code/);
+  assert.doesNotMatch(supportIssue, /NextResponse\.json\([\s\S]{0,500}\bcode\s*[,}]/);
+  assert.match(read('src/app/api/v2/support/tickets/[ticketId]/access-requests/[requestId]/approve/route.ts'), /oneUseCode/);
   assert.doesNotMatch(readOs('public/setup.js'), /supportProof|employeeProofEnvelope/);
   assert.doesNotMatch(support, /employeeHandoff\s*\}\)/);
   assert.match(support, /employeeHandoffConsumedAt/);
@@ -257,6 +296,16 @@ test('R3 persistent rate limits serialize concurrent bucket updates', () => {
   assert.match(limiter, /TransactionIsolationLevel\.Serializable/);
   assert.match(limiter, /P2002|P2034/);
   assert.match(limiter, /rate_limit_retry_exhausted/);
+});
+
+test('Stage 1 integration and clean-clone harnesses do not inherit operator secrets', () => {
+  const integration = fs.readFileSync(path.join(root, 'scripts', 'stage1_integration_harness.mjs'), 'utf8');
+  const cleanClone = fs.readFileSync(path.join(root, 'scripts', 'check_clean_clone.mjs'), 'utf8');
+  assert.match(integration, /function safeProcessEnvironment\(source = process\.env\)/);
+  assert.match(cleanClone, /function safeProcessEnvironment\(\)/);
+  assert.doesNotMatch(integration, /return \{\s*\.\.\.process\.env/);
+  assert.doesNotMatch(cleanClone, /env:\s*\{\s*\.\.\.process\.env/);
+  assert.match(integration, /assertLoopbackTestEndpoint/);
 });
 
 test('R3 credential lifecycle uses the durable unique version and atomic revoke boundary', () => {

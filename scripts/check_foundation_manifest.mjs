@@ -12,9 +12,13 @@ const modifiedFiles = new Set([
   'docs/V2_FOUNDATION_STATUS.md', 'next.config.ts', 'package-lock.json', 'package.json', 'prisma.config.ts',
   'prisma/schema.prisma', 'scripts/assert_v2_target.mjs', 'scripts/check_no_unsafe_logs.mjs',
   'scripts/check_clean_clone.mjs', 'scripts/check_foundation.mjs', 'scripts/check_foundation_manifest.mjs', 'scripts/foundation_db_checks.mjs', 'scripts/reset_rc_database.mjs',
-  'scripts/check_security_headers.mjs', 'src/app/error.tsx', 'src/app/globals.css', 'src/app/layout.tsx',
+  'scripts/check_security_headers.mjs', 'scripts/stage1_integration_harness.mjs', 'src/app/error.tsx', 'src/app/globals.css', 'src/app/layout.tsx',
   'src/app/loading.tsx', 'src/app/not-found.tsx', 'src/app/page.tsx', 'src/lib/prisma.ts', 'supabase/config.toml',
-  'tsconfig.json', 'src/app/api/readiness/route.ts', 'src/lib/foundation.ts', 'test/foundation_contracts.test.mjs', 'vercel.json',
+  'tsconfig.json', 'src/app/api/readiness/route.ts', 'src/app/api/company/auth/bootstrap/complete/route.ts',
+  'src/app/api/company/auth/bootstrap/route.ts', 'src/app/api/hub-agent/support/v2/redeem/route.ts', 'src/app/api/hub-agent/support/v2/revocation/route.ts',
+  'src/app/api/installer/workflows/route.ts', 'src/app/api/installer/hubs/provision/route.ts', 'src/app/api/v2/auth/session/route.ts', 'src/app/api/v2/hub-sessions/route.ts', 'src/app/api/v2/support/tickets/[ticketId]/route.ts', 'src/app/api/v2/support/tickets/[ticketId]/access-requests/[requestId]/approve/route.ts', 'src/app/api/v2/support/tickets/[ticketId]/access-requests/[requestId]/issue/route.ts', 'src/app/api/v2/security/step-up/challenge/route.ts', 'src/app/api/v2/security/step-up/consume/route.ts', 'src/app/api/v2/trusted-devices/[trustedDeviceId]/route.ts', 'src/app/installer/page.tsx', 'src/app/installer/home-support/page.tsx', 'src/lib/foundation.ts', 'src/lib/stage1Auth.ts',
+  'src/lib/hubOperatorCredentials.ts', 'src/lib/nativeOperations.ts', 'src/lib/sensitiveOperationStepUp.ts', 'src/lib/stage1ClaimContract.ts', 'src/lib/stage1Operator.ts', 'test/foundation_contracts.test.mjs',
+  'test/stage1_security.test.mjs', 'vercel.json',
 ]);
 
 const addedFiles = [
@@ -26,7 +30,7 @@ const addedFiles = [
   /^src\/app\/api\/(health|readiness)(?:\/|$)/,
   /^src\/app\/api\/(company|cron|hub-agent|installer|internal|v2)(?:\/|$)/,
   /^src\/app\/(company|installer)(?:\/|$)/,
-  /^src\/lib\/(foundation|foundationContracts|manufacturingEnrollment|runtimeDatabaseUrl|runtimeTarget|hubOperatorCredentials|nativeOperations|passwords|rateLimit|sensitiveOperationStepUp|stage1Auth|stage1ClaimContract|stage1Crypto|stage1HubAuth|stage1Operator)\.(mjs|ts)$/,
+  /^src\/lib\/(foundation|foundationContracts|initialCxoInvitation|manufacturingEnrollment|runtimeDatabaseUrl|runtimeTarget|hubOperatorCredentials|nativeOperations|passwords|rateLimit|sensitiveOperationStepUp|stage1Auth|stage1ClaimContract|stage1Crypto|stage1HubAuth|stage1Operator|supportNotifications)\.(mjs|ts)$/,
   /^test(?:\/|$)/,
   /^vercel\.json$/,
 ];

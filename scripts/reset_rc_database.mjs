@@ -17,6 +17,9 @@ const expectedMigrations = [
   '20260924005000_r4_operator_handoff_secret',
   '20260925000000_r4_support_hub_handoff',
   '20260925010000_r6_browser_attempt_binding',
+  '20260925020000_r7_cxo_delivery_and_work_assignment',
+  '20260925030000_r8_trusted_device_session_version',
+  '20260925040000_r7_support_notifications',
 ];
 const expectedModels = new Set([
   'CustomerAccount', 'CompanyEmployeeAccount', 'TrustedDevice', 'CustomerSession', 'PolicyAcceptance', 'AuthChallenge', 'StepUpAuthorization',
@@ -24,7 +27,7 @@ const expectedModels = new Set([
   'HubManufacturingIdentity', 'CompanyOperationalWorkItem', 'HubInstallation', 'HubCredentialVersion', 'HubProvisioningAttempt',
   'MembershipInvitation', 'MembershipInvitationArea', 'AreaQrCredential', 'AreaAccessRequest', 'HomeClaimReference', 'HomeClaimChallenge', 'HomeClaimReservation', 'PendingHomeSetup',
   'HomeDocument', 'MemberPreferenceDocument', 'AuditEvent', 'DeletionSecurityReceipt', 'IdempotencyRecord', 'ReplayNonce',
-  'EmployeeSession', 'OperatorHandoff', 'OperatorBrowserAttempt', 'StepUpChallenge', 'SupportTicket', 'SupportAccessRequest', 'SupportSession', 'OfflineMembershipAuthorisation', 'CloudUrlVerification',
+  'EmployeeSession', 'OperatorHandoff', 'OperatorBrowserAttempt', 'StepUpChallenge', 'SupportTicket', 'SupportAccessRequest', 'SupportSession', 'OfflineMembershipAuthorisation', 'CloudUrlVerification', 'SupportAccessNotification',
 ]);
 
 function fail(message) {

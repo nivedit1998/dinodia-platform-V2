@@ -31,7 +31,7 @@ export function operationDigest(input: { operationKind?: string; operation?: str
   }), 'utf8').digest('hex');
 }
 
-export const ALLOWED_OPERATIONS = new Set(['trusted_device_remove', 'support_ticket_close', 'support_access_approve', 'alexa_unlink', 'heating_sensitive_command', 'device_sensitive_command']);
+export const ALLOWED_OPERATIONS = new Set(['trusted_device_remove', 'support_ticket_close', 'support_access_approve', 'support_access_revoke', 'alexa_unlink', 'heating_sensitive_command', 'device_sensitive_command']);
 
 function platformPrivateKey(): crypto.KeyObject {
   const pem = String(process.env.DINODIA_APP_SESSION_PRIVATE_KEY ?? '').replaceAll('\\n', '\n');
@@ -59,18 +59,21 @@ export async function issueStepUp(input: { customerAccountId: string; customerSe
   if (!challenge || challenge.customerAccountId !== input.customerAccountId || challenge.customerSessionId !== input.customerSessionId || challenge.trustedDeviceId !== input.trustedDeviceId || challenge.consumedAt || challenge.cancelledAt || challenge.expiresAt <= now) throw new Stage1AuthError(403, 'step_up_challenge_invalid', 'The trusted-device challenge is invalid or expired');
   if (crypto.createHash('sha256').update(input.assertionNonce, 'utf8').digest('hex') !== challenge.nonceHash) throw new Stage1AuthError(403, 'step_up_challenge_invalid', 'The trusted-device challenge nonce is invalid');
   verifyTrustedDeviceAssertion({ publicKey: input.trustedDevicePublicKey, signature: input.assertionSignature, nonce: input.assertionNonce, challengeId: challenge.id, operationDigest: challenge.normalizedValueDigest });
-  const consumed = await prisma.stepUpChallenge.updateMany({ where: { id: challenge.id, consumedAt: null, cancelledAt: null, expiresAt: { gt: now } }, data: { consumedAt: now } });
-  if (consumed.count !== 1) throw new Stage1AuthError(403, 'step_up_challenge_replayed', 'The trusted-device challenge has already been consumed');
   const nowSeconds = Math.floor(Date.now() / 1000);
   const unsigned = { jti: crypto.randomUUID(), actorId: input.customerAccountId, trustedDeviceId: input.trustedDeviceId, customerSessionId: input.customerSessionId, homeId: challenge.homeId, membershipId: challenge.membershipId, hubInstallId: challenge.hubInstallationId, operationDigest: challenge.normalizedValueDigest, issuedAt: nowSeconds, expiresAt: nowSeconds + 60 };
   const signingInput = encoded(unsigned);
   const proof = `${signingInput}.${crypto.sign(null, Buffer.from(signingInput, 'utf8'), platformPrivateKey()).toString('base64url')}`;
   const expiresAt = new Date((nowSeconds + 60) * 1000);
-  const row = await prisma.stepUpAuthorization.create({ data: { customerAccountId: input.customerAccountId, customerSessionId: input.customerSessionId, trustedDeviceId: input.trustedDeviceId, homeId: challenge.homeId, membershipId: challenge.membershipId, operationKind: challenge.operationKind, targetDigest: challenge.targetDigest, normalizedValueDigest: challenge.normalizedValueDigest, policyRevision: challenge.policyRevision, nonceHash: crypto.createHash('sha256').update(proof).digest('hex'), issuedAt: now, expiresAt }, select: { id: true, expiresAt: true } });
-  return { proof, proofId: row.id, expiresAt: row.expiresAt };
+  const result = await prisma.$transaction(async (tx) => {
+    const consumed = await tx.stepUpChallenge.updateMany({ where: { id: challenge.id, consumedAt: null, cancelledAt: null, expiresAt: { gt: now } }, data: { consumedAt: now } });
+    if (consumed.count !== 1) throw new Stage1AuthError(403, 'step_up_challenge_replayed', 'The trusted-device challenge has already been consumed');
+    const row = await tx.stepUpAuthorization.create({ data: { customerAccountId: input.customerAccountId, customerSessionId: input.customerSessionId, trustedDeviceId: input.trustedDeviceId, homeId: challenge.homeId, membershipId: challenge.membershipId, operationKind: challenge.operationKind, targetDigest: challenge.targetDigest, normalizedValueDigest: challenge.normalizedValueDigest, policyRevision: challenge.policyRevision, nonceHash: crypto.createHash('sha256').update(proof).digest('hex'), issuedAt: now, expiresAt }, select: { id: true, expiresAt: true } });
+    return { proof, proofId: row.id, expiresAt: row.expiresAt };
+  });
+  return result;
 }
 
-export async function consumeStepUp(input: { proof: string; customerAccountId: string; customerSessionId?: string; trustedDeviceId?: string; homeId: string; membershipId: string; operationKind: string; targetIds: string[]; value: unknown; policyRevision: number }) {
+export async function consumeStepUp(input: { proof: string; customerAccountId: string; customerSessionId?: string; trustedDeviceId?: string; homeId: string; membershipId: string; hubInstallationId: string; operationKind: string; targetIds: string[]; value: unknown; policyRevision: number }) {
   const now = new Date();
   const nonceHash = crypto.createHash('sha256').update(input.proof).digest('hex');
   const digest = operationDigest(input);

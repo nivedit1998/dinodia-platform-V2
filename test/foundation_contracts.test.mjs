@@ -4,7 +4,7 @@ import fs from 'node:fs';
 
 test('foundation and Stage 1 schema is exactly native and bounded', () => {
   const schema = fs.readFileSync('prisma/schema.prisma', 'utf8');
-  assert.equal([...schema.matchAll(/^model\s+/gm)].length, 43);
+  assert.equal([...schema.matchAll(/^model\s+/gm)].length, 44);
   assert.doesNotMatch(schema, /HaConnection|HomeAssistant|SupportRequest|NativeAutomation|AlexaRefreshToken/);
   assert.match(schema, /model HomeMembership/);
   assert.match(schema, /model TenantAreaGrant/);
@@ -16,6 +16,7 @@ test('foundation and Stage 1 schema is exactly native and bounded', () => {
   assert.match(schema, /model CloudUrlVerification/);
   assert.match(schema, /model AuthRateLimitBucket/);
   assert.match(schema, /model InitialCxoBootstrap/);
+  assert.match(schema, /model SupportAccessNotification/);
 });
 
 test('foundation HTTP surfaces are the only compiled application routes', () => {

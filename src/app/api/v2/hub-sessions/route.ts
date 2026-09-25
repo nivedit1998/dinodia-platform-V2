@@ -12,13 +12,13 @@ export async function POST(request: Request) {
     const homeId = String((await request.clone().json().catch(() => ({})) as Record<string, unknown>).homeId ?? '').trim();
     const sessionHash = crypto.createHash('sha256').update(rawSession).digest('hex');
     if (!rawSession || !homeId) throw new Stage1AuthError(401, 'customer_session_required', 'A customer session and selected home are required');
-    const session = await prisma.customerSession.findUnique({ where: { refreshTokenHash: sessionHash }, select: { id: true, customerAccountId: true, trustedDeviceId: true, securityVersion: true, revokedAt: true, expiresAt: true } });
+    const session = await prisma.customerSession.findUnique({ where: { refreshTokenHash: sessionHash }, select: { id: true, customerAccountId: true, trustedDeviceId: true, trustedDeviceSessionVersion: true, securityVersion: true, revokedAt: true, expiresAt: true } });
     if (!session || session.revokedAt || session.expiresAt <= new Date()) throw new Stage1AuthError(401, 'customer_session_invalid', 'The customer session is invalid');
     const account = await prisma.customerAccount.findUnique({ where: { id: session.customerAccountId }, select: { id: true, status: true, securityVersion: true } });
-    const trusted = await prisma.trustedDevice.findUnique({ where: { id: session.trustedDeviceId }, select: { id: true, customerAccountId: true, revokedAt: true } });
+    const trusted = await prisma.trustedDevice.findUnique({ where: { id: session.trustedDeviceId }, select: { id: true, customerAccountId: true, revokedAt: true, sessionVersion: true } });
     const membership = await prisma.homeMembership.findFirst({ where: { customerAccountId: session.customerAccountId, homeId, status: 'ACTIVE' }, select: { id: true, role: true, homeId: true, accessRevision: true } });
     const hub = await prisma.hubInstallation.findFirst({ where: { homeId, state: { in: ['PAIRING', 'ACTIVE', 'MAINTENANCE'] } }, select: { id: true, homeId: true, accessPolicyRevision: true } });
-    if (!account || account.status !== 'ACTIVE' || session.securityVersion !== account.securityVersion || !trusted || trusted.customerAccountId !== account.id || trusted.revokedAt || !membership || !hub) throw new Stage1AuthError(401, 'customer_session_invalid', 'The selected home session is invalid');
+    if (!account || account.status !== 'ACTIVE' || session.securityVersion !== account.securityVersion || !trusted || trusted.customerAccountId !== account.id || trusted.revokedAt || session.trustedDeviceSessionVersion !== trusted.sessionVersion || !membership || !hub) throw new Stage1AuthError(401, 'customer_session_invalid', 'The selected home session is invalid');
     const grants = membership.role === 'TENANT' ? await prisma.tenantAreaGrant.findMany({ where: { membershipId: membership.id, revokedAt: null, area: { status: 'ACTIVE' } }, select: { areaId: true } }) : [];
     const now = Math.floor(Date.now() / 1000);
     const privatePem = String(process.env.DINODIA_APP_SESSION_PRIVATE_KEY ?? '').replaceAll('\\n', '\n');

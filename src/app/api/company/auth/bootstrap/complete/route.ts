@@ -20,11 +20,13 @@ export async function POST(request: Request) {
     const now = new Date();
     const passwordHash = hashPassword(password);
     const result = await prisma.$transaction(async (tx) => {
+      const ceremony = await tx.initialCxoBootstrap.findFirst({ where: { invitationHash, deliveryStatus: 'SENT', consumedAt: null, invitationExpiresAt: { gt: now } }, select: { id: true } });
       const employee = await tx.companyEmployeeAccount.findFirst({ where: { bootstrapInvitationHash: invitationHash, status: 'PENDING', bootstrapInvitationExpiresAt: { gt: now } }, select: { id: true, emailNormalized: true, role: true, bootstrapInvitationExpiresAt: true } });
-      if (!employee) throw new Stage1AuthError(401, 'bootstrap_invitation_invalid', 'The employee invitation is invalid or expired');
+      if (!employee || !ceremony) throw new Stage1AuthError(401, 'bootstrap_invitation_invalid', 'The employee invitation is invalid or expired');
       const updated = await tx.companyEmployeeAccount.updateMany({ where: { id: employee.id, status: 'PENDING', bootstrapInvitationHash: invitationHash, bootstrapInvitationExpiresAt: { gt: now } }, data: { username, passwordHash, emailVerifiedAt: now, status: 'ACTIVE', bootstrapInvitationHash: null, bootstrapInvitationExpiresAt: null, recentAuthenticationAt: null } });
       if (updated.count !== 1) throw new Stage1AuthError(409, 'bootstrap_invitation_replayed', 'The employee invitation was already completed');
-      await tx.initialCxoBootstrap.updateMany({ where: { invitationHash, consumedAt: null }, data: { consumedAt: now } });
+      const consumed = await tx.initialCxoBootstrap.updateMany({ where: { id: ceremony.id, invitationHash, deliveryStatus: 'SENT', consumedAt: null }, data: { consumedAt: now, deliveryStatus: 'CONSUMED' } });
+      if (consumed.count !== 1) throw new Stage1AuthError(409, 'bootstrap_invitation_replayed', 'The employee invitation was already completed');
       await tx.auditEvent.create({ data: { actorType: 'EMPLOYEE', actorId: employee.id, category: 'SECURITY', action: 'initial_cxo_bootstrap_completed', targetType: 'CompanyEmployeeAccount', targetId: employee.id, metadata: { outcome: 'completed', ceremony: 'initial-cxo-v1' }, purgeAt: new Date(now.getTime() + 365 * 24 * 60 * 60 * 1000) } });
       return { id: employee.id, emailNormalized: employee.emailNormalized, role: employee.role };
     }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });

@@ -7,11 +7,11 @@ export const STAGE1_MODEL_COUNT = 40;
 // Readiness is a release gate, so it must identify the complete checked-in
 // Stage 1 candidate rather than the first Stage 1 migration. The later R3/R4
 // the R6 browser-attempt migration adds one durable application table, giving
-// the native candidate 43 application tables, including the durable
+// the native candidate 44 application tables, including the durable
 // operator-browser attempt used by the R6 handoff protocol.
 // application tables in total.
-export const REQUIRED_MIGRATION = '20260925010000_r6_browser_attempt_binding';
-export const REQUIRED_MODEL_COUNT = 43;
+export const REQUIRED_MIGRATION = '20260925040000_r7_support_notifications';
+export const REQUIRED_MODEL_COUNT = 44;
 export const CANONICAL_PRODUCTION_ORIGIN = 'https://dinodia-platform-v2.vercel.app';
 export function safeBuildId(): string {
   return process.env.FOUNDATION_SOURCE_FINGERPRINT?.slice(0, 16)

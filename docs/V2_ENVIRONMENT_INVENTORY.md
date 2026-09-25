@@ -41,6 +41,11 @@ This document is a value-free contract. Secret values belong only in the new Ver
 | `MANUFACTURING_ENROLLMENT_OPERATOR_PUBLIC_KEYS` | Platform | No | local/rc/production | Verifies the separately authorised operator signature for manufacturing enrolment; never grants installer self-certification | Operator-key rotation with overlap and audit |
 | `STAGE1_CONTRACT_SECRET` | Platform | Yes | local/test/rc only | Restricts the non-public Stage 1 contract harness | Replace before each RC |
 | `COMPANY_PORTAL_INITIAL_CXO_BOOTSTRAP_SECRET` | Platform | Yes | empty local/rc only | One-use first-CXO ceremony when the employee table is empty | Revoke/delete immediately after ceremony |
+| `COMPANY_PORTAL_INITIAL_CXO_EMAIL` | Platform/CXO owner | No | empty local/rc/production during first ceremony only | Exact verified mailbox allowed to receive the first CXO invitation | Remove/lock after ceremony |
+| `AWS_REGION` | Platform | No | empty local/rc/production during first ceremony only | SES region for outbound first-CXO mail; not an AWS backend | Change only with SES verification |
+| `SES_FROM_EMAIL` | Platform | No | empty local/rc/production during first ceremony only | Verified SES sender for first-CXO invitation | Rotate after sender/domain review |
+| `AWS_ACCESS_KEY_ID` | Platform | Yes | empty local/rc/production during first ceremony only | Narrow SES send-only IAM identity used by Vercel mail transport | Rotate/revoke after ceremony; never client-visible |
+| `AWS_SECRET_ACCESS_KEY` | Platform | Yes | empty local/rc/production during first ceremony only | Secret half of the narrow SES send-only IAM identity | Rotate/revoke after ceremony; never client-visible |
 | `DINODIA_IDENTITY_BROKER_SOCKET` | Dinodia OS | No | local/rc/production | Root-owned `dinodia-identityd` Unix socket path | OS image configuration |
 
 Supabase Vault must contain these named secrets for the optional Supabase-owned two-minute trigger. The values are never stored in the migration or this document:

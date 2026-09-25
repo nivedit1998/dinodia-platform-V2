@@ -64,9 +64,6 @@ export async function acknowledgeOperatorCredential(hubInstallationId: string, v
   await prisma.$transaction(async (tx) => {
     const updated = await tx.hubCredentialVersion.updateMany({ where: { id: row.id, state: { in: ['PENDING', 'DELIVERED', 'ACKNOWLEDGED'] } }, data: { state: 'ACKNOWLEDGED', acknowledgedAt: now } });
     if (updated.count !== 1) throw new Error('credential acknowledgement race');
-    await tx.hubCredentialVersion.updateMany({ where: { hubInstallationId, purpose: 'operator-credential', state: 'ACTIVE' }, data: { state: 'GRACE', graceUntil: new Date(now.getTime() + OPERATOR_GRACE_MS) } });
-    await tx.hubCredentialVersion.update({ where: { id: row.id }, data: { state: 'ACTIVE', activatedAt: now } });
-    await tx.hubInstallation.update({ where: { id: hubInstallationId }, data: { currentOperatorCredentialVersion: version } });
   });
 }
 

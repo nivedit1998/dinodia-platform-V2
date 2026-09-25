@@ -2,7 +2,7 @@ import { PrismaClient } from '@prisma/client';
 
 const prisma = new PrismaClient({ datasourceUrl: process.env.DIRECT_URL });
 const expected = new Set([
-  'CustomerAccount', 'CompanyEmployeeAccount', 'TrustedDevice', 'CustomerSession', 'PolicyAcceptance', 'AuthChallenge', 'StepUpAuthorization', 'Home', 'HomeMembership', 'Area', 'TenantAreaGrant', 'NativeDevice', 'DeviceAreaAssignment', 'HubManufacturingIdentity', 'CompanyOperationalWorkItem', 'HubInstallation', 'HubCredentialVersion', 'HubProvisioningAttempt', 'MembershipInvitation', 'MembershipInvitationArea', 'AreaQrCredential', 'AreaAccessRequest', 'HomeClaimReference', 'HomeClaimChallenge', 'HomeClaimReservation', 'PendingHomeSetup', 'HomeDocument', 'MemberPreferenceDocument', 'AuditEvent', 'DeletionSecurityReceipt', 'IdempotencyRecord', 'ReplayNonce', 'AuthRateLimitBucket', 'InitialCxoBootstrap', 'EmployeeSession', 'OperatorHandoff', 'OperatorBrowserAttempt', 'StepUpChallenge', 'SupportTicket', 'SupportAccessRequest', 'SupportSession', 'OfflineMembershipAuthorisation', 'CloudUrlVerification',
+  'CustomerAccount', 'CompanyEmployeeAccount', 'TrustedDevice', 'CustomerSession', 'PolicyAcceptance', 'AuthChallenge', 'StepUpAuthorization', 'Home', 'HomeMembership', 'Area', 'TenantAreaGrant', 'NativeDevice', 'DeviceAreaAssignment', 'HubManufacturingIdentity', 'CompanyOperationalWorkItem', 'HubInstallation', 'HubCredentialVersion', 'HubProvisioningAttempt', 'MembershipInvitation', 'MembershipInvitationArea', 'AreaQrCredential', 'AreaAccessRequest', 'HomeClaimReference', 'HomeClaimChallenge', 'HomeClaimReservation', 'PendingHomeSetup', 'HomeDocument', 'MemberPreferenceDocument', 'AuditEvent', 'DeletionSecurityReceipt', 'IdempotencyRecord', 'ReplayNonce', 'AuthRateLimitBucket', 'InitialCxoBootstrap', 'EmployeeSession', 'OperatorHandoff', 'OperatorBrowserAttempt', 'StepUpChallenge', 'SupportTicket', 'SupportAccessRequest', 'SupportSession', 'OfflineMembershipAuthorisation', 'CloudUrlVerification', 'SupportAccessNotification',
 ]);
 try {
   const tables = await prisma.$queryRaw`SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE' AND table_name <> '_prisma_migrations' ORDER BY table_name`;
@@ -26,6 +26,9 @@ try {
     '20260924005000_r4_operator_handoff_secret',
     '20260925000000_r4_support_hub_handoff',
     '20260925010000_r6_browser_attempt_binding',
+    '20260925020000_r7_cxo_delivery_and_work_assignment',
+    '20260925030000_r8_trusted_device_session_version',
+    '20260925040000_r7_support_notifications',
   ];
   if (migration.length !== required.length || required.some((name) => !migrations.has(name)) || required.some((name) => !migrations.get(name).finished_at || migrations.get(name).rolled_back_at)) throw new Error('migration ledger is not exactly the completed native baseline and Stage 1 migrations');
   console.log(`[test:foundation] OK: ${names.size} tables, no direct anon/authenticated grants, native baseline and ${required.length - 1} Stage 1 migrations completed`);

@@ -29,7 +29,7 @@ export async function POST(request: Request) {
       }
       operationValue = descriptorBoundValue(body.value ?? null, descriptorDigests);
     }
-    const result = await consumeStepUp({ proof, customerAccountId: customer.id, customerSessionId: customer.sessionId, trustedDeviceId: customer.trustedDeviceId, homeId: customer.homeId, membershipId: customer.membershipId, operationKind, targetIds, value: operationValue, policyRevision: customer.policyRevision });
+    const result = await consumeStepUp({ proof, customerAccountId: customer.id, customerSessionId: customer.sessionId, trustedDeviceId: customer.trustedDeviceId, homeId: customer.homeId, membershipId: customer.membershipId, hubInstallationId: customer.hubInstallationId, operationKind, targetIds, value: operationValue, policyRevision: customer.policyRevision });
     return NextResponse.json(result, { headers: { 'Cache-Control': 'no-store', Pragma: 'no-cache' } });
   } catch (error) { return authErrorResponse(error); }
 }

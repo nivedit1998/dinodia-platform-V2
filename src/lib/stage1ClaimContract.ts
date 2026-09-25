@@ -112,8 +112,8 @@ export async function completeClaimSetup(reservationId: string, customerAccountI
   });
 }
 
-export async function releaseExpiredClaim(reservationId: string, manual: { employeeId?: string; reason?: string } = {}) {
-  const now = new Date();
+export async function releaseExpiredClaim(reservationId: string, manual: { employeeId?: string; reason?: string } = {}, effectiveNow = new Date()) {
+  const now = effectiveNow;
   return prisma.$transaction(async (tx) => {
     const reservation = await tx.homeClaimReservation.findUnique({ where: { id: reservationId }, select: { id: true, claimReferenceId: true, customerAccountId: true, state: true, expiresAt: true } });
     if (!reservation || !['ACTIVE'].includes(reservation.state)) return { released: false };

@@ -63,6 +63,7 @@ export async function POST(request: Request) {
           const attempt = await tx.hubProvisioningAttempt.findUnique({ where: { attemptId }, select: { id: true, attemptId: true, manufacturingIdentityId: true, hubInstallationId: true, companyWorkItemId: true, codeHash: true, state: true, expiresAt: true, baseUrlPresentation: true } });
           if (!attempt || attempt.expiresAt <= now || ['EXPIRED', 'REVOKED', 'CONSUMED'].includes(attempt.state)) throw new Stage1AuthError(409, 'pairing_attempt_unavailable', 'The provisioning presentation is unavailable');
           if (attempt.companyWorkItemId && attempt.companyWorkItemId !== work.id) throw new Stage1AuthError(403, 'workflow_attempt_mismatch', 'The provisioning attempt belongs to another workflow');
+          if (attempt.hubInstallationId && work.hubInstallationId && attempt.hubInstallationId !== work.hubInstallationId) throw new Stage1AuthError(403, 'workflow_hub_mismatch', 'The selected workflow is bound to another hub');
           if (work.certifiedSerialNumber) {
             const checkedIdentity = await tx.hubManufacturingIdentity.findUnique({ where: { id: attempt.manufacturingIdentityId }, select: { serialNumber: true } });
             if (!checkedIdentity || checkedIdentity.serialNumber !== work.certifiedSerialNumber) throw new Stage1AuthError(403, 'workflow_serial_mismatch', 'The selected workflow is not assigned to this hub');
@@ -70,7 +71,7 @@ export async function POST(request: Request) {
           if (attempt.codeHash !== sha256(presentation)) throw new Stage1AuthError(401, 'pairing_presentation_invalid', 'The provisioning presentation is invalid');
           if (attempt.state !== 'PRESENTED' && attempt.state !== 'EMPLOYEE_APPROVED' && attempt.state !== 'CHALLENGE_ISSUED') throw new Stage1AuthError(409, 'pairing_state_invalid', 'The provisioning attempt is not ready for approval');
           let homeId = work.homeId;
-          let hubInstallationId = work.hubInstallationId;
+          let hubInstallationId = work.hubInstallationId || attempt.hubInstallationId;
           let claimPresentation: string | null = null;
           const identity = await tx.hubManufacturingIdentity.findUniqueOrThrow({ where: { id: attempt.manufacturingIdentityId }, select: { serialNumber: true } });
           if (!hubInstallationId) {

@@ -29,6 +29,14 @@ enum EmployeeStatus {
   REVOKED
 }
 
+enum BootstrapDeliveryStatus {
+  PENDING
+  SENT
+  FAILED
+  CONSUMED
+  REVOKED
+}
+
 enum HomeLifecycle {
   INSTALLING
   CLAIMABLE
@@ -265,40 +273,41 @@ model CustomerAccount {
   createdAt              DateTime       @default(now())
   updatedAt              DateTime       @updatedAt
 
-  lastUsedHome         Home?                  @relation("CustomerLastUsedHome", fields: [lastUsedHomeId], references: [id], onDelete: SetNull)
+  lastUsedHome         Home?                       @relation("CustomerLastUsedHome", fields: [lastUsedHomeId], references: [id], onDelete: SetNull)
   memberships          HomeMembership[]
   trustedDevices       TrustedDevice[]
   sessions             CustomerSession[]
   policyAcceptances    PolicyAcceptance[]
   authChallenges       AuthChallenge[]
   stepUpAuthorizations StepUpAuthorization[]
-  invitationsReceived  MembershipInvitation[] @relation("InvitationTarget")
+  invitationsReceived  MembershipInvitation[]      @relation("InvitationTarget")
   areaAccessRequests   AreaAccessRequest[]
   claimReservations    HomeClaimReservation[]
   pendingHomeSetups    PendingHomeSetup[]
-  createdHomeDocuments HomeDocument[]         @relation("HomeDocumentCreator")
+  createdHomeDocuments HomeDocument[]              @relation("HomeDocumentCreator")
   homeClaimReferences  HomeClaimReference[]
+  supportNotifications SupportAccessNotification[]
 
   @@index([status])
   @@index([lastUsedHomeId])
 }
 
 model CompanyEmployeeAccount {
-  id                     String         @id @default(uuid()) @db.Uuid
-  displayName            String         @db.VarChar(160)
-  email                  String         @db.VarChar(320)
-  emailNormalized        String         @unique @db.VarChar(320)
-  emailVerifiedAt        DateTime?
-  username               String?        @unique @db.VarChar(80)
-  passwordHash           String?        @db.VarChar(255)
-  role                   EmployeeRole
-  status                 EmployeeStatus @default(ACTIVE)
-  bootstrapInvitationHash String?       @unique @db.VarChar(128)
+  id                           String         @id @default(uuid()) @db.Uuid
+  displayName                  String         @db.VarChar(160)
+  email                        String         @db.VarChar(320)
+  emailNormalized              String         @unique @db.VarChar(320)
+  emailVerifiedAt              DateTime?
+  username                     String?        @unique @db.VarChar(80)
+  passwordHash                 String?        @db.VarChar(255)
+  role                         EmployeeRole
+  status                       EmployeeStatus @default(ACTIVE)
+  bootstrapInvitationHash      String?        @unique @db.VarChar(128)
   bootstrapInvitationExpiresAt DateTime?
-  securityVersion        Int            @default(1)
-  recentAuthenticationAt DateTime?
-  createdAt              DateTime       @default(now())
-  updatedAt              DateTime       @updatedAt
+  securityVersion              Int            @default(1)
+  recentAuthenticationAt       DateTime?
+  createdAt                    DateTime       @default(now())
+  updatedAt                    DateTime       @updatedAt
 
   assignedWork         CompanyOperationalWorkItem[] @relation("AssignedWork")
   createdWork          CompanyOperationalWorkItem[] @relation("CreatedWork")
@@ -334,18 +343,19 @@ model TrustedDevice {
 }
 
 model CustomerSession {
-  id                String    @id @default(uuid()) @db.Uuid
-  customerAccountId String    @db.Uuid
-  trustedDeviceId   String    @db.Uuid
-  refreshTokenHash  String    @unique @db.VarChar(128)
-  securityVersion   Int
-  issuedAt          DateTime  @default(now())
-  expiresAt         DateTime
-  lastUsedAt        DateTime  @default(now())
-  revokedAt         DateTime?
-  revokeReason      String?   @db.VarChar(160)
-  createdAt         DateTime  @default(now())
-  updatedAt         DateTime  @updatedAt
+  id                          String    @id @default(uuid()) @db.Uuid
+  customerAccountId           String    @db.Uuid
+  trustedDeviceId             String    @db.Uuid
+  refreshTokenHash            String    @unique @db.VarChar(128)
+  securityVersion             Int
+  trustedDeviceSessionVersion Int       @default(1)
+  issuedAt                    DateTime  @default(now())
+  expiresAt                   DateTime
+  lastUsedAt                  DateTime  @default(now())
+  revokedAt                   DateTime?
+  revokeReason                String?   @db.VarChar(160)
+  createdAt                   DateTime  @default(now())
+  updatedAt                   DateTime  @updatedAt
 
   customerAccount CustomerAccount @relation(fields: [customerAccountId], references: [id], onDelete: Cascade)
   trustedDevice   TrustedDevice   @relation(fields: [trustedDeviceId], references: [id], onDelete: Cascade)
@@ -432,17 +442,18 @@ model Home {
   createdAt               DateTime           @default(now())
   updatedAt               DateTime           @updatedAt
 
-  lastUsedBy      CustomerAccount[]            @relation("CustomerLastUsedHome")
-  memberships     HomeMembership[]
-  areas           Area[]
-  devices         NativeDevice[]
-  hubInstallation HubInstallation?
-  workItems       CompanyOperationalWorkItem[]
+  lastUsedBy              CustomerAccount[]            @relation("CustomerLastUsedHome")
+  memberships             HomeMembership[]
+  areas                   Area[]
+  devices                 NativeDevice[]
+  hubInstallation         HubInstallation?
+  workItems               CompanyOperationalWorkItem[]
   operatorBrowserAttempts OperatorBrowserAttempt[]
-  invitations     MembershipInvitation[]
-  claims          HomeClaimReference[]
-  homeDocuments   HomeDocument[]
-  auditEvents     AuditEvent[]
+  invitations             MembershipInvitation[]
+  claims                  HomeClaimReference[]
+  homeDocuments           HomeDocument[]
+  auditEvents             AuditEvent[]
+  supportNotifications    SupportAccessNotification[]
 
   @@index([lifecycle, installationStatus])
   @@index([postcode])
@@ -633,51 +644,51 @@ model CompanyOperationalWorkItem {
 }
 
 model HubInstallation {
-  id                          String            @id @default(uuid()) @db.Uuid
-  homeId                      String            @unique @db.Uuid
-  manufacturingIdentityId     String            @unique @db.Uuid
-  serialNumberSnapshot        String            @unique @db.VarChar(120)
-  state                       HubLifecycleState @default(PAIRING)
-  provisioningRevision        Int               @default(1)
-  baseUrl                     String?           @db.VarChar(500)
-  cloudUrl                    String?           @db.VarChar(500)
-  cloudUrlVerifiedAt          DateTime?
-  cloudflareTunnelId          String?           @db.VarChar(200)
-  cloudflareTunnelName        String?           @db.VarChar(200)
-  cloudflareReservationToken  String?           @db.VarChar(128)
-  reservedHostname            String?           @db.VarChar(255)
-  reservedTunnelName          String?           @db.VarChar(200)
-  remoteChallengeAt           DateTime?
-  remoteVerificationAt        DateTime?
-  currentCredentialVersion    Int?
+  id                               String            @id @default(uuid()) @db.Uuid
+  homeId                           String            @unique @db.Uuid
+  manufacturingIdentityId          String            @unique @db.Uuid
+  serialNumberSnapshot             String            @unique @db.VarChar(120)
+  state                            HubLifecycleState @default(PAIRING)
+  provisioningRevision             Int               @default(1)
+  baseUrl                          String?           @db.VarChar(500)
+  cloudUrl                         String?           @db.VarChar(500)
+  cloudUrlVerifiedAt               DateTime?
+  cloudflareTunnelId               String?           @db.VarChar(200)
+  cloudflareTunnelName             String?           @db.VarChar(200)
+  cloudflareReservationToken       String?           @db.VarChar(128)
+  reservedHostname                 String?           @db.VarChar(255)
+  reservedTunnelName               String?           @db.VarChar(200)
+  remoteChallengeAt                DateTime?
+  remoteVerificationAt             DateTime?
+  currentCredentialVersion         Int?
   // Deprecated compatibility field. Runtime authority uses the purpose-specific pointers.
-  currentMachineCredentialVersion Int?
+  currentMachineCredentialVersion  Int?
   currentOperatorCredentialVersion Int?
-  accessPolicyRevision        Int               @default(1)
-  lastSeenAt                  DateTime?
-  onlineStateEvaluatedAt      DateTime?
-  runtimeVersion              String?           @db.VarChar(120)
-  capabilitySummary           Json?
-  cleanupState                String?           @db.VarChar(80)
-  cleanupGeneration           Int               @default(0)
-  permanentResolverHash       String?           @unique @db.VarChar(128)
-  permanentResolverGeneration Int               @default(1)
-  permanentResolverStatus     String            @default("ACTIVE") @db.VarChar(32)
-  resolverIssuedAt            DateTime?
-  resolverReplacedAt          DateTime?
-  resolverRevokedAt           DateTime?
-  createdAt                   DateTime          @default(now())
-  updatedAt                   DateTime          @updatedAt
+  accessPolicyRevision             Int               @default(1)
+  lastSeenAt                       DateTime?
+  onlineStateEvaluatedAt           DateTime?
+  runtimeVersion                   String?           @db.VarChar(120)
+  capabilitySummary                Json?
+  cleanupState                     String?           @db.VarChar(80)
+  cleanupGeneration                Int               @default(0)
+  permanentResolverHash            String?           @unique @db.VarChar(128)
+  permanentResolverGeneration      Int               @default(1)
+  permanentResolverStatus          String            @default("ACTIVE") @db.VarChar(32)
+  resolverIssuedAt                 DateTime?
+  resolverReplacedAt               DateTime?
+  resolverRevokedAt                DateTime?
+  createdAt                        DateTime          @default(now())
+  updatedAt                        DateTime          @updatedAt
 
-  home                  Home                         @relation(fields: [homeId], references: [id], onDelete: Restrict)
-  manufacturingIdentity HubManufacturingIdentity     @relation(fields: [manufacturingIdentityId], references: [id], onDelete: Restrict)
-  devices               NativeDevice[]
-  credentialVersions    HubCredentialVersion[]
-  provisioningAttempts  HubProvisioningAttempt[]
+  home                    Home                         @relation(fields: [homeId], references: [id], onDelete: Restrict)
+  manufacturingIdentity   HubManufacturingIdentity     @relation(fields: [manufacturingIdentityId], references: [id], onDelete: Restrict)
+  devices                 NativeDevice[]
+  credentialVersions      HubCredentialVersion[]
+  provisioningAttempts    HubProvisioningAttempt[]
   operatorBrowserAttempts OperatorBrowserAttempt[]
-  workItems             CompanyOperationalWorkItem[]
-  homeClaimReferences   HomeClaimReference[]
-  homeClaimChallenges   HomeClaimChallenge[]
+  workItems               CompanyOperationalWorkItem[]
+  homeClaimReferences     HomeClaimReference[]
+  homeClaimChallenges     HomeClaimChallenge[]
 
   @@unique([id, homeId])
   @@unique([id, manufacturingIdentityId])
@@ -1036,12 +1047,16 @@ model AuthRateLimitBucket {
 }
 
 model InitialCxoBootstrap {
-  id          String    @id @default(uuid()) @db.Uuid
-  ceremonyKey String    @unique @db.VarChar(80)
-  invitationHash String? @db.VarChar(128)
-  invitationExpiresAt DateTime?
-  consumedAt  DateTime?
-  createdAt   DateTime  @default(now())
+  id                      String                  @id @default(uuid()) @db.Uuid
+  ceremonyKey             String                  @unique @db.VarChar(80)
+  invitationHash          String?                 @db.VarChar(128)
+  invitationExpiresAt     DateTime?
+  deliveryStatus          BootstrapDeliveryStatus @default(PENDING)
+  deliveryAttempts        Int                     @default(0)
+  lastDeliveryAt          DateTime?
+  lastDeliveryFailureCode String?                 @db.VarChar(80)
+  consumedAt              DateTime?
+  createdAt               DateTime                @default(now())
 }
 
 // Stage 1 security authorities. These records are deliberately separate from
@@ -1102,25 +1117,26 @@ model EmployeeSession {
 }
 
 model OperatorHandoff {
-  id                String    @id @default(uuid()) @db.Uuid
-  employeeId        String    @db.Uuid
-  workflowId        String    @db.Uuid
-  homeId            String    @db.Uuid
-  hubInstallationId String    @db.Uuid
-  attemptId         String?   @db.Uuid
-  operatorBrowserAttemptId String? @unique @db.Uuid
-  setupAttemptId    String    @db.VarChar(160)
-  browserBindingHash String   @db.VarChar(128)
-  handoffHash       String    @unique @db.VarChar(128)
-  handoffEnvelope   String    @db.Text
-  scope             Json
-  issuedAt          DateTime  @default(now())
-  expiresAt         DateTime
-  consumedAt        DateTime?
-  revokedAt         DateTime?
-  createdAt         DateTime  @default(now())
+  id                       String    @id @default(uuid()) @db.Uuid
+  employeeId               String    @db.Uuid
+  workflowId               String    @db.Uuid
+  homeId                   String    @db.Uuid
+  hubInstallationId        String    @db.Uuid
+  attemptId                String?   @db.Uuid
+  operatorBrowserAttemptId String?   @unique @db.Uuid
+  setupAttemptId           String    @db.VarChar(160)
+  browserBindingHash       String    @db.VarChar(128)
+  handoffHash              String    @unique @db.VarChar(128)
+  handoffEnvelope          String    @db.Text
+  scope                    Json
+  issuedAt                 DateTime  @default(now())
+  expiresAt                DateTime
+  consumedAt               DateTime?
+  revokedAt                DateTime?
+  createdAt                DateTime  @default(now())
 
   operatorBrowserAttempt OperatorBrowserAttempt? @relation(fields: [operatorBrowserAttemptId], references: [id], onDelete: Restrict)
+
   @@index([employeeId, expiresAt, consumedAt])
   @@index([hubInstallationId, expiresAt, consumedAt])
   @@index([setupAttemptId])
@@ -1140,8 +1156,8 @@ model OperatorBrowserAttempt {
   revokedAt          DateTime?
   createdAt          DateTime  @default(now())
 
-  home            Home            @relation(fields: [homeId], references: [id], onDelete: Restrict)
-  hubInstallation HubInstallation @relation(fields: [hubInstallationId], references: [id], onDelete: Restrict)
+  home            Home              @relation(fields: [homeId], references: [id], onDelete: Restrict)
+  hubInstallation HubInstallation   @relation(fields: [hubInstallationId], references: [id], onDelete: Restrict)
   handoffs        OperatorHandoff[]
 
   @@unique([id, homeId])
@@ -1152,41 +1168,42 @@ model OperatorBrowserAttempt {
 // exact server-created digest after local Face ID/passcode succeeds; clients
 // cannot choose the operation authority by posting a nonce directly.
 model StepUpChallenge {
-  id                    String    @id @default(uuid()) @db.Uuid
-  customerAccountId     String    @db.Uuid
-  customerSessionId     String    @db.Uuid
-  trustedDeviceId       String    @db.Uuid
-  homeId                String    @db.Uuid
-  membershipId          String    @db.Uuid
-  hubInstallationId     String    @db.Uuid
-  operationKind         String    @db.VarChar(120)
-  targetDigest          String    @db.VarChar(128)
-  normalizedValueDigest String    @db.VarChar(128)
-  policyRevision        Int
-  nonceHash             String    @unique @db.VarChar(128)
-  hubDescriptorNonceHash String?  @unique @db.VarChar(128)
-  issuedAt              DateTime  @default(now())
-  expiresAt             DateTime
-  consumedAt            DateTime?
-  cancelledAt           DateTime?
+  id                     String    @id @default(uuid()) @db.Uuid
+  customerAccountId      String    @db.Uuid
+  customerSessionId      String    @db.Uuid
+  trustedDeviceId        String    @db.Uuid
+  homeId                 String    @db.Uuid
+  membershipId           String    @db.Uuid
+  hubInstallationId      String    @db.Uuid
+  operationKind          String    @db.VarChar(120)
+  targetDigest           String    @db.VarChar(128)
+  normalizedValueDigest  String    @db.VarChar(128)
+  policyRevision         Int
+  nonceHash              String    @unique @db.VarChar(128)
+  hubDescriptorNonceHash String?   @unique @db.VarChar(128)
+  issuedAt               DateTime  @default(now())
+  expiresAt              DateTime
+  consumedAt             DateTime?
+  cancelledAt            DateTime?
 
   @@index([customerSessionId, expiresAt, consumedAt])
   @@index([customerAccountId, homeId, membershipId])
 }
 
 model SupportTicket {
-  id                   String              @id @default(uuid()) @db.Uuid
-  publicReference      String              @unique @db.VarChar(32)
-  customerAccountId    String              @db.Uuid
-  homeId               String              @db.Uuid
-  selectedMembershipId String              @db.Uuid
-  assignedEmployeeId   String?             @db.Uuid
-  status               SupportTicketStatus @default(OPEN)
-  category             String              @db.VarChar(80)
-  description          String              @db.VarChar(4000)
-  createdAt            DateTime            @default(now())
+  id                   String                      @id @default(uuid()) @db.Uuid
+  publicReference      String                      @unique @db.VarChar(32)
+  customerAccountId    String                      @db.Uuid
+  homeId               String                      @db.Uuid
+  selectedMembershipId String                      @db.Uuid
+  assignedEmployeeId   String?                     @db.Uuid
+  status               SupportTicketStatus         @default(OPEN)
+  category             String                      @db.VarChar(80)
+  description          String                      @db.VarChar(4000)
+  createdAt            DateTime                    @default(now())
   closedAt             DateTime?
-  updatedAt            DateTime            @updatedAt
+  updatedAt            DateTime                    @updatedAt
+  notifications        SupportAccessNotification[]
 
   @@index([customerAccountId, status])
   @@index([homeId, status])
@@ -1194,38 +1211,39 @@ model SupportTicket {
 }
 
 model SupportAccessRequest {
-  id                            String                     @id @default(uuid()) @db.Uuid
-  ticketId                      String                     @db.Uuid
-  requestedByEmployeeId         String                     @db.Uuid
-  homeId                        String                     @db.Uuid
-  hubInstallationId             String                     @db.Uuid
+  id                            String                      @id @default(uuid()) @db.Uuid
+  ticketId                      String                      @db.Uuid
+  requestedByEmployeeId         String                      @db.Uuid
+  homeId                        String                      @db.Uuid
+  hubInstallationId             String                      @db.Uuid
   requestedScope                SupportAccessScope
-  targetMembershipId            String?                    @db.Uuid
-  targetUserId                  String?                    @db.Uuid
+  targetMembershipId            String?                     @db.Uuid
+  targetUserId                  String?                     @db.Uuid
   canonicalAreaIds              Json
   targetIds                     Json
-  touchesPropertyInfrastructure Boolean                    @default(false)
-  status                        SupportAccessRequestStatus @default(REQUESTED)
-  approvedByMembershipId        String?                    @db.Uuid
+  touchesPropertyInfrastructure Boolean                     @default(false)
+  status                        SupportAccessRequestStatus  @default(REQUESTED)
+  approvedByMembershipId        String?                     @db.Uuid
   approvedAt                    DateTime?
   deniedAt                      DateTime?
-  denialReason                  String?                    @db.VarChar(500)
-  codeHash                      String?                    @db.VarChar(128)
+  denialReason                  String?                     @db.VarChar(500)
+  codeHash                      String?                     @db.VarChar(128)
   codeIssuedAt                  DateTime?
   codeExpiresAt                 DateTime?
   codeConsumedAt                DateTime?
-  employeeHandoffHash           String?                    @db.VarChar(128)
-  employeeHandoffEnvelope       String?                    @db.Text
+  employeeHandoffHash           String?                     @db.VarChar(128)
+  employeeHandoffEnvelope       String?                     @db.Text
   employeeHandoffIssuedAt       DateTime?
   employeeHandoffExpiresAt      DateTime?
   employeeHandoffConsumedAt     DateTime?
-  codeAttemptCount              Int                        @default(0)
+  codeAttemptCount              Int                         @default(0)
   sessionHardStopAt             DateTime?
   desiredRevokedAt              DateTime?
   hubRevokedAt                  DateTime?
-  revision                      Int                        @default(1)
-  createdAt                     DateTime                   @default(now())
-  updatedAt                     DateTime                   @updatedAt
+  revision                      Int                         @default(1)
+  createdAt                     DateTime                    @default(now())
+  updatedAt                     DateTime                    @updatedAt
+  notifications                 SupportAccessNotification[]
 
   @@index([ticketId, status])
   @@index([homeId, status])
@@ -1234,28 +1252,55 @@ model SupportAccessRequest {
 }
 
 model SupportSession {
-  id                String               @id @default(uuid()) @db.Uuid
-  accessRequestId   String               @db.Uuid
-  ticketId          String               @db.Uuid
-  employeeId        String               @db.Uuid
-  homeId            String               @db.Uuid
-  hubInstallationId String               @db.Uuid
-  scope             SupportAccessScope
-  areaIds           Json
-  targetMembershipId String?             @db.Uuid
-  targetUserId      String?              @db.Uuid
-  status            SupportSessionStatus @default(ACTIVE)
-  leaseHash         String               @unique @db.VarChar(128)
-  approvedAt        DateTime
-  expiresAt         DateTime
-  desiredRevokedAt  DateTime?
-  hubAcknowledgedAt DateTime?
-  endedAt           DateTime?
-  createdAt         DateTime             @default(now())
-  updatedAt         DateTime             @updatedAt
+  id                 String                      @id @default(uuid()) @db.Uuid
+  accessRequestId    String                      @db.Uuid
+  ticketId           String                      @db.Uuid
+  employeeId         String                      @db.Uuid
+  homeId             String                      @db.Uuid
+  hubInstallationId  String                      @db.Uuid
+  scope              SupportAccessScope
+  areaIds            Json
+  targetMembershipId String?                     @db.Uuid
+  targetUserId       String?                     @db.Uuid
+  status             SupportSessionStatus        @default(ACTIVE)
+  leaseHash          String                      @unique @db.VarChar(128)
+  approvedAt         DateTime
+  expiresAt          DateTime
+  desiredRevokedAt   DateTime?
+  hubAcknowledgedAt  DateTime?
+  endedAt            DateTime?
+  createdAt          DateTime                    @default(now())
+  updatedAt          DateTime                    @updatedAt
+  notifications      SupportAccessNotification[]
 
   @@index([ticketId, status])
   @@index([hubInstallationId, status, expiresAt])
+}
+
+// Durable, privacy-scoped customer notification records for support access.
+// Tenant-private sessions intentionally create no row. Property-level access
+// creates one row per authorised homeowner/manager recipient and carries no
+// tenant-private metadata.
+model SupportAccessNotification {
+  id                 String   @id @default(uuid()) @db.Uuid
+  recipientAccountId String   @db.Uuid
+  homeId             String   @db.Uuid
+  ticketId           String   @db.Uuid
+  accessRequestId    String   @db.Uuid
+  sessionId          String?  @db.Uuid
+  eventType          String   @db.VarChar(40)
+  createdAt          DateTime @default(now())
+
+  recipientAccount CustomerAccount      @relation(fields: [recipientAccountId], references: [id], onDelete: Cascade)
+  home             Home                 @relation(fields: [homeId], references: [id], onDelete: Cascade)
+  ticket           SupportTicket        @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  accessRequest    SupportAccessRequest @relation(fields: [accessRequestId], references: [id], onDelete: Cascade)
+  session          SupportSession?      @relation(fields: [sessionId], references: [id], onDelete: SetNull)
+
+  @@unique([recipientAccountId, accessRequestId, eventType])
+  @@index([recipientAccountId, createdAt])
+  @@index([homeId, createdAt])
+  @@index([ticketId, eventType])
 }
 
 model OfflineMembershipAuthorisation {

@@ -11,8 +11,16 @@ const databasePassword = 'local-clean-clone-only';
 const databaseUrl = `postgresql://postgres:${databasePassword}@127.0.0.1:${dockerPort}/dinodia_v2_foundation`;
 let dockerStarted = false;
 
+function safeProcessEnvironment() {
+  const safe = {};
+  for (const name of ['PATH', 'HOME', 'TMPDIR', 'LANG', 'LC_ALL', 'CI']) {
+    if (process.env[name]) safe[name] = process.env[name];
+  }
+  return safe;
+}
+
 function run(command, args, options = {}) {
-  const result = spawnSync(command, args, { cwd: options.cwd ?? sourceRoot, env: options.env ?? process.env, stdio: 'inherit' });
+  const result = spawnSync(command, args, { cwd: options.cwd ?? sourceRoot, env: options.env ?? safeProcessEnvironment(), stdio: 'inherit' });
   if (result.status !== 0) throw new Error(`${command} ${args.join(' ')} failed with exit ${result.status ?? 1}`);
 }
 
@@ -129,13 +137,13 @@ try {
   fs.mkdirSync(temporaryVercelDirectory, { recursive: true });
   fs.writeFileSync(path.join(temporaryVercelDirectory, 'project.json'), JSON.stringify({ projectId: target.vercelProjectId, orgId: target.vercelOrgId }));
 
-  run('npm', ['ci'], { cwd: tempRoot, env: { ...process.env, CI: '1', NODE_ENV: 'test' } });
+  run('npm', ['ci'], { cwd: tempRoot, env: { ...safeProcessEnvironment(), CI: '1', NODE_ENV: 'test' } });
   run('docker', ['run', '-d', '--name', dockerName, '-e', `POSTGRES_PASSWORD=${databasePassword}`, '-e', 'POSTGRES_DB=dinodia_v2_foundation', '-p', `127.0.0.1:${dockerPort}:5432`, 'postgres:16-alpine']);
   dockerStarted = true;
   waitForPostgres();
 
   const localEnv = {
-    ...process.env,
+    ...safeProcessEnvironment(),
     CI: '1',
     NODE_ENV: 'test',
     V2_ENVIRONMENT: 'local',

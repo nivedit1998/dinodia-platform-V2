@@ -22,7 +22,7 @@ const approvedModels = [
   'HubManufacturingIdentity', 'CompanyOperationalWorkItem', 'HubInstallation', 'HubCredentialVersion', 'HubProvisioningAttempt',
   'MembershipInvitation', 'MembershipInvitationArea', 'AreaQrCredential', 'AreaAccessRequest', 'HomeClaimReference', 'HomeClaimChallenge', 'HomeClaimReservation', 'PendingHomeSetup',
   'HomeDocument', 'MemberPreferenceDocument', 'AuditEvent', 'DeletionSecurityReceipt', 'IdempotencyRecord', 'ReplayNonce',
-  'AuthRateLimitBucket', 'InitialCxoBootstrap', 'EmployeeSession', 'OperatorHandoff', 'OperatorBrowserAttempt', 'StepUpChallenge', 'SupportTicket', 'SupportAccessRequest', 'SupportSession', 'OfflineMembershipAuthorisation', 'CloudUrlVerification',
+  'AuthRateLimitBucket', 'InitialCxoBootstrap', 'EmployeeSession', 'OperatorHandoff', 'OperatorBrowserAttempt', 'StepUpChallenge', 'SupportTicket', 'SupportAccessRequest', 'SupportSession', 'SupportAccessNotification', 'OfflineMembershipAuthorisation', 'CloudUrlVerification',
 ];
 const actualModels = [...schema.matchAll(/^model\s+(\w+)/gm)].map((m) => m[1]);
 if (actualModels.length !== approvedModels.length || actualModels.some((model, i) => model !== approvedModels[i])) {

@@ -11,7 +11,7 @@ export async function DELETE(request: Request, context: { params: Promise<{ trus
     const { trustedDeviceId } = await context.params;
     if (!trustedDeviceId || trustedDeviceId === customer.trustedDeviceId) throw new Stage1AuthError(400, 'trusted_device_target_invalid', 'The current phone cannot remove itself through this route');
     const body = await request.json().catch(() => ({})) as Record<string, unknown>;
-    await consumeStepUp({ proof: String(body.proof ?? request.headers.get('x-dinodia-step-up-proof') ?? ''), customerAccountId: customer.id, customerSessionId: customer.sessionId, trustedDeviceId: customer.trustedDeviceId, homeId: customer.homeId, membershipId: customer.membershipId, operationKind: 'trusted_device_remove', targetIds: [trustedDeviceId], value: null, policyRevision: customer.policyRevision });
+    await consumeStepUp({ proof: String(body.proof ?? request.headers.get('x-dinodia-step-up-proof') ?? ''), customerAccountId: customer.id, customerSessionId: customer.sessionId, trustedDeviceId: customer.trustedDeviceId, homeId: customer.homeId, membershipId: customer.membershipId, hubInstallationId: customer.hubInstallationId, operationKind: 'trusted_device_remove', targetIds: [trustedDeviceId], value: null, policyRevision: customer.policyRevision });
     const device = await prisma.trustedDevice.findUnique({ where: { id: trustedDeviceId }, select: { id: true, customerAccountId: true } });
     if (!device || device.customerAccountId !== customer.id) throw new Stage1AuthError(404, 'trusted_device_not_found', 'The trusted device was not found');
     await prisma.$transaction(async (tx) => {
