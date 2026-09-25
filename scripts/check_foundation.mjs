@@ -6,6 +6,15 @@ const failures = [];
 const read = (file) => fs.readFileSync(path.join(root, file), 'utf8');
 const schema = read('prisma/schema.prisma');
 const migration = read('prisma/migrations/00000000000000_native_v2_lean_foundation/migration.sql');
+const stage1Migration = read('prisma/migrations/20260922000000_stage1_security_authorities/migration.sql');
+const stage1RemediationMigration = read('prisma/migrations/20260922010000_stage1_r3_remediation/migration.sql');
+const laterStage1Migrations = fs.readdirSync(path.join(root, 'prisma/migrations'))
+  .filter((name) => name > '20260922010000_stage1_r3_remediation')
+  .sort()
+  .map((name) => path.join(root, 'prisma/migrations', name, 'migration.sql'))
+  .filter((file) => fs.existsSync(file))
+  .map((file) => fs.readFileSync(file, 'utf8'))
+  .join('\n');
 
 const approvedModels = [
   'CustomerAccount', 'CompanyEmployeeAccount', 'TrustedDevice', 'CustomerSession', 'PolicyAcceptance', 'AuthChallenge', 'StepUpAuthorization',
@@ -13,12 +22,14 @@ const approvedModels = [
   'HubManufacturingIdentity', 'CompanyOperationalWorkItem', 'HubInstallation', 'HubCredentialVersion', 'HubProvisioningAttempt',
   'MembershipInvitation', 'MembershipInvitationArea', 'AreaQrCredential', 'AreaAccessRequest', 'HomeClaimReference', 'HomeClaimChallenge', 'HomeClaimReservation', 'PendingHomeSetup',
   'HomeDocument', 'MemberPreferenceDocument', 'AuditEvent', 'DeletionSecurityReceipt', 'IdempotencyRecord', 'ReplayNonce',
+  'AuthRateLimitBucket', 'InitialCxoBootstrap', 'EmployeeSession', 'OperatorHandoff', 'OperatorBrowserAttempt', 'StepUpChallenge', 'SupportTicket', 'SupportAccessRequest', 'SupportSession', 'OfflineMembershipAuthorisation', 'CloudUrlVerification',
 ];
 const actualModels = [...schema.matchAll(/^model\s+(\w+)/gm)].map((m) => m[1]);
 if (actualModels.length !== approvedModels.length || actualModels.some((model, i) => model !== approvedModels[i])) {
   failures.push(`schema models are not the approved ${approvedModels.length}-model order: ${actualModels.join(', ')}`);
 }
-for (const model of approvedModels) if (!migration.includes(`CREATE TABLE "${model}"`)) failures.push(`migration does not create ${model}`);
+for (const model of approvedModels.slice(0, 32)) if (!migration.includes(`CREATE TABLE "${model}"`)) failures.push(`baseline migration does not create ${model}`);
+for (const model of approvedModels.slice(32)) if (!(stage1Migration + stage1RemediationMigration + laterStage1Migrations).includes(`CREATE TABLE "${model}"`)) failures.push(`Stage 1 migration does not create ${model}`);
 
 const forbidden = /HaConnection|HomeAssistant|homeassistant|haConnectionId|SupportRequest|NativeAutomation|AlexaRefreshToken|AWS_ORIGIN|dinodia-platform-aws|old\.vercel\.app|fppzzesvukjbsfmxmfxe-old/i;
 for (const dir of ['src', 'prisma/schema.prisma']) {
@@ -54,4 +65,4 @@ if (failures.length) {
   failures.forEach((failure) => console.error(`- ${failure}`));
   process.exit(1);
 }
-console.log(`[check:foundation] OK: ${actualModels.length} native models, one migration, no active legacy identifiers, <=2 Vercel crons`);
+console.log(`[check:foundation] OK: ${actualModels.length} native models, baseline plus Stage 1 migration, no active legacy identifiers, <=2 Vercel crons`);

@@ -59,6 +59,34 @@ function copyPreservingLink(relativeFile) {
   fs.chmodSync(destination, stat.mode & 0o777);
 }
 
+function copyCrossRepositoryFixture(source, destination, files) {
+  if (!fs.existsSync(source)) throw new Error(`required cross-repository source is missing: ${source}`);
+  for (const file of files) {
+    const from = path.join(source, file);
+    if (!fs.existsSync(from)) throw new Error(`required cross-repository contract file is missing: ${from}`);
+    const to = path.join(destination, file);
+    fs.mkdirSync(path.dirname(to), { recursive: true });
+    fs.copyFileSync(from, to);
+  }
+}
+
+function copyCrossRepositoryTree(source, destination, relativeDirectories) {
+  if (!fs.existsSync(source)) throw new Error(`required cross-repository source is missing: ${source}`);
+  for (const relativeDirectory of relativeDirectories) {
+    const from = path.join(source, relativeDirectory);
+    if (!fs.existsSync(from)) throw new Error(`required cross-repository directory is missing: ${from}`);
+    const to = path.join(destination, relativeDirectory);
+    fs.mkdirSync(path.dirname(to), { recursive: true });
+    fs.cpSync(from, to, {
+      recursive: true,
+      filter: (entry) => {
+        const relative = path.relative(source, entry);
+        return !relative.startsWith('node_modules') && !relative.startsWith('.git') && !relative.startsWith('.env.local');
+      },
+    });
+  }
+}
+
 function waitForPostgres() {
   for (let attempt = 0; attempt < 30; attempt += 1) {
     const result = spawnSync('docker', ['exec', dockerName, 'pg_isready', '-U', 'postgres', '-d', 'dinodia_v2_foundation'], { encoding: 'utf8' });
@@ -76,6 +104,17 @@ function cleanup() {
 try {
   const files = sourceFiles();
   for (const file of files) copyPreservingLink(file);
+  // The clean-source proof must exercise the real cross-repository security
+  // contracts. Copy only the reviewed contract surfaces into an isolated
+  // fixture; no dependency or local/secret material is imported.
+  const crossRoot = path.join(tempRoot, '.cross-repository');
+  const osFixture = path.join(crossRoot, 'Dinodia OS');
+  const edgeFixture = path.join(crossRoot, 'dinodia-edge-worker-V2');
+  copyCrossRepositoryTree(path.resolve(sourceRoot, '../Dinodia OS'), osFixture, ['src', 'public']);
+  copyCrossRepositoryFixture(path.resolve(sourceRoot, '../Dinodia OS'), osFixture, [
+    'package.json', 'package-lock.json', '.env.example',
+  ]);
+  copyCrossRepositoryFixture(path.resolve(sourceRoot, '../dinodia-edge-worker-V2'), edgeFixture, ['wrangler.toml', 'src/index.ts']);
   if (!fs.existsSync(path.join(tempRoot, '.env.example'))) throw new Error('.env.example is missing from the clean source snapshot');
   const example = fs.readFileSync(path.join(tempRoot, '.env.example'), 'utf8');
   if (/postgres(?:ql)?:\/\/[^\s:]+:[^\s@]+@/i.test(example.replaceAll('USER:PASSWORD', 'PLACEHOLDER'))) throw new Error('.env.example appears to contain a real database credential');
@@ -102,16 +141,24 @@ try {
     V2_ENVIRONMENT: 'local',
     DATABASE_URL: databaseUrl,
     DIRECT_URL: databaseUrl,
+    DINODIA_OS_ROOT: osFixture,
+    DINODIA_EDGE_ROOT: edgeFixture,
   };
   run('npx', ['prisma', 'validate'], { cwd: tempRoot, env: localEnv });
   run('npx', ['prisma', 'generate'], { cwd: tempRoot, env: localEnv });
   run('node', ['scripts/assert_v2_target.mjs', '--mode', 'local', '--run-prisma'], { cwd: tempRoot, env: localEnv });
+  // The second guarded deployment is part of the clean-source proof: a
+  // release candidate must be safe to restart after an interrupted deploy.
+  run('node', ['scripts/assert_v2_target.mjs', '--mode', 'local', '--run-prisma'], { cwd: tempRoot, env: localEnv });
+  run('npm', ['run', 'check:stage1'], { cwd: tempRoot, env: localEnv });
   run('node', ['scripts/foundation_db_checks.mjs'], { cwd: tempRoot, env: localEnv });
   run('node', ['scripts/foundation_invariants.mjs'], { cwd: tempRoot, env: localEnv });
+  run('npm', ['run', 'test:stage1:db'], { cwd: tempRoot, env: localEnv });
   run('npm', ['run', 'lint'], { cwd: tempRoot, env: localEnv });
   run('npm', ['run', 'typecheck'], { cwd: tempRoot, env: localEnv });
   run('npm', ['test'], { cwd: tempRoot, env: localEnv });
   run('npm', ['run', 'build'], { cwd: tempRoot, env: localEnv });
+  run('npm', ['run', 'test:stage1'], { cwd: tempRoot, env: localEnv });
   run('node', ['scripts/schema_fingerprint.mjs'], { cwd: tempRoot, env: localEnv });
   console.log(`[clean-clone:check] OK: reconstructed ${files.length} intended files, installed, migrated, tested and built in ${tempRoot}`);
 } finally {

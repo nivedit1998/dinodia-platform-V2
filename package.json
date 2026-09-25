@@ -14,10 +14,12 @@
     "check:security": "node scripts/check_security_headers.mjs",
     "check:foundation": "node scripts/check_foundation.mjs",
     "check:foundation:manifest": "node scripts/check_foundation_manifest.mjs",
-    "check:stage1": "node scripts/check_foundation.mjs",
+    "check:stage1": "node scripts/check_stage1_security.mjs",
     "test:foundation": "node scripts/foundation_db_checks.mjs",
     "test:foundation:invariants": "node scripts/foundation_invariants.mjs",
-    "test:stage1": "node scripts/foundation_db_checks.mjs",
+    "test:stage1:db": "node scripts/stage1_db_checks.mjs",
+    "test:stage1:integration": "node scripts/stage1_integration_harness.mjs",
+    "test:stage1": "node --test test/stage1_security.test.mjs && npm run test:stage1:integration",
     "foundation:target": "node scripts/assert_v2_target.mjs --mode local",
     "db:validate-target": "node scripts/assert_v2_target.mjs --mode \"${V2_ENVIRONMENT:-local}\"",
     "db:local:up": "node scripts/local_database.mjs up",
@@ -28,7 +30,8 @@
     "db:reset:rc": "node scripts/reset_rc_database.mjs",
     "db:migrate:rc": "node scripts/assert_v2_target.mjs --mode rc --run-prisma",
     "postinstall": "prisma generate",
-    "clean-clone:check": "node scripts/check_clean_clone.mjs"
+    "clean-clone:check": "node scripts/check_clean_clone.mjs",
+    "manufacturing:enroll": "node scripts/enrol_manufactured_hub.mjs"
   },
   "dependencies": {
     "@prisma/client": "^6.19.0",

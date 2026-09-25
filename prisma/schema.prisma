@@ -3,10 +3,10 @@ generator client {
 }
 
 datasource db {
-  provider  = "postgresql"
+  provider = "postgresql"
   // Runtime clients and guarded migration scripts inject the actual URL.
   // This non-secret local default keeps clean source snapshots reproducible.
-  url       = "postgresql://127.0.0.1:5432/dinodia_v2_local"
+  url      = "postgresql://127.0.0.1:5432/dinodia_v2_local"
 }
 
 enum CustomerStatus {
@@ -24,6 +24,7 @@ enum EmployeeRole {
 }
 
 enum EmployeeStatus {
+  PENDING
   ACTIVE
   REVOKED
 }
@@ -140,11 +141,15 @@ enum HubCredentialState {
 enum ProvisioningState {
   CREATED
   PRESENTED
+  EMPLOYEE_APPROVED
+  CHALLENGE_ISSUED
+  HUB_PROVED
   REDEEMED
   CHALLENGE_PENDING
   PROOF_RECEIVED
   CREDENTIAL_DELIVERED
   ACKNOWLEDGED
+  CONSUMED
   COMPLETED
   EXPIRED
   REVOKED
@@ -284,9 +289,12 @@ model CompanyEmployeeAccount {
   email                  String         @db.VarChar(320)
   emailNormalized        String         @unique @db.VarChar(320)
   emailVerifiedAt        DateTime?
-  passwordHash           String         @db.VarChar(255)
+  username               String?        @unique @db.VarChar(80)
+  passwordHash           String?        @db.VarChar(255)
   role                   EmployeeRole
   status                 EmployeeStatus @default(ACTIVE)
+  bootstrapInvitationHash String?       @unique @db.VarChar(128)
+  bootstrapInvitationExpiresAt DateTime?
   securityVersion        Int            @default(1)
   recentAuthenticationAt DateTime?
   createdAt              DateTime       @default(now())
@@ -430,6 +438,7 @@ model Home {
   devices         NativeDevice[]
   hubInstallation HubInstallation?
   workItems       CompanyOperationalWorkItem[]
+  operatorBrowserAttempts OperatorBrowserAttempt[]
   invitations     MembershipInvitation[]
   claims          HomeClaimReference[]
   homeDocuments   HomeDocument[]
@@ -617,6 +626,7 @@ model CompanyOperationalWorkItem {
   createdBy            CompanyEmployeeAccount   @relation("CreatedWork", fields: [createdByEmployeeId], references: [id], onDelete: Restrict)
   provisioningAttempts HubProvisioningAttempt[]
 
+  @@unique([id, homeId])
   @@index([assignedEmployeeId, state])
   @@index([homeId, state])
   @@index([hubInstallationId, state])
@@ -634,10 +644,15 @@ model HubInstallation {
   cloudUrlVerifiedAt          DateTime?
   cloudflareTunnelId          String?           @db.VarChar(200)
   cloudflareTunnelName        String?           @db.VarChar(200)
+  cloudflareReservationToken  String?           @db.VarChar(128)
   reservedHostname            String?           @db.VarChar(255)
+  reservedTunnelName          String?           @db.VarChar(200)
   remoteChallengeAt           DateTime?
   remoteVerificationAt        DateTime?
   currentCredentialVersion    Int?
+  // Deprecated compatibility field. Runtime authority uses the purpose-specific pointers.
+  currentMachineCredentialVersion Int?
+  currentOperatorCredentialVersion Int?
   accessPolicyRevision        Int               @default(1)
   lastSeenAt                  DateTime?
   onlineStateEvaluatedAt      DateTime?
@@ -659,34 +674,40 @@ model HubInstallation {
   devices               NativeDevice[]
   credentialVersions    HubCredentialVersion[]
   provisioningAttempts  HubProvisioningAttempt[]
+  operatorBrowserAttempts OperatorBrowserAttempt[]
   workItems             CompanyOperationalWorkItem[]
   homeClaimReferences   HomeClaimReference[]
   homeClaimChallenges   HomeClaimChallenge[]
 
-  @@index([state, lastSeenAt])
   @@unique([id, homeId])
   @@unique([id, manufacturingIdentityId])
+  @@index([state, lastSeenAt])
 }
 
 model HubCredentialVersion {
   id                        String             @id @default(uuid()) @db.Uuid
   hubInstallationId         String             @db.Uuid
   version                   Int
+  purpose                   String             @default("operator-credential") @db.VarChar(40)
   state                     HubCredentialState @default(PENDING)
   tokenHash                 String             @db.VarChar(128)
   encryptedDeliveryEnvelope Json?
+  ciphertextKeyVersion      Int?
   issuedAt                  DateTime           @default(now())
   deliveredAt               DateTime?
   acknowledgedAt            DateTime?
   activatedAt               DateTime?
   graceUntil                DateTime?
   revokedAt                 DateTime?
+  revokedReason             String?            @db.VarChar(160)
+  deliveryAttempts          Int                @default(0)
+  lastDeliveryError         String?            @db.VarChar(500)
   createdAt                 DateTime           @default(now())
 
   hubInstallation HubInstallation @relation(fields: [hubInstallationId], references: [id], onDelete: Cascade)
 
-  @@unique([hubInstallationId, version])
-  @@index([hubInstallationId, state])
+  @@unique([hubInstallationId, purpose, version], name: "HubCredentialVersion_hub_purpose_version_key")
+  @@index([hubInstallationId, purpose, state])
 }
 
 model HubProvisioningAttempt {
@@ -694,7 +715,7 @@ model HubProvisioningAttempt {
   attemptId                   String            @unique @db.VarChar(160)
   manufacturingIdentityId     String            @db.Uuid
   hubInstallationId           String?           @db.Uuid
-  companyWorkItemId           String            @db.Uuid
+  companyWorkItemId           String?           @db.Uuid
   redeemerEmployeeId          String?           @db.Uuid
   state                       ProvisioningState @default(CREATED)
   codeHash                    String            @db.VarChar(128)
@@ -711,10 +732,10 @@ model HubProvisioningAttempt {
   createdAt                   DateTime          @default(now())
   updatedAt                   DateTime          @updatedAt
 
-  manufacturingIdentity HubManufacturingIdentity   @relation(fields: [manufacturingIdentityId], references: [id], onDelete: Restrict)
-  hubInstallation       HubInstallation?           @relation(fields: [hubInstallationId], references: [id], onDelete: SetNull)
-  companyWorkItem       CompanyOperationalWorkItem @relation(fields: [companyWorkItemId], references: [id], onDelete: Restrict)
-  redeemerEmployee      CompanyEmployeeAccount?    @relation("ProvisioningRedeemer", fields: [redeemerEmployeeId], references: [id], onDelete: SetNull)
+  manufacturingIdentity HubManufacturingIdentity    @relation(fields: [manufacturingIdentityId], references: [id], onDelete: Restrict)
+  hubInstallation       HubInstallation?            @relation(fields: [hubInstallationId], references: [id], onDelete: SetNull)
+  companyWorkItem       CompanyOperationalWorkItem? @relation(fields: [companyWorkItemId], references: [id], onDelete: Restrict)
+  redeemerEmployee      CompanyEmployeeAccount?     @relation("ProvisioningRedeemer", fields: [redeemerEmployeeId], references: [id], onDelete: SetNull)
 
   @@unique([manufacturingIdentityId, idempotencyKeyHash])
   @@index([manufacturingIdentityId, state, expiresAt])
@@ -745,10 +766,10 @@ model MembershipInvitation {
   targetAccount CustomerAccount?           @relation("InvitationTarget", fields: [targetAccountId], references: [id], onDelete: SetNull)
   areas         MembershipInvitationArea[]
 
+  @@unique([id, homeId])
   @@index([targetEmailNormalized, state, expiresAt])
   @@index([homeId, state, expiresAt])
   @@index([inviterMembershipId, state])
-  @@unique([id, homeId])
 }
 
 model MembershipInvitationArea {
@@ -1000,4 +1021,282 @@ model ReplayNonce {
 
   @@unique([principalKind, principalId, nonceHash])
   @@index([expiresAt])
+}
+
+model AuthRateLimitBucket {
+  id           String    @id @default(uuid()) @db.Uuid
+  bucketKey    String    @unique @db.VarChar(160)
+  windowStart  DateTime
+  attempts     Int       @default(0)
+  blockedUntil DateTime?
+  updatedAt    DateTime  @updatedAt
+  createdAt    DateTime  @default(now())
+
+  @@index([blockedUntil])
+}
+
+model InitialCxoBootstrap {
+  id          String    @id @default(uuid()) @db.Uuid
+  ceremonyKey String    @unique @db.VarChar(80)
+  invitationHash String? @db.VarChar(128)
+  invitationExpiresAt DateTime?
+  consumedAt  DateTime?
+  createdAt   DateTime  @default(now())
+}
+
+// Stage 1 security authorities. These records are deliberately separate from
+// customer feature DTOs and are retained by later stages.
+enum EmployeeSessionStatus {
+  ACTIVE
+  REVOKED
+  EXPIRED
+}
+
+enum SupportTicketStatus {
+  OPEN
+  CLOSED
+}
+
+enum SupportAccessScope {
+  TENANT_SCOPE
+  PROPERTY_SCOPE
+}
+
+enum SupportAccessRequestStatus {
+  REQUESTED
+  APPROVED
+  DENIED
+  ISSUED
+  REDEEMED
+  EXPIRED
+  REVOKED
+  ENDED
+}
+
+enum SupportSessionStatus {
+  ACTIVE
+  REVOKED
+  EXPIRED
+  ENDED
+  PENDING_HUB_REVOKE
+}
+
+enum CloudUrlVerificationStatus {
+  PENDING
+  VERIFIED
+  FAILED
+}
+
+model EmployeeSession {
+  id                    String                @id @default(uuid()) @db.Uuid
+  employeeId            String                @db.Uuid
+  tokenHash             String                @unique @db.VarChar(128)
+  status                EmployeeSessionStatus @default(ACTIVE)
+  recentAuthenticatedAt DateTime
+  expiresAt             DateTime
+  revokedAt             DateTime?
+  createdAt             DateTime              @default(now())
+  updatedAt             DateTime              @updatedAt
+
+  @@index([employeeId, status, expiresAt])
+}
+
+model OperatorHandoff {
+  id                String    @id @default(uuid()) @db.Uuid
+  employeeId        String    @db.Uuid
+  workflowId        String    @db.Uuid
+  homeId            String    @db.Uuid
+  hubInstallationId String    @db.Uuid
+  attemptId         String?   @db.Uuid
+  operatorBrowserAttemptId String? @unique @db.Uuid
+  setupAttemptId    String    @db.VarChar(160)
+  browserBindingHash String   @db.VarChar(128)
+  handoffHash       String    @unique @db.VarChar(128)
+  handoffEnvelope   String    @db.Text
+  scope             Json
+  issuedAt          DateTime  @default(now())
+  expiresAt         DateTime
+  consumedAt        DateTime?
+  revokedAt         DateTime?
+  createdAt         DateTime  @default(now())
+
+  operatorBrowserAttempt OperatorBrowserAttempt? @relation(fields: [operatorBrowserAttemptId], references: [id], onDelete: Restrict)
+  @@index([employeeId, expiresAt, consumedAt])
+  @@index([hubInstallationId, expiresAt, consumedAt])
+  @@index([setupAttemptId])
+}
+
+// Created by the paired hub before Company Portal creates an operator
+// handoff. The browser binding is stored as a hash and cannot be replaced.
+model OperatorBrowserAttempt {
+  id                 String    @id @default(uuid()) @db.Uuid
+  attemptId          String    @unique @db.VarChar(160)
+  homeId             String    @db.Uuid
+  hubInstallationId  String    @db.Uuid
+  browserBindingHash String    @db.VarChar(128)
+  issuedAt           DateTime  @default(now())
+  expiresAt          DateTime
+  consumedAt         DateTime?
+  revokedAt          DateTime?
+  createdAt          DateTime  @default(now())
+
+  home            Home            @relation(fields: [homeId], references: [id], onDelete: Restrict)
+  hubInstallation HubInstallation @relation(fields: [hubInstallationId], references: [id], onDelete: Restrict)
+  handoffs        OperatorHandoff[]
+
+  @@unique([id, homeId])
+  @@index([hubInstallationId, expiresAt, consumedAt, revokedAt])
+}
+
+// A server-issued, one-use trusted-phone challenge. The phone signs this
+// exact server-created digest after local Face ID/passcode succeeds; clients
+// cannot choose the operation authority by posting a nonce directly.
+model StepUpChallenge {
+  id                    String    @id @default(uuid()) @db.Uuid
+  customerAccountId     String    @db.Uuid
+  customerSessionId     String    @db.Uuid
+  trustedDeviceId       String    @db.Uuid
+  homeId                String    @db.Uuid
+  membershipId          String    @db.Uuid
+  hubInstallationId     String    @db.Uuid
+  operationKind         String    @db.VarChar(120)
+  targetDigest          String    @db.VarChar(128)
+  normalizedValueDigest String    @db.VarChar(128)
+  policyRevision        Int
+  nonceHash             String    @unique @db.VarChar(128)
+  hubDescriptorNonceHash String?  @unique @db.VarChar(128)
+  issuedAt              DateTime  @default(now())
+  expiresAt             DateTime
+  consumedAt            DateTime?
+  cancelledAt           DateTime?
+
+  @@index([customerSessionId, expiresAt, consumedAt])
+  @@index([customerAccountId, homeId, membershipId])
+}
+
+model SupportTicket {
+  id                   String              @id @default(uuid()) @db.Uuid
+  publicReference      String              @unique @db.VarChar(32)
+  customerAccountId    String              @db.Uuid
+  homeId               String              @db.Uuid
+  selectedMembershipId String              @db.Uuid
+  assignedEmployeeId   String?             @db.Uuid
+  status               SupportTicketStatus @default(OPEN)
+  category             String              @db.VarChar(80)
+  description          String              @db.VarChar(4000)
+  createdAt            DateTime            @default(now())
+  closedAt             DateTime?
+  updatedAt            DateTime            @updatedAt
+
+  @@index([customerAccountId, status])
+  @@index([homeId, status])
+  @@index([assignedEmployeeId, status])
+}
+
+model SupportAccessRequest {
+  id                            String                     @id @default(uuid()) @db.Uuid
+  ticketId                      String                     @db.Uuid
+  requestedByEmployeeId         String                     @db.Uuid
+  homeId                        String                     @db.Uuid
+  hubInstallationId             String                     @db.Uuid
+  requestedScope                SupportAccessScope
+  targetMembershipId            String?                    @db.Uuid
+  targetUserId                  String?                    @db.Uuid
+  canonicalAreaIds              Json
+  targetIds                     Json
+  touchesPropertyInfrastructure Boolean                    @default(false)
+  status                        SupportAccessRequestStatus @default(REQUESTED)
+  approvedByMembershipId        String?                    @db.Uuid
+  approvedAt                    DateTime?
+  deniedAt                      DateTime?
+  denialReason                  String?                    @db.VarChar(500)
+  codeHash                      String?                    @db.VarChar(128)
+  codeIssuedAt                  DateTime?
+  codeExpiresAt                 DateTime?
+  codeConsumedAt                DateTime?
+  employeeHandoffHash           String?                    @db.VarChar(128)
+  employeeHandoffEnvelope       String?                    @db.Text
+  employeeHandoffIssuedAt       DateTime?
+  employeeHandoffExpiresAt      DateTime?
+  employeeHandoffConsumedAt     DateTime?
+  codeAttemptCount              Int                        @default(0)
+  sessionHardStopAt             DateTime?
+  desiredRevokedAt              DateTime?
+  hubRevokedAt                  DateTime?
+  revision                      Int                        @default(1)
+  createdAt                     DateTime                   @default(now())
+  updatedAt                     DateTime                   @updatedAt
+
+  @@index([ticketId, status])
+  @@index([homeId, status])
+  @@index([requestedByEmployeeId, status])
+  @@index([codeHash, codeExpiresAt])
+}
+
+model SupportSession {
+  id                String               @id @default(uuid()) @db.Uuid
+  accessRequestId   String               @db.Uuid
+  ticketId          String               @db.Uuid
+  employeeId        String               @db.Uuid
+  homeId            String               @db.Uuid
+  hubInstallationId String               @db.Uuid
+  scope             SupportAccessScope
+  areaIds           Json
+  targetMembershipId String?             @db.Uuid
+  targetUserId      String?              @db.Uuid
+  status            SupportSessionStatus @default(ACTIVE)
+  leaseHash         String               @unique @db.VarChar(128)
+  approvedAt        DateTime
+  expiresAt         DateTime
+  desiredRevokedAt  DateTime?
+  hubAcknowledgedAt DateTime?
+  endedAt           DateTime?
+  createdAt         DateTime             @default(now())
+  updatedAt         DateTime             @updatedAt
+
+  @@index([ticketId, status])
+  @@index([hubInstallationId, status, expiresAt])
+}
+
+model OfflineMembershipAuthorisation {
+  id                  String    @id @default(uuid()) @db.Uuid
+  trustedDeviceId     String    @db.Uuid
+  membershipId        String    @db.Uuid
+  homeId              String    @db.Uuid
+  hubInstallationId   String    @db.Uuid
+  publicKey           String    @db.Text
+  publicKeyThumbprint String    @db.VarChar(128)
+  areaIds             Json
+  scopes              Json
+  policyRevision      Int
+  issuedAt            DateTime  @default(now())
+  revokedAt           DateTime?
+  revokeReason        String?   @db.VarChar(160)
+  updatedAt           DateTime  @updatedAt
+
+  @@unique([trustedDeviceId, membershipId, hubInstallationId])
+  @@index([homeId, membershipId, revokedAt])
+  @@index([publicKeyThumbprint, revokedAt])
+}
+
+model CloudUrlVerification {
+  id                   String                     @id @default(uuid()) @db.Uuid
+  hubInstallationId    String                     @db.Uuid
+  homeId               String                     @db.Uuid
+  reservedHostname     String                     @db.VarChar(255)
+  tunnelId             String                     @db.VarChar(200)
+  tunnelName           String                     @db.VarChar(200)
+  cloudUrl             String                     @db.VarChar(500)
+  challengeHash        String                     @db.VarChar(128)
+  signedResponseDigest String?
+  status               CloudUrlVerificationStatus @default(PENDING)
+  issuedAt             DateTime                   @default(now())
+  expiresAt            DateTime
+  verifiedAt           DateTime?
+  failedAt             DateTime?
+  createdAt            DateTime                   @default(now())
+  updatedAt            DateTime                   @updatedAt
+
+  @@unique([hubInstallationId, tunnelId])
+  @@index([hubInstallationId, status])
 }

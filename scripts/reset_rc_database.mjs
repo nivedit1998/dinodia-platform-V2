@@ -5,13 +5,26 @@ import { spawnSync } from 'node:child_process';
 
 const expectedResetConfirmation = 'I_UNDERSTAND_FRESH_V2_PROJECT_fppzzesvukjbsfmxmfxe';
 const expectedMigrationConfirmation = 'I_UNDERSTAND_NEW_V2_DATABASE';
-const expectedMigration = '00000000000000_native_v2_lean_foundation';
+const expectedMigrations = [
+  '00000000000000_native_v2_lean_foundation',
+  '20260922000000_stage1_security_authorities',
+  '20260922010000_stage1_r3_remediation',
+  '20260924000000_r4_credential_purpose_separation',
+  '20260924001000_r4_operator_handoff_binding',
+  '20260924002000_r4_employee_bootstrap_invitation',
+  '20260924003000_r4_cloudflare_reservation_token',
+  '20260924004000_r4_step_up_hub_descriptor_nonce',
+  '20260924005000_r4_operator_handoff_secret',
+  '20260925000000_r4_support_hub_handoff',
+  '20260925010000_r6_browser_attempt_binding',
+];
 const expectedModels = new Set([
   'CustomerAccount', 'CompanyEmployeeAccount', 'TrustedDevice', 'CustomerSession', 'PolicyAcceptance', 'AuthChallenge', 'StepUpAuthorization',
   'Home', 'HomeMembership', 'Area', 'TenantAreaGrant', 'NativeDevice', 'DeviceAreaAssignment',
   'HubManufacturingIdentity', 'CompanyOperationalWorkItem', 'HubInstallation', 'HubCredentialVersion', 'HubProvisioningAttempt',
   'MembershipInvitation', 'MembershipInvitationArea', 'AreaQrCredential', 'AreaAccessRequest', 'HomeClaimReference', 'HomeClaimChallenge', 'HomeClaimReservation', 'PendingHomeSetup',
   'HomeDocument', 'MemberPreferenceDocument', 'AuditEvent', 'DeletionSecurityReceipt', 'IdempotencyRecord', 'ReplayNonce',
+  'EmployeeSession', 'OperatorHandoff', 'OperatorBrowserAttempt', 'StepUpChallenge', 'SupportTicket', 'SupportAccessRequest', 'SupportSession', 'OfflineMembershipAuthorisation', 'CloudUrlVerification',
 ]);
 
 function fail(message) {
@@ -30,7 +43,7 @@ if (!process.env.DIRECT_URL) fail('DIRECT_URL is required in the calling process
 
 const root = process.cwd();
 const artifactDir = path.resolve(process.env.V2_RC_ARTIFACT_DIR);
-const migrationPath = path.join(root, 'prisma', 'migrations', expectedMigration, 'migration.sql');
+const migrationPaths = expectedMigrations.map((migration) => path.join(root, 'prisma', 'migrations', migration, 'migration.sql'));
 
 function runTargetGuard() {
   const result = spawnSync(process.execPath, ['scripts/assert_v2_target.mjs', '--mode', 'rc'], {
@@ -147,8 +160,10 @@ function verifyPostReset(snapshot) {
   if (missing.length || extra.length) fail(`remote table inventory mismatch; missing=${missing.join(',')} extra=${extra.join(',')}`);
   const nonZero = snapshot.rowCounts.filter((row) => row.table !== '_prisma_migrations' && Number(row.count) !== 0);
   if (nonZero.length) fail(`remote reset left application rows: ${nonZero.map((row) => `${row.table}=${row.count}`).join(',')}`);
-  if (snapshot.migrationLedger.length !== 1 || snapshot.migrationLedger[0].migration_name !== expectedMigration || !snapshot.migrationLedger[0].finished_at || snapshot.migrationLedger[0].rolled_back_at) {
-    fail('remote migration ledger is not exactly one completed native foundation migration');
+  const migrationNames = snapshot.migrationLedger.map((row) => row.migration_name).sort();
+  const expectedNames = [...expectedMigrations].sort();
+  if (migrationNames.length !== expectedNames.length || migrationNames.some((name, index) => name !== expectedNames[index]) || snapshot.migrationLedger.some((row) => !row.finished_at || row.rolled_back_at)) {
+    fail('remote migration ledger is not exactly the completed native baseline plus all checked-in Stage 1 migrations');
   }
   if (snapshot.fingerprint !== process.env.V2_EXPECTED_SCHEMA_FINGERPRINT) fail(`remote schema fingerprint mismatch: ${snapshot.fingerprint}`);
   const grants = queryJson(`SELECT COALESCE(json_agg(q),'[]'::json) FROM (SELECT grantee,table_name,privilege_type FROM information_schema.role_table_grants WHERE table_schema='public' AND grantee IN ('anon','authenticated')) q`, 'remote privilege verification');
@@ -156,8 +171,8 @@ function verifyPostReset(snapshot) {
 }
 
 runTargetGuard();
-const migrationSha = crypto.createHash('sha256').update(fs.readFileSync(migrationPath)).digest('hex');
-if (migrationSha !== process.env.V2_EXPECTED_MIGRATION_SHA256) fail('checked-in migration SHA-256 does not match the supplied expected value');
+const migrationSha = crypto.createHash('sha256').update(Buffer.concat(migrationPaths.map((file) => fs.readFileSync(file)))).digest('hex');
+if (migrationSha !== process.env.V2_EXPECTED_MIGRATION_SHA256) fail('checked-in migration bundle SHA-256 does not match the supplied expected value');
 
 const pre = captureSnapshot('pre-reset');
 const preArtifact = writeArtifact('pre-reset-schema-metadata.json', pre);
@@ -166,9 +181,12 @@ if (existingApplicationRows.length) fail(`unexpected existing application rows; 
 console.log(`[db:reset:rc] target guard passed for fppzzesvukjbsfmxmfxe; pre-reset artifact SHA-256=${preArtifact.sha256}`);
 
 runPsql(['-qAt', '-c', 'DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public;'], 'authorized V2 schema reset');
-runPsql(['-f', migrationPath], 'native baseline SQL migration');
+for (const migrationPath of migrationPaths) runPsql(['-f', migrationPath], `native SQL migration ${path.basename(path.dirname(migrationPath))}`);
 runPsql(['-qAt', '-c', 'CREATE TABLE "_prisma_migrations" ("id" VARCHAR(36) NOT NULL, "checksum" VARCHAR(64) NOT NULL, "finished_at" TIMESTAMPTZ, "migration_name" VARCHAR(255) NOT NULL, "logs" TEXT, "rolled_back_at" TIMESTAMPTZ, "started_at" TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP, "applied_steps_count" INTEGER NOT NULL DEFAULT 0, CONSTRAINT "_prisma_migrations_pkey" PRIMARY KEY ("id"));'], 'migration ledger creation');
-runPsql(['-qAt', '-c', `INSERT INTO "_prisma_migrations" ("id","checksum","finished_at","migration_name","logs","rolled_back_at","started_at","applied_steps_count") VALUES (gen_random_uuid()::text,'${migrationSha}',CURRENT_TIMESTAMP,'${expectedMigration}',NULL,NULL,CURRENT_TIMESTAMP,1);`], 'migration ledger recording');
+for (const [index, migration] of expectedMigrations.entries()) {
+  const checksum = crypto.createHash('sha256').update(fs.readFileSync(migrationPaths[index])).digest('hex');
+  runPsql(['-qAt', '-c', `INSERT INTO "_prisma_migrations" ("id","checksum","finished_at","migration_name","logs","rolled_back_at","started_at","applied_steps_count") VALUES (gen_random_uuid()::text,'${checksum}',CURRENT_TIMESTAMP,'${migration}',NULL,NULL,CURRENT_TIMESTAMP,1);`], `migration ledger recording ${migration}`);
+}
 
 const post = captureSnapshot('post-reset');
 verifyPostReset(post);
@@ -179,5 +197,5 @@ const postArtifact = writeArtifact('post-reset-schema-metadata.json', post);
 // same durable ledger invariant without passing a database URL to a Prisma
 // child process, which is unsafe for a credential-bearing Supabase URL.
 const idempotentLedger = queryJson(`SELECT COALESCE(json_agg(q),'[]'::json) FROM (SELECT migration_name,checksum,finished_at,rolled_back_at FROM _prisma_migrations) q`, 'idempotent migration ledger check');
-if (idempotentLedger.length !== 1 || idempotentLedger[0].migration_name !== expectedMigration || idempotentLedger[0].checksum !== migrationSha || !idempotentLedger[0].finished_at || idempotentLedger[0].rolled_back_at) fail('idempotent migration ledger check failed');
-console.log(`[db:reset:rc] SUCCESS: native baseline applied to fppzzesvukjbsfmxmfxe; fingerprint=${post.fingerprint}; post-reset artifact SHA-256=${postArtifact.sha256}`);
+if (idempotentLedger.length !== expectedMigrations.length || idempotentLedger.some((row) => !expectedMigrations.includes(row.migration_name) || !row.finished_at || row.rolled_back_at)) fail('idempotent migration ledger check failed');
+console.log(`[db:reset:rc] SUCCESS: native baseline plus Stage 1 applied to the authorised V2 project; fingerprint=${post.fingerprint}; post-reset artifact SHA-256=${postArtifact.sha256}`);
