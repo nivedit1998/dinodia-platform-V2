@@ -24,6 +24,7 @@ export default function InstallerPage() {
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
   const [opening, setOpening] = useState<string | null>(null);
+  const [reservingCloudflare, setReservingCloudflare] = useState<string | null>(null);
   const [actionMessage, setActionMessage] = useState("");
   const [employeeRole, setEmployeeRole] = useState("");
   const [employees, setEmployees] = useState<Employee[]>([]);
@@ -79,6 +80,28 @@ export default function InstallerPage() {
     finally { setOpening(null); }
   }
 
+  async function reserveCloudflare(work: Workflow) {
+    if (!work.homeId || !work.hubInstallationId) return;
+    setReservingCloudflare(work.id); setActionMessage("");
+    try {
+      const response = await fetch(`/api/installer/hubs/${encodeURIComponent(work.hubInstallationId)}/cloudflare/reserve`, {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "Content-Type": "application/json", "Idempotency-Key": crypto.randomUUID() },
+        body: JSON.stringify({ workflowId: work.id, reason: "Reserve the installation-specific secure Dinodia OS endpoint" }),
+      });
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(body.error || "The secure endpoint could not be reserved");
+      const refreshed = await fetch("/api/installer/workflows", { credentials: "same-origin", cache: "no-store" });
+      const refreshedBody = await refreshed.json().catch(() => ({}));
+      if (!refreshed.ok) throw new Error(refreshedBody.error || "Assigned work could not be refreshed");
+      setWorkflows(refreshedBody.workflows || []);
+      setActionMessage("The installation-specific secure endpoint is reserved. Open the local Dinodia OS dashboard and complete its Cloudflare setup, then return here.");
+    } catch (caught) {
+      setActionMessage(caught instanceof Error ? caught.message : "The secure endpoint could not be reserved");
+    } finally { setReservingCloudflare(null); }
+  }
+
   async function assignWork(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault(); setAssigning(true); setActionMessage("");
     try {
@@ -97,6 +120,6 @@ export default function InstallerPage() {
     {error && <p role="alert" className="mt-8 rounded-xl border border-red-200 bg-red-50 p-4 text-sm text-red-800">{error}</p>}
     {actionMessage && <p role="status" aria-live="polite" className="mt-6 rounded-xl border border-[var(--border)] p-4 text-sm">{actionMessage}</p>}
     {(employeeRole === "CXO" || employeeRole === "SENIOR_OPERATIONS_MANAGER") && <form onSubmit={assignWork} className="mt-8 rounded-2xl border border-[var(--border)] bg-[var(--surface)] p-6 shadow-[var(--shadow)]"><h2 className="text-xl font-semibold">Create assigned installation work</h2><p className="mt-2 text-sm text-[var(--muted)]">Enter the pairing code shown by the locked Dinodia OS setup page or scan its QR value. Serial, identity, work type and later home/hub bindings are loaded from the server.</p><label className="mt-5 block text-sm font-semibold" htmlFor="pairing-code">Pairing code or QR value</label><input id="pairing-code" required autoComplete="one-time-code" inputMode="text" value={pairingCode} onChange={(event) => setPairingCode(event.target.value)} className="mt-2 w-full rounded-xl border border-[var(--border)] bg-transparent px-4 py-3" /><label className="mt-5 block text-sm font-semibold" htmlFor="assignee">Assign to</label><select id="assignee" required value={assignedEmployeeId} onChange={(event) => setAssignedEmployeeId(event.target.value)} className="mt-2 w-full rounded-xl border border-[var(--border)] bg-transparent px-4 py-3"><option value="">Select an installation employee</option>{employees.map((candidate) => <option key={candidate.id} value={candidate.id}>{candidate.displayName} — {candidate.role}</option>)}</select><label className="mt-5 block text-sm font-semibold" htmlFor="work-reason">Reason</label><input id="work-reason" required maxLength={500} value={workReason} onChange={(event) => setWorkReason(event.target.value)} className="mt-2 w-full rounded-xl border border-[var(--border)] bg-transparent px-4 py-3" /><button disabled={assigning} className="mt-5 rounded-xl bg-[var(--accent)] px-5 py-3 font-semibold text-white disabled:opacity-50">{assigning ? "Assigning…" : "Assign installation work"}</button></form>}
-    {loading ? <p className="mt-10 text-[var(--muted)]" aria-live="polite">Loading assigned work…</p> : <section className="mt-10 grid gap-4">{workflows.length === 0 ? <p className="rounded-2xl border border-[var(--border)] p-6 text-[var(--muted)]">No active work is assigned to this employee.</p> : workflows.map((work) => <article key={work.id} className="rounded-2xl border border-[var(--border)] bg-[var(--surface)] p-6 shadow-[var(--shadow)]"><div className="flex flex-wrap items-start justify-between gap-4"><div><p className="text-xs font-semibold uppercase tracking-[0.16em] text-[var(--muted)]">{work.publicReference}</p><h2 className="mt-2 text-xl font-semibold">{work.kind}</h2><p className="mt-2 text-[var(--muted)]">{work.reason || "Installation or property work"}</p></div><span className="rounded-full bg-[var(--surface-2)] px-3 py-1 text-sm font-semibold">{work.state}</span></div><div className="mt-5 flex flex-wrap gap-3"><a className="rounded-xl bg-[var(--accent)] px-4 py-3 text-sm font-semibold text-white" href={`/installer/provision?workflowId=${encodeURIComponent(work.id)}`}>Open provisioning</a>{work.hubInstallationId && work.homeId && <button type="button" onClick={() => openHub(work)} disabled={opening === work.id} className="rounded-xl border border-[var(--border)] px-4 py-3 text-sm font-semibold disabled:opacity-50">{opening === work.id ? "Opening secure OS…" : "Open secure Dinodia OS"}</button>}{work.homeId && <a className="rounded-xl border border-[var(--border)] px-4 py-3 text-sm font-semibold" href={`/installer/home-support?homeId=${encodeURIComponent(work.homeId)}`}>Open home support</a>}</div></article>)}</section>}
+    {loading ? <p className="mt-10 text-[var(--muted)]" aria-live="polite">Loading assigned work…</p> : <section className="mt-10 grid gap-4">{workflows.length === 0 ? <p className="rounded-2xl border border-[var(--border)] p-6 text-[var(--muted)]">No active work is assigned to this employee.</p> : workflows.map((work) => <article key={work.id} className="rounded-2xl border border-[var(--border)] bg-[var(--surface)] p-6 shadow-[var(--shadow)]"><div className="flex flex-wrap items-start justify-between gap-4"><div><p className="text-xs font-semibold uppercase tracking-[0.16em] text-[var(--muted)]">{work.publicReference}</p><h2 className="mt-2 text-xl font-semibold">{work.kind}</h2><p className="mt-2 text-[var(--muted)]">{work.reason || "Installation or property work"}</p></div><span className="rounded-full bg-[var(--surface-2)] px-3 py-1 text-sm font-semibold">{work.state}</span></div><div className="mt-5 flex flex-wrap gap-3"><a className="rounded-xl bg-[var(--accent)] px-4 py-3 text-sm font-semibold text-white" href={`/installer/provision?workflowId=${encodeURIComponent(work.id)}`}>Open provisioning</a>{work.hubInstallationId && work.homeId && !work.hubInstallation?.cloudUrl && <button type="button" onClick={() => reserveCloudflare(work)} disabled={reservingCloudflare === work.id} className="rounded-xl border border-[var(--border)] px-4 py-3 text-sm font-semibold disabled:opacity-50">{reservingCloudflare === work.id ? "Reserving secure endpoint…" : "Reserve secure endpoint"}</button>}{work.hubInstallationId && work.homeId && work.hubInstallation?.cloudUrl && <button type="button" onClick={() => openHub(work)} disabled={opening === work.id} className="rounded-xl border border-[var(--border)] px-4 py-3 text-sm font-semibold disabled:opacity-50">{opening === work.id ? "Opening secure OS…" : "Open secure Dinodia OS"}</button>}{work.homeId && <a className="rounded-xl border border-[var(--border)] px-4 py-3 text-sm font-semibold" href={`/installer/home-support?homeId=${encodeURIComponent(work.homeId)}`}>Open home support</a>}</div></article>)}</section>}
   </main>;
 }
