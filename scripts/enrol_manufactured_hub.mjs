@@ -23,6 +23,8 @@ function assertDatabaseTarget() {
   if (environment === 'production' && projectRef !== 'fppzzesvukjbsfmxmfxe') throw new Error('Production manufacturing enrollment target is not the authorised V2 project');
 }
 assertDatabaseTarget();
+const runtimeDatabaseUrl = String(process.env.DIRECT_URL || process.env.DATABASE_URL || '').trim();
+if (!runtimeDatabaseUrl) throw new Error('Manufacturing enrollment requires a validated runtime database URL');
 const fileStat = fs.lstatSync(inputFile);
 if (fileStat.isSymbolicLink() || !fileStat.isFile()) throw new Error('MANUFACTURING_ENROLLMENT_FILE must be a regular non-symlink file');
 const input = JSON.parse(fs.readFileSync(inputFile, 'utf8'));
@@ -46,7 +48,7 @@ if (environment === 'production') {
   const operatorPayload = JSON.stringify({ projectRef, serial, identityGeneration: generation, publicKeyFingerprint: signingKeyFingerprint, encryptionKeyFingerprint });
   if (!operatorKeys.length || !operatorSignature.length || !operatorKeys.some((pem) => { try { return crypto.verify(null, Buffer.from(operatorPayload), crypto.createPublicKey(pem), operatorSignature); } catch { return false; } })) throw new Error('Production manufacturing operator authorisation rejected');
 }
-const prisma = new PrismaClient();
+const prisma = new PrismaClient({ datasourceUrl: runtimeDatabaseUrl });
 try {
   const result = await prisma.$transaction(async (tx) => {
     const existing = await tx.hubManufacturingIdentity.findFirst({ where: { serialNumber: serial, identityGeneration: generation } });
