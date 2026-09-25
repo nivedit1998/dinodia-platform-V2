@@ -136,8 +136,12 @@ function cookieHeader(jar) {
 function cookieValue(jar, name) {
   return String(jar[name] || '');
 }
-function encode(value) { return Buffer.from(JSON.stringify(value), 'utf8').toString('base64url'); }
 function sha256(value) { return crypto.createHash('sha256').update(String(value), 'utf8').digest('hex'); }
+function hashPassword(password) {
+  const salt = crypto.randomBytes(16);
+  const derived = crypto.scryptSync(password, salt, 32, { N: 16384, r: 8, p: 1, maxmem: 32 * 1024 * 1024 });
+  return `scrypt$16384$8$1$${salt.toString('base64url')}$${derived.toString('base64url')}`;
+}
 function claimReferenceHash(value, pepper) { return crypto.createHmac('sha256', String(pepper)).update(String(value), 'utf8').digest('hex'); }
 function canonicalHubRequest({ method, path: requestPath, timestamp, nonce, bodyHash }) {
   return [String(method).toUpperCase(), String(requestPath), String(timestamp), String(nonce), String(bodyHash).toLowerCase()].join('\n');
@@ -168,15 +172,6 @@ function machineRequest({ base, path: requestPath, body, machineSecret, machineV
   const machineSignature = crypto.createHmac('sha256', sha256(machineSecret)).update(canonicalHubRequest({ method: 'POST', path: requestPath, timestamp, nonce, bodyHash }), 'utf8').digest('base64url');
   return fetchJson(`${base}${requestPath}`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-machine-version': String(machineVersion), 'x-dinodia-machine-signature': machineSignature, 'x-dinodia-hub-timestamp': timestamp, 'x-dinodia-hub-nonce': nonce, 'x-dinodia-body-sha256': bodyHash }, body: raw });
 }
-function employeeToken(employeeId, sessionId, privateKey, now = Date.now()) {
-  const issuedAt = Math.floor(now / 1000);
-  const expiresAt = issuedAt + 8 * 60 * 60;
-  const header = encode({ alg: 'EdDSA', typ: 'DNO-EMP-1', v: 1 });
-  const payload = encode({ iss: 'dinodia-platform-v2', aud: 'dinodia-company-portal', sub: employeeId, sid: sessionId, jti: crypto.randomBytes(18).toString('base64url'), areaIds: [], scope: ['company:portal'], policyRevision: 0, iat: issuedAt, exp: expiresAt, recentAuthenticatedAt: now });
-  const input = `${header}.${payload}`;
-  const signature = crypto.sign(null, Buffer.from(input), privateKey).toString('base64url');
-  return `dno-employee-1.${input}.${signature}`;
-}
 function baseEnv() {
   const company = keyPair();
   const app = keyPair();
@@ -206,6 +201,16 @@ function baseEnv() {
 async function fetchJson(url, init = {}) {
   const response = await fetch(url, init);
   return { response, body: await response.json().catch(() => ({})) };
+}
+async function loginEmployee(base, employee, password) {
+  const jar = {};
+  const login = await fetchJson(`${base}/api/company/auth/session`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ email: employee.email, password }) });
+  updateCookieJar(jar, login.response);
+  const token = cookieValue(jar, 'dinodia_employee_session');
+  if (login.response.status !== 200 || !token) fail(`Real employee login failed (${login.response.status}/${login.body.errorCode || 'missing-cookie'})`);
+  const session = await prisma.employeeSession.findFirst({ where: { employeeId: employee.id }, orderBy: { createdAt: 'desc' }, select: { id: true } });
+  if (!session) fail('Real employee login did not create a durable session');
+  return { token, jar, session };
 }
 
 async function startFakeSes() {
@@ -306,18 +311,28 @@ async function platformChecks() {
   const pendingCount = spawnSync('docker', ['exec', dockerName, 'psql', '-U', 'postgres', '-d', 'dinodia_stage1', '-At', '-c', pendingCountSql], { encoding: 'utf8' }).stdout.trim();
   if (pendingCount !== '0/0') fail(`Bootstrap created durable rows before delivery configuration (${pendingCount})`);
 
-  // Prove the new assignment route through a real signed employee session,
-  // durable employee/work/attempt rows and the running Next server. This is
-  // not the live bootstrap ceremony: the employee is a disposable harness
-  // fixture and no mailbox or production credential is involved.
-  const employee = await prisma.companyEmployeeAccount.create({ data: { displayName: 'Harness CXO', email: `harness-${crypto.randomUUID()}@invalid.test`, emailNormalized: `harness-${crypto.randomUUID()}@invalid.test`, role: 'CXO', status: 'ACTIVE' } });
-  const session = await prisma.employeeSession.create({ data: { employeeId: employee.id, tokenHash: sha256(`pending-${crypto.randomUUID()}`), recentAuthenticatedAt: new Date(), expiresAt: new Date(Date.now() + 60 * 60 * 1000) } });
+  // Prove the assignment route through the actual Company Portal login
+  // route and its real HttpOnly cookie. The harness must never manufacture a
+  // signed employee token and then rewrite a database hash to make it pass.
+  const employeePassword = `harness-cxo-password-${crypto.randomUUID()}`;
+  const employeeEmail = `harness-${crypto.randomUUID()}@invalid.test`;
+  const employee = await prisma.companyEmployeeAccount.create({ data: { displayName: 'Harness CXO', email: employeeEmail, emailNormalized: employeeEmail, role: 'CXO', status: 'ACTIVE', passwordHash: hashPassword(employeePassword) } });
+  const wrongPassword = await fetchJson(`${base}/api/company/auth/session`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ email: employee.email, password: 'definitely-the-wrong-password' }) });
+  if (wrongPassword.response.status !== 401) fail(`Wrong employee password was accepted (${wrongPassword.response.status})`);
+  const employeeLogin = await loginEmployee(base, employee, employeePassword);
+  const session = employeeLogin.session;
+  const malformedEmployeeToken = await fetchJson(`${base}/api/installer/workflows`, { headers: { 'x-dinodia-employee-session': 'not-a-session-token' } });
+  if (malformedEmployeeToken.response.status !== 401) fail(`Malformed employee session was not denied (${malformedEmployeeToken.response.status})`);
+  const signatureOffset = employeeLogin.token.lastIndexOf('.') + 1;
+  const signatureByte = employeeLogin.token[signatureOffset];
+  const tamperedEmployeeToken = `${employeeLogin.token.slice(0, signatureOffset)}${signatureByte === 'a' ? 'b' : 'a'}${employeeLogin.token.slice(signatureOffset + 1)}`;
+  const wrongSignature = await fetchJson(`${base}/api/installer/workflows`, { headers: { 'x-dinodia-employee-session': tamperedEmployeeToken } });
+  if (wrongSignature.response.status !== 401) fail(`Wrong-signature employee session was not denied (${wrongSignature.response.status})`);
   const identity = await prisma.hubManufacturingIdentity.create({ data: { serialNumber: `harness-${crypto.randomUUID()}`, signingPublicKey: 'harness-signing-public-key', encryptionPublicKey: 'harness-encryption-public-key', signingKeyFingerprint: crypto.randomUUID(), encryptionKeyFingerprint: crypto.randomUUID(), status: 'ACTIVE' } });
   const attemptId = `harness-attempt-${crypto.randomUUID()}`;
   const presentation = `harness-presentation-${crypto.randomUUID()}`;
   const attempt = await prisma.hubProvisioningAttempt.create({ data: { attemptId, manufacturingIdentityId: identity.id, state: 'PRESENTED', codeHash: sha256(presentation), baseUrlPresentation: 'http://dinodia-harness.local:8099', expiresAt: new Date(Date.now() + 15 * 60 * 1000), idempotencyKeyHash: sha256(`harness-${attemptId}`) } });
-  const token = employeeToken(employee.id, session.id, crypto.createPrivateKey(env.COMPANY_PORTAL_SESSION_PRIVATE_KEY));
-  await prisma.employeeSession.update({ where: { id: session.id }, data: { tokenHash: sha256(token) } });
+  const token = employeeLogin.token;
   const assignmentKey = `harness-assignment-${crypto.randomUUID()}`;
   const assignment = await fetchJson(`${base}/api/installer/workflows`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-employee-session': token, 'idempotency-key': assignmentKey }, body: JSON.stringify({ attemptId, assignedEmployeeId: employee.id, kind: 'INITIAL_HUB_INSTALLATION', reason: 'Disposable Stage 1 authenticated route test' }) });
   if (assignment.response.status !== 201 || assignment.body.work?.certifiedSerialNumber !== identity.serialNumber) fail(`Authenticated work assignment failed (${assignment.response.status}/${assignment.body.errorCode})`);
@@ -329,8 +344,12 @@ async function platformChecks() {
   if (boundAttempt?.hubInstallationId !== provision.body.hubInstallationId) fail('Provisioning attempt and HubInstallation binding is inconsistent');
   const replay = await fetchJson(`${base}/api/installer/workflows`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-employee-session': token, 'idempotency-key': assignmentKey }, body: JSON.stringify({ attemptId, assignedEmployeeId: employee.id, kind: 'INITIAL_HUB_INSTALLATION', reason: 'Disposable Stage 1 authenticated route test' }) });
   if (replay.response.status !== 200 || replay.body.work?.id !== assignment.body.work?.id || replay.body.work?.idempotentReplay !== true) fail(`Authenticated work assignment replay was not idempotent (${replay.response.status})`);
-  const assigned = await fetchJson(`${base}/api/installer/workflows`, { headers: { 'x-dinodia-employee-session': token } });
+  const assigned = await fetchJson(`${base}/api/installer/workflows`, { headers: { cookie: cookieHeader(employeeLogin.jar) } });
   if (assigned.response.status !== 200 || !assigned.body.workflows?.some((work) => work.id === assignment.body.work.id)) fail(`Assigned work was not returned to the authenticated employee (${assigned.response.status})`);
+  const logout = await fetchJson(`${base}/api/company/auth/session`, { method: 'DELETE', headers: { cookie: cookieHeader(employeeLogin.jar) } });
+  if (logout.response.status !== 204) fail(`Real employee logout failed (${logout.response.status})`);
+  const afterLogout = await fetchJson(`${base}/api/installer/workflows`, { headers: { cookie: cookieHeader(employeeLogin.jar) } });
+  if (afterLogout.response.status !== 401) fail(`Revoked real employee cookie remained usable (${afterLogout.response.status})`);
   seededWork = { employeeId: employee.id, employeeSessionId: session.id, workId: assignment.body.work.id, attemptId: attempt.id, identityId: identity.id, homeId: provision.body.homeId, hubInstallationId: provision.body.hubInstallationId };
   await prisma.homeClaimChallenge.deleteMany({ where: { hubInstallationId: seededWork.hubInstallationId } });
   await prisma.homeClaimReference.deleteMany({ where: { hubInstallationId: seededWork.hubInstallationId } });
@@ -498,10 +517,12 @@ async function customerAuthorizationChecks() {
   // Support is exercised through the real customer, employee and
   // machine-authenticated routes. The employee never receives the customer
   // code or plaintext proof; the hub presents only proof-of-possession.
-  const supportEmployee = await prisma.companyEmployeeAccount.create({ data: { displayName: 'Harness Support', email: `support-${crypto.randomUUID()}@invalid.test`, emailNormalized: `support-${crypto.randomUUID()}@invalid.test`, role: 'SENIOR_CUSTOMER_SUPPORT', status: 'ACTIVE' } });
-  const supportSession = await prisma.employeeSession.create({ data: { employeeId: supportEmployee.id, tokenHash: sha256(`pending-support-${crypto.randomUUID()}`), recentAuthenticatedAt: new Date(), expiresAt: new Date(Date.now() + 60 * 60 * 1000) } });
-  const supportToken = employeeToken(supportEmployee.id, supportSession.id, crypto.createPrivateKey(env.COMPANY_PORTAL_SESSION_PRIVATE_KEY));
-  await prisma.employeeSession.update({ where: { id: supportSession.id }, data: { tokenHash: sha256(supportToken) } });
+  const supportPassword = `harness-support-password-${crypto.randomUUID()}`;
+  const supportEmail = `support-${crypto.randomUUID()}@invalid.test`;
+  const supportEmployee = await prisma.companyEmployeeAccount.create({ data: { displayName: 'Harness Support', email: supportEmail, emailNormalized: supportEmail, role: 'SENIOR_CUSTOMER_SUPPORT', status: 'ACTIVE', passwordHash: hashPassword(supportPassword) } });
+  const supportLogin = await loginEmployee(base, supportEmployee, supportPassword);
+  const supportSession = supportLogin.session;
+  const supportToken = supportLogin.token;
   const ticketResponse = await fetchJson(`${base}/api/v2/support/tickets`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-app-token': tenantToken.body.token }, body: JSON.stringify({ category: 'HARNESS', description: 'Disposable tenant-private support test' }) });
   if (ticketResponse.response.status !== 201) fail(`Customer support ticket creation failed (${ticketResponse.response.status})`);
   const ticketId = ticketResponse.body.ticket?.id;
@@ -558,10 +579,12 @@ async function customerAuthorizationChecks() {
   const propertyTicketId = propertyTicketResponse.body.ticket.id;
   // The employee was deleted with the tenant-private ticket above; create a
   // fresh assigned employee for the property flow.
-  const propertySupportEmployee = await prisma.companyEmployeeAccount.create({ data: { displayName: 'Harness Property Support', email: `property-support-${crypto.randomUUID()}@invalid.test`, emailNormalized: `property-support-${crypto.randomUUID()}@invalid.test`, role: 'SENIOR_CUSTOMER_SUPPORT', status: 'ACTIVE' } });
-  const propertySupportSession = await prisma.employeeSession.create({ data: { employeeId: propertySupportEmployee.id, tokenHash: sha256(`pending-property-support-${crypto.randomUUID()}`), recentAuthenticatedAt: new Date(), expiresAt: new Date(Date.now() + 60 * 60 * 1000) } });
-  const propertySupportToken = employeeToken(propertySupportEmployee.id, propertySupportSession.id, crypto.createPrivateKey(env.COMPANY_PORTAL_SESSION_PRIVATE_KEY));
-  await prisma.employeeSession.update({ where: { id: propertySupportSession.id }, data: { tokenHash: sha256(propertySupportToken) } });
+  const propertySupportPassword = `harness-property-support-${crypto.randomUUID()}`;
+  const propertySupportEmail = `property-support-${crypto.randomUUID()}@invalid.test`;
+  const propertySupportEmployee = await prisma.companyEmployeeAccount.create({ data: { displayName: 'Harness Property Support', email: propertySupportEmail, emailNormalized: propertySupportEmail, role: 'SENIOR_CUSTOMER_SUPPORT', status: 'ACTIVE', passwordHash: hashPassword(propertySupportPassword) } });
+  const propertySupportLogin = await loginEmployee(base, propertySupportEmployee, propertySupportPassword);
+  const propertySupportSession = propertySupportLogin.session;
+  const propertySupportToken = propertySupportLogin.token;
   await prisma.supportTicket.update({ where: { id: propertyTicketId }, data: { assignedEmployeeId: propertySupportEmployee.id } });
   const broadeningTenantRequest = await fetchJson(`${base}/api/v2/support/tickets/${propertyTicketId}/access-requests`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-employee-session': propertySupportToken }, body: JSON.stringify({ requestedScope: 'TENANT_SCOPE', targetMembershipId: tenantMembership.id, areaIds: [areaOne.id], targetIds: [] }) });
   if (broadeningTenantRequest.response.status !== 201) fail(`Tenant approval prerequisite could not be created (${broadeningTenantRequest.response.status})`);
@@ -833,10 +856,12 @@ async function customerAuthorizationChecks() {
   if (revokedByPhoneRotation.response.status !== 401) fail(`Trusted-device rotation did not invalidate the old customer session (${revokedByPhoneRotation.response.status})`);
   const revokedSecondHomeSession = await issue(homeTwo.id);
   if (revokedSecondHomeSession.response.status !== 401) fail(`Trusted-device rotation did not revoke the account-wide second-home session (${revokedSecondHomeSession.response.status})`);
-  const operatorEmployee = await prisma.companyEmployeeAccount.create({ data: { displayName: 'Harness Installer', email: `installer-${crypto.randomUUID()}@invalid.test`, emailNormalized: `installer-${crypto.randomUUID()}@invalid.test`, role: 'INSTALLER', status: 'ACTIVE' } });
-  const operatorSession = await prisma.employeeSession.create({ data: { employeeId: operatorEmployee.id, tokenHash: sha256(`pending-operator-${crypto.randomUUID()}`), recentAuthenticatedAt: new Date(), expiresAt: new Date(Date.now() + 60 * 60 * 1000) } });
-  const operatorToken = employeeToken(operatorEmployee.id, operatorSession.id, crypto.createPrivateKey(env.COMPANY_PORTAL_SESSION_PRIVATE_KEY));
-  await prisma.employeeSession.update({ where: { id: operatorSession.id }, data: { tokenHash: sha256(operatorToken) } });
+  const operatorPassword = `harness-installer-password-${crypto.randomUUID()}`;
+  const operatorEmail = `installer-${crypto.randomUUID()}@invalid.test`;
+  const operatorEmployee = await prisma.companyEmployeeAccount.create({ data: { displayName: 'Harness Installer', email: operatorEmail, emailNormalized: operatorEmail, role: 'INSTALLER', status: 'ACTIVE', passwordHash: hashPassword(operatorPassword) } });
+  const operatorLogin = await loginEmployee(base, operatorEmployee, operatorPassword);
+  const operatorSession = operatorLogin.session;
+  const operatorToken = operatorLogin.token;
   const operatorWork = await prisma.companyOperationalWorkItem.create({ data: { publicReference: `DIN-${sha256(`handoff-${crypto.randomUUID()}`).slice(0, 16).toUpperCase()}`, kind: 'INITIAL_HUB_INSTALLATION', state: 'ASSIGNED', homeId: homeOne.id, hubInstallationId: hubOne.id, certifiedSerialNumber: identityOne.serialNumber, assignedEmployeeId: operatorEmployee.id, createdByEmployeeId: operatorEmployee.id, reason: 'Disposable browser-bound operator handoff test' } });
   customerFixture = { accountId: account.id, sessionId: session.id, trustedDeviceId: trusted.id, propertyAccountId: propertyAccount.id, propertySessionId: propertySession.id, propertyTrustedDeviceId: propertyTrusted.id, homeOneId: homeOne.id, homeTwoId: homeTwo.id, hubOneId: hubOne.id, hubTwoId: hubTwo.id, identityOneId: identityOne.id, identityTwoId: identityTwo.id, tenantDeviceId: tenantDevice.id, machineSecret, tenantMembershipId: tenantMembership.id, ownerMembershipId: ownerMembership.id, propertyMembershipId: propertyMembership.id, areaOneId: areaOne.id, areaTwoId: areaTwo.id, tenantToken: tenantToken.body.token, ownerToken: ownerToken.body.token, propertyToken: propertyToken.body.token, ticketId, stepUpTicketId, identityOneSigningPrivateKey: identityOneSigning.privateKey, identityOneSigningPublicKey: identityOneSigning.publicKey, identityOneEncryptionPrivateKey: identityOneEncryption.privateKey, identityOneEncryptionPublicKey: identityOneEncryption.publicKey, identityOneSerial: identityOne.serialNumber, identityOneGeneration: identityOne.identityGeneration, operatorEmployeeId: operatorEmployee.id, operatorSessionId: operatorSession.id, operatorWorkId: operatorWork.id, operatorToken };
 }

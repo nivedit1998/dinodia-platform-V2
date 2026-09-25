@@ -62,10 +62,10 @@ export async function requireEmployeeToken(token: string, allowedRoles: Employee
   const employee = await prisma.companyEmployeeAccount.findUnique({ where: { id: verified.id }, select: { id: true, role: true, status: true } });
   if (!employee || employee.status !== 'ACTIVE') fail(new Stage1AuthError(401, 'employee_revoked', 'The employee session is no longer active'));
   if (allowedRoles.length > 0 && !allowedRoles.includes(employee.role)) fail(new Stage1AuthError(403, 'employee_role_denied', 'This employee role is not allowed for the operation'));
-  const session = await prisma.employeeSession.findUnique({ where: { tokenHash: sha256(token) }, select: { id: true, employeeId: true, status: true, expiresAt: true, recentAuthenticatedAt: true } });
-  if (!session || session.id !== verified.sessionId || session.employeeId !== employee.id || session.status !== 'ACTIVE' || session.expiresAt <= new Date()) fail(new Stage1AuthError(401, 'employee_session_revoked', 'The employee session is no longer active'));
+  const session = await prisma.employeeSession.findUnique({ where: { id: verified.sessionId }, select: { id: true, employeeId: true, tokenHash: true, status: true, expiresAt: true, recentAuthenticatedAt: true } });
+  if (!session || session.employeeId !== employee.id || session.tokenHash !== sha256(verified.sessionId) || session.status !== 'ACTIVE' || session.expiresAt <= new Date()) fail(new Stage1AuthError(401, 'employee_session_revoked', 'The employee session is no longer active'));
   if (requireRecent && Date.now() - session.recentAuthenticatedAt.getTime() > 5 * 60 * 1000) fail(new Stage1AuthError(401, 'recent_authentication_required', 'Recent Company Portal authentication is required'));
-  return { kind: 'employee', id: employee.id, role: employee.role, sessionId: verified.sessionId, recentAuthenticatedAt: session.recentAuthenticatedAt.getTime(), tokenHash: sha256(token) };
+  return { kind: 'employee', id: employee.id, role: employee.role, sessionId: verified.sessionId, recentAuthenticatedAt: session.recentAuthenticatedAt.getTime(), tokenHash: sha256(verified.sessionId) };
 }
 
 export async function requireCustomer(request: Request): Promise<CustomerPrincipal> {

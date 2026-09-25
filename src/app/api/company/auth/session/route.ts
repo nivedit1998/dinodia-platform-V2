@@ -2,8 +2,8 @@ import crypto from 'node:crypto';
 import { NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
 import { verifyPassword } from '@/lib/passwords';
-import { randomSecret, signStage1Token } from '@/lib/stage1Crypto';
-import { authErrorResponse, recordFailedAuthentication, Stage1AuthError } from '@/lib/stage1Auth';
+import { signStage1Token } from '@/lib/stage1Crypto';
+import { authErrorResponse, recordFailedAuthentication, requireEmployeeToken, Stage1AuthError } from '@/lib/stage1Auth';
 import { enforcePersistentRateLimit } from '@/lib/rateLimit';
 
 export const dynamic = 'force-dynamic';
@@ -29,10 +29,13 @@ export async function POST(request: Request) {
       await recordFailedAuthentication('employee_login_failed', email);
       throw new Stage1AuthError(401, 'employee_credentials_invalid', 'The employee credentials are invalid');
     }
-    const raw = `dno_employee_session_${randomSecret(32)}`;
     const now = new Date();
+    // Bind the durable row to the signed token's session identifier.  The
+    // browser never receives a separate raw lookup secret, so storing a hash
+    // of an unrelated transient value would make every real session unusable.
+    const sessionId = crypto.randomUUID();
     const session = await prisma.$transaction(async (tx) => {
-      const created = await tx.employeeSession.create({ data: { employeeId: employee.id, tokenHash: crypto.createHash('sha256').update(raw).digest('hex'), recentAuthenticatedAt: now, expiresAt: new Date(now.getTime() + 8 * 60 * 60 * 1000) }, select: { id: true, recentAuthenticatedAt: true, expiresAt: true } });
+      const created = await tx.employeeSession.create({ data: { id: sessionId, employeeId: employee.id, tokenHash: crypto.createHash('sha256').update(sessionId).digest('hex'), recentAuthenticatedAt: now, expiresAt: new Date(now.getTime() + 8 * 60 * 60 * 1000) }, select: { id: true, recentAuthenticatedAt: true, expiresAt: true } });
       await tx.auditEvent.create({ data: { actorType: 'EMPLOYEE', actorId: employee.id, category: 'SECURITY', action: 'employee_login_succeeded', targetType: 'EmployeeSession', targetId: created.id, metadata: { outcome: 'succeeded' }, purgeAt: new Date(now.getTime() + 365 * 24 * 60 * 60 * 1000) } });
       return created;
     });
@@ -43,6 +46,13 @@ export async function POST(request: Request) {
 
 export async function DELETE(request: Request) {
   const value = request.headers.get('cookie')?.split(';').map((part) => part.trim()).find((part) => part.startsWith('dinodia_employee_session='))?.slice('dinodia_employee_session='.length) ?? '';
-  if (value) await prisma.employeeSession.updateMany({ where: { tokenHash: crypto.createHash('sha256').update(decodeURIComponent(value)).digest('hex'), status: 'ACTIVE' }, data: { status: 'REVOKED', revokedAt: new Date() } });
+  if (value) {
+    try {
+      const principal = await requireEmployeeToken(decodeURIComponent(value));
+      await prisma.employeeSession.updateMany({ where: { id: principal.sessionId, employeeId: principal.id, status: 'ACTIVE' }, data: { status: 'REVOKED', revokedAt: new Date() } });
+    } catch {
+      // Logout is idempotent for an expired or already-invalid cookie.
+    }
+  }
   return new NextResponse(null, { status: 204, headers: { 'Set-Cookie': 'dinodia_employee_session=; HttpOnly; SameSite=Lax; Secure; Path=/; Max-Age=0', 'Cache-Control': 'no-store' } });
 }
