@@ -585,6 +585,7 @@ async function protectedRouteDenialChecks(base) {
 }
 async function customerAuthorizationChecks() {
   const base = `http://127.0.0.1:${appPort}`;
+  const platformBase = base;
   const now = new Date();
   const homeData = { lifecycle: 'INSTALLING', installationStatus: 'DRAFT', addressStatus: 'VERIFIED', addressLine1: '1 Harness Street', city: 'London', postcode: 'N1 1AA', country: 'GB', timezone: 'Europe/London' };
   const homeOne = await prisma.home.create({ data: homeData });
@@ -671,6 +672,15 @@ async function customerAuthorizationChecks() {
   if (managerToken.response.status !== 200 || !managerToken.body.token) fail(`Property-manager session was not issued (${managerToken.response.status})`);
   const tenantOffline = await fetchJson(`${base}/api/v2/offline-authorisations`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-app-token': tenantToken.body.token }, body: JSON.stringify({ trustedDeviceId: trusted.id, publicKey: phone.publicKey }) });
   if (tenantOffline.response.status !== 200 || tenantOffline.body.authorisation?.homeId !== homeOne.id) fail(`Tenant offline authority was not scoped to the selected home (${tenantOffline.response.status})`);
+  const revocablePhone = keyPair();
+  const revocablePhoneThumbprint = crypto.createHash('sha256').update(crypto.createPublicKey(revocablePhone.publicKey).export({ type: 'spki', format: 'der' })).digest('hex');
+  const revocableTrustedDevice = await prisma.trustedDevice.create({ data: { customerAccountId: account.id, deviceInstallationId: `harness-revocable-phone-${crypto.randomUUID()}`, publicKey: revocablePhone.publicKey, publicKeyThumbprint: revocablePhoneThumbprint, deviceName: 'Harness revocable phone' } });
+  const revocableRawSession = `harness-revocable-session-${crypto.randomUUID()}`;
+  await prisma.customerSession.create({ data: { customerAccountId: account.id, trustedDeviceId: revocableTrustedDevice.id, refreshTokenHash: sha256(revocableRawSession), securityVersion: account.securityVersion, trustedDeviceSessionVersion: revocableTrustedDevice.sessionVersion, expiresAt: new Date(Date.now() + 60 * 60 * 1000) } });
+  const revocableToken = await fetchJson(`${base}/api/v2/hub-sessions`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-session': revocableRawSession }, body: JSON.stringify({ homeId: homeOne.id }) });
+  if (revocableToken.response.status !== 200 || !revocableToken.body.token) fail(`Second enrolled test phone did not receive its real customer token (${revocableToken.response.status})`);
+  const revocableOffline = await fetchJson(`${base}/api/v2/offline-authorisations`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-app-token': revocableToken.body.token }, body: JSON.stringify({ trustedDeviceId: revocableTrustedDevice.id, publicKey: revocablePhone.publicKey }) });
+  if (revocableOffline.response.status !== 200 || revocableOffline.body.authorisation?.trustedDeviceId !== revocableTrustedDevice.id) fail(`Second phone did not receive a durable Platform offline authorisation (${revocableOffline.response.status})`);
   const ownerOffline = await fetchJson(`${base}/api/v2/offline-authorisations`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-app-token': ownerToken.body.token }, body: JSON.stringify({ trustedDeviceId: trusted.id, publicKey: phone.publicKey }) });
   if (ownerOffline.response.status !== 403) fail(`Owner received offline household command authority (${ownerOffline.response.status})`);
   const wrongPhone = await fetchJson(`${base}/api/v2/offline-authorisations`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-app-token': tenantToken.body.token }, body: JSON.stringify({ trustedDeviceId: crypto.randomUUID(), publicKey: phone.publicKey }) });
@@ -1015,6 +1025,17 @@ async function customerAuthorizationChecks() {
   // The broker does not expose a descriptor-signing oracle: PlatformPairing
   // signs this fixed request path with the descriptor bytes as its body hash.
   hub.pairing.identityBroker = {
+    async getPublicIdentity() {
+      return {
+        serial: identityOne.serialNumber,
+        signingPublicKeyPem: identityOneSigning.publicKey,
+        encryptionPublicKeyPem: identityOneEncryption.publicKey,
+        publicKeyFingerprint: publicKeyFingerprint(identityOneSigning.publicKey),
+        encryptionKeyFingerprint: publicKeyFingerprint(identityOneEncryption.publicKey),
+        manufacturingSignature: '',
+        generation: identityOne.identityGeneration,
+      };
+    },
     async signPlatformRequest(input) {
       const canonical = [String(input.method).toUpperCase(), String(input.path), String(input.timestamp), String(input.nonce), String(input.bodyHash)].join('\n');
       return { signature: crypto.sign(null, Buffer.from(canonical, 'utf8'), crypto.createPrivateKey(identityOneSigning.privateKey)).toString('base64url') };
@@ -1192,11 +1213,49 @@ async function customerAuthorizationChecks() {
   const wrongOfflineHeaders = { ...offlineHeaders, 'x-dinodia-offline-challenge': Buffer.from(JSON.stringify(wrongOfflineChallenge), 'utf8').toString('base64url'), 'x-dinodia-offline-signature': crypto.sign(null, Buffer.from(JSON.stringify(wrongOfflineChallenge), 'utf8'), crypto.createPrivateKey(phone.privateKey)).toString('base64url') };
   const wrongOffline = await fetchJson(`${osBase}/_dinodia/admin/api/entities/${offlineEntityPath}/service`, { method: 'POST', headers: { 'content-type': 'application/json', ...wrongOfflineHeaders }, body: JSON.stringify({ serviceId: 'switch.turn_on', data: offlineCommandValue }) });
   if (wrongOffline.response.status !== 403 || fakePhysicalCommandCount !== 2) fail(`Offline value mismatch was not denied without a side effect (${wrongOffline.response.status}/${fakePhysicalCommandCount})`);
-  await prisma.trustedDevice.update({ where: { id: trusted.id }, data: { sessionVersion: { increment: 1 } } });
-  const revokedByPhoneRotation = await issue(homeOne.id);
-  if (revokedByPhoneRotation.response.status !== 401) fail(`Trusted-device rotation did not invalidate the old customer session (${revokedByPhoneRotation.response.status})`);
-  const revokedSecondHomeSession = await issue(homeTwo.id);
-  if (revokedSecondHomeSession.response.status !== 401) fail(`Trusted-device rotation did not revoke the account-wide second-home session (${revokedSecondHomeSession.response.status})`);
+  hub.pairing.apiUrl = base;
+  await hub.vault.set('platform.machineCredential', machineSecret);
+  await hub.store.savePlatform({ paired: true, hubInstallId: hubOne.id, provisioningCredentialVersion: 1 });
+  // This disposable installation fixture intentionally lacks the separate
+  // provisioning approval object; skip only the initial-liveness heartbeat
+  // and exercise the real machine-authenticated policy/token-state route.
+  hub.pairing.lastHeartbeatAt = Date.now();
+  await hub.pairing.syncNow();
+  const preRevocationOsGrant = hub.store.getSecurity().offlineAuthorisations?.[revocableOffline.body.authorisation.id];
+  if (!preRevocationOsGrant || preRevocationOsGrant.userId !== account.id || preRevocationOsGrant.revokedAt) {
+    const platformGrant = await prisma.offlineMembershipAuthorisation.findUnique({ where: { id: revocableOffline.body.authorisation.id }, select: { id: true, homeId: true, hubInstallationId: true, revokedAt: true } });
+    fail(`The real active offline grant was not synchronized to Dinodia OS before device removal (${JSON.stringify({ osHasGrant: Boolean(preRevocationOsGrant), osAccountMatches: preRevocationOsGrant?.userId === account.id, osRevoked: Boolean(preRevocationOsGrant?.revokedAt), platformHasGrant: Boolean(platformGrant), platformHomeMatches: platformGrant?.homeId === homeOne.id, platformHubMatches: platformGrant?.hubInstallationId === hubOne.id, syncError: String(hub.pairing.lastError || '').slice(0, 160) })})`);
+  }
+  const removalChallenge = await fetchJson(`${platformBase}/api/v2/security/step-up/challenge`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-app-token': tenantToken.body.token }, body: JSON.stringify({ operationKind: 'trusted_device_remove', targetIds: [revocableTrustedDevice.id], value: null }) });
+  if (removalChallenge.response.status !== 200) fail(`Trusted-device removal challenge failed (${removalChallenge.response.status})`);
+  const removalSignature = crypto.sign(null, stepUpChallengeMessage({ challengeId: removalChallenge.body.challengeId, nonce: removalChallenge.body.nonce, operationDigest: removalChallenge.body.operationDigest }), crypto.createPrivateKey(phone.privateKey)).toString('base64url');
+  const removalProof = await fetchJson(`${platformBase}/api/v2/security/step-up/issue`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-app-token': tenantToken.body.token }, body: JSON.stringify({ challengeId: removalChallenge.body.challengeId, nonce: removalChallenge.body.nonce, deviceSignature: removalSignature }) });
+  if (removalProof.response.status !== 200) fail(`Trusted-device removal proof failed (${removalProof.response.status})`);
+  const removedDevice = await fetchJson(`${platformBase}/api/v2/trusted-devices/${revocableTrustedDevice.id}`, { method: 'DELETE', headers: { 'content-type': 'application/json', 'x-dinodia-app-token': tenantToken.body.token }, body: JSON.stringify({ proof: removalProof.body.proof }) });
+  if (removedDevice.response.status !== 200 || removedDevice.body.accountWide !== true) fail(`Real account-wide trusted-device removal failed (${removedDevice.response.status})`);
+  const revokedGrantRow = await prisma.offlineMembershipAuthorisation.findUnique({ where: { id: revocableOffline.body.authorisation.id }, select: { revokedAt: true, revokeReason: true } });
+  if (!revokedGrantRow?.revokedAt || revokedGrantRow.revokeReason !== 'trusted_device_removed') fail('Platform device removal did not revoke its durable offline authority');
+  const removedSessionRetry = await fetchJson(`${platformBase}/api/v2/hub-sessions`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-session': revocableRawSession }, body: JSON.stringify({ homeId: homeOne.id }) });
+  if (removedSessionRetry.response.status !== 401) fail(`Removed trusted device could issue another customer token (${removedSessionRetry.response.status})`);
+  while (hub.pairing.syncing) await new Promise((resolve) => setTimeout(resolve, 10));
+  hub.pairing.nextRetryAt = 0;
+  let callbackRevocation = null;
+  const acceptOfflineAuthorisations = hub.pairing.acceptOfflineAuthorisations;
+  hub.pairing.acceptOfflineAuthorisations = async (rows) => {
+    callbackRevocation = rows.find((entry) => entry.payload?.id === revocableOffline.body.authorisation.id)?.payload || null;
+    return acceptOfflineAuthorisations(rows);
+  };
+  const revocationSync = await hub.pairing.syncNow();
+  hub.pairing.acceptOfflineAuthorisations = acceptOfflineAuthorisations;
+  const signedRevocation = revocationSync?.offlineAuthorisations?.find((entry) => entry.payload?.id === revocableOffline.body.authorisation.id);
+  if (!signedRevocation?.payload?.revokedAt || signedRevocation.payload.revokeReason !== 'trusted_device_removed') fail('The real machine-authenticated token-state response did not contain the signed account-wide revocation');
+  const revokedOsGrant = hub.store.getSecurity().offlineAuthorisations?.[revocableOffline.body.authorisation.id];
+  if (!revokedOsGrant?.revokedAt || revokedOsGrant.revokeReason !== 'trusted_device_removed') fail(`Running Dinodia OS did not persist the Platform-signed account-wide offline revocation (${JSON.stringify({ osHasGrant: Boolean(revokedOsGrant), osRevoked: Boolean(revokedOsGrant?.revokedAt), osReason: revokedOsGrant?.revokeReason || null, osUserMatches: revokedOsGrant?.userId === account.id, callbackHadGrant: Boolean(callbackRevocation), callbackRevoked: Boolean(callbackRevocation?.revokedAt), callbackReason: callbackRevocation?.revokeReason || null, syncError: String(hub.pairing.lastError || '').slice(0, 160) })})`);
+  const revokedChallenge = { v: 1, homeId: homeOne.id, hubInstallId: hubOne.id, areaId: areaOne.id, deviceId: 'harness-tenant-device', controlId: offlineControlId, valueDigest: offlineValueDigest, nonce: `offline-revoked-${crypto.randomUUID()}`, issuedAt: Date.now() };
+  const revokedHeaders = { 'x-dinodia-offline-grant': revocableOffline.body.authorisation.id, 'x-dinodia-offline-challenge': Buffer.from(JSON.stringify(revokedChallenge), 'utf8').toString('base64url'), 'x-dinodia-offline-signature': crypto.sign(null, Buffer.from(JSON.stringify(revokedChallenge), 'utf8'), crypto.createPrivateKey(revocablePhone.privateKey)).toString('base64url') };
+  const revokedCommand = await fetchJson(`${osBase}/_dinodia/admin/api/entities/${offlineEntityPath}/service`, { method: 'POST', headers: { 'content-type': 'application/json', ...revokedHeaders }, body: JSON.stringify({ serviceId: 'switch.turn_on', data: offlineCommandValue }) });
+  if (revokedCommand.response.status !== 401 || fakePhysicalCommandCount !== 2) fail(`Revoked phone retained offline command authority or caused a side effect (${revokedCommand.response.status}/${fakePhysicalCommandCount})`);
+  console.log('[stage1:integration] PASS: real trusted-device removal revokes durable Platform and signed OS offline grants; revoked phone cannot issue sessions or dispatch commands');
   const operatorPassword = `harness-installer-password-${crypto.randomUUID()}`;
   const operatorEmail = `installer-${crypto.randomUUID()}@invalid.test`;
   const operatorEmployee = await prisma.companyEmployeeAccount.create({ data: { displayName: 'Harness Installer', email: operatorEmail, emailNormalized: operatorEmail, role: 'INSTALLER', status: 'ACTIVE', passwordHash: hashPassword(operatorPassword) } });
@@ -1204,7 +1263,7 @@ async function customerAuthorizationChecks() {
   const operatorSession = operatorLogin.session;
   const operatorToken = operatorLogin.token;
   const operatorWork = await prisma.companyOperationalWorkItem.create({ data: { publicReference: `DIN-${sha256(`handoff-${crypto.randomUUID()}`).slice(0, 16).toUpperCase()}`, kind: 'INITIAL_HUB_INSTALLATION', state: 'ASSIGNED', homeId: homeOne.id, hubInstallationId: hubOne.id, certifiedSerialNumber: identityOne.serialNumber, assignedEmployeeId: operatorEmployee.id, createdByEmployeeId: operatorEmployee.id, reason: 'Disposable browser-bound operator handoff test' } });
-  customerFixture = { accountId: account.id, sessionId: session.id, trustedDeviceId: trusted.id, propertyAccountId: propertyAccount.id, propertySessionId: propertySession.id, propertyTrustedDeviceId: propertyTrusted.id, managerAccountId: managerAccount.id, managerMembershipId: managerMembership.id, managerSessionId: managerSession.id, managerTrustedDeviceId: managerTrusted.id, homeOneId: homeOne.id, homeTwoId: homeTwo.id, hubOneId: hubOne.id, hubTwoId: hubTwo.id, identityOneId: identityOne.id, identityTwoId: identityTwo.id, tenantDeviceId: tenantDevice.id, machineSecret, tenantMembershipId: tenantMembership.id, ownerMembershipId: ownerMembership.id, propertyMembershipId: propertyMembership.id, areaOneId: areaOne.id, areaTwoId: areaTwo.id, tenantToken: tenantToken.body.token, ownerToken: ownerToken.body.token, propertyToken: propertyToken.body.token, managerToken: managerToken.body.token, ticketId, stepUpTicketId, identityOneSigningPrivateKey: identityOneSigning.privateKey, identityOneSigningPublicKey: identityOneSigning.publicKey, identityOneEncryptionPrivateKey: identityOneEncryption.privateKey, identityOneEncryptionPublicKey: identityOneEncryption.publicKey, identityOneSerial: identityOne.serialNumber, identityOneGeneration: identityOne.identityGeneration, operatorEmployeeId: operatorEmployee.id, operatorSessionId: operatorSession.id, operatorWorkId: operatorWork.id, operatorToken };
+  customerFixture = { accountId: account.id, sessionId: session.id, trustedDeviceId: trusted.id, trustedPhonePrivateKey: phone.privateKey, offlineAuthorisationId: tenantOffline.body.authorisation.id, revocableTrustedDeviceId: revocableTrustedDevice.id, revocableRawSession, revocablePhonePrivateKey: revocablePhone.privateKey, revocableOfflineAuthorisationId: revocableOffline.body.authorisation.id, propertyAccountId: propertyAccount.id, propertySessionId: propertySession.id, propertyTrustedDeviceId: propertyTrusted.id, managerAccountId: managerAccount.id, managerMembershipId: managerMembership.id, managerSessionId: managerSession.id, managerTrustedDeviceId: managerTrusted.id, homeOneId: homeOne.id, homeTwoId: homeTwo.id, hubOneId: hubOne.id, hubTwoId: hubTwo.id, identityOneId: identityOne.id, identityTwoId: identityTwo.id, tenantDeviceId: tenantDevice.id, machineSecret, tenantMembershipId: tenantMembership.id, ownerMembershipId: ownerMembership.id, propertyMembershipId: propertyMembership.id, areaOneId: areaOne.id, areaTwoId: areaTwo.id, tenantToken: tenantToken.body.token, ownerToken: ownerToken.body.token, propertyToken: propertyToken.body.token, managerToken: managerToken.body.token, ticketId, stepUpTicketId, identityOneSigningPrivateKey: identityOneSigning.privateKey, identityOneSigningPublicKey: identityOneSigning.publicKey, identityOneEncryptionPrivateKey: identityOneEncryption.privateKey, identityOneEncryptionPublicKey: identityOneEncryption.publicKey, identityOneSerial: identityOne.serialNumber, identityOneGeneration: identityOne.identityGeneration, operatorEmployeeId: operatorEmployee.id, operatorSessionId: operatorSession.id, operatorWorkId: operatorWork.id, operatorToken };
 }
 
 async function operatorMutationChecks() {
@@ -1364,6 +1423,23 @@ async function osChecks() {
       return { credential: decryptHubEnvelope(input.envelope, customerFixture.identityOneEncryptionPrivateKey, input.purpose, input.version) };
     },
   };
+  // Synchronize signed policy from the actual Platform machine route into the
+  // running OS store, including both active and later-revoked phone grants.
+  await hub.pairing.syncNow();
+  const syncedOfflineGrants = hub.store.getSecurity().offlineAuthorisations || {};
+  if (!syncedOfflineGrants[customerFixture.offlineAuthorisationId] || syncedOfflineGrants[customerFixture.offlineAuthorisationId].userId !== customerFixture.accountId) fail('Platform-signed offline grant did not retain its customer identity on the OS');
+  const revokedOsGrant = syncedOfflineGrants[customerFixture.revocableOfflineAuthorisationId];
+  if (!revokedOsGrant?.userId || revokedOsGrant.userId !== customerFixture.accountId || !revokedOsGrant.revokedAt || revokedOsGrant.revokeReason !== 'trusted_device_removed') fail('Real signed policy sync did not persist the account-wide phone revocation on the OS');
+  const revokedEntity = hub.model.entities().find((entity) => entity.device.id === 'harness-tenant-device');
+  if (!revokedEntity) fail('Cannot find the fake tenant control for the revoked offline command check');
+  const revokedControlId = String(revokedEntity.entity.id);
+  const revokedCommandValue = {};
+  const revokedValueDigest = sha256(JSON.stringify({ deviceId: 'harness-tenant-device', entityId: revokedEntity.haId, controlId: revokedControlId, serviceId: 'switch.turn_on', value: revokedCommandValue }));
+  const revokedChallenge = { v: 1, homeId: customerFixture.homeOneId, hubInstallId: customerFixture.hubOneId, areaId: customerFixture.areaOneId, deviceId: 'harness-tenant-device', controlId: revokedControlId, valueDigest: revokedValueDigest, nonce: `offline-revoked-${crypto.randomUUID()}`, issuedAt: Date.now() };
+  const revokedHeaders = { 'x-dinodia-offline-grant': customerFixture.revocableOfflineAuthorisationId, 'x-dinodia-offline-challenge': Buffer.from(JSON.stringify(revokedChallenge), 'utf8').toString('base64url'), 'x-dinodia-offline-signature': crypto.sign(null, Buffer.from(JSON.stringify(revokedChallenge), 'utf8'), crypto.createPrivateKey(customerFixture.revocablePhonePrivateKey)).toString('base64url') };
+  const revokedCommand = await fetchJson(`${base}/_dinodia/admin/api/entities/${encodeURIComponent(revokedControlId)}/service`, { method: 'POST', headers: { 'content-type': 'application/json', ...revokedHeaders }, body: JSON.stringify({ serviceId: 'switch.turn_on', data: revokedCommandValue }) });
+  if (revokedCommand.response.status !== 401 || fakePhysicalCommandCount !== 2) fail(`Revoked phone retained offline command authority or caused a side effect (${revokedCommand.response.status}/${fakePhysicalCommandCount})`);
+  console.log('[stage1:integration] PASS: post-revocation hub sync rejects the previously issued offline grant without a command side effect');
   const platformTenantRead = await fetchJson(`${base}/_dinodia/admin/api/devices`, { headers: { authorization: `Bearer ${customerFixture.tenantToken}` } });
   if (platformTenantRead.response.status !== 200) fail(`A real Platform-issued tenant token was not accepted by Dinodia OS (${platformTenantRead.response.status}/${platformTenantRead.body.errorCode || platformTenantRead.body.error || 'unknown'})`);
   const wrongHomeReplay = await fetchJson(`${base}/_dinodia/admin/api/devices`, { headers: { authorization: `Bearer ${customerFixture.ownerToken}` } });
