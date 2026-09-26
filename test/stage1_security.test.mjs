@@ -59,7 +59,7 @@ test('Stage 1 database migration includes durable privacy and authority objects'
 
 test('readiness requires the completed Stage 1 migration rather than only the baseline', () => {
   assert.match(read('src/app/api/readiness/route.ts'), /REQUIRED_MIGRATION/);
-  assert.match(read('src/lib/foundation.ts'), /20260925040000_r7_support_notifications/);
+  assert.match(read('src/lib/foundation.ts'), /20260925230000_r11_operator_mutation_idempotency/);
   assert.match(read('src/lib/foundation.ts'), /REQUIRED_MODEL_COUNT = 44/);
 });
 
@@ -175,6 +175,35 @@ test('Platform and Dinodia OS use the same ten-field CloudURL challenge vector',
   const complete = { ...input, bodyHash };
   assert.equal(canonicalCloudUrlChallenge(complete), osIdentity.canonicalCloudChallenge(complete));
   assert.equal(canonicalCloudUrlUnsignedBody(input), osIdentity.canonicalCloudChallengeUnsigned(input));
+});
+
+test('trusted-phone assertions interoperate with Secure Enclave P-256 and preserve Ed25519 compatibility', () => {
+  const crypto = createRequire(import.meta.url)('node:crypto');
+  const { verifyTrustedDeviceAssertion } = loadTypeScriptModule('src/lib/sensitiveOperationStepUp.ts', {
+    './prisma': { prisma: {} },
+    './stage1Auth': { Stage1AuthError: class Stage1AuthError extends Error { constructor(status, code, message) { super(message); this.status = status; this.code = code; } } },
+  });
+  const input = { nonce: 'nonce-1', challengeId: 'challenge-1', operationDigest: 'digest-1' };
+  const message = Buffer.from('DINODIA_STEP_UP_CHALLENGE_V1\nchallenge-1\nnonce-1\ndigest-1', 'utf8');
+  const p256 = crypto.generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
+  const p256Signature = crypto.sign('sha256', message, p256.privateKey).toString('base64url');
+  assert.doesNotThrow(() => verifyTrustedDeviceAssertion({ ...input, publicKey: p256.publicKey.export({ type: 'spki', format: 'pem' }).toString(), signature: p256Signature }));
+  const corruptedSignature = `${p256Signature[0] === 'A' ? 'B' : 'A'}${p256Signature.slice(1)}`;
+  assert.throws(() => verifyTrustedDeviceAssertion({ ...input, publicKey: p256.publicKey.export({ type: 'spki', format: 'pem' }).toString(), signature: corruptedSignature }));
+  const ed25519 = crypto.generateKeyPairSync('ed25519');
+  const edSignature = crypto.sign(null, message, ed25519.privateKey).toString('base64url');
+  assert.doesNotThrow(() => verifyTrustedDeviceAssertion({ ...input, publicKey: ed25519.publicKey.export({ type: 'spki', format: 'pem' }).toString(), signature: edSignature }));
+});
+
+test('operator handoff expiry accepts only timestamps strictly before the bound deadline', () => {
+  const { isStrictlyUnexpired } = loadTypeScriptModule('src/lib/stage1Operator.ts', {
+    './hubOperatorCredentials': { encryptToHubKey: () => ({}) },
+  });
+  const now = new Date('2026-09-25T12:00:00.000Z');
+  const deadline = new Date(now.getTime() + 60_000);
+  assert.equal(isStrictlyUnexpired(deadline, new Date(deadline.getTime() - 1)), true);
+  assert.equal(isStrictlyUnexpired(deadline, deadline), false);
+  assert.equal(isStrictlyUnexpired(deadline, new Date(deadline.getTime() + 1)), false);
 });
 
 test('manufacturing certificates sign only stable identity material and use separate key types', () => {

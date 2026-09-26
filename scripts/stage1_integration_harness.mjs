@@ -7,10 +7,13 @@ import { spawn, spawnSync } from 'node:child_process';
 import { createServer } from 'node:http';
 import net from 'node:net';
 import { PrismaClient } from '@prisma/client';
+import { stage1RouteInventory } from '../test/stage1_route_inventory.mjs';
 
 const root = process.cwd();
 const osRoot = process.env.DINODIA_OS_ROOT || path.resolve(root, '../Dinodia OS');
 const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'dinodia-stage1-integration-'));
+const outboundTargetFile = path.join(tempRoot, 'outbound-targets.log');
+fs.writeFileSync(outboundTargetFile, '', { mode: 0o600 });
 const dockerName = `dinodia-stage1-${process.pid}`;
 async function findFreePort() {
   const server = net.createServer();
@@ -74,6 +77,13 @@ function assertParentCredentialsAreNotForwarded() {
   for (const name of ['AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'DATABASE_URL', 'VERCEL_AUTOMATION_BYPASS_SECRET', 'SUPABASE_SERVICE_ROLE_KEY']) {
     if (Object.prototype.hasOwnProperty.call(isolated, name)) fail(`Sensitive parent environment variable was forwarded: ${name}`);
   }
+  const guard = path.join(root, 'scripts/stage1_loopback_guard.mjs');
+  const probeLog = path.join(tempRoot, 'egress-probe.log');
+  const blockedProbe = spawnSync(process.execPath, ['-e', "fetch('https://not-allowed.example.invalid').then(() => process.exit(2), (error) => { if (!String(error.message).includes('restricted to loopback')) process.exit(3); })"], {
+    encoding: 'utf8',
+    env: { ...isolated, NODE_OPTIONS: `--import=${JSON.stringify(guard)}`, STAGE1_OUTBOUND_TARGET_LOG: probeLog },
+  });
+  if (blockedProbe.status !== 0) fail('The child-process egress guard did not block a real-looking external destination before network access');
 }
 function run(command, args, envOrOptions = null) {
   const options = envOrOptions && (envOrOptions.env || envOrOptions.cwd) ? envOrOptions : { env: envOrOptions };
@@ -200,6 +210,9 @@ function baseEnv() {
   return {
     ...safeProcessEnvironment(),
     CI: '1', NODE_ENV: 'production', V2_ENVIRONMENT: 'test',
+    NEXT_TELEMETRY_DISABLED: '1', PRISMA_TELEMETRY_DISABLED: '1', CHECKPOINT_DISABLE: '1',
+    NODE_OPTIONS: `--import=${JSON.stringify(path.join(root, 'scripts/stage1_loopback_guard.mjs'))}`,
+    STAGE1_OUTBOUND_TARGET_LOG: outboundTargetFile,
     // Empty values must be explicit: Next loads .env.local in the child
     // process, and an omitted variable would allow the developer's real SES
     // configuration to leak back into this disposable server.
@@ -217,6 +230,18 @@ function baseEnv() {
     OPERATOR_SESSION_PRIVATE_KEY: operator.privateKey, MANUFACTURING_ROOT_PUBLIC_KEYS: harnessManufacturingRoot.publicKey,
     MANUFACTURING_ENROLLMENT_OPERATOR_PUBLIC_KEYS: company.publicKey, COMPANY_PORTAL_INITIAL_CXO_BOOTSTRAP_SECRET: crypto.randomBytes(32).toString('base64url'),
   };
+}
+function verifyChildOutboundTargets() {
+  const lines = fs.readFileSync(outboundTargetFile, 'utf8').split('\n').filter(Boolean);
+  const denied = lines.filter((line) => line.startsWith('DENIED\t'));
+  if (denied.length) fail(`An integration child attempted non-loopback egress (${denied.map((line) => line.split('\t')[1]).join(',')})`);
+  const allowed = new Set();
+  for (const line of lines) {
+    const [disposition, host, port] = line.split('\t');
+    if (disposition !== 'ALLOWED' || !['127.0.0.1', 'localhost', '::1'].includes(host.replace(/^\[|\]$/g, '').toLowerCase())) fail(`Integration child target escaped the loopback allow-list (${host})`);
+    allowed.add(`${host}:${port}`);
+  }
+  return [...allowed].sort();
 }
 async function fetchJson(url, init = {}) {
   const response = await fetch(url, init);
@@ -322,6 +347,7 @@ async function platformChecks() {
   if ((await fetch(`${base}/api/hub-agent/v2/heartbeat`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ serial: 'unauthenticated', identityGeneration: 1 }) })).status !== 401) fail('Unauthenticated hub route was not denied');
   if ((await fetch(`${base}/api/installer/workflows`)).status !== 401) fail('Unauthenticated work-list route was not denied');
   if ((await fetch(`${base}/api/installer/workflows`, { method: 'POST', headers: { 'content-type': 'application/json', 'idempotency-key': crypto.randomUUID() }, body: JSON.stringify({ attemptId: 'unauthenticated', assignedEmployeeId: crypto.randomUUID(), kind: 'INITIAL_HUB_INSTALLATION', reason: 'denial test' }) })).status !== 401) fail('Unauthenticated work-assignment route was not denied');
+  await protectedRouteDenialChecks(base);
   // The local harness deliberately omits mail-provider configuration. The
   // bootstrap capability must fail closed before creating an employee or
   // invitation, and must not require a live mailbox during engineering tests.
@@ -399,6 +425,59 @@ async function platformChecks() {
   await prisma.hubManufacturingIdentity.delete({ where: { id: seededWork.identityId } });
   seededWork = undefined;
 }
+
+async function tableRowSnapshot() {
+  const tables = await prisma.$queryRaw`SELECT tablename FROM pg_tables WHERE schemaname = 'public' ORDER BY tablename`;
+  const snapshot = {};
+  for (const { tablename } of tables) {
+    const safeTable = String(tablename).replaceAll('"', '""');
+    const rows = await prisma.$queryRawUnsafe(`SELECT COUNT(*)::text AS count FROM public."${safeTable}"`);
+    snapshot[tablename] = String(rows[0]?.count ?? '0');
+  }
+  return snapshot;
+}
+
+async function protectedRouteDenialChecks(base) {
+  const before = await tableRowSnapshot();
+  const results = [];
+  for (const [method, template, auth] of stage1RouteInventory.filter(([, , kind]) => !['public', 'public-login', 'capability'].includes(kind))) {
+    const route = template.replaceAll(':homeId', '00000000-0000-4000-8000-000000000001')
+      .replaceAll(':hubInstallationId', '00000000-0000-4000-8000-000000000001')
+      .replaceAll(':ticketId', '00000000-0000-4000-8000-000000000001')
+      .replaceAll(':requestId', '00000000-0000-4000-8000-000000000002')
+      .replaceAll(':trustedDeviceId', '00000000-0000-4000-8000-000000000001');
+    const response = await fetch(`${base}${route}`, {
+      method,
+      headers: method === 'GET' ? {} : { 'content-type': 'application/json' },
+      ...(method === 'GET' ? {} : { body: '{}' }),
+    });
+    results.push({ method, route, status: response.status });
+    const expected = auth === 'public-idempotent-logout' ? 204 : auth === 'signed-manufacturing-bootstrap' ? 400 : 401;
+    if (response.status !== expected) fail(`Route auth contract mismatch: ${method} ${route} expected ${expected}, got ${response.status} (${auth})`);
+  }
+  const invalidManufacturing = keyPair();
+  const invalidEncryption = x25519KeyPair();
+  const signatureDenial = await fetch(`${base}/api/hub-agent/v2/pairing/register`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ code: `DNO-${crypto.randomBytes(10).toString('hex')}`, envelope: {
+      serial: `untrusted-${crypto.randomUUID()}`, publicKeyPem: invalidManufacturing.publicKey,
+      encryptionPublicKeyPem: invalidEncryption.publicKey, identityGeneration: 1,
+      attemptId: crypto.randomUUID(),
+      baseUrl: 'http://dinodia-harness.local', expiresAt: Date.now() + 60_000,
+      publicKeyFingerprint: publicKeyFingerprint(invalidManufacturing.publicKey),
+      encryptionKeyFingerprint: publicKeyFingerprint(invalidEncryption.publicKey),
+      manufacturingRootSignature: 'invalid-test-root-signature', hubSignature: 'invalid-test-hub-signature',
+    } }),
+  });
+  if (signatureDenial.status !== 401) fail(`Well-formed but untrusted manufacturing registration did not return 401 (${signatureDenial.status})`);
+  const after = await tableRowSnapshot();
+  if (JSON.stringify(before) !== JSON.stringify(after)) {
+    const changed = Object.keys(after).filter((table) => before[table] !== after[table]).map((table) => `${table}:${before[table]}->${after[table]}`);
+    fail(`Unauthenticated/invalid-signature route matrix changed durable row counts: ${changed.join(', ')}`);
+  }
+  console.log(`[stage1:integration] PASS: ${results.length} inventoried protected Platform route/methods enforced unauthenticated 401 (idempotent logout 204, signed enrollment malformed-input 400) with no durable row-count changes; invalid root signature returned 401`);
+}
 async function customerAuthorizationChecks() {
   const base = `http://127.0.0.1:${appPort}`;
   const now = new Date();
@@ -433,7 +512,6 @@ async function customerAuthorizationChecks() {
   const machineSecret = `harness-machine-${crypto.randomUUID()}`;
   await prisma.hubCredentialVersion.create({ data: { hubInstallationId: hubOne.id, version: 1, purpose: 'machine-credential', state: 'ACTIVE', tokenHash: sha256(machineSecret), encryptedDeliveryEnvelope: { harness: true }, ciphertextKeyVersion: 1, deliveredAt: verifiedAt, acknowledgedAt: verifiedAt, activatedAt: verifiedAt } });
   await prisma.hubCredentialVersion.create({ data: { hubInstallationId: hubOne.id, version: 1, purpose: 'operator-credential', state: 'ACTIVE', tokenHash: sha256(`harness-operator-v1-${crypto.randomUUID()}`), encryptedDeliveryEnvelope: { harness: true }, ciphertextKeyVersion: 1, issuedAt: new Date(Date.now() - 61 * 60 * 1000), deliveredAt: verifiedAt, acknowledgedAt: verifiedAt, activatedAt: new Date(Date.now() - 61 * 60 * 1000) } });
-  await prisma.hubCredentialVersion.create({ data: { hubInstallationId: hubOne.id, version: 2, purpose: 'operator-credential', state: 'PENDING', tokenHash: sha256(`harness-operator-v2-${crypto.randomUUID()}`), encryptedDeliveryEnvelope: { harness: true }, ciphertextKeyVersion: 1 } });
   const email = `stage1-${crypto.randomUUID()}@invalid.test`;
   const username = `stage1-${crypto.randomUUID().slice(0, 8)}`;
   const account = await prisma.customerAccount.create({ data: { displayName: 'Stage 1 customer', username, usernameNormalized: username, email, emailNormalized: email, emailVerifiedAt: now, passwordHash: 'harness-only-password-hash' } });
@@ -444,6 +522,10 @@ async function customerAuthorizationChecks() {
   const propertyUsername = `stage1-owner-${crypto.randomUUID().slice(0, 8)}`;
   const propertyAccount = await prisma.customerAccount.create({ data: { displayName: 'Stage 1 homeowner', username: propertyUsername, usernameNormalized: propertyUsername, email: propertyEmail, emailNormalized: propertyEmail, emailVerifiedAt: now, passwordHash: 'harness-only-password-hash' } });
   const propertyMembership = await prisma.homeMembership.create({ data: { customerAccountId: propertyAccount.id, homeId: homeOne.id, role: 'OWNER' } });
+  const managerEmail = `stage1-manager-${crypto.randomUUID()}@invalid.test`;
+  const managerUsername = `stage1-manager-${crypto.randomUUID().slice(0, 8)}`;
+  const managerAccount = await prisma.customerAccount.create({ data: { displayName: 'Stage 1 property manager', username: managerUsername, usernameNormalized: managerUsername, email: managerEmail, emailNormalized: managerEmail, emailVerifiedAt: now, passwordHash: 'harness-only-password-hash' } });
+  const managerMembership = await prisma.homeMembership.create({ data: { customerAccountId: managerAccount.id, homeId: homeOne.id, role: 'PROPERTY_MANAGER' } });
   const phone = keyPair();
   const phoneThumbprint = crypto.createHash('sha256').update(crypto.createPublicKey(phone.publicKey).export({ type: 'spki', format: 'der' })).digest('hex');
   const trusted = await prisma.trustedDevice.create({ data: { customerAccountId: account.id, deviceInstallationId: `harness-phone-${crypto.randomUUID()}`, publicKey: phone.publicKey, publicKeyThumbprint: phoneThumbprint, deviceName: 'Harness phone' } });
@@ -454,14 +536,22 @@ async function customerAuthorizationChecks() {
   const propertyTrusted = await prisma.trustedDevice.create({ data: { customerAccountId: propertyAccount.id, deviceInstallationId: `harness-owner-phone-${crypto.randomUUID()}`, publicKey: propertyPhone.publicKey, publicKeyThumbprint: propertyPhoneThumbprint, deviceName: 'Harness homeowner phone' } });
   const propertyRawSession = `harness-owner-session-${crypto.randomUUID()}`;
   const propertySession = await prisma.customerSession.create({ data: { customerAccountId: propertyAccount.id, trustedDeviceId: propertyTrusted.id, refreshTokenHash: sha256(propertyRawSession), securityVersion: propertyAccount.securityVersion, trustedDeviceSessionVersion: propertyTrusted.sessionVersion, expiresAt: new Date(Date.now() + 60 * 60 * 1000) } });
+  const managerPhone = keyPair();
+  const managerPhoneThumbprint = crypto.createHash('sha256').update(crypto.createPublicKey(managerPhone.publicKey).export({ type: 'spki', format: 'der' })).digest('hex');
+  const managerTrusted = await prisma.trustedDevice.create({ data: { customerAccountId: managerAccount.id, deviceInstallationId: `harness-manager-phone-${crypto.randomUUID()}`, publicKey: managerPhone.publicKey, publicKeyThumbprint: managerPhoneThumbprint, deviceName: 'Harness property-manager phone' } });
+  const managerRawSession = `harness-manager-session-${crypto.randomUUID()}`;
+  const managerSession = await prisma.customerSession.create({ data: { customerAccountId: managerAccount.id, trustedDeviceId: managerTrusted.id, refreshTokenHash: sha256(managerRawSession), securityVersion: managerAccount.securityVersion, trustedDeviceSessionVersion: managerTrusted.sessionVersion, expiresAt: new Date(Date.now() + 60 * 60 * 1000) } });
   const issue = async (homeId) => fetchJson(`${base}/api/v2/hub-sessions`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-session': rawSession }, body: JSON.stringify({ homeId }) });
   const issueProperty = async () => fetchJson(`${base}/api/v2/hub-sessions`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-session': propertyRawSession }, body: JSON.stringify({ homeId: homeOne.id }) });
+  const issueManager = async () => fetchJson(`${base}/api/v2/hub-sessions`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-session': managerRawSession }, body: JSON.stringify({ homeId: homeOne.id }) });
   const tenantToken = await issue(homeOne.id);
   if (tenantToken.response.status !== 200 || !tenantToken.body.token) fail(`Tenant hub session was not issued (${tenantToken.response.status})`);
   const ownerToken = await issue(homeTwo.id);
   if (ownerToken.response.status !== 200 || !ownerToken.body.token) fail(`Second-home owner session was not issued (${ownerToken.response.status})`);
   const propertyToken = await issueProperty();
   if (propertyToken.response.status !== 200 || !propertyToken.body.token) fail(`Homeowner session was not issued (${propertyToken.response.status})`);
+  const managerToken = await issueManager();
+  if (managerToken.response.status !== 200 || !managerToken.body.token) fail(`Property-manager session was not issued (${managerToken.response.status})`);
   const tenantOffline = await fetchJson(`${base}/api/v2/offline-authorisations`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-app-token': tenantToken.body.token }, body: JSON.stringify({ trustedDeviceId: trusted.id, publicKey: phone.publicKey }) });
   if (tenantOffline.response.status !== 200 || tenantOffline.body.authorisation?.homeId !== homeOne.id) fail(`Tenant offline authority was not scoped to the selected home (${tenantOffline.response.status})`);
   const ownerOffline = await fetchJson(`${base}/api/v2/offline-authorisations`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-app-token': ownerToken.body.token }, body: JSON.stringify({ trustedDeviceId: trusted.id, publicKey: phone.publicKey }) });
@@ -527,6 +617,9 @@ async function customerAuthorizationChecks() {
   await prisma.homeClaimReservation.update({ where: { id: scheduledReservation.body.reservationId }, data: { createdAt: new Date(Date.now() - 2000), expiresAt: new Date(Date.now() - 1000) } });
   const scheduledRun = await fetchJson(`${machineBase}/api/cron/native-operations`, { method: 'POST', headers: { authorization: `Bearer ${env.CRON_SECRET}` } });
   if (scheduledRun.response.status !== 200 || Number(scheduledRun.body.releasedClaims) < 1) fail(`Shared native-operations dispatcher did not release the expired claim (${scheduledRun.response.status}/${JSON.stringify(scheduledRun.body)})`);
+  if (Number(scheduledRun.body.credentials?.rotated) < 1) fail(`The shared native-operations dispatcher did not rotate an operator credential past its 60-minute issue deadline (${JSON.stringify(scheduledRun.body.credentials)})`);
+  const automaticallyRotated = await prisma.hubCredentialVersion.findFirst({ where: { hubInstallationId: hubOne.id, purpose: 'operator-credential', version: 2 }, select: { state: true, issuedAt: true } });
+  if (automaticallyRotated?.state !== 'PENDING' || automaticallyRotated.issuedAt.getTime() > Date.now()) fail('The due operator rotation did not persist exactly one pending version before hub delivery');
   if (await prisma.customerAccount.findUnique({ where: { id: scheduledAccount.id }, select: { id: true } })) fail('Scheduled claim expiry did not delete an otherwise-unrelated verified account');
   await prisma.homeClaimChallenge.deleteMany({ where: { hubInstallationId: claimHub.id } });
   await prisma.homeClaimReference.deleteMany({ where: { id: claimReference.id } });
@@ -544,12 +637,12 @@ async function customerAuthorizationChecks() {
   if (acknowledgedRow?.state !== 'ACKNOWLEDGED' || !acknowledgedRow.acknowledgedAt || acknowledgedRow.activatedAt) fail('Acknowledgement incorrectly activated the operator credential');
   const activated = await machineRequest({ base: machineBase, path: '/api/hub-agent/v2/credentials/activate', machineSecret, body: { serial: identityOne.serialNumber, identityGeneration: identityOne.identityGeneration, version: 2, credentialFingerprint: operatorV2.tokenHash } });
   if (activated.response.status !== 200 || activated.body.state !== 'ACTIVE') fail(`Operator activation failed (${activated.response.status})`);
-  const lifecycleRows = await prisma.hubCredentialVersion.findMany({ where: { hubInstallationId: hubOne.id, purpose: 'operator-credential' }, orderBy: { version: 'asc' }, select: { version: true, state: true, graceUntil: true } });
+  const lifecycleRows = await prisma.hubCredentialVersion.findMany({ where: { hubInstallationId: hubOne.id, purpose: 'operator-credential' }, orderBy: { version: 'asc' }, select: { version: true, state: true, graceUntil: true, activatedAt: true } });
   const oldOperator = lifecycleRows.find((row) => row.version === 1);
   const newOperator = lifecycleRows.find((row) => row.version === 2);
   if (oldOperator?.state !== 'GRACE' || !oldOperator.graceUntil || newOperator?.state !== 'ACTIVE') fail(`Operator lifecycle did not separate grace and active states (${JSON.stringify(lifecycleRows)})`);
-  const graceRemaining = oldOperator.graceUntil.getTime() - Date.now();
-  if (graceRemaining < 19 * 60 * 1000 || graceRemaining > 20 * 60 * 1000 + 5000) fail(`Operator grace was not exactly 20 minutes (${graceRemaining})`);
+  const graceDuration = oldOperator.graceUntil.getTime() - newOperator.activatedAt.getTime();
+  if (!newOperator.activatedAt || graceDuration !== 20 * 60 * 1000) fail(`Operator grace was not exactly 20 minutes from the new version's activation transition (${graceDuration})`);
 
   // Support is exercised through the real customer, employee and
   // machine-authenticated routes. The employee never receives the customer
@@ -806,6 +899,38 @@ async function customerAuthorizationChecks() {
     const tokenClaims = JSON.parse(Buffer.from(String(tenantToken.body.token).split('.')[2], 'base64url').toString('utf8'));
     fail(`Authorized command did not reach the safe fake physical adapter (${JSON.stringify({ commandResult, fakePhysicalCommandCount, token: { householdRole: tokenClaims.householdRole, scope: tokenClaims.scope, areaIds: tokenClaims.areaIds, membershipId: tokenClaims.membershipId, hubInstallationId: tokenClaims.hubInstallationId }, entity: { haId: tenantEntity.haId, capability: tenantEntity.entity?.capability, device: { areaId: tenantEntity.device.areaId, metadata: tenantEntity.device.metadata, labelIds: tenantEntity.device.labelIds } } })})`);
   }
+  for (const { role, token } of [
+    { role: 'owner', token: propertyToken.body.token },
+    { role: 'property manager', token: managerToken.body.token },
+  ]) {
+    const roleSocket = new WebSocket(socketUrl);
+    const roleAuthRequired = wsMessage(roleSocket, `same-home ${role} auth_required`);
+    await wsOpen(roleSocket, `same-home ${role}`);
+    if ((await roleAuthRequired).type !== 'auth_required') fail(`Same-home ${role} WebSocket did not request authentication`);
+    roleSocket.send(JSON.stringify({ type: 'auth', access_token: token }));
+    if ((await wsMessage(roleSocket, `same-home ${role} auth_ok`)).type !== 'auth_ok') fail(`Valid same-home ${role} token was not distinguished from invalid authentication`);
+    roleSocket.send(JSON.stringify({ id: 10, type: 'get_states' }));
+    const roleStates = await wsMessage(roleSocket, `same-home ${role} filtered states`);
+    if (!roleStates.success || roleStates.result.some((state) => state.entity_id === tenantEntity.haId)) fail(`${role} WebSocket exposed tenant-private device state`);
+    roleSocket.send(JSON.stringify({ id: 11, type: 'call_service', domain: 'switch', service: 'turn_on', target: { entity_id: tenantEntity.haId } }));
+    const roleCommand = await wsMessage(roleSocket, `same-home ${role} denied command`);
+    if (roleCommand.success || roleCommand.error?.code !== 'insufficient_scope' || fakePhysicalCommandCount !== 1) fail(`Same-home ${role} command was not denied without a physical side effect`);
+    roleSocket.close();
+  }
+
+  await hub.store.upsertDevice({
+    id: 'harness-tenant-device', name: 'Harness tenant light', protocol: 'zigbee', areaId: areaTwo.id,
+    labelIds: ['tenant_device'], metadata: { label: 'tenant_device', tenantOwnerMembershipId: tenantMembership.id }, state: { state: 'OFF' }, setup: { status: 'ready' },
+    entities: { 'harness-tenant-device:state': { name: 'Harness tenant light', stateKey: 'state', domain: 'switch', category: 'control', writable: true, primary: true, capability: { readable: true, writable: true, primary: true, category: 'control', bindings: [{ serviceId: 'switch.turn_on' }] } } },
+  });
+  tenantSocket.send(JSON.stringify({ id: 12, type: 'call_service', domain: 'switch', service: 'turn_on', target: { entity_id: tenantEntity.haId } }));
+  const movedDeviceCommand = await wsMessage(tenantSocket, 'moved tenant device command');
+  if (movedDeviceCommand.success || fakePhysicalCommandCount !== 1) fail('Tenant command remained allowed after its device moved outside the granted area');
+  await hub.store.upsertDevice({
+    id: 'harness-tenant-device', name: 'Harness tenant light', protocol: 'zigbee', areaId: areaOne.id,
+    labelIds: ['tenant_device'], metadata: { label: 'tenant_device', tenantOwnerMembershipId: tenantMembership.id }, state: { state: 'OFF' }, setup: { status: 'ready' },
+    entities: { 'harness-tenant-device:state': { name: 'Harness tenant light', stateKey: 'state', domain: 'switch', category: 'control', writable: true, primary: true, capability: { readable: true, writable: true, primary: true, category: 'control', bindings: [{ serviceId: 'switch.turn_on' }, { serviceId: 'switch.turn_off' }, { serviceId: 'switch.toggle' }] } } },
+  });
   await hub.store.upsertDevice({
     id: 'harness-tenant-device',
     name: 'Harness tenant light',
@@ -900,7 +1025,122 @@ async function customerAuthorizationChecks() {
   const operatorSession = operatorLogin.session;
   const operatorToken = operatorLogin.token;
   const operatorWork = await prisma.companyOperationalWorkItem.create({ data: { publicReference: `DIN-${sha256(`handoff-${crypto.randomUUID()}`).slice(0, 16).toUpperCase()}`, kind: 'INITIAL_HUB_INSTALLATION', state: 'ASSIGNED', homeId: homeOne.id, hubInstallationId: hubOne.id, certifiedSerialNumber: identityOne.serialNumber, assignedEmployeeId: operatorEmployee.id, createdByEmployeeId: operatorEmployee.id, reason: 'Disposable browser-bound operator handoff test' } });
-  customerFixture = { accountId: account.id, sessionId: session.id, trustedDeviceId: trusted.id, propertyAccountId: propertyAccount.id, propertySessionId: propertySession.id, propertyTrustedDeviceId: propertyTrusted.id, homeOneId: homeOne.id, homeTwoId: homeTwo.id, hubOneId: hubOne.id, hubTwoId: hubTwo.id, identityOneId: identityOne.id, identityTwoId: identityTwo.id, tenantDeviceId: tenantDevice.id, machineSecret, tenantMembershipId: tenantMembership.id, ownerMembershipId: ownerMembership.id, propertyMembershipId: propertyMembership.id, areaOneId: areaOne.id, areaTwoId: areaTwo.id, tenantToken: tenantToken.body.token, ownerToken: ownerToken.body.token, propertyToken: propertyToken.body.token, ticketId, stepUpTicketId, identityOneSigningPrivateKey: identityOneSigning.privateKey, identityOneSigningPublicKey: identityOneSigning.publicKey, identityOneEncryptionPrivateKey: identityOneEncryption.privateKey, identityOneEncryptionPublicKey: identityOneEncryption.publicKey, identityOneSerial: identityOne.serialNumber, identityOneGeneration: identityOne.identityGeneration, operatorEmployeeId: operatorEmployee.id, operatorSessionId: operatorSession.id, operatorWorkId: operatorWork.id, operatorToken };
+  customerFixture = { accountId: account.id, sessionId: session.id, trustedDeviceId: trusted.id, propertyAccountId: propertyAccount.id, propertySessionId: propertySession.id, propertyTrustedDeviceId: propertyTrusted.id, managerAccountId: managerAccount.id, managerMembershipId: managerMembership.id, managerSessionId: managerSession.id, managerTrustedDeviceId: managerTrusted.id, homeOneId: homeOne.id, homeTwoId: homeTwo.id, hubOneId: hubOne.id, hubTwoId: hubTwo.id, identityOneId: identityOne.id, identityTwoId: identityTwo.id, tenantDeviceId: tenantDevice.id, machineSecret, tenantMembershipId: tenantMembership.id, ownerMembershipId: ownerMembership.id, propertyMembershipId: propertyMembership.id, areaOneId: areaOne.id, areaTwoId: areaTwo.id, tenantToken: tenantToken.body.token, ownerToken: ownerToken.body.token, propertyToken: propertyToken.body.token, managerToken: managerToken.body.token, ticketId, stepUpTicketId, identityOneSigningPrivateKey: identityOneSigning.privateKey, identityOneSigningPublicKey: identityOneSigning.publicKey, identityOneEncryptionPrivateKey: identityOneEncryption.privateKey, identityOneEncryptionPublicKey: identityOneEncryption.publicKey, identityOneSerial: identityOne.serialNumber, identityOneGeneration: identityOne.identityGeneration, operatorEmployeeId: operatorEmployee.id, operatorSessionId: operatorSession.id, operatorWorkId: operatorWork.id, operatorToken };
+}
+
+async function operatorMutationChecks() {
+  const base = `http://127.0.0.1:${appPort}`;
+  const homeId = customerFixture.homeOneId;
+  const hubId = customerFixture.hubOneId;
+  const employeePassword = `harness-cxo-operator-${crypto.randomUUID()}`;
+  const employeeEmail = `operator-cxo-${crypto.randomUUID()}@invalid.test`;
+  const employee = await prisma.companyEmployeeAccount.create({ data: {
+    displayName: 'Harness CXO operator mutation',
+    email: employeeEmail,
+    emailNormalized: employeeEmail,
+    role: 'CXO',
+    status: 'ACTIVE',
+    passwordHash: hashPassword(employeePassword),
+  } });
+  const login = await loginEmployee(base, employee, employeePassword);
+  const makeWork = async (suffix) => prisma.companyOperationalWorkItem.create({ data: {
+    publicReference: `DIN-${sha256(`operator-mutation-${suffix}-${crypto.randomUUID()}`).slice(0, 16).toUpperCase()}`,
+    kind: 'INITIAL_HUB_INSTALLATION',
+    state: 'IN_PROGRESS',
+    homeId,
+    hubInstallationId: hubId,
+    certifiedSerialNumber: customerFixture.identityOneSerial,
+    assignedEmployeeId: employee.id,
+    createdByEmployeeId: employee.id,
+    reason: `Disposable operator mutation ${suffix}`,
+  } });
+  const work = await makeWork('primary');
+  const alternateWork = await makeWork('alternate');
+  const idempotencyKeys = [];
+  const post = (action, key, workflowId, extra = {}) => {
+    idempotencyKeys.push(key);
+    return fetchJson(`${base}/api/installer/home-support/homes/${encodeURIComponent(homeId)}/os-access/${action}`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        cookie: cookieHeader(login.jar),
+        'idempotency-key': key,
+      },
+      body: JSON.stringify({ workflowId, ...extra }),
+    });
+  };
+  const createdVersions = new Set();
+  const baselineVersion = (await prisma.hubCredentialVersion.aggregate({ where: { hubInstallationId: hubId, purpose: 'operator-credential' }, _max: { version: true } }))._max.version ?? 0;
+  const originalHub = await prisma.hubInstallation.findUnique({ where: { id: hubId }, select: { currentOperatorCredentialVersion: true, accessPolicyRevision: true } });
+  try {
+    const firstKey = `operator-rotate-initial-${crypto.randomUUID()}`;
+    const first = await post('rotate', firstKey, work.id);
+    if (first.response.status !== 200 || first.body.state !== 'PENDING' || !Number.isInteger(first.body.version)) fail(`Authenticated operator rotation failed (${first.response.status}/${first.body.errorCode || 'unknown'})`);
+    createdVersions.add(first.body.version);
+    const firstRowCount = await prisma.hubCredentialVersion.count({ where: { hubInstallationId: hubId, purpose: 'operator-credential' } });
+    const rateKey = `operator-rotate:${employee.id}:${hubId}`;
+    const mutationRecord = await prisma.idempotencyRecord.findUniqueOrThrow({ where: { namespace_keyHash: { namespace: 'operator-rotate:v1', keyHash: sha256(`${employee.id}:${firstKey}`) } }, select: { actorId: true, homeId: true, hubInstallationId: true, requestHash: true } });
+    if (mutationRecord.actorId !== employee.id || mutationRecord.homeId !== homeId || mutationRecord.hubInstallationId !== hubId || !mutationRecord.requestHash) fail('Operator idempotency record is not durably bound to the resolved actor, home, hub and workflow request');
+    const firstRateBucket = await prisma.authRateLimitBucket.findUniqueOrThrow({ where: { bucketKey: rateKey }, select: { attempts: true } });
+    const replay = await post('rotate', firstKey, work.id);
+    if (replay.response.status !== 200 || replay.body.version !== first.body.version || canonicalValue(replay.body) !== canonicalValue(first.body)) fail('Exact operator rotate retry did not return its original result');
+    if (await prisma.hubCredentialVersion.count({ where: { hubInstallationId: hubId, purpose: 'operator-credential' } }) !== firstRowCount) fail('Exact operator rotate retry created a duplicate credential version');
+    const replayRateBucket = await prisma.authRateLimitBucket.findUniqueOrThrow({ where: { bucketKey: rateKey }, select: { attempts: true } });
+    if (replayRateBucket.attempts !== firstRateBucket.attempts) fail('Exact operator retry consumed an additional rate-limit attempt');
+
+    const conflict = await post('rotate', firstKey, alternateWork.id);
+    if (conflict.response.status !== 409) fail(`Conflicting operator idempotency-key reuse was accepted (${conflict.response.status})`);
+
+    const concurrentKey = `operator-rotate-race-${crypto.randomUUID()}`;
+    const concurrent = await Promise.all([post('rotate', concurrentKey, alternateWork.id), post('rotate', concurrentKey, alternateWork.id)]);
+    if (concurrent.some((entry) => entry.response.status !== 200 || entry.body.version !== concurrent[0].body.version)) fail(`Concurrent same-key rotations did not converge (${concurrent.map((entry) => entry.response.status).join('/')})`);
+    createdVersions.add(concurrent[0].body.version);
+    if (await prisma.hubCredentialVersion.count({ where: { hubInstallationId: hubId, purpose: 'operator-credential' } }) !== firstRowCount + 1) fail('Concurrent same-key rotation created more than one credential version');
+    const concurrentRateBucket = await prisma.authRateLimitBucket.findUniqueOrThrow({ where: { bucketKey: rateKey }, select: { attempts: true } });
+    if (concurrentRateBucket.attempts !== firstRateBucket.attempts + 1) fail('Concurrent same-key rotation consumed more than one rate-limit attempt');
+
+    for (let index = 0; index < 3; index += 1) {
+      const key = `operator-rotate-limit-${index}-${crypto.randomUUID()}`;
+      const accepted = await post('rotate', key, work.id);
+      if (accepted.response.status !== 200) fail(`Operator rotation attempt ${index + 3} was unexpectedly denied (${accepted.response.status})`);
+      createdVersions.add(accepted.body.version);
+    }
+    const sixth = await post('rotate', `operator-rotate-sixth-${crypto.randomUUID()}`, work.id);
+    if (sixth.response.status !== 429) fail(`The sixth operator rotation attempt was not rate-limited (${sixth.response.status})`);
+
+    const exactHourBoundary = new Date(Date.now() - 60 * 60 * 1000);
+    await prisma.authRateLimitBucket.update({ where: { bucketKey: rateKey }, data: { windowStart: exactHourBoundary, attempts: 5, attemptTimestamps: Array.from({ length: 5 }, () => exactHourBoundary.toISOString()), blockedUntil: null } });
+    const boundary = await post('rotate', `operator-rotate-boundary-${crypto.randomUUID()}`, work.id);
+    if (boundary.response.status !== 200) fail(`Operator rotate window did not reset at the one-hour boundary (${boundary.response.status})`);
+    createdVersions.add(boundary.body.version);
+
+    const revokeKey = `operator-revoke-initial-${crypto.randomUUID()}`;
+    const revoke = await post('revoke', revokeKey, work.id, { reason: 'Disposable operator revoke idempotency test' });
+    if (revoke.response.status !== 200 || typeof revoke.body.revoked !== 'number') fail(`Authenticated operator revocation failed (${revoke.response.status})`);
+    const revokeReplay = await post('revoke', revokeKey, work.id, { reason: 'Disposable operator revoke idempotency test' });
+    if (revokeReplay.response.status !== 200 || JSON.stringify(revokeReplay.body) !== JSON.stringify(revoke.body)) fail('Exact operator revoke retry did not return its original result');
+    const conflictingRevoke = await post('revoke', revokeKey, work.id, { reason: 'Different reason for same idempotency key' });
+    if (conflictingRevoke.response.status !== 409) fail(`Conflicting operator revoke idempotency-key reuse was accepted (${conflictingRevoke.response.status})`);
+
+    for (let index = 0; index < 4; index += 1) {
+      const accepted = await post('revoke', `operator-revoke-limit-${index}-${crypto.randomUUID()}`, work.id, { reason: `Disposable rate test ${index}` });
+      if (accepted.response.status !== 200) fail(`Operator revoke attempt ${index + 2} was unexpectedly denied (${accepted.response.status})`);
+    }
+    const sixthRevoke = await post('revoke', `operator-revoke-sixth-${crypto.randomUUID()}`, work.id, { reason: 'Sixth attempt must be denied' });
+    if (sixthRevoke.response.status !== 429) fail(`The sixth operator revoke attempt was not rate-limited (${sixthRevoke.response.status})`);
+    const revokedRows = await prisma.hubCredentialVersion.count({ where: { hubInstallationId: hubId, purpose: 'operator-credential', state: 'REVOKED', version: { gt: baselineVersion } } });
+    if (revokedRows !== createdVersions.size) fail(`Operator revocation did not revoke every created test version (${revokedRows}/${createdVersions.size})`);
+    console.log('[stage1:integration] PASS: operator rotate/revoke routes enforce five-per-hub limits and transactionally replay idempotent results under concurrency');
+  } finally {
+    await prisma.hubCredentialVersion.deleteMany({ where: { hubInstallationId: hubId, purpose: 'operator-credential', version: { gt: baselineVersion } } }).catch(() => {});
+    await prisma.idempotencyRecord.deleteMany({ where: { actorId: employee.id, namespace: { in: ['operator-rotate:v1', 'operator-revoke:v1'] } } }).catch(() => {});
+    await prisma.authRateLimitBucket.deleteMany({ where: { bucketKey: { in: [`operator-rotate:${employee.id}:${hubId}`, `operator-revoke:${employee.id}:${hubId}`] } } }).catch(() => {});
+    await prisma.auditEvent.deleteMany({ where: { actorType: 'EMPLOYEE', actorId: employee.id } }).catch(() => {});
+    await prisma.hubInstallation.update({ where: { id: hubId }, data: { currentOperatorCredentialVersion: originalHub?.currentOperatorCredentialVersion ?? null, accessPolicyRevision: originalHub?.accessPolicyRevision ?? 0 } }).catch(() => {});
+    await prisma.companyOperationalWorkItem.deleteMany({ where: { id: { in: [work.id, alternateWork.id] } } }).catch(() => {});
+    await prisma.employeeSession.deleteMany({ where: { employeeId: employee.id } }).catch(() => {});
+    await prisma.companyEmployeeAccount.delete({ where: { id: employee.id } }).catch(() => {});
+  }
 }
 
 async function osChecks() {
@@ -914,7 +1154,7 @@ async function osChecks() {
   // without copying private key material into the OS application or logs.
   hub.pairing.apiUrl = platformBase;
   await hub.vault.set('platform.machineCredential', customerFixture.machineSecret);
-  await hub.store.savePlatform({ paired: true, hubInstallId: customerFixture.hubOneId, provisioningCredentialVersion: 1, operatorCredentialVersion: 2, policyRevision: 0 });
+  await hub.store.savePlatform({ paired: true, hubInstallId: customerFixture.hubOneId, provisioningCredentialVersion: 1, operatorCredentialVersion: 2, operatorCredentialStates: [{ version: 2, state: 'ACTIVE', graceUntil: null }], policyRevision: 0 });
   hub.pairing.identityBroker = {
     async getPublicIdentity() {
       return {
@@ -961,6 +1201,50 @@ async function osChecks() {
   if (!identityCheck || identityCheck.status !== 'ACTIVE') fail(`Operator fixture identity is not active before handoff (${JSON.stringify(identityCheck)})`);
   const hubIdentity = hub.store.getIdentity?.() || {};
   if (String(hubIdentity.serial || '') !== customerFixture.identityOneSerial) fail(`Disposable hub serial is not bound to the registered manufacturing serial (${String(hubIdentity.serial || '')}/${customerFixture.identityOneSerial})`);
+  const wrongHomeLaunch = await fetchJson(`${platformBase}/api/installer/home-support/homes/${encodeURIComponent(customerFixture.homeTwoId)}/os-access/launch`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-dinodia-employee-session': customerFixture.operatorToken },
+    body: JSON.stringify({ workflowId: customerFixture.operatorWorkId, setupAttemptId: setupAttempt.body.setupAttemptId }),
+  });
+  if (wrongHomeLaunch.response.status !== 403) fail(`Operator work was accepted for a different home (${wrongHomeLaunch.response.status})`);
+  const wrongAttemptLaunch = await fetchJson(`${platformBase}/api/installer/home-support/homes/${encodeURIComponent(customerFixture.homeOneId)}/os-access/launch`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-dinodia-employee-session': customerFixture.operatorToken },
+    body: JSON.stringify({ workflowId: customerFixture.operatorWorkId, setupAttemptId: crypto.randomBytes(32).toString('base64url') }),
+  });
+  if (wrongAttemptLaunch.response.status !== 403) fail(`An unregistered setup attempt was accepted for operator handoff (${wrongAttemptLaunch.response.status})`);
+
+  const wrongEmployeePassword = `harness-wrong-employee-${crypto.randomUUID()}`;
+  const wrongEmployeeEmail = `other-installer-${crypto.randomUUID()}@invalid.test`;
+  const wrongEmployee = await prisma.companyEmployeeAccount.create({ data: { displayName: 'Different assigned employee', email: wrongEmployeeEmail, emailNormalized: wrongEmployeeEmail, role: 'INSTALLER', status: 'ACTIVE', passwordHash: hashPassword(wrongEmployeePassword) } });
+  const wrongEmployeeLogin = await loginEmployee(platformBase, wrongEmployee, wrongEmployeePassword);
+  try {
+    const wrongEmployeeLaunch = await fetchJson(`${platformBase}/api/installer/home-support/homes/${encodeURIComponent(customerFixture.homeOneId)}/os-access/launch`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie: cookieHeader(wrongEmployeeLogin.jar) },
+      body: JSON.stringify({ workflowId: customerFixture.operatorWorkId, setupAttemptId: setupAttempt.body.setupAttemptId }),
+    });
+    if (wrongEmployeeLaunch.response.status !== 403) fail(`A different active employee received an unassigned operator handoff (${wrongEmployeeLaunch.response.status})`);
+  } finally {
+    await prisma.employeeSession.deleteMany({ where: { employeeId: wrongEmployee.id } }).catch(() => {});
+    await prisma.companyEmployeeAccount.delete({ where: { id: wrongEmployee.id } }).catch(() => {});
+  }
+
+  const expiredSetup = await fetch(`${base}/setup`, { headers: { host: '127.0.0.1' } });
+  const expiredBrowser = {};
+  updateCookieJar(expiredBrowser, expiredSetup);
+  const expiredRegistration = await fetchJson(`${base}/_dinodia/setup/operator-attempt`, {
+    method: 'POST',
+    headers: { host: osHost, origin: osOrigin, cookie: cookieHeader(expiredBrowser), 'x-dinodia-setup-csrf': decodeURIComponent(cookieValue(expiredBrowser, 'dinodia_setup_csrf')) },
+  });
+  if (expiredRegistration.response.status !== 200 || !expiredRegistration.body.setupAttemptId) fail(`Could not register disposable attempt for expiry denial (${expiredRegistration.response.status})`);
+  await prisma.operatorBrowserAttempt.update({ where: { attemptId: expiredRegistration.body.setupAttemptId }, data: { expiresAt: new Date(Date.now() - 1) } });
+  const expiredAttemptLaunch = await fetchJson(`${platformBase}/api/installer/home-support/homes/${encodeURIComponent(customerFixture.homeOneId)}/os-access/launch`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-dinodia-employee-session': customerFixture.operatorToken },
+    body: JSON.stringify({ workflowId: customerFixture.operatorWorkId, setupAttemptId: expiredRegistration.body.setupAttemptId }),
+  });
+  if (expiredAttemptLaunch.response.status !== 403) fail(`An expired hub-created browser attempt received an operator handoff (${expiredAttemptLaunch.response.status})`);
   const launch = await fetchJson(`${platformBase}/api/installer/home-support/homes/${encodeURIComponent(customerFixture.homeOneId)}/os-access/launch`, {
     method: 'POST',
     headers: { 'content-type': 'application/json', 'x-dinodia-employee-session': customerFixture.operatorToken },
@@ -971,6 +1255,8 @@ async function osChecks() {
   if (/dno1\.|osb_|handoffSecret|secret/i.test(handoffJson)) fail('Company Portal handoff response contained a reusable credential');
   const directPrepare = await machineRequest({ base: platformBase, path: '/api/hub-agent/operator-session/consume', machineSecret: customerFixture.machineSecret, body: { serial: customerFixture.identityOneSerial, identityGeneration: customerFixture.identityOneGeneration, handoffId: launch.body.handoffId, browserBinding: decodeURIComponent(cookieValue(browserA, 'dinodia_operator_binding')), setupAttemptId: setupAttempt.body.setupAttemptId, phase: 'prepare' } });
   if (directPrepare.response.status !== 200 || !directPrepare.body.handoffSecretEnvelope) fail(`Machine-authenticated handoff prepare failed before OS consumption (${directPrepare.response.status}/${directPrepare.body.errorCode || directPrepare.body.error || 'unknown'})`);
+  const missingSecretConsume = await machineRequest({ base: platformBase, path: '/api/hub-agent/operator-session/consume', machineSecret: customerFixture.machineSecret, body: { serial: customerFixture.identityOneSerial, identityGeneration: customerFixture.identityOneGeneration, handoffId: launch.body.handoffId, browserBinding: decodeURIComponent(cookieValue(browserA, 'dinodia_operator_binding')), setupAttemptId: setupAttempt.body.setupAttemptId, phase: 'consume' } });
+  if (missingSecretConsume.response.status !== 401 || missingSecretConsume.body.errorCode !== 'handoff_secret_required') fail(`A machine handoff was consumed without proof of its one-use secret (${missingSecretConsume.response.status}/${missingSecretConsume.body.errorCode || 'unknown'})`);
 
   const setupB = await fetch(`${base}/setup`, { headers: { host: '127.0.0.1' } });
   const browserB = {};
@@ -993,12 +1279,20 @@ async function osChecks() {
   const intendedSetCookies = typeof intendedHandoff.headers.getSetCookie === 'function' ? intendedHandoff.headers.getSetCookie().join(';') : String(intendedHandoff.headers.get('set-cookie') || '');
   if (!/dinodia_os_operator_session=[^;]+/.test(intendedSetCookies) || !/HttpOnly/i.test(intendedSetCookies)) fail('The originating browser did not receive an HttpOnly OS session cookie');
   if (/dno1\.|operatorToken|handoffSecret|sessionGrant|DINODIA_ADMIN_TOKEN/i.test(JSON.stringify(intendedBody))) fail('Operator handoff response exposed an OS bearer or reusable secret');
+  const intendedOsRead = await fetchJson(`${base}/_dinodia/admin/api/devices`, { headers: { host: '127.0.0.1', cookie: cookieHeader(browserA) } });
+  if (intendedOsRead.response.status !== 200 || !Array.isArray(intendedOsRead.body.devices)) fail(`The intended browser's HttpOnly handoff session did not authorize a real OS devices read (${intendedOsRead.response.status})`);
+  const copiedSessionRead = await fetchJson(`${base}/_dinodia/admin/api/devices`, { headers: { host: '127.0.0.1', cookie: cookieHeader(browserB) } });
+  if (copiedSessionRead.response.status !== 401) fail(`A second browser obtained OS access without the originating browser session (${copiedSessionRead.response.status})`);
   const replayHandoff = await fetchJson(`${base}/_dinodia/setup/operator-session`, {
     method: 'POST',
     headers: { 'content-type': 'application/json', host: osHost, origin: osOrigin, cookie: cookieHeader(browserA), 'x-dinodia-setup-csrf': decodeURIComponent(cookieValue(browserA, 'dinodia_setup_csrf')) },
     body: JSON.stringify({ handoffId: launch.body.handoffId }),
   });
   if (![400, 401, 403].includes(replayHandoff.response.status)) fail(`The operator handoff replay was accepted (${replayHandoff.response.status})`);
+  await hub.store.savePlatform({ operatorCredentialStates: [] });
+  const revokedOsRead = await fetchJson(`${base}/_dinodia/admin/api/devices`, { headers: { host: '127.0.0.1', cookie: cookieHeader(browserA) } });
+  if (revokedOsRead.response.status !== 401) fail(`Removing the active operator credential did not revoke the real OS session (${revokedOsRead.response.status})`);
+  console.log('[stage1:integration] PASS: authenticated 200 proves the intended browser session; second browser and revoked credential receive 401 without exposing token material');
 
   const WebSocket = createRequire(import.meta.url)(path.join(osRoot, 'node_modules/ws'));
   await new Promise((resolve, reject) => {
@@ -1037,6 +1331,9 @@ async function cleanup() {
     await prisma.trustedDevice.deleteMany({ where: { id: customerFixture.trustedDeviceId } }).catch(() => {});
     await prisma.customerSession.deleteMany({ where: { id: customerFixture.propertySessionId } }).catch(() => {});
     await prisma.trustedDevice.deleteMany({ where: { id: customerFixture.propertyTrustedDeviceId } }).catch(() => {});
+    await prisma.customerSession.deleteMany({ where: { id: customerFixture.managerSessionId } }).catch(() => {});
+    await prisma.trustedDevice.deleteMany({ where: { id: customerFixture.managerTrustedDeviceId } }).catch(() => {});
+    await prisma.homeMembership.deleteMany({ where: { id: customerFixture.managerMembershipId } }).catch(() => {});
     await prisma.tenantAreaGrant.deleteMany({ where: { membershipId: { in: [customerFixture.tenantMembershipId, customerFixture.ownerMembershipId] } } }).catch(() => {});
     await prisma.homeMembership.deleteMany({ where: { id: { in: [customerFixture.tenantMembershipId, customerFixture.ownerMembershipId] } } }).catch(() => {});
     await prisma.area.deleteMany({ where: { id: { in: [customerFixture.areaOneId, customerFixture.areaTwoId] } } }).catch(() => {});
@@ -1045,6 +1342,7 @@ async function cleanup() {
     await prisma.home.deleteMany({ where: { id: { in: [customerFixture.homeOneId, customerFixture.homeTwoId] } } }).catch(() => {});
     await prisma.customerAccount.deleteMany({ where: { id: customerFixture.accountId } }).catch(() => {});
     await prisma.customerAccount.deleteMany({ where: { id: customerFixture.propertyAccountId } }).catch(() => {});
+    await prisma.customerAccount.deleteMany({ where: { id: customerFixture.managerAccountId } }).catch(() => {});
   }
   if (prisma) await prisma.$disconnect().catch(() => {});
   if (sesServer) await new Promise((resolve) => sesServer.close(resolve));
@@ -1079,7 +1377,9 @@ try {
     encryptionKeyFingerprint: harnessProvisioningIdentity.encryptionKeyFingerprint,
     status: 'ACTIVE',
   } });
-  const operator = keyPair();
+  // The OS verifier must use the public half of the exact disposable key
+  // injected into the actual Platform server, not an unrelated generated key.
+  const operatorPublicKey = crypto.createPublicKey(env.OPERATOR_SESSION_PRIVATE_KEY).export({ format: 'pem', type: 'spki' });
   const harnessIdentityBroker = {
     async getPublicIdentity() {
       return { serial: harnessProvisioningIdentity.serial, signingPublicKeyPem: harnessProvisioningIdentity.signingPublicKeyPem, encryptionPublicKeyPem: harnessProvisioningIdentity.encryptionPublicKeyPem, publicKeyFingerprint: harnessProvisioningIdentity.publicKeyFingerprint, encryptionKeyFingerprint: harnessProvisioningIdentity.encryptionKeyFingerprint, manufacturingSignature: harnessManufacturingSignature, generation: harnessProvisioningIdentity.generation };
@@ -1097,7 +1397,10 @@ try {
   };
   const { createHub } = await import(pathToFileURL(path.join(osRoot, 'src/server.js')).href);
   hub = createHub({
-    config: { nodeEnv: 'production', v2Environment: 'test', hubId: harnessHubInstallationId, haPort: 0, hubAgentPort: 0, dataDir, dataFile: path.join(dataDir, 'dinodia.json'), backupDir: path.join(dataDir, 'backups'), staticDir: path.join(osRoot, 'public'), operatorPublicKey: operator.publicKey, appPublicKeys: env.DINODIA_APP_PUBLIC_KEYS, platformApiUrl: 'https://dinodia-platform-v2.vercel.app', nativeAutomationsMode: 'off', hiveEnabled: false, googleNestEnabled: false, cloudflarePublicHostname: '' },
+    // This fixture's certified serial is deliberately the same opaque string
+    // as its installation UUID; the separate seed above still asserts the
+    // Platform grants are bound to the certified serial snapshot.
+    config: { nodeEnv: 'production', v2Environment: 'test', hubId: harnessHubInstallationId, haPort: 0, hubAgentPort: 0, dataDir, dataFile: path.join(dataDir, 'dinodia.json'), backupDir: path.join(dataDir, 'backups'), staticDir: path.join(osRoot, 'public'), operatorPublicKey, appPublicKeys: env.DINODIA_APP_PUBLIC_KEYS, platformApiUrl: 'https://dinodia-platform-v2.vercel.app', nativeAutomationsMode: 'off', hiveEnabled: false, googleNestEnabled: false, cloudflarePublicHostname: '' },
     identityBroker: harnessIdentityBroker,
     logger: { error() {}, warn() {}, log() {} },
     mqttBridge: { start() {}, close() {}, status() { return { configured: false, connected: false }; }, async command() { fakePhysicalCommandCount += 1; } },
@@ -1116,7 +1419,9 @@ try {
   await bootstrapDeliveryChecks(deliveryEnv);
   await customerAuthorizationChecks();
   await osChecks();
-  console.log(`[stage1:integration] PASS: live Platform routes, locked Dinodia OS HTTP, browser isolation, authenticated native WebSocket command authorization and denial exercised against disposable PostgreSQL; outbound=${[...outboundTargets].sort().join(',')}`);
+  await operatorMutationChecks();
+  const childTargets = verifyChildOutboundTargets();
+  console.log(`[stage1:integration] PASS: live Platform routes, locked Dinodia OS HTTP, browser isolation, authenticated native WebSocket command authorization and denial exercised against disposable PostgreSQL; parent=${[...outboundTargets].sort().join(',')}; children=${childTargets.join(',')}`);
 } finally {
   await cleanup();
 }

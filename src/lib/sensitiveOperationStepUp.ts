@@ -49,7 +49,13 @@ export function verifyTrustedDeviceAssertion(input: { publicKey: string; signatu
   if (!input.nonce || !input.signature || !input.challengeId || !input.operationDigest) throw new Stage1AuthError(403, 'step_up_assertion_invalid', 'A valid trusted-device confirmation is required');
   try {
     const key = crypto.createPublicKey(input.publicKey);
-    if (!crypto.verify(null, challengeMessage(input), key, Buffer.from(input.signature, 'base64url'))) throw new Error('invalid signature');
+    const signature = Buffer.from(input.signature, 'base64url');
+    const valid = key.asymmetricKeyType === 'ed25519'
+      ? crypto.verify(null, challengeMessage(input), key, signature)
+      : key.asymmetricKeyType === 'ec' && key.asymmetricKeyDetails?.namedCurve === 'prime256v1'
+        ? crypto.verify('sha256', challengeMessage(input), key, signature)
+        : false;
+    if (!valid) throw new Error('invalid signature');
   } catch { throw new Stage1AuthError(403, 'step_up_assertion_invalid', 'A valid trusted-device confirmation is required'); }
 }
 

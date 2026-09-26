@@ -20,6 +20,7 @@ const expectedMigrations = [
   '20260925020000_r7_cxo_delivery_and_work_assignment',
   '20260925030000_r8_trusted_device_session_version',
   '20260925040000_r7_support_notifications',
+  '20260925230000_r11_operator_mutation_idempotency',
 ];
 const expectedModels = new Set([
   'CustomerAccount', 'CompanyEmployeeAccount', 'TrustedDevice', 'CustomerSession', 'PolicyAcceptance', 'AuthChallenge', 'StepUpAuthorization',

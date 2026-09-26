@@ -19,7 +19,7 @@
     "test:foundation:invariants": "node scripts/foundation_invariants.mjs",
     "test:stage1:db": "node scripts/stage1_db_checks.mjs",
     "test:stage1:integration": "node scripts/stage1_integration_harness.mjs",
-    "test:stage1": "node --test test/stage1_security.test.mjs && npm run test:stage1:integration",
+    "test:stage1": "node --test test/stage1_security.test.mjs test/operator_rate_limit_policy.test.mjs && npm run test:stage1:integration",
     "foundation:target": "node scripts/assert_v2_target.mjs --mode local",
     "db:validate-target": "node scripts/assert_v2_target.mjs --mode \"${V2_ENVIRONMENT:-local}\"",
     "db:local:up": "node scripts/local_database.mjs up",
@@ -52,5 +52,8 @@
     "prisma": "^6.19.3",
     "tailwindcss": "^4",
     "typescript": "^5"
+  },
+  "overrides": {
+    "deepmerge-ts": "^8.0.2"
   }
 }

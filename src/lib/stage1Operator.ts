@@ -31,6 +31,11 @@ export function supportProofOfPossessionDigest(input: { employeeProofHash: strin
   }), 'utf8').digest('hex');
 }
 
+/** Equality is expired; this strict predicate is shared by handoff issue and redemption. */
+export function isStrictlyUnexpired(expiresAt: Date | number, now: Date | number): boolean {
+  return new Date(expiresAt).getTime() > new Date(now).getTime();
+}
+
 export function createHubBoundOperatorGrant(input: { employeeId: string; hubId: string; workflowId: string; scope: string[]; areaIds?: string[]; recentAuthAt: number; expiresAt: number; credentialVersion?: number; requestId?: string; homeId?: string; identityGeneration?: number; requestBodyDigest?: string }): string {
   const privatePem = String(process.env.OPERATOR_SESSION_PRIVATE_KEY ?? '');
   if (!privatePem) throw new Error('OPERATOR_SESSION_PRIVATE_KEY is required');

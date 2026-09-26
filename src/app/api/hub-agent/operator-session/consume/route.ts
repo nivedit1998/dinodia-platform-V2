@@ -2,7 +2,7 @@ import { NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
 import { authErrorResponse, Stage1AuthError } from '@/lib/stage1Auth';
 import { authenticateHub } from '@/lib/stage1HubAuth';
-import { encryptOperatorGrant, createHubBoundOperatorGrant } from '@/lib/stage1Operator';
+import { encryptOperatorGrant, createHubBoundOperatorGrant, isStrictlyUnexpired } from '@/lib/stage1Operator';
 import { sha256 } from '@/lib/stage1Crypto';
 
 export const dynamic = 'force-dynamic';
@@ -21,10 +21,10 @@ export async function POST(request: Request) {
     const now = new Date();
     const result = await prisma.$transaction(async (tx) => {
       const handoff = await tx.operatorHandoff.findUnique({ where: { id: handoffId }, select: { id: true, employeeId: true, workflowId: true, homeId: true, hubInstallationId: true, operatorBrowserAttemptId: true, setupAttemptId: true, scope: true, expiresAt: true, consumedAt: true, revokedAt: true, browserBindingHash: true, handoffHash: true, handoffEnvelope: true } });
-      if (!handoff || handoff.hubInstallationId !== hub.installation.id || handoff.homeId !== hub.installation.homeId || handoff.expiresAt <= now || handoff.consumedAt || handoff.revokedAt) throw new Stage1AuthError(401, 'handoff_rejected', 'The operator handoff is invalid or expired');
+      if (!handoff || handoff.hubInstallationId !== hub.installation.id || handoff.homeId !== hub.installation.homeId || !isStrictlyUnexpired(handoff.expiresAt, now) || handoff.consumedAt || handoff.revokedAt) throw new Stage1AuthError(401, 'handoff_rejected', 'The operator handoff is invalid or expired');
       if (!handoff.operatorBrowserAttemptId) throw new Stage1AuthError(401, 'handoff_attempt_missing', 'The operator handoff has no hub-created browser attempt');
       const browserAttempt = await tx.operatorBrowserAttempt.findUnique({ where: { id: handoff.operatorBrowserAttemptId }, select: { id: true, attemptId: true, homeId: true, hubInstallationId: true, browserBindingHash: true, expiresAt: true, consumedAt: true, revokedAt: true } });
-      if (!browserAttempt || browserAttempt.homeId !== handoff.homeId || browserAttempt.hubInstallationId !== handoff.hubInstallationId || browserAttempt.attemptId !== setupAttemptId || browserAttempt.browserBindingHash !== sha256(browserBinding) || browserAttempt.expiresAt <= now || browserAttempt.consumedAt || browserAttempt.revokedAt || handoff.browserBindingHash !== browserAttempt.browserBindingHash) throw new Stage1AuthError(401, 'handoff_rejected', 'The operator handoff is not bound to this hub browser');
+      if (!browserAttempt || browserAttempt.homeId !== handoff.homeId || browserAttempt.hubInstallationId !== handoff.hubInstallationId || browserAttempt.attemptId !== setupAttemptId || browserAttempt.browserBindingHash !== sha256(browserBinding) || !isStrictlyUnexpired(browserAttempt.expiresAt, now) || browserAttempt.consumedAt || browserAttempt.revokedAt || handoff.browserBindingHash !== browserAttempt.browserBindingHash) throw new Stage1AuthError(401, 'handoff_rejected', 'The operator handoff is not bound to this hub browser');
       if (phase === 'prepare') return { handoffSecretEnvelope: handoff.handoffEnvelope };
       if (sha256(handoffSecret) !== handoff.handoffHash) throw new Stage1AuthError(401, 'handoff_secret_invalid', 'The one-use operator handoff secret is invalid');
       const work = await tx.companyOperationalWorkItem.findUnique({ where: { id: handoff.workflowId }, select: { id: true, assignedEmployeeId: true, homeId: true, hubInstallationId: true, state: true } });

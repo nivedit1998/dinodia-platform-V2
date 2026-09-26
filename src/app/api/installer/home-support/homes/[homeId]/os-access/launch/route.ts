@@ -3,7 +3,7 @@ import { prisma } from '@/lib/prisma';
 import { requireEmployeeRecentAuth, Stage1AuthError, authErrorResponse } from '@/lib/stage1Auth';
 import { randomSecret, sha256 } from '@/lib/stage1Crypto';
 import { enforcePersistentRateLimit } from '@/lib/rateLimit';
-import { encryptOperatorGrant } from '@/lib/stage1Operator';
+import { encryptOperatorGrant, isStrictlyUnexpired } from '@/lib/stage1Operator';
 
 export const dynamic = 'force-dynamic';
 
@@ -26,7 +26,7 @@ export async function POST(request: Request, context: { params: Promise<{ homeId
       if (!hub.cloudUrl && !hub.baseUrl) throw new Stage1AuthError(409, 'hub_endpoint_unavailable', 'The hub local endpoint is not available yet');
       if (!hub.manufacturingIdentity?.encryptionPublicKey) throw new Stage1AuthError(409, 'hub_identity_unavailable', 'The hub encryption identity is not available yet');
       const browserAttempt = await tx.operatorBrowserAttempt.findUnique({ where: { attemptId: setupAttemptId }, select: { id: true, attemptId: true, homeId: true, hubInstallationId: true, browserBindingHash: true, expiresAt: true, consumedAt: true, revokedAt: true } });
-      if (!browserAttempt || browserAttempt.homeId !== homeId || browserAttempt.hubInstallationId !== hub.id || browserAttempt.consumedAt || browserAttempt.revokedAt || browserAttempt.expiresAt <= now) throw new Stage1AuthError(403, 'operator_attempt_not_authorized', 'The setup attempt was not created by this paired hub browser or has expired');
+      if (!browserAttempt || browserAttempt.homeId !== homeId || browserAttempt.hubInstallationId !== hub.id || browserAttempt.consumedAt || browserAttempt.revokedAt || !isStrictlyUnexpired(browserAttempt.expiresAt, now)) throw new Stage1AuthError(403, 'operator_attempt_not_authorized', 'The setup attempt was not created by this paired hub browser or has expired');
       const existing = await tx.operatorHandoff.findFirst({ where: { operatorBrowserAttemptId: browserAttempt.id, employeeId: employee.id, workflowId: work.id, consumedAt: null, revokedAt: null, expiresAt: { gt: now } }, select: { id: true, expiresAt: true } });
       if (existing) return { id: existing.id, expiresAt: existing.expiresAt, baseUrl: hub.baseUrl, cloudUrl: hub.cloudUrl };
       const expiresAt = new Date(now.getTime() + 60 * 1000);

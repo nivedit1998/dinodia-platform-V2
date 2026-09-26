@@ -29,6 +29,7 @@ try {
     '20260925020000_r7_cxo_delivery_and_work_assignment',
     '20260925030000_r8_trusted_device_session_version',
     '20260925040000_r7_support_notifications',
+    '20260925230000_r11_operator_mutation_idempotency',
   ];
   if (migration.length !== required.length || required.some((name) => !migrations.has(name)) || required.some((name) => !migrations.get(name).finished_at || migrations.get(name).rolled_back_at)) throw new Error('migration ledger is not exactly the completed native baseline and Stage 1 migrations');
   console.log(`[test:foundation] OK: ${names.size} tables, no direct anon/authenticated grants, native baseline and ${required.length - 1} Stage 1 migrations completed`);

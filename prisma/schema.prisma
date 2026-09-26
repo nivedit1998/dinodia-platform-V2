@@ -687,6 +687,7 @@ model HubInstallation {
   provisioningAttempts    HubProvisioningAttempt[]
   operatorBrowserAttempts OperatorBrowserAttempt[]
   workItems               CompanyOperationalWorkItem[]
+  idempotencyRecords      IdempotencyRecord[]
   homeClaimReferences     HomeClaimReference[]
   homeClaimChallenges     HomeClaimChallenge[]
 
@@ -1011,14 +1012,19 @@ model IdempotencyRecord {
   keyHash        String   @db.VarChar(128)
   actorId        String?  @db.Uuid
   homeId         String?  @db.Uuid
+  hubInstallationId String? @db.Uuid
   requestHash    String   @db.VarChar(128)
   responseStatus Int
   responseDigest String?  @db.VarChar(128)
+  responseBody   Json?
   expiresAt      DateTime
   createdAt      DateTime @default(now())
 
+  hubInstallation HubInstallation? @relation(fields: [hubInstallationId], references: [id], onDelete: SetNull)
+
   @@unique([namespace, keyHash])
   @@index([homeId, expiresAt])
+  @@index([hubInstallationId, expiresAt])
 }
 
 model ReplayNonce {
@@ -1039,6 +1045,7 @@ model AuthRateLimitBucket {
   bucketKey    String    @unique @db.VarChar(160)
   windowStart  DateTime
   attempts     Int       @default(0)
+  attemptTimestamps Json?
   blockedUntil DateTime?
   updatedAt    DateTime  @updatedAt
   createdAt    DateTime  @default(now())
