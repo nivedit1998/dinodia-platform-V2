@@ -357,6 +357,108 @@ test('R3 persistent rate limits serialize concurrent bucket updates', () => {
   assert.match(limiter, /rate_limit_retry_exhausted/);
 });
 
+test('R11 signed CloudURL re-verification is challenge-bound and compare-and-set', () => {
+  const cloud = read('src/app/api/hub-agent/v2/pairing/cloud-url/route.ts');
+  const pairing = readOs('src/platformPairing.js');
+  const server = readOs('src/server.js');
+  const dashboard = readOs('public/app.js');
+  const setup = readOs('public/setup.js');
+  const installer = read('src/app/installer/page.tsx');
+  assert.match(cloud, /hub\.body\.reverifyChallenge !== undefined && typeof hub\.body\.reverifyChallenge !== 'boolean'/);
+  assert.match(cloud, /existing\?\.status === 'VERIFIED' && !reverifyChallenge/);
+  assert.match(cloud, /challengeHash, status: 'PENDING', expiresAt: \{ gt: new Date\(\) \}/);
+  assert.match(cloud, /cloudUrlVerification\.updateMany/);
+  assert.match(cloud, /cloudflare_challenge_replaced/);
+  assert.match(pairing, /metadata\.reverifyChallenge === true \? \{ reverifyChallenge: true \}/);
+  assert.match(server, /reportCloudflareVerification\(result, \{ reverifyChallenge: true \}\)/);
+  assert.match(dashboard, /verified && localConnected/);
+  assert.match(dashboard, /action: "reverify"/);
+  assert.match(setup, /sessionCheck\.ok/);
+  assert.match(setup, /dinodia-operator-session-established/);
+  assert.match(setup, /"https:\/\/dinodia-platform-v2\.vercel\.app"/);
+  assert.match(installer, /event\.source !== popup \|\| event\.origin !== operatorOrigin/);
+  assert.match(installer, /The hub did not confirm an authenticated operator session/);
+  assert.match(installer, /operator session was verified by the hub/);
+  assert.doesNotMatch(installer, /The secure Dinodia OS window opened/);
+});
+
+test('R11 CloudURL route issues a fresh signed challenge and rejects a replayed remote response', async () => {
+  const crypto = createRequire(import.meta.url)('node:crypto');
+  const { publicKey, privateKey } = crypto.generateKeyPairSync('ed25519');
+  const signingPublicKey = publicKey.export({ type: 'spki', format: 'pem' }).toString();
+  const fingerprint = crypto.createHash('sha256').update(publicKey.export({ type: 'spki', format: 'der' })).digest('hex');
+  const sha256 = (value) => crypto.createHash('sha256').update(String(value), 'utf8').digest('hex');
+  const identity = { id: 'identity-test', serialNumber: 'DINODIA-CLOUD-TEST', identityGeneration: 1, signingPublicKey, encryptionPublicKey: 'test-encryption-key', signingKeyFingerprint: fingerprint, encryptionKeyFingerprint: 'test-encryption-fingerprint', status: 'ACTIVE' };
+  const installation = { id: 'installation-test', homeId: 'home-test', serialNumberSnapshot: identity.serialNumber, accessPolicyRevision: 1, state: 'PAIRED', reservedHostname: 'dinodia-test.dinodiasmartliving.com', reservedTunnelName: 'dinodia-test', cloudflareTunnelId: 'tunnel-test', cloudflareReservationToken: 'reservation-test' };
+  const record = { id: 'verification-test', hubInstallationId: installation.id, homeId: installation.homeId, reservedHostname: installation.reservedHostname, tunnelId: installation.cloudflareTunnelId, tunnelName: installation.reservedTunnelName, cloudUrl: `https://${installation.reservedHostname}`, challengeHash: sha256('previous-challenge'), status: 'VERIFIED', expiresAt: new Date(Date.now() + 60_000), verifiedAt: new Date(Date.now() - 60_000), failedAt: null, signedResponseDigest: 'previous-digest' };
+  const hubUpdates = [];
+  const prisma = {
+    cloudUrlVerification: {
+      findUnique: async () => structuredClone(record),
+      updateMany: async ({ where, data }) => {
+        if (where.id !== record.id || where.status !== record.status || where.challengeHash !== record.challengeHash) return { count: 0 };
+        if (where.expiresAt?.gt && record.expiresAt <= where.expiresAt.gt) return { count: 0 };
+        Object.assign(record, data);
+        return { count: 1 };
+      },
+      create: async () => { throw new Error('unexpected create for existing installation'); },
+    },
+    hubInstallation: { update: async ({ data }) => { hubUpdates.push(data); return data; } },
+    $transaction: async (callback) => callback(prisma),
+  };
+  const authErrorResponse = (error) => new Response(JSON.stringify({ error: error.message, errorCode: error.code }), { status: error.statusCode || 500, headers: { 'content-type': 'application/json' } });
+  class Stage1AuthError extends Error { constructor(statusCode, code, message) { super(message); this.statusCode = statusCode; this.code = code; } }
+  const hubAuth = loadTypeScriptModule('src/lib/stage1HubAuth.ts', {
+    './prisma': { prisma },
+    './stage1Crypto': { sha256, canonicalHubRequest: () => '', verifyHubSignature: () => false },
+    './stage1Auth': { Stage1AuthError },
+    './manufacturingEnrollment': { manufacturingIdentityPayload: () => '' },
+  });
+  let replayPreviousResponse = false;
+  let previousSignedResponse;
+  const observedChallenges = [];
+  const previousFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    const parsed = new URL(url);
+    const challenge = parsed.searchParams.get('challenge') || '';
+    observedChallenges.push(challenge);
+    if (replayPreviousResponse && previousSignedResponse) return new Response(JSON.stringify(previousSignedResponse), { status: 200, headers: { 'content-type': 'application/json' } });
+    const unsigned = { version: 1, serial: identity.serialNumber, cloudUrl: `https://${installation.reservedHostname}`, challenge, tunnelId: installation.cloudflareTunnelId, tunnelName: installation.reservedTunnelName, timestamp: Date.now(), identityFingerprint: fingerprint, identityGeneration: 1 };
+    const bodyHash = sha256(hubAuth.canonicalCloudUrlUnsignedBody(unsigned));
+    const signedBody = { ...unsigned, bodyHash };
+    previousSignedResponse = { ok: true, ...signedBody, hubSignature: crypto.sign(null, Buffer.from(hubAuth.canonicalCloudUrlChallenge(signedBody)), privateKey).toString('base64url') };
+    return new Response(JSON.stringify(previousSignedResponse), { status: 200, headers: { 'content-type': 'application/json' } });
+  };
+  const route = loadTypeScriptModule('src/app/api/hub-agent/v2/pairing/cloud-url/route.ts', {
+    'next/server': { NextResponse: { json: (body, init = {}) => new Response(JSON.stringify(body), { ...init, headers: { 'content-type': 'application/json', ...(init.headers || {}) } }) } },
+    '@/lib/prisma': { prisma },
+    '@/lib/stage1Auth': { authErrorResponse, Stage1AuthError },
+    '@/lib/stage1HubAuth': { authenticateHub: async (_request, _raw) => ({ installation, identity, body: JSON.parse(_raw) }), canonicalCloudUrlChallenge: hubAuth.canonicalCloudUrlChallenge, canonicalCloudUrlUnsignedBody: hubAuth.canonicalCloudUrlUnsignedBody },
+    '@/lib/stage1Crypto': { randomSecret: (bytes = 32) => crypto.randomBytes(bytes).toString('base64url'), sha256 },
+  });
+  const call = (reverifyChallenge) => route.POST(new Request('https://platform.test/api/hub-agent/v2/pairing/cloud-url', {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ serial: identity.serialNumber, identityGeneration: 1, cloudUrl: `https://${installation.reservedHostname}`, hostname: installation.reservedHostname, tunnelId: installation.cloudflareTunnelId, tunnelName: installation.reservedTunnelName, reservationToken: installation.cloudflareReservationToken, ...(reverifyChallenge ? { reverifyChallenge: true } : {}) }),
+  }));
+  try {
+    const first = await call(true);
+    assert.equal(first.status, 200);
+    assert.equal((await first.json()).verified, true);
+    assert.equal(record.status, 'VERIFIED');
+    assert.equal(record.challengeHash, sha256(observedChallenges[0]));
+    assert.equal(hubUpdates.length, 1);
+    assert.notEqual(record.challengeHash, sha256('previous-challenge'));
+    replayPreviousResponse = true;
+    const replay = await call(true);
+    assert.equal(replay.status, 502);
+    assert.equal(record.status, 'FAILED');
+    assert.equal(hubUpdates.length, 1, 'replayed response must not update HubInstallation verification evidence');
+    assert.notEqual(observedChallenges[0], observedChallenges[1], 're-verification must use a fresh challenge');
+  } finally {
+    globalThis.fetch = previousFetch;
+  }
+});
+
 test('Stage 1 integration and clean-clone harnesses do not inherit operator secrets', () => {
   const integration = fs.readFileSync(path.join(root, 'scripts', 'stage1_integration_harness.mjs'), 'utf8');
   const cleanClone = fs.readFileSync(path.join(root, 'scripts', 'check_clean_clone.mjs'), 'utf8');

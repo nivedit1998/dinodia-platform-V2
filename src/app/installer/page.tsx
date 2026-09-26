@@ -86,12 +86,27 @@ export default function InstallerPage() {
       const body = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(body.error || "The secure Dinodia OS session could not be started");
       if (!popup) throw new Error("The secure Dinodia OS window is unavailable");
+      const sessionEstablished = new Promise<void>((resolve, reject) => {
+        const timeout = window.setTimeout(() => {
+          if (messageHandler) window.removeEventListener("message", messageHandler);
+          reject(new Error("The hub did not confirm an authenticated operator session. Check the Dinodia OS window before retrying."));
+        }, 30_000);
+        messageHandler = (event: MessageEvent) => {
+          if (event.source !== popup || event.origin !== operatorOrigin || event.data?.type !== "dinodia-operator-session-established") return;
+          window.clearTimeout(timeout);
+          window.removeEventListener("message", messageHandler!);
+          resolve();
+        };
+        window.addEventListener("message", messageHandler);
+      });
       const deliver = () => { try { popup?.postMessage({ type: "dinodia-operator-handoff", handoffId: body.handoffId }, operatorOrigin); } catch {} };
       deliver();
       const retry = window.setInterval(() => { if (popup?.closed) { window.clearInterval(retry); return; } deliver(); }, 500);
-      window.setTimeout(() => window.clearInterval(retry), 15000);
-      setActionMessage(`${cloudUrl ? "The secure" : "The private-LAN"} Dinodia OS window opened. The handoff is one-use and expires in 60 seconds.`);
-    } catch (caught) { (popup as Window | null)?.close(); setActionMessage(caught instanceof Error ? caught.message : "The secure Dinodia OS session could not be started"); }
+      const stopRetry = window.setTimeout(() => window.clearInterval(retry), 15000);
+      try { await sessionEstablished; }
+      finally { window.clearInterval(retry); window.clearTimeout(stopRetry); }
+      setActionMessage(`${cloudUrl ? "The secure" : "The private-LAN"} Dinodia OS operator session was verified by the hub.`);
+    } catch (caught) { setActionMessage(caught instanceof Error ? caught.message : "The secure Dinodia OS session could not be verified"); }
     finally { setOpening(null); }
   }
 

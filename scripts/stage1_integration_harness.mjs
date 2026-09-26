@@ -6,7 +6,7 @@ import { createRequire } from 'node:module';
 import { spawn, spawnSync } from 'node:child_process';
 import { createServer } from 'node:http';
 import net from 'node:net';
-import { PrismaClient } from '@prisma/client';
+import { Prisma, PrismaClient } from '@prisma/client';
 import { stage1RouteInventory } from '../test/stage1_route_inventory.mjs';
 
 const root = process.cwd();
@@ -63,6 +63,21 @@ function safeProcessEnvironment(source = process.env) {
     if (source[name]) safe[name] = source[name];
   }
   return safe;
+}
+function loadOperatorLifecycleService() {
+  const require = createRequire(import.meta.url);
+  const ts = require('typescript');
+  const source = fs.readFileSync(path.join(root, 'src/lib/hubOperatorCredentials.ts'), 'utf8');
+  const compiled = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, esModuleInterop: true } }).outputText;
+  const loaded = { exports: {} };
+  const localRequire = (specifier) => {
+    if (specifier === './prisma') return { prisma };
+    if (specifier === './stage1Crypto') return { randomSecret: (bytes = 32) => crypto.randomBytes(bytes).toString('base64url'), sha256 };
+    if (specifier === '@prisma/client') return { Prisma };
+    return require(specifier);
+  };
+  new Function('require', 'module', 'exports', compiled)(localRequire, loaded, loaded.exports);
+  return loaded.exports;
 }
 function assertParentCredentialsAreNotForwarded() {
   const fakeParent = {
@@ -512,6 +527,18 @@ async function customerAuthorizationChecks() {
   const machineSecret = `harness-machine-${crypto.randomUUID()}`;
   await prisma.hubCredentialVersion.create({ data: { hubInstallationId: hubOne.id, version: 1, purpose: 'machine-credential', state: 'ACTIVE', tokenHash: sha256(machineSecret), encryptedDeliveryEnvelope: { harness: true }, ciphertextKeyVersion: 1, deliveredAt: verifiedAt, acknowledgedAt: verifiedAt, activatedAt: verifiedAt } });
   await prisma.hubCredentialVersion.create({ data: { hubInstallationId: hubOne.id, version: 1, purpose: 'operator-credential', state: 'ACTIVE', tokenHash: sha256(`harness-operator-v1-${crypto.randomUUID()}`), encryptedDeliveryEnvelope: { harness: true }, ciphertextKeyVersion: 1, issuedAt: new Date(Date.now() - 61 * 60 * 1000), deliveredAt: verifiedAt, acknowledgedAt: verifiedAt, activatedAt: new Date(Date.now() - 61 * 60 * 1000) } });
+  const { reconcileCredentialLifecycle, OPERATOR_ROTATION_MS } = loadOperatorLifecycleService();
+  const operatorV1BeforeBoundary = await prisma.hubCredentialVersion.findUniqueOrThrow({ where: { HubCredentialVersion_hub_purpose_version_key: { hubInstallationId: hubOne.id, purpose: 'operator-credential', version: 1 } }, select: { issuedAt: true } });
+  const operatorRotationBoundary = new Date(operatorV1BeforeBoundary.issuedAt.getTime() + OPERATOR_ROTATION_MS);
+  const rotationBefore = await reconcileCredentialLifecycle(new Date(operatorRotationBoundary.getTime() - 1));
+  if (rotationBefore.rotated !== 0 || await prisma.hubCredentialVersion.count({ where: { hubInstallationId: hubOne.id, purpose: 'operator-credential', version: 2 } })) fail('Automatic operator rotation occurred before the exact 60-minute boundary');
+  const rotationAt = await reconcileCredentialLifecycle(operatorRotationBoundary);
+  const boundaryPending = await prisma.hubCredentialVersion.findUnique({ where: { HubCredentialVersion_hub_purpose_version_key: { hubInstallationId: hubOne.id, purpose: 'operator-credential', version: 2 } }, select: { state: true } });
+  if (rotationAt.rotated !== 1 || boundaryPending?.state !== 'PENDING') fail('Automatic operator rotation did not create one pending version exactly at 60 minutes');
+  const rotationAfter = await reconcileCredentialLifecycle(new Date(operatorRotationBoundary.getTime() + 1));
+  if (rotationAfter.rotated !== 0 || await prisma.hubCredentialVersion.count({ where: { hubInstallationId: hubOne.id, purpose: 'operator-credential', version: 2 } }) !== 1) fail('Automatic operator rotation did not converge after the exact 60-minute boundary');
+  await prisma.hubCredentialVersion.deleteMany({ where: { hubInstallationId: hubOne.id, purpose: 'operator-credential', version: 2 } });
+  console.log('[stage1:integration] PASS: durable operator rotation remains idle at 59:59.999, creates one PENDING version at 60:00.000, and converges after the boundary');
   const email = `stage1-${crypto.randomUUID()}@invalid.test`;
   const username = `stage1-${crypto.randomUUID().slice(0, 8)}`;
   const account = await prisma.customerAccount.create({ data: { displayName: 'Stage 1 customer', username, usernameNormalized: username, email, emailNormalized: email, emailVerifiedAt: now, passwordHash: 'harness-only-password-hash' } });
@@ -643,6 +670,16 @@ async function customerAuthorizationChecks() {
   if (oldOperator?.state !== 'GRACE' || !oldOperator.graceUntil || newOperator?.state !== 'ACTIVE') fail(`Operator lifecycle did not separate grace and active states (${JSON.stringify(lifecycleRows)})`);
   const graceDuration = oldOperator.graceUntil.getTime() - newOperator.activatedAt.getTime();
   if (!newOperator.activatedAt || graceDuration !== 20 * 60 * 1000) fail(`Operator grace was not exactly 20 minutes from the new version's activation transition (${graceDuration})`);
+  await reconcileCredentialLifecycle(new Date(oldOperator.graceUntil.getTime() - 1));
+  const graceImmediatelyBefore = await prisma.hubCredentialVersion.findUniqueOrThrow({ where: { HubCredentialVersion_hub_purpose_version_key: { hubInstallationId: hubOne.id, purpose: 'operator-credential', version: oldOperator.version } }, select: { state: true } });
+  if (graceImmediatelyBefore.state !== 'GRACE') fail('Previous operator credential was revoked before its exact 20-minute grace deadline');
+  await reconcileCredentialLifecycle(oldOperator.graceUntil);
+  const graceAtBoundary = await prisma.hubCredentialVersion.findUniqueOrThrow({ where: { HubCredentialVersion_hub_purpose_version_key: { hubInstallationId: hubOne.id, purpose: 'operator-credential', version: oldOperator.version } }, select: { state: true } });
+  if (graceAtBoundary.state !== 'REVOKED') fail('Previous operator credential remained valid at its exact 20-minute grace deadline');
+  await reconcileCredentialLifecycle(new Date(oldOperator.graceUntil.getTime() + 1));
+  const graceImmediatelyAfter = await prisma.hubCredentialVersion.findUniqueOrThrow({ where: { HubCredentialVersion_hub_purpose_version_key: { hubInstallationId: hubOne.id, purpose: 'operator-credential', version: oldOperator.version } }, select: { state: true } });
+  if (graceImmediatelyAfter.state !== 'REVOKED') fail('Previous operator credential did not remain revoked after the exact grace deadline');
+  console.log('[stage1:integration] PASS: previous operator credential remains GRACE at 19:59.999 and is durably REVOKED at 20:00.000 and after');
 
   // Support is exercised through the real customer, employee and
   // machine-authenticated routes. The employee never receives the customer
