@@ -70,7 +70,13 @@ Supabase Vault must contain these named secrets for the optional Supabase-owned 
 - The customer app receives only short-lived membership-scoped sessions; employee sessions and OS operator grants use separate keys and cookies.
 - Dinodia OS private identity material remains on the hub.
 - Phone private keys remain in iOS Keychain/Secure Enclave.
-- AWS backend variables are not part of V2.
+- AWS storage, compute, database and scheduling variables are not part of V2.
+  The only permitted AWS use is the temporary SES email transport for the
+  first-CXO invitation: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
+  `AWS_REGION` and `SES_FROM_EMAIL` are Vercel-only configuration for that
+  ceremony, not client, Pi, Worker or backend credentials. The CXO ceremony is
+  already consumed; remove those temporary Vercel values and revoke the
+  dedicated SES access key after confirming no invitation retry is pending.
 - Home Assistant credential variables are not part of native V2 runtime configuration.
 - Empty, missing, malformed or old-project values must fail closed.
 - Logs, error responses, browser storage and build output must not contain secret values.
@@ -90,7 +96,7 @@ the deployed request handlers.
 
 | Review date | Package path | Runtime reachable? | Decision | Owner | Follow-up |
 |---|---|---:|---|---|---|
-| 2026-09-22 | Prisma/Next development toolchain findings reported by `npm audit` | No runtime path proven; confirmed with `npm audit --omit=dev --omit=optional --audit-level=high` | Accept temporarily for local tooling only; do not downgrade Prisma blindly | Dinodia engineering | Re-run audit on every Stage 1 candidate and upgrade when a compatible patched Prisma/toolchain release is available |
+| 2026-09-26 | Platform, OS and Edge Node dependency trees | No high-severity runtime or tooling findings in the full and runtime-only audits; all six audit commands returned 0 vulnerabilities | No advisory exception required; keep current tested versions | Dinodia Platform Engineering, Dinodia OS Engineering, Dinodia Edge Engineering | Review 2026-10-15 and before each candidate; any new runtime-reachable high/critical finding blocks release |
 
 The full audit output is intentionally not copied here because it can include
 local package paths. The exact command and exit status belong in the Stage 1
@@ -119,6 +125,9 @@ consumer listed here is the only runtime that may read it.
 | `DIRECT_URL` | Supabase connection settings | Prisma migration/administrative scripts | Vercel encrypted environment or local Keychain for guarded operator commands | Never print, commit or send to the hub |
 | `SUPABASE_ANON_KEY` | Supabase Legacy anon key for the V2 project | Server/client integration where explicitly required | Vercel encrypted environment; client exposure only if a future route deliberately needs it | Must identify `fppzzesvukjbsfmxmfxe`; never use an old-project key |
 | `SUPABASE_SERVICE_ROLE_KEY` | Supabase Legacy service-role key for the V2 project | Server-only Supabase integration | Vercel encrypted Production environment | Never expose to browser, iOS, hub, logs or evidence |
+| `COMPANY_PORTAL_INITIAL_CXO_EMAIL` | CXO owner | Initial-CXO allowlist and SES invitation recipient | Vercel encrypted Production environment during the one-use ceremony | Exact mailbox only; remove or lock after the existing CXO ceremony is consumed |
+| `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | AWS IAM key ceremony | Vercel SES invitation mailer only | Vercel encrypted environment, temporary ceremony scope | Grant only SES send for the verified sender/recipient; revoke after the first-CXO ceremony; never copied to OS, Edge, browser or iOS |
+| `AWS_REGION` / `SES_FROM_EMAIL` | Dinodia release configuration | Vercel SES invitation mailer only | Vercel encrypted environment, temporary ceremony scope | Use the verified SES region and sender; remove after the first-CXO ceremony if no mail consumer remains |
 | `JWT_SECRET` | Dinodia operator-generated random value | Platform-native signing/compatibility code only | Vercel encrypted environment | Not a Supabase replacement; rotate deliberately and invalidate affected sessions |
 | `PLATFORM_DATA_ENCRYPTION_KEY` | Dinodia operator-generated random value | Platform envelope/data encryption | Vercel encrypted environment | Key-versioned rotation; never put in Prisma or client config |
 | `CLAIM_REFERENCE_PEPPER` | Dinodia operator-generated random value | Platform claim-reference hashing | Vercel encrypted environment | Replacement invalidates affected claim references by policy |
