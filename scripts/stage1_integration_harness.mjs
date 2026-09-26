@@ -632,7 +632,8 @@ async function customerAuthorizationChecks() {
   console.log('[stage1:integration] PASS: durable operator rotation remains idle at 59:59.999, creates one PENDING version at 60:00.000, and converges after the boundary');
   const email = `stage1-${crypto.randomUUID()}@invalid.test`;
   const username = `stage1-${crypto.randomUUID().slice(0, 8)}`;
-  const account = await prisma.customerAccount.create({ data: { displayName: 'Stage 1 customer', username, usernameNormalized: username, email, emailNormalized: email, emailVerifiedAt: now, passwordHash: 'harness-only-password-hash' } });
+  const customerPassword = `harness-customer-${crypto.randomUUID()}`;
+  const account = await prisma.customerAccount.create({ data: { displayName: 'Stage 1 customer', username, usernameNormalized: username, email, emailNormalized: email, emailVerifiedAt: now, passwordHash: hashPassword(customerPassword) } });
   const tenantMembership = await prisma.homeMembership.create({ data: { customerAccountId: account.id, homeId: homeOne.id, role: 'TENANT' } });
   const ownerMembership = await prisma.homeMembership.create({ data: { customerAccountId: account.id, homeId: homeTwo.id, role: 'OWNER' } });
   await prisma.tenantAreaGrant.create({ data: { membershipId: tenantMembership.id, areaId: areaOne.id, homeId: homeOne.id } });
@@ -646,7 +647,8 @@ async function customerAuthorizationChecks() {
   const managerMembership = await prisma.homeMembership.create({ data: { customerAccountId: managerAccount.id, homeId: homeOne.id, role: 'PROPERTY_MANAGER' } });
   const phone = keyPair();
   const phoneThumbprint = crypto.createHash('sha256').update(crypto.createPublicKey(phone.publicKey).export({ type: 'spki', format: 'der' })).digest('hex');
-  const trusted = await prisma.trustedDevice.create({ data: { customerAccountId: account.id, deviceInstallationId: `harness-phone-${crypto.randomUUID()}`, publicKey: phone.publicKey, publicKeyThumbprint: phoneThumbprint, deviceName: 'Harness phone' } });
+  const trustedInstallationId = `harness-phone-${crypto.randomUUID()}`;
+  const trusted = await prisma.trustedDevice.create({ data: { customerAccountId: account.id, deviceInstallationId: trustedInstallationId, publicKey: phone.publicKey, publicKeyThumbprint: phoneThumbprint, deviceName: 'Harness phone' } });
   const rawSession = `harness-customer-session-${crypto.randomUUID()}`;
   const session = await prisma.customerSession.create({ data: { customerAccountId: account.id, trustedDeviceId: trusted.id, refreshTokenHash: sha256(rawSession), securityVersion: account.securityVersion, trustedDeviceSessionVersion: trusted.sessionVersion, expiresAt: new Date(Date.now() + 60 * 60 * 1000) } });
   const propertyPhone = keyPair();
@@ -674,7 +676,8 @@ async function customerAuthorizationChecks() {
   if (tenantOffline.response.status !== 200 || tenantOffline.body.authorisation?.homeId !== homeOne.id) fail(`Tenant offline authority was not scoped to the selected home (${tenantOffline.response.status})`);
   const revocablePhone = keyPair();
   const revocablePhoneThumbprint = crypto.createHash('sha256').update(crypto.createPublicKey(revocablePhone.publicKey).export({ type: 'spki', format: 'der' })).digest('hex');
-  const revocableTrustedDevice = await prisma.trustedDevice.create({ data: { customerAccountId: account.id, deviceInstallationId: `harness-revocable-phone-${crypto.randomUUID()}`, publicKey: revocablePhone.publicKey, publicKeyThumbprint: revocablePhoneThumbprint, deviceName: 'Harness revocable phone' } });
+  const revocableInstallationId = `harness-revocable-phone-${crypto.randomUUID()}`;
+  const revocableTrustedDevice = await prisma.trustedDevice.create({ data: { customerAccountId: account.id, deviceInstallationId: revocableInstallationId, publicKey: revocablePhone.publicKey, publicKeyThumbprint: revocablePhoneThumbprint, deviceName: 'Harness revocable phone' } });
   const revocableRawSession = `harness-revocable-session-${crypto.randomUUID()}`;
   await prisma.customerSession.create({ data: { customerAccountId: account.id, trustedDeviceId: revocableTrustedDevice.id, refreshTokenHash: sha256(revocableRawSession), securityVersion: account.securityVersion, trustedDeviceSessionVersion: revocableTrustedDevice.sessionVersion, expiresAt: new Date(Date.now() + 60 * 60 * 1000) } });
   const revocableToken = await fetchJson(`${base}/api/v2/hub-sessions`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-session': revocableRawSession }, body: JSON.stringify({ homeId: homeOne.id }) });
@@ -1237,6 +1240,12 @@ async function customerAuthorizationChecks() {
   if (!revokedGrantRow?.revokedAt || revokedGrantRow.revokeReason !== 'trusted_device_removed') fail('Platform device removal did not revoke its durable offline authority');
   const removedSessionRetry = await fetchJson(`${platformBase}/api/v2/hub-sessions`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-session': revocableRawSession }, body: JSON.stringify({ homeId: homeOne.id }) });
   if (removedSessionRetry.response.status !== 401) fail(`Removed trusted device could issue another customer token (${removedSessionRetry.response.status})`);
+  const revokedDeviceLogin = await fetchJson(`${platformBase}/api/v2/auth/session`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ email, password: customerPassword, deviceInstallationId: revocableInstallationId, publicKey: revocablePhone.publicKey, deviceName: 'Harness revoked phone re-login', model: 'integration-test', osFamily: 'test', osVersion: 'test' }) });
+  const revokedDeviceAfterLogin = await prisma.trustedDevice.findUniqueOrThrow({ where: { id: revocableTrustedDevice.id }, select: { revokedAt: true, publicKeyThumbprint: true, sessionVersion: true } });
+  const revokedDeviceSessionCount = await prisma.customerSession.count({ where: { trustedDeviceId: revocableTrustedDevice.id } });
+  if (revokedDeviceLogin.response.status !== 403 || revokedDeviceLogin.body.errorCode !== 'trusted_device_revoked' || !revokedDeviceAfterLogin.revokedAt || revokedDeviceAfterLogin.publicKeyThumbprint !== revocablePhoneThumbprint || revokedDeviceSessionCount !== 1) fail('Ordinary password login silently restored a revoked trusted phone or created a new session');
+  const changedIdentityLogin = await fetchJson(`${platformBase}/api/v2/auth/session`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ email, password: customerPassword, deviceInstallationId: trustedInstallationId, publicKey: revocablePhone.publicKey, deviceName: 'Harness substituted phone key', model: 'integration-test', osFamily: 'test', osVersion: 'test' }) });
+  if (changedIdentityLogin.response.status !== 409 || changedIdentityLogin.body.errorCode !== 'trusted_device_identity_changed') fail(`An active installation ID silently replaced its signing key (${changedIdentityLogin.response.status})`);
   while (hub.pairing.syncing) await new Promise((resolve) => setTimeout(resolve, 10));
   hub.pairing.nextRetryAt = 0;
   let callbackRevocation = null;
@@ -1255,7 +1264,7 @@ async function customerAuthorizationChecks() {
   const revokedHeaders = { 'x-dinodia-offline-grant': revocableOffline.body.authorisation.id, 'x-dinodia-offline-challenge': Buffer.from(JSON.stringify(revokedChallenge), 'utf8').toString('base64url'), 'x-dinodia-offline-signature': crypto.sign(null, Buffer.from(JSON.stringify(revokedChallenge), 'utf8'), crypto.createPrivateKey(revocablePhone.privateKey)).toString('base64url') };
   const revokedCommand = await fetchJson(`${osBase}/_dinodia/admin/api/entities/${offlineEntityPath}/service`, { method: 'POST', headers: { 'content-type': 'application/json', ...revokedHeaders }, body: JSON.stringify({ serviceId: 'switch.turn_on', data: offlineCommandValue }) });
   if (revokedCommand.response.status !== 401 || fakePhysicalCommandCount !== 2) fail(`Revoked phone retained offline command authority or caused a side effect (${revokedCommand.response.status}/${fakePhysicalCommandCount})`);
-  console.log('[stage1:integration] PASS: real trusted-device removal revokes durable Platform and signed OS offline grants; revoked phone cannot issue sessions or dispatch commands');
+  console.log('[stage1:integration] PASS: real trusted-device removal revokes durable Platform and signed OS offline grants; revoked phone cannot re-login, replace its key, issue sessions or dispatch commands');
   const operatorPassword = `harness-installer-password-${crypto.randomUUID()}`;
   const operatorEmail = `installer-${crypto.randomUUID()}@invalid.test`;
   const operatorEmployee = await prisma.companyEmployeeAccount.create({ data: { displayName: 'Harness Installer', email: operatorEmail, emailNormalized: operatorEmail, role: 'INSTALLER', status: 'ACTIVE', passwordHash: hashPassword(operatorPassword) } });

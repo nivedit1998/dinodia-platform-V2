@@ -3,7 +3,7 @@ import { NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
 import { authErrorResponse, recordFailedAuthentication, Stage1AuthError, cookieToken } from '@/lib/stage1Auth';
 import { verifyPassword } from '@/lib/passwords';
-import { randomSecret, sha256 } from '@/lib/stage1Crypto';
+import { constantTimeEqual, randomSecret, sha256 } from '@/lib/stage1Crypto';
 import { enforcePersistentRateLimit } from '@/lib/rateLimit';
 
 export const dynamic = 'force-dynamic';
@@ -38,9 +38,13 @@ export async function POST(request: Request) {
       const trusted = await tx.trustedDevice.upsert({
         where: { customerAccountId_deviceInstallationId: { customerAccountId: account.id, deviceInstallationId } },
         create: { customerAccountId: account.id, deviceInstallationId, publicKey, publicKeyThumbprint: thumbprint, deviceName, model: text(body.model, 160) || null, osFamily: text(body.osFamily, 80) || null, osVersion: text(body.osVersion, 80) || null },
-        update: { publicKey, publicKeyThumbprint: thumbprint, deviceName, lastUsedAt: new Date(), revokedAt: null, sessionVersion: { increment: 1 } },
-        select: { id: true, sessionVersion: true },
+        // Ordinary password login cannot silently re-enrol a removed phone or
+        // replace the key already bound to an installation identity.
+        update: { deviceName, lastUsedAt: new Date(), sessionVersion: { increment: 1 } },
+        select: { id: true, sessionVersion: true, revokedAt: true, publicKeyThumbprint: true },
       });
+      if (trusted.revokedAt) throw new Stage1AuthError(403, 'trusted_device_revoked', 'This trusted device was removed; use the approved re-enrolment process');
+      if (!constantTimeEqual(trusted.publicKeyThumbprint, thumbprint)) throw new Stage1AuthError(409, 'trusted_device_identity_changed', 'This installation ID is already bound to another signing key');
       const created = await tx.customerSession.create({ data: { customerAccountId: account.id, trustedDeviceId: trusted.id, refreshTokenHash: sha256(rawSession), securityVersion: account.securityVersion, trustedDeviceSessionVersion: trusted.sessionVersion, expiresAt: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000) }, select: { id: true, expiresAt: true } });
       await tx.auditEvent.create({ data: { actorType: 'CUSTOMER', actorId: account.id, category: 'SECURITY', action: 'customer_login_succeeded', targetType: 'CustomerSession', targetId: created.id, metadata: { trustedDeviceId: trusted.id, outcome: 'succeeded' }, purgeAt: new Date(Date.now() + 365 * 24 * 60 * 60 * 1000) } });
       return { ...created, trustedDeviceId: trusted.id };
