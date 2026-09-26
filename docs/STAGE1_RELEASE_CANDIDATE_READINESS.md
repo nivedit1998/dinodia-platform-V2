@@ -1,9 +1,9 @@
 # Stage 1 release-candidate readiness
 
 Updated 2026-09-26. This is a value-free evidence/runbook record. The reviewed
-CloudURL challenge-evidence follow-up and the audited operator credential
-transitions are deployed to the canonical Production alias as Vercel
-deployment `dpl_BgEMjyMhzEDZgNDsh1NACrET1PQn`. A separate Native V2 OS package
+CloudURL challenge-evidence follow-up, audited operator credential transitions,
+and support close/redeem race fix are deployed to the canonical Production
+alias as Vercel deployment `dpl_8hjtjMusx6Cm4u8soX4doKbh7tYz`. A separate Native V2 OS package
 with the locked-setup mDNS fix is staged on the existing Pi; its guarded
 installer has not yet been run. Stage 1 remains incomplete.
 
@@ -23,9 +23,10 @@ installer has not yet been run. Stage 1 remains incomplete.
 - Read-only checks after the latest Platform deployment on 2026-09-26:
   canonical Vercel `/`, `/api/health` and `/api/readiness` returned 200;
   an unknown route returned 404; unauthenticated `/api/installer/workflows`
-  returned 401. Deployment `dpl_BgEMjyMhzEDZgNDsh1NACrET1PQn` is Ready and
+  returned 401. Deployment `dpl_8hjtjMusx6Cm4u8soX4doKbh7tYz` is Ready and
   aliased to the canonical origin. The preceding Ready deployment
-  `dpl_ETjeK2SyLTudMrSpqVYMaphGqiBd` is the immediate rollback target;
+  `dpl_BgEMjyMhzEDZgNDsh1NACrET1PQn` is the immediate rollback target;
+  `dpl_ETjeK2SyLTudMrSpqVYMaphGqiBd` remains available as an older rollback point;
   `dpl_5ZHziTkyXjykfNqmzXNpKxFQRaf4` and
   `dpl_33F8xEAGdAqBU8UxbPeQXT76fmk3` remain available as older rollback points.
 - Before staging the mDNS update, Pi `192.168.1.76` reported
@@ -87,6 +88,18 @@ installer has not yet been run. Stage 1 remains incomplete.
   `/api/readiness` 200, unauthenticated protected workflow 401 and unknown
   route 404; `X-Frame-Options: DENY` and HSTS were present.
 
+- After the support close/redeem concurrency regression passed against
+  disposable PostgreSQL and `npm run clean-clone:check`, commit
+  `c043ab1cbf87baa9e27fbeade0c80f02031b16a4` was deployed to Production with
+  Vercel CLI 60.1.3 as `dpl_8hjtjMusx6Cm4u8soX4doKbh7tYz`; it is READY and
+  aliased to the canonical origin. This commit records the reviewed R11
+  credential lifecycle and CloudURL changes as well as the support
+  close/redeem serializable-transaction fix. No migration or Production row
+  mutation was part of the deployment. Post-deploy smoke: `/`, `/api/health`,
+  `/api/readiness` returned 200; unauthenticated support redeem, ticket
+  creation and installer workflow requests returned 401; an unknown path
+  returned 404; all sampled responses had frame denial and HSTS.
+
 - Vercel CLI 60.1.3 deployed the reviewed Platform source commit
   `a08f45624c9c9f8b59b7bfda3e7c934e8d632cec` to Production as
   `dpl_5ZHziTkyXjykfNqmzXNpKxFQRaf4`; the canonical alias now resolves to that
@@ -144,11 +157,10 @@ Fill these fields only after final review/deployment. Do not put credentials,
 database URLs, cookies, pairing codes, private keys or other secret values in
 this file or a deployment ticket.
 
-- Platform source head `3fab8b7e0cbdbc4f6983e9a67a89e5f031291068` plus reviewed
-  source diffs: immutable Production deployment `dpl_BgEMjyMhzEDZgNDsh1NACrET1PQn`;
-  the prior Ready deployment `dpl_ETjeK2SyLTudMrSpqVYMaphGqiBd` remains the
-  immediate rollback target. The deployment is a source snapshot, not a clean
-  Git commit; preserve this distinction in release records.
+- Platform commit `c043ab1cbf87baa9e27fbeade0c80f02031b16a4`: immutable
+  Production deployment `dpl_8hjtjMusx6Cm4u8soX4doKbh7tYz`; prior Ready
+  deployment `dpl_BgEMjyMhzEDZgNDsh1NACrET1PQn` is the immediate rollback
+  target. Earlier deployments were source snapshots rather than clean commits.
 - Dinodia OS source head `c0b4f71795d73bc307abf5518dc34ea0418d1264` plus reviewed
   source diff; candidate build ID `native-v2-fb5ba1404cd34a79feb649f9`, archive
   SHA-256 `f2a30dfd37ae6e696e98391d73c9e115e8f1650d5e068c53681f2b197aefd127`.
@@ -186,12 +198,14 @@ reconstruction/idempotency runs, OS tests/checks, Edge tests/typecheck/lint and
 RC dry-run, iOS simulator tests, full/runtime dependency audits, schema
 fingerprint and exact-value client-bundle scan. The R11 additive migration was
 already applied and verified; no Production data mutation occurred during this
-deployment. Do not commit or push `.env.local`, credentials, keys, pairing data
+deployment. The support close/redeem race fix was validated on the actual
+Platform routes with disposable PostgreSQL before deployment. Do not commit or
+push `.env.local`, credentials, keys, pairing data
 or generated local material.
 
 Vercel rollback target: restore the prior Ready deployment
-`dinodia-platform-v2-os5eibkkh-dinodia-supabase.vercel.app` (deployment ID
-`dpl_ETjeK2SyLTudMrSpqVYMaphGqiBd`) to the canonical alias using the current
+`dinodia-platform-v2-kdkucpnft-dinodia-supabase.vercel.app` (deployment ID
+`dpl_BgEMjyMhzEDZgNDsh1NACrET1PQn`) to the canonical alias using the current
 Vercel CLI; keep the additive migration and all data in place. The Pi rollback
 must use the installer's preserved previous release symlink and saved service
 units, never the old HA installation. Do not claim the Pi candidate is live
@@ -237,8 +251,7 @@ test:stage1`, `npm test`, `npm run lint`, `npm run typecheck`, `npm run
 check:foundation:manifest`, `npm run check:logs`, `npm run check:security`,
 `npm run check:stage1`, `npm run check:foundation`, `npx prisma validate`, both
 dependency audits, `npm run build`, and `npm run clean-clone:check` passed on
-the reviewed worktree. This support-race fix is **not yet deployed**; the
-canonical Vercel deployment remains `dpl_BgEMjyMhzEDZgNDsh1NACrET1PQn` until a
-reviewed deployment explicitly records a new immutable deployment ID. This
+the reviewed worktree. Commit `c043ab1cbf87baa9e27fbeade0c80f02031b16a4` is
+deployed as `dpl_8hjtjMusx6Cm4u8soX4doKbh7tYz`; production smoke passed. This
 regression does not prove the full support clock-boundary, participant or
 offline acceptance matrix.
