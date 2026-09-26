@@ -30,28 +30,29 @@ worktree candidate; do not describe the R11 changes as deployed.
   working Pi health endpoint, CloudURL verification or an opened browser as
   proof that operator version 1 is active. Refresh this state after the real
   Platform/Portal/Pi lifecycle is exercised.
-- R11 Platform changes and migration
-  `20260925230000_r11_operator_mutation_idempotency` are local worktree changes
-  and have not been deployed by this engineering run. Production migration
-  ledger/checksums and immutable Vercel deployment ID still require guarded
-  read-only verification before an additive migration or rollout.
+- R11 Platform source is reviewed and committed as
+  `b9cf43c17ed1461b76e66280db6d985d285d64ca`; it is not yet the deployed
+  Vercel build. The additive migration
+  `20260925230000_r11_operator_mutation_idempotency` was applied to the
+  specifically guarded Supabase project after baseline/checksum/schema
+  verification. It was reapplied successfully with no pending migrations.
 
 ## Refreshed read-only Production evidence — 2026-09-26
 
-- Latest stable Vercel inspection (CLI 60.1.3) resolved the canonical alias to
+- Pre-R11 stable Vercel inspection (CLI 60.1.3) resolved the canonical alias to
   deployment `dpl_7mL7k37PEDpT8ThCNxVMKbndSc1z`, target `production`, status
   Ready. The canonical alias remains the sole Production origin. This is the
-  currently deployed baseline, not the R11 worktree candidate.
-- Hidden-Keychain target validation confirmed the configured connection pair
-  resolves only to Supabase project `fppzzesvukjbsfmxmfxe`; no URL or password
-  was printed. Production has 14 applied migrations; every applied checksum
-  matches the local history, and the R11 migration is the sole pending
-  migration. No Production migration or data mutation was performed.
-- Production schema-only inventory: 45 tables, 620 columns, 187 constraints,
-  189 indexes and 22 triggers. Direct table grants to `anon` and
-  `authenticated` were empty. The local R11 candidate schema is 45 tables,
-  623 columns, 188 constraints and 190 indexes; apply its additive migration
-  only after the guarded deployment gate.
+  deployed application baseline; R11 deployment is still pending.
+- Non-printing target validation and guarded read-only SQL confirmed the
+  configured database pair resolves only to Supabase project
+  `fppzzesvukjbsfmxmfxe`. Before migration, all 14 applied checksums matched
+  local history and R11 was the sole pending migration. The migration is now
+  recorded as applied, all 15 ledger checksums match, and guarded reapplication
+  reported no pending migrations. No reset or customer-data deletion occurred.
+- Production schema-only inventory after R11: 45 tables, 623 columns, 188
+  constraints, 190 indexes and 22 triggers. Direct table grants to `anon` and
+  `authenticated` remain empty. The post-migration fingerprint is
+  `f54717c673934fb30c35a48ad18ef76c5e95d478f73e277e18d0d9d533ca2382`.
 - The schedule inventory contains exactly one active Supabase
   `dinodia-native-operations` job at `*/2 * * * *`. Vault contains the names
   `DINODIA_NATIVE_OPERATIONS_URL` and
@@ -63,10 +64,10 @@ worktree candidate; do not describe the R11 changes as deployed.
   remain present. No active Production operator-credential version was found;
   the Pi's reported `operatorCredentialStates` is still empty. Do not claim
   operator access or credential lifecycle acceptance.
-- The current deployed `/api/readiness` returning 200 describes its older
-  schema contract. It is not evidence that the R11 candidate is ready: that
-  candidate's exact migration is still absent in Production, so deploy the
-  reviewed additive migration before expecting R11 readiness to pass.
+- The currently deployed `/api/readiness` returning 200 describes its older
+  application build. It does not prove that the R11 code is deployed. After
+  deploying the immutable R11 commit, recheck readiness against the new
+  migration checksum and verify the exact deployment ID.
 
 ## Immutable candidate manifest
 
@@ -74,12 +75,14 @@ Fill these fields only after final review/deployment. Do not put credentials,
 database URLs, cookies, pairing codes, private keys or other secret values in
 this file or a deployment ticket.
 
-- Platform Stage 1 commit and Vercel deployment/build ID: pending reviewed
-  immutable release.
+- Platform Stage 1 commit: `b9cf43c17ed1461b76e66280db6d985d285d64ca`;
+  immutable Vercel deployment/build ID: pending guarded deployment.
 - Dinodia OS commit/package checksum/build ID: retain and verify the existing
   Native V2 release; record a new ID only if OS source changes and is deployed.
-- Migration name/checksum and verified Supabase ledger: pending guarded
-  read-only inspection, then additive migration only after approval/gates.
+- Migration `20260925230000_r11_operator_mutation_idempotency`, SHA-256
+  `8297d0923192b9ea2d4fd364bc1ae365a7709461b65da1e1981aaa1b93eb7014`;
+  Supabase ledger contains the matching completed row and a guarded reapply
+  reports no pending migration.
 - Cloudflare Worker version/source hash: current deployed version remains the
   existing V2 version unless reviewed Worker source changes; do not redeploy
   for documentation-only edits.
