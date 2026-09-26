@@ -91,15 +91,17 @@ export default function InstallerPage() {
         const timeout = window.setTimeout(() => {
           if (messageHandler) window.removeEventListener("message", messageHandler);
           reject(new Error("The hub did not confirm an authenticated operator session. Check the Dinodia OS window before retrying."));
-        }, 30_000);
+        }, 55_000);
         messageHandler = (event: MessageEvent) => {
           if (event.source !== popup || event.origin !== operatorOrigin) return;
           if (event.data?.type === "dinodia-operator-handoff-failed") {
             window.clearTimeout(timeout);
             window.removeEventListener("message", messageHandler!);
-            const phase = event.data.phase === "prepare" || event.data.phase === "consume" ? event.data.phase : "unknown";
+            const phase = ["prepare", "consume", "hub"].includes(event.data.phase) ? event.data.phase : "unknown";
             const code = typeof event.data.errorCode === "string" && /^[a-z0-9_]{1,64}$/.test(event.data.errorCode) ? event.data.errorCode : "operator_handoff_rejected";
-            reject(new Error(`Dinodia OS rejected the operator handoff during ${phase} (${code}). Check the OS window and retry the launch.`));
+            const correlationId = typeof event.data.correlationId === "string" && /^[0-9a-f-]{36}$/i.test(event.data.correlationId) ? event.data.correlationId : "";
+            const reference = correlationId ? ` Reference ${correlationId.slice(0, 8)}.` : "";
+            reject(new Error(`Dinodia OS could not complete the operator handoff during ${phase} (${code}).${reference} Check the OS window and relaunch if needed.`));
             return;
           }
           if (event.data?.type !== "dinodia-operator-session-established") return;

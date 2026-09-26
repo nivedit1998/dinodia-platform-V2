@@ -44,6 +44,8 @@ let capturedInvitation;
 let customerFixture;
 let fakePhysicalCommandCount = 0;
 let osHarnessNow = Date.now();
+let operatorHandoffFetchDelayMs = 0;
+let operatorHandoffPlatformRequestCount = 0;
 const outboundTargets = new Set();
 
 function fail(message) { throw new Error(`[stage1:integration] ${message}`); }
@@ -52,6 +54,10 @@ globalThis.fetch = async (input, init) => {
   const parsed = new URL(typeof input === 'string' ? input : input.url);
   outboundTargets.add(`${parsed.protocol}//${parsed.host}`);
   if (!['127.0.0.1', 'localhost', '::1'].includes(parsed.hostname)) fail(`Harness attempted an outbound request to ${parsed.hostname}`);
+  if (parsed.pathname === '/api/hub-agent/operator-session/consume') {
+    operatorHandoffPlatformRequestCount += 1;
+    if (operatorHandoffFetchDelayMs > 0) await sleep(operatorHandoffFetchDelayMs);
+  }
   return nativeFetch(input, init);
 };
 function safeProcessEnvironment(source = process.env) {
@@ -1600,41 +1606,76 @@ async function osChecks() {
 
   const remoteHost = 'harness-one.example.invalid';
   const remoteOsHeaders = { host: remoteHost, origin: `https://${remoteHost}`, 'x-forwarded-proto': 'https' };
+  const localOsHeaders = { host: osHost, origin: osOrigin };
+  const postHandoffStart = (jar, handoffId, originHeaders = localOsHeaders) => fetchJsonLoopback(`${base}/_dinodia/setup/operator-session`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', ...originHeaders, cookie: cookieHeader(jar), 'x-dinodia-setup-csrf': decodeURIComponent(cookieValue(jar, 'dinodia_setup_csrf')) },
+    body: JSON.stringify({ action: 'start', handoffId }),
+  });
+  const pollHandoff = async (jar, originHeaders = localOsHeaders, timeoutMs = 15_000) => {
+    const deadline = Date.now() + timeoutMs;
+    let result;
+    do {
+      result = await fetchJsonLoopback(`${base}/_dinodia/setup/operator-session`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', ...originHeaders, cookie: cookieHeader(jar), 'x-dinodia-setup-csrf': decodeURIComponent(cookieValue(jar, 'dinodia_setup_csrf')) },
+        body: JSON.stringify({ action: 'status' }),
+      });
+      if (result.response.status !== 202) return result;
+      await sleep(50);
+    } while (Date.now() < deadline);
+    fail(`OS operator handoff did not reach a terminal state (${result?.body?.handoffPhase || 'pending'})`);
+  };
   const setupB = await fetchLoopback(`${base}/support-access`, { headers: remoteOsHeaders });
   const browserB = {};
   updateCookieJar(browserB, setupB);
-  const copiedHandoff = await fetchJsonLoopback(`${base}/_dinodia/setup/operator-session`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json', ...remoteOsHeaders, cookie: cookieHeader(browserB), 'x-dinodia-setup-csrf': decodeURIComponent(cookieValue(browserB, 'dinodia_setup_csrf')) },
-    body: JSON.stringify({ handoffId: launch.body.handoffId }),
-  });
-  if (![401, 403].includes(copiedHandoff.response.status)) fail(`A second browser redeemed a copied handoff (${copiedHandoff.response.status})`);
+  const copiedStart = await postHandoffStart(browserB, launch.body.handoffId, remoteOsHeaders);
+  if (copiedStart.response.status !== 202 || copiedStart.body.state !== 'pending') fail(`The second browser did not receive an asynchronous, non-authoritative handoff result (${copiedStart.response.status})`);
+  const copiedHandoff = await pollHandoff(browserB, remoteOsHeaders);
+  if (![401, 403].includes(copiedHandoff.response.status) || copiedHandoff.body.handoffPhase !== 'prepare' || !/^[0-9a-f-]{36}$/i.test(String(copiedHandoff.body.correlationId || ''))) fail(`A second browser's copied handoff was not denied at prepare with safe correlation (${copiedHandoff.response.status}/${copiedHandoff.body.handoffPhase || 'no-phase'})`);
 
   // Attribute a genuine OS->Platform prepare rejection separately. The
   // browser cookie jar remains otherwise valid, but the setup attempt is
   // deliberately substituted; this must fail before the one-use secret is
   // fetched or consumed and must leave the real handoff usable.
   const prepareFailureJar = { ...browserA, dinodia_operator_attempt: `wrong-${crypto.randomUUID()}` };
-  const prepareFailure = await fetchJson(`${base}/_dinodia/setup/operator-session`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json', host: osHost, origin: osOrigin, cookie: cookieHeader(prepareFailureJar), 'x-dinodia-setup-csrf': decodeURIComponent(cookieValue(prepareFailureJar, 'dinodia_setup_csrf')) },
-    body: JSON.stringify({ handoffId: launch.body.handoffId }),
-  });
+  const prepareFailureStart = await postHandoffStart(prepareFailureJar, launch.body.handoffId);
+  if (prepareFailureStart.response.status !== 202) fail(`OS did not accept a validly shaped attempt for asynchronous prepare attribution (${prepareFailureStart.response.status})`);
+  const prepareFailure = await pollHandoff(prepareFailureJar);
   if (![401, 403].includes(prepareFailure.response.status) || prepareFailure.body.handoffPhase !== 'prepare' || !/^[a-z0-9_]{1,64}$/.test(String(prepareFailure.body.errorCode || ''))) fail(`OS did not safely attribute the rejected attempt to the prepare phase (${prepareFailure.response.status}/${prepareFailure.body.handoffPhase || 'no-phase'}/${prepareFailure.body.errorCode || 'no-code'})`);
 
-  const intendedHandoff = await fetch(`${base}/_dinodia/setup/operator-session`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json', host: osHost, origin: osOrigin, cookie: cookieHeader(browserA), 'x-dinodia-setup-csrf': decodeURIComponent(cookieValue(browserA, 'dinodia_setup_csrf')) },
-    body: JSON.stringify({ handoffId: launch.body.handoffId }),
-  });
-  const intendedBody = await intendedHandoff.json().catch(() => ({}));
-  updateCookieJar(browserA, intendedHandoff);
-  if (intendedHandoff.status !== 200 || intendedBody.ok !== true) fail(`The originating browser could not consume the operator handoff (${intendedHandoff.status}/${intendedBody.errorCode || intendedBody.error || 'unknown'})`);
-  const intendedSetCookies = typeof intendedHandoff.headers.getSetCookie === 'function' ? intendedHandoff.headers.getSetCookie().join(';') : String(intendedHandoff.headers.get('set-cookie') || '');
+  // Reproduce the live CloudURL condition: two sequential machine-authenticated
+  // Platform phases take longer than the proxy's observed response window.
+  // Duplicate Portal messages must attach to one in-memory job, while the
+  // browser-facing start response stays short and status polling later returns
+  // the same single-use result.
+  const platformCallsBeforeSlowHandoff = operatorHandoffPlatformRequestCount;
+  operatorHandoffFetchDelayMs = 2_750;
+  let startElapsedMs = 0;
+  let handoffElapsedMs = 0;
+  let intendedHandoff;
+  try {
+    const startedAt = Date.now();
+    const [firstStart, duplicateStart] = await Promise.all([
+      postHandoffStart(browserA, launch.body.handoffId),
+      postHandoffStart(browserA, launch.body.handoffId),
+    ]);
+    startElapsedMs = Date.now() - startedAt;
+    if (firstStart.response.status !== 202 || duplicateStart.response.status !== 202 || firstStart.body.correlationId !== duplicateStart.body.correlationId || !/^[0-9a-f-]{36}$/i.test(String(firstStart.body.correlationId || '')) || startElapsedMs >= 1_500) fail(`Slow handoff start was not promptly idempotent across duplicate messages (${firstStart.response.status}/${duplicateStart.response.status}, ${startElapsedMs}ms)`);
+    if (/handoffId|handoffSecret|operatorToken|sessionGrant|osb_/.test(JSON.stringify([firstStart.body, duplicateStart.body]))) fail('Pending browser responses contained handoff authority or a reusable credential');
+    intendedHandoff = await pollHandoff(browserA);
+    handoffElapsedMs = Date.now() - startedAt;
+  } finally { operatorHandoffFetchDelayMs = 0; }
+  const intendedBody = intendedHandoff.body;
+  updateCookieJar(browserA, intendedHandoff.response);
+  if (intendedHandoff.response.status !== 200 || intendedBody.ok !== true || intendedBody.state !== 'established') fail(`The originating browser could not complete the asynchronous operator handoff (${intendedHandoff.response.status}/${intendedBody.errorCode || intendedBody.error || 'unknown'})`);
+  if (handoffElapsedMs < 5_000 || operatorHandoffPlatformRequestCount - platformCallsBeforeSlowHandoff !== 2) fail(`A handoff slower than the live proxy window did not converge to exactly one prepare and one consume request (${handoffElapsedMs}ms/${operatorHandoffPlatformRequestCount - platformCallsBeforeSlowHandoff} calls)`);
+  const intendedSetCookies = typeof intendedHandoff.response.headers.getSetCookie === 'function' ? intendedHandoff.response.headers.getSetCookie().join(';') : String(intendedHandoff.response.headers.get('set-cookie') || '');
   if (!/dinodia_os_operator_session=[^;]+/.test(intendedSetCookies) || !/HttpOnly/i.test(intendedSetCookies)) fail('The originating browser did not receive an HttpOnly OS session cookie');
   const firstDeadline = Date.parse(intendedBody.expiresAt);
   const firstMaxAge = Number(intendedSetCookies.match(/Max-Age=(\d+)/i)?.[1]);
-  if (!Number.isFinite(firstDeadline) || firstMaxAge !== 86_400 || firstDeadline - Date.now() > 86_400_000 || firstDeadline - Date.now() < 86_390_000) fail('The OS browser handle/cookie did not receive a bounded absolute 24-hour grant deadline');
+  const firstRemainingMs = firstDeadline - Date.now();
+  if (!Number.isFinite(firstDeadline) || !Number.isInteger(firstMaxAge) || firstMaxAge < 86_380 || firstMaxAge > 86_400 || firstRemainingMs > 86_400_000 || firstRemainingMs < 86_380_000 || Math.abs(firstRemainingMs - firstMaxAge * 1000) > 1_500) fail('The OS browser handle/cookie did not share one bounded absolute 24-hour grant deadline');
   if (/dno1\.|operatorToken|handoffSecret|sessionGrant|DINODIA_ADMIN_TOKEN/i.test(JSON.stringify(intendedBody))) fail('Operator handoff response exposed an OS bearer or reusable secret');
   const persistedGrantAuthority = await prisma.operatorHandoff.findUnique({ where: { id: launch.body.handoffId }, select: { scope: true } });
   const authorityScope = persistedGrantAuthority?.scope && typeof persistedGrantAuthority.scope === 'object' ? persistedGrantAuthority.scope : {};
@@ -1681,26 +1722,29 @@ async function osChecks() {
   // Establish a second legitimate handoff in the independent browser so the
   // absolute-deadline test exercises a live server-held session after the
   // first browser has explicitly ended its session.
-  const attemptB = await fetchJsonLoopback(`${base}/_dinodia/setup/operator-attempt`, { method: 'POST', headers: { ...remoteOsHeaders, cookie: cookieHeader(browserB), 'x-dinodia-setup-csrf': decodeURIComponent(cookieValue(browserB, 'dinodia_setup_csrf')) } });
-  if (attemptB.response.status !== 200 || !attemptB.body.setupAttemptId) fail(`Independent secure-origin browser could not create its own hub attempt (${attemptB.response.status}/${attemptB.body.error || attemptB.body.errorCode || 'unknown'}; browser=${Boolean(browserB.dinodia_setup_browser)}, csrf=${Boolean(browserB.dinodia_setup_csrf)}, binding=${Boolean(browserB.dinodia_operator_binding)}, attempt=${Boolean(browserB.dinodia_operator_attempt)})`);
+  const setupC = await fetchLoopback(`${base}/support-access`, { headers: remoteOsHeaders });
+  const browserC = {};
+  updateCookieJar(browserC, setupC);
+  const attemptB = await fetchJsonLoopback(`${base}/_dinodia/setup/operator-attempt`, { method: 'POST', headers: { ...remoteOsHeaders, cookie: cookieHeader(browserC), 'x-dinodia-setup-csrf': decodeURIComponent(cookieValue(browserC, 'dinodia_setup_csrf')) } });
+  if (attemptB.response.status !== 200 || !attemptB.body.setupAttemptId) fail(`Independent secure-origin browser could not create its own hub attempt (${attemptB.response.status}/${attemptB.body.error || attemptB.body.errorCode || 'unknown'}; browser=${Boolean(browserC.dinodia_setup_browser)}, csrf=${Boolean(browserC.dinodia_setup_csrf)}, binding=${Boolean(browserC.dinodia_operator_binding)}, attempt=${Boolean(browserC.dinodia_operator_attempt)})`);
   const launchB = await fetchJson(`${platformBase}/api/installer/home-support/homes/${encodeURIComponent(customerFixture.homeOneId)}/os-access/launch`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-employee-session': customerFixture.operatorToken }, body: JSON.stringify({ workflowId: customerFixture.operatorWorkId, setupAttemptId: attemptB.body.setupAttemptId }) });
   if (launchB.response.status !== 200 || !launchB.body.handoffId) fail(`A valid fresh handoff could not be issued for the independent browser (${launchB.response.status})`);
-  const concurrentConsumeResponses = await Promise.all([0, 1].map(() => fetchLoopback(`${base}/_dinodia/setup/operator-session`, { method: 'POST', headers: { 'content-type': 'application/json', ...remoteOsHeaders, cookie: cookieHeader(browserB), 'x-dinodia-setup-csrf': decodeURIComponent(cookieValue(browserB, 'dinodia_setup_csrf')) }, body: JSON.stringify({ handoffId: launchB.body.handoffId }) })));
-  const concurrentConsumeBodies = await Promise.all(concurrentConsumeResponses.map((response) => response.json().catch(() => ({}))));
-  const consumeBIndex = concurrentConsumeResponses.findIndex((response) => response.status === 200 && concurrentConsumeBodies[concurrentConsumeResponses.indexOf(response)]?.ok === true);
-  const rejectedConcurrentIndex = consumeBIndex === 0 ? 1 : 0;
-  if (consumeBIndex < 0 || ![400, 401, 403].includes(concurrentConsumeResponses[rejectedConcurrentIndex].status)
-    || concurrentConsumeBodies[rejectedConcurrentIndex]?.handoffPhase !== 'consume'
-    || !/^[a-z0-9_]{1,64}$/.test(String(concurrentConsumeBodies[rejectedConcurrentIndex]?.errorCode || ''))) fail(`Concurrent duplicate browser messages did not converge to one success and one safely attributed one-use denial (${concurrentConsumeResponses.map((response, index) => `${response.status}:${concurrentConsumeBodies[index]?.handoffPhase || 'no-phase'}`).join('/')})`);
-  const consumeB = concurrentConsumeResponses[consumeBIndex];
-  const consumeBBody = concurrentConsumeBodies[consumeBIndex];
-  updateCookieJar(browserB, consumeB);
-  if (consumeB.status !== 200 || consumeBBody.ok !== true) fail(`The independent browser's own handoff did not establish its opaque OS session (${consumeB.status})`);
+  operatorHandoffFetchDelayMs = 250;
+  const platformCallsBeforeDuplicateB = operatorHandoffPlatformRequestCount;
+  let consumeB;
+  try {
+    const duplicateStartsB = await Promise.all([0, 1].map(() => postHandoffStart(browserC, launchB.body.handoffId, remoteOsHeaders)));
+    if (duplicateStartsB.some((entry) => entry.response.status !== 202 || entry.body.correlationId !== duplicateStartsB[0].body.correlationId)) fail('Concurrent duplicate Portal messages did not attach to the same secure-origin handoff job');
+    consumeB = await pollHandoff(browserC, remoteOsHeaders);
+  } finally { operatorHandoffFetchDelayMs = 0; }
+  const consumeBBody = consumeB.body;
+  updateCookieJar(browserC, consumeB.response);
+  if (consumeB.response.status !== 200 || consumeBBody.ok !== true || consumeBBody.state !== 'established' || operatorHandoffPlatformRequestCount - platformCallsBeforeDuplicateB !== 2) fail(`The independent browser's duplicate handoff did not converge to exactly one prepare/consume pair and one OS session (${consumeB.response.status}/${operatorHandoffPlatformRequestCount - platformCallsBeforeDuplicateB})`);
   const secondDeadline = Date.parse(consumeBBody.expiresAt);
   if (!Number.isFinite(secondDeadline) || secondDeadline - Date.now() > 86_400_000 || secondDeadline - Date.now() < 86_390_000) fail('The second OS grant does not carry a single absolute 24-hour deadline');
-  const remoteSetCookies = typeof consumeB.headers.getSetCookie === 'function' ? consumeB.headers.getSetCookie().join(';') : String(consumeB.headers.get('set-cookie') || '');
+  const remoteSetCookies = typeof consumeB.response.headers.getSetCookie === 'function' ? consumeB.response.headers.getSetCookie().join(';') : String(consumeB.response.headers.get('set-cookie') || '');
   if (!/dinodia_os_operator_session=[^;]+/.test(remoteSetCookies) || !/HttpOnly/i.test(remoteSetCookies) || !/Secure/i.test(remoteSetCookies) || !/SameSite=Strict/i.test(remoteSetCookies)) fail('Secure CloudURL handoff did not issue an HttpOnly/Secure/SameSite OS cookie');
-  const secondRead = await fetchJsonLoopback(`${base}/_dinodia/admin/api/devices`, { headers: { host: remoteHost, 'x-forwarded-proto': 'https', cookie: cookieHeader(browserB) } });
+  const secondRead = await fetchJsonLoopback(`${base}/_dinodia/admin/api/devices`, { headers: { host: remoteHost, 'x-forwarded-proto': 'https', cookie: cookieHeader(browserC) } });
   if (secondRead.response.status !== 200) fail(`The second browser's own fresh handoff did not authorize a protected OS read (${secondRead.response.status})`);
   // The two absolute deadlines are independent: advance Platform past the
   // real Portal token/database deadline while the later-issued OS grant is
@@ -1714,10 +1758,10 @@ async function osChecks() {
   const expiredPortal = await fetchJson(`${platformBase}/api/company/auth/session`, { headers: { 'x-dinodia-employee-session': customerFixture.operatorToken } });
   if (expiredPortal.response.status !== 401) fail(`Portal login remained valid after its own 24-hour absolute deadline (${expiredPortal.response.status})`);
   await hub.syncOperatorBrowserSessions();
-  const afterPortalExpiryRead = await fetchJsonLoopback(`${base}/_dinodia/admin/api/devices`, { headers: { host: remoteHost, 'x-forwarded-proto': 'https', cookie: cookieHeader(browserB) } });
+  const afterPortalExpiryRead = await fetchJsonLoopback(`${base}/_dinodia/admin/api/devices`, { headers: { host: remoteHost, 'x-forwarded-proto': 'https', cookie: cookieHeader(browserC) } });
   if (afterPortalExpiryRead.response.status !== 200) fail(`Natural Portal expiry incorrectly ended the independent OS operator grant (${afterPortalExpiryRead.response.status})`);
 
-  const socket = new WebSocket(`${base.replace('http', 'ws')}/api/websocket`, { headers: { host: remoteHost, origin: `https://${remoteHost}`, 'x-forwarded-proto': 'https', cookie: cookieHeader(browserB) } });
+  const socket = new WebSocket(`${base.replace('http', 'ws')}/api/websocket`, { headers: { host: remoteHost, origin: `https://${remoteHost}`, 'x-forwarded-proto': 'https', cookie: cookieHeader(browserC) } });
   await new Promise((resolve, reject) => {
     const timer = setTimeout(() => { socket.terminate(); reject(new Error('valid operator WebSocket did not authenticate')); }, 5000);
     socket.on('message', (value) => { try { const message = JSON.parse(String(value)); if (message.type === 'auth_required') socket.send(JSON.stringify({ type: 'auth', access_token: '' })); if (message.type === 'auth_ok') { clearTimeout(timer); resolve(); } } catch {} });
@@ -1732,7 +1776,7 @@ async function osChecks() {
   if (initialWsRead?.success !== true) fail('Intended-browser WebSocket could not perform a protected read before session expiry');
   osHarnessNow = secondDeadline - 1;
   await hub.syncOperatorBrowserSessions();
-  const beforeOsExpiry = await fetchJsonLoopback(`${base}/_dinodia/admin/api/devices`, { headers: { host: remoteHost, 'x-forwarded-proto': 'https', cookie: cookieHeader(browserB) } });
+  const beforeOsExpiry = await fetchJsonLoopback(`${base}/_dinodia/admin/api/devices`, { headers: { host: remoteHost, 'x-forwarded-proto': 'https', cookie: cookieHeader(browserC) } });
   if (beforeOsExpiry.response.status !== 200) fail(`OS protected HTTP read was denied immediately before 24-hour expiry (${beforeOsExpiry.response.status})`);
   osHarnessNow = secondDeadline;
   socket.send(JSON.stringify({ id: 42, type: 'get_states' }));
@@ -1740,9 +1784,9 @@ async function osChecks() {
     const timer = setTimeout(() => reject(new Error('operator WebSocket remained open at the exact 24-hour expiry')), 2000);
     socket.once('close', () => { clearTimeout(timer); resolve(); });
   });
-  const atOsExpiry = await fetchJsonLoopback(`${base}/_dinodia/admin/api/devices`, { headers: { host: remoteHost, 'x-forwarded-proto': 'https', cookie: cookieHeader(browserB) } });
+  const atOsExpiry = await fetchJsonLoopback(`${base}/_dinodia/admin/api/devices`, { headers: { host: remoteHost, 'x-forwarded-proto': 'https', cookie: cookieHeader(browserC) } });
   osHarnessNow = secondDeadline + 1;
-  const afterOsExpiry = await fetchJsonLoopback(`${base}/_dinodia/admin/api/devices`, { headers: { host: remoteHost, 'x-forwarded-proto': 'https', cookie: cookieHeader(browserB) } });
+  const afterOsExpiry = await fetchJsonLoopback(`${base}/_dinodia/admin/api/devices`, { headers: { host: remoteHost, 'x-forwarded-proto': 'https', cookie: cookieHeader(browserC) } });
   if (atOsExpiry.response.status !== 401 || afterOsExpiry.response.status !== 401) fail(`OS protected HTTP authority did not end exactly at 24 hours (${atOsExpiry.response.status}/${afterOsExpiry.response.status})`);
   console.log('[stage1:integration] PASS: real consumed grant is durably JTI-bound; Portal and OS deadlines remain independent; intended and independently handed-off browsers read protected OS data; End session revokes HTTP and closes its WebSocket; HTTP and WebSocket authority stop at the exact 24-hour deadline without exposing bearer material');
   osHarnessNow = Date.now();
