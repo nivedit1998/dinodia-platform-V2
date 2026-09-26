@@ -1,10 +1,10 @@
 import { NextResponse } from 'next/server';
-import { prisma } from '@/lib/prisma';
 import { authErrorResponse, Stage1AuthError } from '@/lib/stage1Auth';
 import { authenticateHub } from '@/lib/stage1HubAuth';
 import { randomSecret, sha256 } from '@/lib/stage1Crypto';
 import { supportProofOfPossessionDigest } from '@/lib/stage1Operator';
 import { createPropertySupportNotifications } from '@/lib/supportNotifications';
+import { serializableTransaction } from '@/lib/serializableTransaction';
 
 export const dynamic = 'force-dynamic';
 
@@ -19,7 +19,7 @@ export async function POST(request: Request) {
     const proofOfPossession = String(hub.body.employeeProofOfPossession ?? '').trim();
     if (!ticketId || !/^[0-9a-f-]{36}$/i.test(requestId) || !Number.isInteger(identityGeneration) || identityGeneration < 1 || !code || !/^[0-9a-f]{64}$/i.test(proofOfPossession)) throw new Stage1AuthError(401, 'support_credentials_required', 'A support ticket, request, one-use support code and hub employee proof are required');
     const now = new Date();
-    const result = await prisma.$transaction(async (tx) => {
+    const result = await serializableTransaction(async (tx) => {
       const row = await tx.supportAccessRequest.findFirst({ where: { id: requestId, ticketId, hubInstallationId: hub.installation.id, status: 'ISSUED', codeHash: sha256(code), employeeHandoffEnvelope: { not: null } }, select: { id: true, ticketId: true, requestedByEmployeeId: true, homeId: true, hubInstallationId: true, requestedScope: true, targetMembershipId: true, targetUserId: true, canonicalAreaIds: true, codeExpiresAt: true, employeeHandoffExpiresAt: true, employeeHandoffConsumedAt: true, sessionHardStopAt: true, codeConsumedAt: true, employeeHandoffHash: true } });
       if (!row || row.codeConsumedAt || row.employeeHandoffConsumedAt || !row.codeExpiresAt || row.codeExpiresAt <= now || !row.employeeHandoffExpiresAt || row.employeeHandoffExpiresAt <= now || !row.sessionHardStopAt || row.sessionHardStopAt <= now) throw new Stage1AuthError(401, 'support_code_invalid', 'The support code and Company Portal handoff are invalid or expired');
       const ticket = await tx.supportTicket.findUnique({ where: { id: row.ticketId }, select: { status: true, assignedEmployeeId: true } });

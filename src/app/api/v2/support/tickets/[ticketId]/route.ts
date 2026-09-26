@@ -3,6 +3,7 @@ import { prisma } from '@/lib/prisma';
 import { requireCustomer, Stage1AuthError, authErrorResponse } from '@/lib/stage1Auth';
 import { consumeStepUp } from '@/lib/sensitiveOperationStepUp';
 import { createPropertySupportNotifications } from '@/lib/supportNotifications';
+import { serializableTransaction } from '@/lib/serializableTransaction';
 
 export const dynamic = 'force-dynamic';
 
@@ -16,7 +17,7 @@ export async function POST(request: Request, context: { params: Promise<{ ticket
     if (!ticket || ticket.customerAccountId !== customer.id || ticket.homeId !== customer.homeId) throw new Stage1AuthError(403, 'support_ticket_denied', 'This ticket is not part of the selected home');
     await consumeStepUp({ proof: String(body.proof ?? request.headers.get('x-dinodia-step-up-proof') ?? ''), customerAccountId: customer.id, customerSessionId: customer.sessionId, trustedDeviceId: customer.trustedDeviceId, homeId: customer.homeId, membershipId: customer.membershipId, hubInstallationId: customer.hubInstallationId, operationKind: 'support_ticket_close', targetIds: [ticketId], value: null, policyRevision: customer.policyRevision });
     const now = new Date();
-    await prisma.$transaction(async (tx) => {
+    await serializableTransaction(async (tx) => {
       const activeSessions = await tx.supportSession.findMany({ where: { ticketId, status: 'ACTIVE' }, select: { id: true, accessRequestId: true, homeId: true } });
       await tx.supportAccessRequest.updateMany({ where: { ticketId, status: { in: ['REQUESTED', 'APPROVED', 'ISSUED', 'REDEEMED'] } }, data: { status: 'REVOKED', desiredRevokedAt: now, revision: { increment: 1 } } });
       await tx.supportSession.updateMany({ where: { ticketId, status: 'ACTIVE' }, data: { status: 'PENDING_HUB_REVOKE', desiredRevokedAt: now, endedAt: now } });

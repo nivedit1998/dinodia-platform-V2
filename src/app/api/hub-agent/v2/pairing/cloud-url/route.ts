@@ -41,19 +41,23 @@ export async function POST(request: Request) {
     if (reverifyChallenge && existing?.status === 'VERIFIED' && (existing.cloudUrl !== cloudUrl || existing.reservedHostname !== hostname || existing.tunnelName !== tunnelName)) throw new Stage1AuthError(409, 'cloudflare_verification_conflict', 'The tunnel identity differs from the verified installation');
     const challenge = randomSecret(32);
     const challengeHash = sha256(challenge);
-    const expiresAt = new Date(Date.now() + 5 * 60 * 1000);
+    const issuedAt = new Date();
+    const expiresAt = new Date(issuedAt.getTime() + 5 * 60 * 1000);
     let verification: { id: string; expiresAt: Date };
     try {
       verification = await prisma.$transaction(async (tx) => {
         if (existing) {
           const reserved = await tx.cloudUrlVerification.updateMany({
             where: { id: existing.id, status: existing.status, challengeHash: existing.challengeHash },
-            data: { homeId: hub.installation.homeId, reservedHostname: hostname, tunnelName, cloudUrl, challengeHash, status: 'PENDING', expiresAt, failedAt: null, verifiedAt: null, signedResponseDigest: null },
+            data: { homeId: hub.installation.homeId, reservedHostname: hostname, tunnelName, cloudUrl, challengeHash, status: 'PENDING', issuedAt, expiresAt, failedAt: null, verifiedAt: null, signedResponseDigest: null },
           });
           if (reserved.count !== 1) throw new Stage1AuthError(409, 'cloudflare_challenge_replaced', 'A newer CloudURL verification challenge superseded this request');
+          await tx.hubInstallation.update({ where: { id: hub.installation.id }, data: { remoteChallengeAt: issuedAt } });
           return { id: existing.id, expiresAt };
         }
-        return tx.cloudUrlVerification.create({ data: { hubInstallationId: hub.installation.id, homeId: hub.installation.homeId, reservedHostname: hostname, tunnelId, tunnelName, cloudUrl, challengeHash, status: 'PENDING', expiresAt }, select: { id: true, expiresAt: true } });
+        const created = await tx.cloudUrlVerification.create({ data: { hubInstallationId: hub.installation.id, homeId: hub.installation.homeId, reservedHostname: hostname, tunnelId, tunnelName, cloudUrl, challengeHash, status: 'PENDING', issuedAt, expiresAt }, select: { id: true, expiresAt: true } });
+        await tx.hubInstallation.update({ where: { id: hub.installation.id }, data: { remoteChallengeAt: issuedAt } });
+        return created;
       });
     } catch (error) {
       if (error instanceof Stage1AuthError) throw error;

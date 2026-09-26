@@ -446,13 +446,17 @@ test('R11 CloudURL route issues a fresh signed challenge and rejects a replayed 
     assert.equal((await first.json()).verified, true);
     assert.equal(record.status, 'VERIFIED');
     assert.equal(record.challengeHash, sha256(observedChallenges[0]));
-    assert.equal(hubUpdates.length, 1);
+    assert.ok(record.issuedAt instanceof Date);
+    assert.ok(Date.now() - record.issuedAt.getTime() < 5_000, 'verification row records this challenge issuance');
+    assert.equal(hubUpdates.filter((update) => update.remoteChallengeAt instanceof Date).length, 1, 'HubInstallation durably records challenge issuance');
+    assert.equal(hubUpdates.filter((update) => update.remoteVerificationAt instanceof Date).length, 1, 'HubInstallation durably records successful verification');
     assert.notEqual(record.challengeHash, sha256('previous-challenge'));
     replayPreviousResponse = true;
     const replay = await call(true);
     assert.equal(replay.status, 502);
     assert.equal(record.status, 'FAILED');
-    assert.equal(hubUpdates.length, 1, 'replayed response must not update HubInstallation verification evidence');
+    assert.equal(hubUpdates.filter((update) => update.remoteChallengeAt instanceof Date).length, 2, 'the failed retry is recorded as a new challenge attempt');
+    assert.equal(hubUpdates.filter((update) => update.remoteVerificationAt instanceof Date).length, 1, 'replayed response must not update HubInstallation verification evidence');
     assert.notEqual(observedChallenges[0], observedChallenges[1], 're-verification must use a fresh challenge');
   } finally {
     globalThis.fetch = previousFetch;

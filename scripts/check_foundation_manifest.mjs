@@ -21,6 +21,9 @@ const modifiedFiles = new Set([
   'test/stage1_security.test.mjs', 'vercel.json',
   'src/app/api/installer/home-support/homes/[homeId]/os-access/rotate/route.ts',
   'src/app/api/installer/home-support/homes/[homeId]/os-access/revoke/route.ts',
+  'src/app/api/hub-agent/token-state/route.ts',
+  'src/app/api/hub-agent/v2/credentials/acknowledge/route.ts',
+  'src/app/api/hub-agent/v2/credentials/activate/route.ts',
   'src/app/api/hub-agent/operator-session/consume/route.ts',
   'src/app/api/installer/home-support/homes/[homeId]/os-access/launch/route.ts',
 ]);
@@ -35,7 +38,7 @@ const addedFiles = [
   /^src\/app\/api\/(health|readiness)(?:\/|$)/,
   /^src\/app\/api\/(company|cron|hub-agent|installer|internal|v2)(?:\/|$)/,
   /^src\/app\/(company|installer)(?:\/|$)/,
-  /^src\/lib\/(foundation|foundationContracts|initialCxoInvitation|manufacturingEnrollment|runtimeDatabaseUrl|runtimeTarget|hubOperatorCredentials|idempotentOperatorMutation|operatorRateLimitPolicy|nativeOperations|passwords|rateLimit|sensitiveOperationStepUp|stage1Auth|stage1ClaimContract|stage1Crypto|stage1HubAuth|stage1Operator|supportNotifications)\.(mjs|ts)$/,
+  /^src\/lib\/(foundation|foundationContracts|initialCxoInvitation|manufacturingEnrollment|runtimeDatabaseUrl|runtimeTarget|hubOperatorCredentials|idempotentOperatorMutation|operatorRateLimitPolicy|nativeOperations|passwords|rateLimit|serializableTransaction|sensitiveOperationStepUp|stage1Auth|stage1ClaimContract|stage1Crypto|stage1HubAuth|stage1Operator|supportNotifications)\.(mjs|ts)$/,
   /^test(?:\/|$)/,
   /^vercel\.json$/,
 ];

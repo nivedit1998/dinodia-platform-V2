@@ -1,9 +1,11 @@
 # Stage 1 release-candidate readiness
 
 Updated 2026-09-26. This is a value-free evidence/runbook record. The reviewed
-R11 Platform candidate is deployed to the canonical Production alias; the new
-OS package is staged on the existing Pi but its guarded installer has not yet
-been run. Stage 1 remains incomplete.
+CloudURL challenge-evidence follow-up and the audited operator credential
+transitions are deployed to the canonical Production alias as Vercel
+deployment `dpl_BgEMjyMhzEDZgNDsh1NACrET1PQn`. A separate Native V2 OS package
+with the locked-setup mDNS fix is staged on the existing Pi; its guarded
+installer has not yet been run. Stage 1 remains incomplete.
 
 ## Canonical topology and current baseline
 
@@ -18,34 +20,72 @@ been run. Stage 1 remains incomplete.
   No Worker redeploy is warranted for a comment-only `wrangler.toml` edit.
 - Scheduled work remains exactly one Supabase two-minute native-operations
   job and one daily Vercel `native-maintenance` cron; Edge has no schedule.
-- Read-only checks after R11 deployment on 2026-09-26: canonical Vercel `/`,
-  `/api/health` and `/api/readiness` returned 200; an unknown route returned
-  404; unauthenticated `/api/installer/workflows` returned 401. Vercel
-  deployment `dpl_5ZHziTkyXjykfNqmzXNpKxFQRaf4` is Ready and aliased to the
-  canonical origin. The previous Ready deployment `dpl_33F8xEAGdAqBU8UxbPeQXT76fmk3`
-  is retained for rollback. Existing CloudURL `/api/health` and `/setup.js`
-  returned 200 before the new OS package was installed.
-- Immediately before preparing the new package, Pi `192.168.1.76` reported
-  `mode=native-v2`, build `native-v2-e40b81df300b7a57dfcc010d`; both
-  `dinodia-os` and `dinodia-identityd` were active. The existing identity
-  directory was not modified. The reviewed OS source commit is
-  `d0fe632cc791168c83302620e38f44f5e89da010`; its transferred source archive
-  SHA-256 is `d44c642a5ea230e1b9df11bf2b131315ef40bf1d91e1b9d0615b3578bf53c614`.
-  The package is staged at `/tmp/dinodia-os-stage1-d0fe632` on the Pi; the
-  atomic installer and post-install health verification are still pending.
-- The Section 25 read recorded `operatorCredentialStates=[]`. Do not treat a
-  working Pi health endpoint, CloudURL verification or an opened browser as
-  proof that operator version 1 is active. Refresh this state after the real
-  Platform/Portal/Pi lifecycle is exercised.
-- R11 rate-limit/idempotency source remains in Platform commit
+- Read-only checks after the latest Platform deployment on 2026-09-26:
+  canonical Vercel `/`, `/api/health` and `/api/readiness` returned 200;
+  an unknown route returned 404; unauthenticated `/api/installer/workflows`
+  returned 401. Deployment `dpl_BgEMjyMhzEDZgNDsh1NACrET1PQn` is Ready and
+  aliased to the canonical origin. The preceding Ready deployment
+  `dpl_ETjeK2SyLTudMrSpqVYMaphGqiBd` is the immediate rollback target;
+  `dpl_5ZHziTkyXjykfNqmzXNpKxFQRaf4` and
+  `dpl_33F8xEAGdAqBU8UxbPeQXT76fmk3` remain available as older rollback points.
+- Before staging the mDNS update, Pi `192.168.1.76` reported
+  `mode=native-v2`, build `native-v2-295865a6263064dc51553536`; both services
+  were reported active. The enrolled identity was not modified. The candidate
+  source fingerprint is `native-v2-fb5ba1404cd34a79feb649f9`; its transferred
+  archive SHA-256 is
+  `f2a30dfd37ae6e696e98391d73c9e115e8f1650d5e068c53681f2b197aefd127`.
+  It is staged at `/tmp/dinodia-os-stage1-fb5ba1404cd34a79feb649f9` on the Pi;
+  the sudo-protected atomic installer and post-install health check remain
+  pending. Before this candidate, the Pi lacked `avahi-publish-address` and
+  `avahi-publish-service`, so `.local` discovery was not proven.
+- Section 27's real operator lifecycle evidence supersedes Section 26. A
+  guarded read-only Production query at approximately `2026-09-26T09:55Z`
+  found version 4 ACTIVE and version 3 REVOKED; version 3's grace deadline was
+  `09:40:09.742Z`, followed by durable revocation at `09:42:00.424Z`. At the
+  earlier `09:28Z` Pi observation, it agreed on version 4 ACTIVE and version 3
+  GRACE, with `lastError` absent and last sync at `09:28:34.601Z`. Version 4
+  was issued at
+  `09:20:02.285Z`, delivered at `09:20:02.969Z`, acknowledged at
+  `09:20:07.448Z` and activated at `09:20:09.742Z`. Version 3 was activated at
+  `08:18:38.445Z` and given a 20-minute grace deadline at `09:40:09.742Z`.
+  Scheduler-driven rotation occurred naturally; no credential value was read
+  or exposed. This is partial live evidence only: exact-boundary behavior,
+  emergency revocation, and active WebSocket revocation remain unproven live.
+- Historical R11 rate-limit/idempotency source is in Platform commit
   `b9cf43c17ed1461b76e66280db6d985d285d64ca`; the CloudURL re-verification
-  follow-up is commit `a08f45624c9c9f8b59b7bfda3e7c934e8d632cec` and is included
-  in the deployed Vercel build above. The additive migration
+  follow-up is in commit `a08f45624c9c9f8b59b7bfda3e7c934e8d632cec`. Both are
+  ancestors of the deployed Platform branch head. The latest deployment also
+  includes the reviewed route/test worktree patch noted below. The additive migration
   `20260925230000_r11_operator_mutation_idempotency` was applied to the
   specifically guarded Supabase project after baseline/checksum/schema
   verification. It was reapplied successfully with no pending migrations.
 
 ## Refreshed read-only Production evidence — 2026-09-26
+
+- Vercel CLI 60.1.3 deployed the reviewed CloudURL route/test source snapshot
+  from Platform branch head `3fab8b7e0cbdbc4f6983e9a67a89e5f031291068` plus
+  the reviewed changes to `src/app/api/hub-agent/v2/pairing/cloud-url/route.ts`
+  and `test/stage1_security.test.mjs` as deployment
+  `dpl_ETjeK2SyLTudMrSpqVYMaphGqiBd`
+  (`dinodia-platform-v2-os5eibkkh-dinodia-supabase.vercel.app`). The deployment
+  is READY and the canonical Production alias resolves to it. The route now
+  records the challenge issuance timestamp and `HubInstallation.remoteChallengeAt`
+  transactionally. No migration or database mutation was part of this deploy.
+  Smoke results: `/` 200, `/api/health` 200, `/api/readiness` 200,
+  unauthenticated protected workflow 401, unknown route 404; frame protection
+  was `DENY` and HSTS was present on each response.
+
+- Vercel CLI 60.1.3 then deployed the reviewed operator transition/audit
+  source snapshot to Production as `dpl_BgEMjyMhzEDZgNDsh1NACrET1PQn`
+  (`dinodia-platform-v2-kdkucpnft-dinodia-supabase.vercel.app`), Ready and
+  aliased to the canonical origin. It includes transactional, redacted audit
+  events for delivery, exact-version acknowledgement and activation, plus
+  idempotent concurrent hub retries. The snapshot is based on Platform
+  `3fab8b7e0cbdbc4f6983e9a67a89e5f031291068` plus the reviewed worktree diff,
+  not a clean Git commit. No migration or Production row mutation was part of
+  the deployment. Post-deploy smoke returned `/`, `/api/health` and
+  `/api/readiness` 200, unauthenticated protected workflow 401 and unknown
+  route 404; `X-Frame-Options: DENY` and HSTS were present.
 
 - Vercel CLI 60.1.3 deployed the reviewed Platform source commit
   `a08f45624c9c9f8b59b7bfda3e7c934e8d632cec` to Production as
@@ -69,17 +109,34 @@ been run. Stage 1 remains incomplete.
   `DINODIA_NATIVE_OPERATIONS_URL` and
   `DINODIA_NATIVE_OPERATIONS_CRON_SECRET`; values were not retrieved. Edge
   has zero schedules and Vercel retains only the daily maintenance cron.
-- Redacted safe-record counts show the existing CXO remains ACTIVE and the
-  initial bootstrap ceremony is CONSUMED; the existing Home, installation
-  work, HubInstallation, active machine credential and verified CloudURL
-  remain present. No active Production operator-credential version was found;
-  the Pi's reported `operatorCredentialStates` is still empty. Do not claim
-  operator access or credential lifecycle acceptance.
+- The existing CXO remains ACTIVE and the initial bootstrap ceremony remains
+  CONSUMED; the existing Home, installation work, HubInstallation, active
+  machine credential and verified CloudURL were preserved. At the 09:55Z
+  observation Production showed operator v4 ACTIVE and v3 REVOKED after grace;
+  Pi had previously converged on v4 ACTIVE. The
+  `HubInstallation.remoteChallengeAt` was still null, and
+  the matching VERIFIED `CloudUrlVerification` row was issued at
+  `2026-09-25T19:38:54.226Z`, verified at `2026-09-26T07:45:02.402Z`, and
+  expired at `2026-09-26T07:50:01.473Z`. The row's tunnel ID equals the installation's stored tunnel
+  ID, and its hostname/name match the reserved installation. The fresh signed
+  challenge has not yet been triggered.
 - The post-deployment `/api/readiness` returns 200 with the existing
   `20260925230000_r11_operator_mutation_idempotency` migration already applied;
   all 15 Production ledger checksums match local migrations. Readiness does not
   prove operator activation, browser handoff, fresh CloudURL proof or user
   acceptance.
+- A read-only tunnel probe at approximately 09:55Z returned `/api/health` 200
+  with `mode=native-v2`, build `native-v2-295865a6263064dc51553536`, and
+  `/setup.js` 200. The Pi services were active. The mDNS candidate remains
+  staged at `/tmp/dinodia-os-stage1-fb5ba1404cd34a79feb649f9`; it has not been
+  installed, so the current Pi still lacks the candidate `.local` helper.
+- The physical iPhone `Gupta` is paired and available. The Stage 1 Debug app
+  was signed, installed and launched with the reference-view argument. This
+  proves installation only—not customer sign-in, Face ID/passcode, a protected
+  command or WAN acceptance. Simulator tests are engineering evidence only.
+  Chrome control remains unavailable after the approved reconnect attempt;
+  the Browser plugin reinstallation request is outstanding. The live
+  two-browser matrix and physical biometric/WAN acceptance remain open.
 
 ## Immutable candidate manifest
 
@@ -87,12 +144,15 @@ Fill these fields only after final review/deployment. Do not put credentials,
 database URLs, cookies, pairing codes, private keys or other secret values in
 this file or a deployment ticket.
 
-- Platform Stage 1 commits: `b9cf43c17ed1461b76e66280db6d985d285d64ca` and
-  `a08f45624c9c9f8b59b7bfda3e7c934e8d632cec`; Production deployment/build ID:
-  `dpl_5ZHziTkyXjykfNqmzXNpKxFQRaf4` at the canonical alias.
-- Dinodia OS source commit `d0fe632cc791168c83302620e38f44f5e89da010`; source
-  archive SHA-256 `d44c642a5ea230e1b9df11bf2b131315ef40bf1d91e1b9d0615b3578bf53c614`;
-  the candidate build ID and successful atomic install remain pending.
+- Platform source head `3fab8b7e0cbdbc4f6983e9a67a89e5f031291068` plus reviewed
+  source diffs: immutable Production deployment `dpl_BgEMjyMhzEDZgNDsh1NACrET1PQn`;
+  the prior Ready deployment `dpl_ETjeK2SyLTudMrSpqVYMaphGqiBd` remains the
+  immediate rollback target. The deployment is a source snapshot, not a clean
+  Git commit; preserve this distinction in release records.
+- Dinodia OS source head `c0b4f71795d73bc307abf5518dc34ea0418d1264` plus reviewed
+  source diff; candidate build ID `native-v2-fb5ba1404cd34a79feb649f9`, archive
+  SHA-256 `f2a30dfd37ae6e696e98391d73c9e115e8f1650d5e068c53681f2b197aefd127`.
+  It remains staged; installation and health verification remain pending.
 - Migration `20260925230000_r11_operator_mutation_idempotency`, SHA-256
   `8297d0923192b9ea2d4fd364bc1ae365a7709461b65da1e1981aaa1b93eb7014`;
   Supabase ledger contains the matching completed row and a guarded reapply
@@ -104,11 +164,15 @@ this file or a deployment ticket.
   `38511013-d158-4783-a541-fa9413a4f244`, created 2026-09-25). No Edge schedule
   or alternate origin was added.
 - Redacted existing hub/home identifiers and safe effective credential state:
-  capture after read-only verification; do not publish full serials or secrets.
+  guarded Production query at approximately 09:55Z showed v4 ACTIVE and v3
+  REVOKED; Pi had reported v4 ACTIVE at 09:28Z. No credential value was read.
 - BaseURL and verified CloudURL scenario evidence: record only redacted
   references and status, never query/session material.
-- iOS reference build and physical Gupta test record: pending real device
-  execution; simulator results are not biometric or UA evidence.
+- iOS simulator suite passed on iPhone 17 Pro simulator. Debug build
+  `com.dinodia.DinodiaV2` was also built, installed and launched on paired
+  Gupta with `-stage1-security-reference`; physical authentication, authorized
+  customer sign-in, exact safe command, replay denial and WAN tests remain
+  pending.
 - Rollback: restore the previously deployed Vercel build and the existing
   backed-up Native V2 Pi release using the tested atomic installer procedure.
   Keep additive database migrations/data in place during application rollback;
@@ -116,8 +180,8 @@ this file or a deployment ticket.
 
 ## Deployment gate and rollback
 
-The critical local engineering gate passed before the Platform deployment:
-Platform Stage 1 integration, two independent clean-source PostgreSQL
+The critical Platform gate passed before the latest Platform deployment:
+Platform Stage 1 integration, clean-source PostgreSQL
 reconstruction/idempotency runs, OS tests/checks, Edge tests/typecheck/lint and
 RC dry-run, iOS simulator tests, full/runtime dependency audits, schema
 fingerprint and exact-value client-bundle scan. The R11 additive migration was
@@ -126,8 +190,8 @@ deployment. Do not commit or push `.env.local`, credentials, keys, pairing data
 or generated local material.
 
 Vercel rollback target: restore the prior Ready deployment
-`dinodia-platform-v2-3i24kx2uj-dinodia-supabase.vercel.app` (deployment ID
-`dpl_33F8xEAGdAqBU8UxbPeQXT76fmk3`) to the canonical alias using the current
+`dinodia-platform-v2-os5eibkkh-dinodia-supabase.vercel.app` (deployment ID
+`dpl_ETjeK2SyLTudMrSpqVYMaphGqiBd`) to the canonical alias using the current
 Vercel CLI; keep the additive migration and all data in place. The Pi rollback
 must use the installer's preserved previous release symlink and saved service
 units, never the old HA installation. Do not claim the Pi candidate is live
@@ -157,3 +221,24 @@ Specifically verify:
 Stage 1 remains incomplete and Stage 2 remains blocked until every AC-01 and
 UA-01 item passes with evidence and both product-owner and security-owner
 sign-off.
+
+## R11-04 support close/redeem race regression — 2026-09-26 10:23Z
+
+The loopback integration harness exposed a missing behavioral race case between
+customer ticket closure and machine-authenticated support redemption. Both
+production routes now use the shared bounded serializable transaction helper
+`src/lib/serializableTransaction.ts`; a retry is limited to PostgreSQL
+serialization conflicts and does not repeat external side effects. The actual
+Platform/OS + disposable PostgreSQL test raced `POST
+/api/v2/support/tickets/:ticketId` against `POST
+/api/hub-agent/support/v2/redeem` and passed: closure returned success, the
+request ended REVOKED, and no ACTIVE support lease remained. `npm run
+test:stage1`, `npm test`, `npm run lint`, `npm run typecheck`, `npm run
+check:foundation:manifest`, `npm run check:logs`, `npm run check:security`,
+`npm run check:stage1`, `npm run check:foundation`, `npx prisma validate`, both
+dependency audits, `npm run build`, and `npm run clean-clone:check` passed on
+the reviewed worktree. This support-race fix is **not yet deployed**; the
+canonical Vercel deployment remains `dpl_BgEMjyMhzEDZgNDsh1NACrET1PQn` until a
+reviewed deployment explicitly records a new immutable deployment ID. This
+regression does not prove the full support clock-boundary, participant or
+offline acceptance matrix.

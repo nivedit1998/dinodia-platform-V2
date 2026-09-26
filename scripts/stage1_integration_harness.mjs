@@ -656,14 +656,30 @@ async function customerAuthorizationChecks() {
   await prisma.customerAccount.deleteMany({ where: { id: { in: [winnerAccount.id, loserAccount.id] } } });
   const tokenState = await machineRequest({ base: machineBase, path: '/api/hub-agent/token-state', machineSecret, body: { serial: identityOne.serialNumber, identityGeneration: identityOne.identityGeneration, operatorCredentialVersion: 1 } });
   if (tokenState.response.status !== 200 || tokenState.body.operatorCredentialDelivery?.version !== 2) fail(`Operator credential delivery did not expose the next version (${tokenState.response.status})`);
-  const operatorV2 = await prisma.hubCredentialVersion.findFirst({ where: { hubInstallationId: hubOne.id, purpose: 'operator-credential', version: 2 }, select: { tokenHash: true, state: true } });
+  const operatorV2 = await prisma.hubCredentialVersion.findFirst({ where: { hubInstallationId: hubOne.id, purpose: 'operator-credential', version: 2 }, select: { id: true, tokenHash: true, state: true } });
   if (operatorV2?.state !== 'DELIVERED') fail(`Operator credential was not durably marked DELIVERED (${operatorV2?.state})`);
-  const acknowledged = await machineRequest({ base: machineBase, path: '/api/hub-agent/v2/credentials/acknowledge', machineSecret, body: { serial: identityOne.serialNumber, identityGeneration: identityOne.identityGeneration, version: 2, credentialFingerprint: operatorV2.tokenHash } });
-  if (acknowledged.response.status !== 200 || acknowledged.body.state !== 'ACKNOWLEDGED') fail(`Operator acknowledgement failed (${acknowledged.response.status})`);
+  const deliveryAudits = await prisma.auditEvent.findMany({ where: { targetType: 'HubCredentialVersion', targetId: operatorV2.id, action: 'operator_credential_delivered' }, select: { id: true, metadata: true } });
+  if (deliveryAudits.length !== 1 || JSON.stringify(deliveryAudits[0].metadata).includes(operatorV2.tokenHash)) fail('Credential delivery did not create exactly one redacted audit event');
+  const deliveryRetry = await machineRequest({ base: machineBase, path: '/api/hub-agent/token-state', machineSecret, body: { serial: identityOne.serialNumber, identityGeneration: identityOne.identityGeneration, operatorCredentialVersion: 1 } });
+  if (deliveryRetry.response.status !== 200 || deliveryRetry.body.operatorCredentialDelivery?.version !== 2) fail(`Interrupted delivery retry did not resend the same version (${deliveryRetry.response.status})`);
+  if (await prisma.auditEvent.count({ where: { targetType: 'HubCredentialVersion', targetId: operatorV2.id, action: 'operator_credential_delivered' } }) !== 1) fail('Idempotent delivery retry duplicated its state-transition audit');
+  const acknowledgementRetries = await Promise.all([0, 1].map(() => machineRequest({ base: machineBase, path: '/api/hub-agent/v2/credentials/acknowledge', machineSecret, body: { serial: identityOne.serialNumber, identityGeneration: identityOne.identityGeneration, version: 2, credentialFingerprint: operatorV2.tokenHash } })));
+  if (acknowledgementRetries.some((result) => result.response.status !== 200 || result.body.state !== 'ACKNOWLEDGED')) fail(`Concurrent exact-version operator acknowledgement did not converge (${acknowledgementRetries.map((result) => result.response.status).join(',')})`);
   const acknowledgedRow = await prisma.hubCredentialVersion.findFirst({ where: { hubInstallationId: hubOne.id, purpose: 'operator-credential', version: 2 }, select: { state: true, acknowledgedAt: true, activatedAt: true } });
   if (acknowledgedRow?.state !== 'ACKNOWLEDGED' || !acknowledgedRow.acknowledgedAt || acknowledgedRow.activatedAt) fail('Acknowledgement incorrectly activated the operator credential');
-  const activated = await machineRequest({ base: machineBase, path: '/api/hub-agent/v2/credentials/activate', machineSecret, body: { serial: identityOne.serialNumber, identityGeneration: identityOne.identityGeneration, version: 2, credentialFingerprint: operatorV2.tokenHash } });
-  if (activated.response.status !== 200 || activated.body.state !== 'ACTIVE') fail(`Operator activation failed (${activated.response.status})`);
+  const acknowledgementAudits = await prisma.auditEvent.findMany({ where: { targetType: 'HubCredentialVersion', targetId: operatorV2.id, action: 'operator_credential_acknowledged' }, select: { id: true, metadata: true } });
+  if (acknowledgementAudits.length !== 1 || JSON.stringify(acknowledgementAudits[0].metadata).includes(operatorV2.tokenHash)) fail('Credential acknowledgement did not create exactly one redacted audit event');
+  const acknowledgementRetry = await machineRequest({ base: machineBase, path: '/api/hub-agent/v2/credentials/acknowledge', machineSecret, body: { serial: identityOne.serialNumber, identityGeneration: identityOne.identityGeneration, version: 2, credentialFingerprint: operatorV2.tokenHash } });
+  if (acknowledgementRetry.response.status !== 200 || acknowledgementRetry.body.state !== 'ACKNOWLEDGED') fail('Exact-version acknowledgement retry was not idempotent');
+  if (await prisma.auditEvent.count({ where: { targetType: 'HubCredentialVersion', targetId: operatorV2.id, action: 'operator_credential_acknowledged' } }) !== 1) fail('Idempotent acknowledgement retry duplicated its state-transition audit');
+  const activationRetries = await Promise.all([0, 1].map(() => machineRequest({ base: machineBase, path: '/api/hub-agent/v2/credentials/activate', machineSecret, body: { serial: identityOne.serialNumber, identityGeneration: identityOne.identityGeneration, version: 2, credentialFingerprint: operatorV2.tokenHash } })));
+  if (activationRetries.some((result) => result.response.status !== 200 || result.body.state !== 'ACTIVE')) fail(`Concurrent exact-version operator activation did not converge (${activationRetries.map((result) => result.response.status).join(',')})`);
+  const activationAudits = await prisma.auditEvent.findMany({ where: { targetType: 'HubCredentialVersion', targetId: operatorV2.id, action: 'operator_credential_activated' }, select: { id: true, metadata: true } });
+  if (activationAudits.length !== 1 || JSON.stringify(activationAudits[0].metadata).includes(operatorV2.tokenHash)) fail('Credential activation did not create exactly one redacted audit event');
+  const activationRetry = await machineRequest({ base: machineBase, path: '/api/hub-agent/v2/credentials/activate', machineSecret, body: { serial: identityOne.serialNumber, identityGeneration: identityOne.identityGeneration, version: 2, credentialFingerprint: operatorV2.tokenHash } });
+  if (activationRetry.response.status !== 200 || activationRetry.body.state !== 'ACTIVE') fail('Exact-version activation retry was not idempotent');
+  if (await prisma.auditEvent.count({ where: { targetType: 'HubCredentialVersion', targetId: operatorV2.id, action: 'operator_credential_activated' } }) !== 1) fail('Idempotent activation retry duplicated its state-transition audit');
+  console.log('[stage1:integration] PASS: PENDING/DELIVERED/ACKNOWLEDGED/ACTIVE are distinct durable transitions with one redacted audit each and idempotent hub retries');
   const lifecycleRows = await prisma.hubCredentialVersion.findMany({ where: { hubInstallationId: hubOne.id, purpose: 'operator-credential' }, orderBy: { version: 'asc' }, select: { version: true, state: true, graceUntil: true, activatedAt: true } });
   const oldOperator = lifecycleRows.find((row) => row.version === 1);
   const newOperator = lifecycleRows.find((row) => row.version === 2);
@@ -811,6 +827,42 @@ async function customerAuthorizationChecks() {
   const propertyNotificationsAfter = await fetchJson(`${base}/api/v2/support/notifications`, { headers: { 'x-dinodia-app-token': propertyToken.body.token } });
   const propertyEvents = (propertyNotificationsAfter.body.notifications || []).filter((item) => item.ticketId === propertyTicketId).map((item) => item.eventType).sort();
   if (propertyNotificationsAfter.response.status !== 200 || propertyEvents.join(',') !== 'REVOKED,STARTED') fail(`Property notification lifecycle was incomplete or leaked (${propertyEvents.join(',')})`);
+
+  // Race customer closure against the real machine-authenticated redemption
+  // route. Regardless of which serializable transaction wins, closure must
+  // leave no active support session and the one-use request must be revoked.
+  const raceTicketResponse = await fetchJson(`${base}/api/v2/support/tickets`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-app-token': tenantToken.body.token }, body: JSON.stringify({ category: 'HARNESS_SUPPORT_RACE', description: 'Disposable close versus redeem race' }) });
+  if (raceTicketResponse.response.status !== 201) fail(`Support race ticket creation failed (${raceTicketResponse.response.status})`);
+  const raceTicketId = raceTicketResponse.body.ticket.id;
+  await prisma.supportTicket.update({ where: { id: raceTicketId }, data: { assignedEmployeeId: propertySupportEmployee.id } });
+  const raceRequestResponse = await fetchJson(`${base}/api/v2/support/tickets/${raceTicketId}/access-requests`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-employee-session': propertySupportToken }, body: JSON.stringify({ requestedScope: 'TENANT_SCOPE', targetMembershipId: tenantMembership.id, areaIds: [areaOne.id], targetIds: [] }) });
+  if (raceRequestResponse.response.status !== 201) fail(`Support race request creation failed (${raceRequestResponse.response.status})`);
+  const raceRequestId = raceRequestResponse.body.accessRequest.id;
+  const raceApproval = await fetchJson(`${base}/api/v2/support/tickets/${raceTicketId}/access-requests/${raceRequestId}/approve`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-app-token': tenantToken.body.token }, body: JSON.stringify({ approve: true }) });
+  if (raceApproval.response.status !== 200 || !raceApproval.body.oneUseCode) fail(`Support race approval failed (${raceApproval.response.status})`);
+  const raceIssue = await fetchJson(`${base}/api/v2/support/tickets/${raceTicketId}/access-requests/${raceRequestId}/issue`, { method: 'POST', headers: { 'x-dinodia-employee-session': propertySupportToken } });
+  if (raceIssue.response.status !== 200) fail(`Support race employee handoff failed (${raceIssue.response.status})`);
+  const raceRow = await prisma.supportAccessRequest.findUniqueOrThrow({ where: { id: raceRequestId }, select: { employeeHandoffHash: true, codeHash: true } });
+  const raceProof = supportProofOfPossessionDigest({ employeeProofHash: raceRow.employeeHandoffHash, serial: identityOne.serialNumber, ticketId: raceTicketId, requestId: raceRequestId, codeHash: raceRow.codeHash, identityGeneration: identityOne.identityGeneration });
+  const closeChallenge = await fetchJson(`${base}/api/v2/security/step-up/challenge`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-app-token': tenantToken.body.token }, body: JSON.stringify({ operationKind: 'support_ticket_close', targetIds: [raceTicketId], value: null }) });
+  if (closeChallenge.response.status !== 200) fail(`Support close race step-up challenge failed (${closeChallenge.response.status})`);
+  const closeSignature = crypto.sign(null, stepUpChallengeMessage({ challengeId: closeChallenge.body.challengeId, nonce: closeChallenge.body.nonce, operationDigest: closeChallenge.body.operationDigest }), crypto.createPrivateKey(phone.privateKey)).toString('base64url');
+  const closeProof = await fetchJson(`${base}/api/v2/security/step-up/issue`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-app-token': tenantToken.body.token }, body: JSON.stringify({ challengeId: closeChallenge.body.challengeId, nonce: closeChallenge.body.nonce, deviceSignature: closeSignature }) });
+  if (closeProof.response.status !== 200) fail(`Support close race step-up proof failed (${closeProof.response.status})`);
+  const [raceRedeem, raceClose] = await Promise.all([
+    machineRequest({ base: machineBase, path: '/api/hub-agent/support/v2/redeem', machineSecret, body: { serial: identityOne.serialNumber, identityGeneration: identityOne.identityGeneration, ticketId: raceTicketId, requestId: raceRequestId, code: raceApproval.body.oneUseCode, employeeProofOfPossession: raceProof } }),
+    fetchJson(`${base}/api/v2/support/tickets/${raceTicketId}`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-app-token': tenantToken.body.token }, body: JSON.stringify({ action: 'close', proof: closeProof.body.proof }) }),
+  ]);
+  if (raceClose.response.status !== 200 || ![200, 401, 403, 409].includes(raceRedeem.response.status)) fail(`Support close/redeem race did not reach a controlled terminal state (${raceClose.response.status}/${raceRedeem.response.status})`);
+  const raceFinal = await prisma.supportAccessRequest.findUniqueOrThrow({ where: { id: raceRequestId }, select: { status: true } });
+  const raceTicketFinal = await prisma.supportTicket.findUniqueOrThrow({ where: { id: raceTicketId }, select: { status: true } });
+  const raceSessions = await prisma.supportSession.findMany({ where: { accessRequestId: raceRequestId }, select: { status: true, desiredRevokedAt: true } });
+  if (raceTicketFinal.status !== 'CLOSED' || raceFinal.status !== 'REVOKED' || raceSessions.some((session) => session.status === 'ACTIVE' || !session.desiredRevokedAt)) fail('Support close/redeem race left live authority after ticket closure');
+  await prisma.supportSession.deleteMany({ where: { accessRequestId: raceRequestId } });
+  await prisma.supportAccessRequest.delete({ where: { id: raceRequestId } });
+  await prisma.supportTicket.delete({ where: { id: raceTicketId } });
+  console.log(`[stage1:integration] PASS: support close/redeem race closed ticket and revoked request with no active lease (redeem=${raceRedeem.response.status})`);
+
   const propertySupportSessionRow = await prisma.supportSession.findFirst({ where: { accessRequestId: propertyRequestId }, select: { id: true } });
   const propertyHubRevoke = await machineRequest({ base: machineBase, path: '/api/hub-agent/support/v2/revocation', machineSecret, body: { serial: identityOne.serialNumber, identityGeneration: identityOne.identityGeneration, sessionId: propertySupportSessionRow.id, lease: propertyRedeemed.body.lease } });
   if (propertyHubRevoke.response.status !== 200) fail(`Property hub revocation acknowledgement failed (${propertyHubRevoke.response.status})`);
