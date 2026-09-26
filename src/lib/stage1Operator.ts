@@ -16,20 +16,62 @@ export function supportRedeemDigest(input: { serial: string; ticketId: string; r
 }
 
 /**
- * The hub proves possession of the decrypted employee grant without sending
- * that grant back to Platform. Platform recomputes this value from the
- * durable grant hash and the exact redemption request.
+ * The hub proves possession of a per-issuance signing key delivered only in
+ * the encrypted employee-proof envelope. These canonical fields are the full
+ * semantic redemption body (with the one-use code represented by its digest);
+ * the separate signature and digest fields are excluded to avoid recursion.
  */
-export function supportProofOfPossessionDigest(input: { employeeProofHash: string; serial: string; ticketId: string; requestId: string; codeHash: string; identityGeneration: number }): string {
+export type SupportProofContext = {
+  serial: string;
+  ticketId: string;
+  requestId: string;
+  employeeId: string;
+  homeId: string;
+  codeHash: string;
+  identityGeneration: number;
+  nonce: string;
+  proofExpiresAt: number;
+};
+
+/** Canonical unsigned support-redemption body; the signature is excluded. */
+export function supportProofRequestDigest(input: SupportProofContext): string {
   return crypto.createHash('sha256').update(JSON.stringify({
-    version: 1,
-    employeeProofHash: String(input.employeeProofHash),
+    version: 2,
     serial: String(input.serial),
     ticketId: String(input.ticketId),
     requestId: String(input.requestId),
+    employeeId: String(input.employeeId),
+    homeId: String(input.homeId),
     codeHash: String(input.codeHash),
     identityGeneration: Number(input.identityGeneration),
+    nonce: String(input.nonce),
+    proofExpiresAt: Number(input.proofExpiresAt),
   }), 'utf8').digest('hex');
+}
+
+export function supportProofMessage(input: SupportProofContext & { requestBodyDigest: string }): Buffer {
+  return Buffer.from(JSON.stringify({
+    version: 2,
+    serial: String(input.serial),
+    ticketId: String(input.ticketId),
+    requestId: String(input.requestId),
+    employeeId: String(input.employeeId),
+    homeId: String(input.homeId),
+    codeHash: String(input.codeHash),
+    identityGeneration: Number(input.identityGeneration),
+    nonce: String(input.nonce),
+    proofExpiresAt: Number(input.proofExpiresAt),
+    requestBodyDigest: String(input.requestBodyDigest),
+  }), 'utf8');
+}
+
+export function verifySupportProofSignature(input: SupportProofContext & { requestBodyDigest: string; signature: string; publicKey: string }): boolean {
+  try {
+    if (input.requestBodyDigest !== supportProofRequestDigest(input)) return false;
+    const key = crypto.createPublicKey(input.publicKey);
+    if (key.asymmetricKeyType !== 'ed25519') return false;
+    return crypto.verify(null, supportProofMessage(input), key, Buffer.from(input.signature, 'base64url'));
+  } catch { return false; }
 }
 
 /** Equality is expired; this strict predicate is shared by handoff issue and redemption. */
@@ -83,7 +125,7 @@ export function verifyHubBoundOperatorGrant(token: string, input: { hubId: strin
   const dayPolicy = adminOnly && payload.sessionPolicy === INTERNAL_OPERATOR_DAY_SESSION_POLICY;
   if (adminOnly && internalOperatorDaySessionEnabled() !== dayPolicy) return null;
   const lifetimeCap = dayPolicy ? INTERNAL_OPERATOR_SESSION_SECONDS : DEFAULT_OPERATOR_SESSION_SECONDS;
-  if (!payload.sub || !payload.sid || !payload.jti || payload.hubId !== input.hubId || payload.workflow !== input.workflowId || !scopes.includes(input.requiredScope) || !Number.isSafeInteger(iat) || !Number.isSafeInteger(exp) || exp <= nowSeconds || exp - iat > lifetimeCap || (!adminOnly && payload.sessionPolicy !== undefined) || !Number.isFinite(recentAuthAt) || now - recentAuthAt > 5 * 60 * 1000) return null;
+  if (!payload.sub || !payload.sid || !payload.jti || payload.hubId !== input.hubId || payload.workflow !== input.workflowId || !scopes.includes(input.requiredScope) || !Number.isSafeInteger(iat) || !Number.isSafeInteger(exp) || exp <= nowSeconds || exp - iat > lifetimeCap || (!adminOnly && payload.sessionPolicy !== undefined) || !Number.isFinite(recentAuthAt) || (!dayPolicy && now - recentAuthAt > 5 * 60 * 1000)) return null;
   if (input.employeeId && payload.sub !== input.employeeId) return null;
   if (input.requestId && payload.requestId !== input.requestId) return null;
   if (input.homeId && payload.homeId !== input.homeId) return null;

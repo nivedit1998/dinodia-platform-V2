@@ -1239,6 +1239,7 @@ model SupportAccessRequest {
   codeExpiresAt                 DateTime?
   codeConsumedAt                DateTime?
   employeeHandoffHash           String?                     @db.VarChar(128)
+  employeeProofPublicKey        String?                     @db.Text
   employeeHandoffEnvelope       String?                     @db.Text
   employeeHandoffIssuedAt       DateTime?
   employeeHandoffExpiresAt      DateTime?

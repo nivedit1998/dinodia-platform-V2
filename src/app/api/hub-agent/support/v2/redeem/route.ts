@@ -2,7 +2,7 @@ import { NextResponse } from 'next/server';
 import { authErrorResponse, Stage1AuthError } from '@/lib/stage1Auth';
 import { authenticateHub } from '@/lib/stage1HubAuth';
 import { randomSecret, sha256 } from '@/lib/stage1Crypto';
-import { supportProofOfPossessionDigest } from '@/lib/stage1Operator';
+import { supportProofRequestDigest, verifySupportProofSignature } from '@/lib/stage1Operator';
 import { createPropertySupportNotifications } from '@/lib/supportNotifications';
 import { serializableTransaction } from '@/lib/serializableTransaction';
 
@@ -12,20 +12,30 @@ export async function POST(request: Request) {
   try {
     const raw = await request.text();
     const hub = await authenticateHub(request, raw);
+    const allowedFields = new Set(['serial', 'identityGeneration', 'ticketId', 'requestId', 'code', 'employeeId', 'homeId', 'nonce', 'proofExpiresAt', 'requestBodyDigest', 'employeeProofSignature']);
+    if (Object.keys(hub.body).length !== allowedFields.size || Object.keys(hub.body).some((key) => !allowedFields.has(key))) throw new Stage1AuthError(400, 'support_proof_body_invalid', 'The support proof request fields are invalid');
+    const serial = String(hub.body.serial ?? '').trim();
     const ticketId = String(hub.body.ticketId ?? '').trim();
     const requestId = String(hub.body.requestId ?? '').trim();
     const identityGeneration = Number(hub.body.identityGeneration);
     const code = String(hub.body.code ?? '').trim();
-    const proofOfPossession = String(hub.body.employeeProofOfPossession ?? '').trim();
-    if (!ticketId || !/^[0-9a-f-]{36}$/i.test(requestId) || !Number.isInteger(identityGeneration) || identityGeneration < 1 || !code || !/^[0-9a-f]{64}$/i.test(proofOfPossession)) throw new Stage1AuthError(401, 'support_credentials_required', 'A support ticket, request, one-use support code and hub employee proof are required');
+    const employeeId = String(hub.body.employeeId ?? '').trim();
+    const homeId = String(hub.body.homeId ?? '').trim();
+    const nonce = String(hub.body.nonce ?? '').trim();
+    const proofExpiresAt = Number(hub.body.proofExpiresAt);
+    const requestBodyDigest = String(hub.body.requestBodyDigest ?? '').trim().toLowerCase();
+    const employeeProofSignature = String(hub.body.employeeProofSignature ?? '').trim();
+    if (!ticketId || !/^[0-9a-f-]{36}$/i.test(requestId) || !Number.isInteger(identityGeneration) || identityGeneration < 1 || !code || !employeeId || !homeId || !/^[A-Za-z0-9_-]{32,128}$/.test(nonce) || !Number.isSafeInteger(proofExpiresAt) || !/^[a-f0-9]{64}$/.test(requestBodyDigest) || !/^[A-Za-z0-9_-]{80,256}$/.test(employeeProofSignature)) throw new Stage1AuthError(401, 'support_credentials_required', 'A support ticket, request, one-use support code and hub employee proof are required');
+    if (serial !== hub.installation.serialNumberSnapshot || identityGeneration !== Number(hub.identity.identityGeneration)) throw new Stage1AuthError(401, 'support_identity_generation_mismatch', 'The support proof is bound to a different hub identity or generation');
     const now = new Date();
     const result = await serializableTransaction(async (tx) => {
-      const row = await tx.supportAccessRequest.findFirst({ where: { id: requestId, ticketId, hubInstallationId: hub.installation.id, status: 'ISSUED', codeHash: sha256(code), employeeHandoffEnvelope: { not: null } }, select: { id: true, ticketId: true, requestedByEmployeeId: true, homeId: true, hubInstallationId: true, requestedScope: true, targetMembershipId: true, targetUserId: true, canonicalAreaIds: true, codeExpiresAt: true, employeeHandoffExpiresAt: true, employeeHandoffConsumedAt: true, sessionHardStopAt: true, codeConsumedAt: true, employeeHandoffHash: true } });
+      const row = await tx.supportAccessRequest.findFirst({ where: { id: requestId, ticketId, hubInstallationId: hub.installation.id, status: 'ISSUED', codeHash: sha256(code), employeeHandoffEnvelope: { not: null } }, select: { id: true, ticketId: true, requestedByEmployeeId: true, homeId: true, hubInstallationId: true, requestedScope: true, targetMembershipId: true, targetUserId: true, canonicalAreaIds: true, codeExpiresAt: true, employeeHandoffExpiresAt: true, employeeHandoffConsumedAt: true, sessionHardStopAt: true, codeConsumedAt: true, employeeProofPublicKey: true } });
       if (!row || row.codeConsumedAt || row.employeeHandoffConsumedAt || !row.codeExpiresAt || row.codeExpiresAt <= now || !row.employeeHandoffExpiresAt || row.employeeHandoffExpiresAt <= now || !row.sessionHardStopAt || row.sessionHardStopAt <= now) throw new Stage1AuthError(401, 'support_code_invalid', 'The support code and Company Portal handoff are invalid or expired');
+      if (employeeId !== row.requestedByEmployeeId || homeId !== row.homeId || proofExpiresAt <= Math.floor(now.getTime() / 1000) || proofExpiresAt > Math.floor(row.employeeHandoffExpiresAt.getTime() / 1000)) throw new Stage1AuthError(401, 'support_proof_context_invalid', 'The employee proof is invalid, expired or bound to another request');
       const ticket = await tx.supportTicket.findUnique({ where: { id: row.ticketId }, select: { status: true, assignedEmployeeId: true } });
       if (!ticket || ticket.status !== 'OPEN' || ticket.assignedEmployeeId !== row.requestedByEmployeeId) throw new Stage1AuthError(403, 'support_ticket_closed', 'The support ticket is not open for the assigned employee');
-      const expectedProof = supportProofOfPossessionDigest({ employeeProofHash: String(row.employeeHandoffHash ?? ''), serial: hub.installation.serialNumberSnapshot, ticketId: row.ticketId, requestId: row.id, codeHash: sha256(code), identityGeneration });
-      if (!row.employeeHandoffHash || expectedProof.toLowerCase() !== proofOfPossession.toLowerCase()) throw new Stage1AuthError(401, 'support_proof_invalid', 'The Company Portal proof is invalid, expired or not bound to this request');
+      const proofContext = { serial: hub.installation.serialNumberSnapshot, ticketId: row.ticketId, requestId: row.id, employeeId, homeId, codeHash: sha256(code), identityGeneration, nonce, proofExpiresAt };
+      if (!row.employeeProofPublicKey || !verifySupportProofSignature({ ...proofContext, requestBodyDigest, signature: employeeProofSignature, publicKey: row.employeeProofPublicKey }) || requestBodyDigest !== supportProofRequestDigest(proofContext)) throw new Stage1AuthError(401, 'support_proof_invalid', 'The Company Portal proof is invalid, expired or not bound to this request');
       let targetUserId = row.targetUserId;
       let areaIds = Array.isArray(row.canonicalAreaIds) ? row.canonicalAreaIds.map(String) : [];
       if (row.requestedScope === 'TENANT_SCOPE') {

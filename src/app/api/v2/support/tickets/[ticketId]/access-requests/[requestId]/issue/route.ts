@@ -1,4 +1,5 @@
 import { NextResponse } from 'next/server';
+import crypto from 'node:crypto';
 import { prisma } from '@/lib/prisma';
 import { requireEmployeeRecentAuth, Stage1AuthError, authErrorResponse } from '@/lib/stage1Auth';
 import { sha256 } from '@/lib/stage1Crypto';
@@ -20,10 +21,14 @@ export async function POST(request: Request, context: { params: Promise<{ ticket
     if (!hub) throw new Stage1AuthError(409, 'hub_not_available', 'The support hub is not available');
     if (!hub.cloudUrl) throw new Stage1AuthError(409, 'hub_cloud_url_unavailable', 'The hub secure support endpoint is not available yet');
     const employeeGrant = createHubBoundOperatorGrant({ employeeId: employee.id, hubId: hub.serialNumberSnapshot, workflowId: row.ticketId, requestId: row.id, homeId: row.homeId, identityGeneration: hub.manufacturingIdentity.identityGeneration, requestBodyDigest: supportRedeemDigest({ serial: hub.serialNumberSnapshot, ticketId: row.ticketId, requestId: row.id, codeHash: approved.codeHash, identityGeneration: hub.manufacturingIdentity.identityGeneration }), scope: ['support:redeem'], areaIds: Array.isArray(row.canonicalAreaIds) ? row.canonicalAreaIds.map(String) : [], recentAuthAt: Date.now(), expiresAt: expiresAt.getTime(), credentialVersion: 0 });
-    const employeeProofEnvelope = JSON.stringify(encryptOperatorGrant(employeeGrant, hub.manufacturingIdentity.encryptionPublicKey, 1, 'support-session'));
+    const proofKeyPair = crypto.generateKeyPairSync('ed25519');
+    const employeeProofPublicKey = proofKeyPair.publicKey.export({ type: 'spki', format: 'pem' }).toString();
+    const employeeProofPrivateKey = proofKeyPair.privateKey.export({ type: 'pkcs8', format: 'pem' }).toString();
+    const encryptedProofPayload = JSON.stringify({ version: 2, employeeGrant, employeeProofPrivateKey });
+    const employeeProofEnvelope = JSON.stringify(encryptOperatorGrant(encryptedProofPayload, hub.manufacturingIdentity.encryptionPublicKey, 1, 'support-session'));
     const employeeHandoffEnvelope = employeeProofEnvelope;
     await prisma.$transaction(async (tx) => {
-      const updated = await tx.supportAccessRequest.updateMany({ where: { id: row.id, requestedByEmployeeId: employee.id, status: 'APPROVED', codeHash: approved.codeHash, codeConsumedAt: null }, data: { status: 'ISSUED', employeeHandoffHash: sha256(employeeGrant), employeeHandoffEnvelope: employeeHandoffEnvelope, employeeHandoffIssuedAt: issuedAt, employeeHandoffExpiresAt: expiresAt } });
+      const updated = await tx.supportAccessRequest.updateMany({ where: { id: row.id, requestedByEmployeeId: employee.id, status: 'APPROVED', codeHash: approved.codeHash, codeConsumedAt: null }, data: { status: 'ISSUED', employeeHandoffHash: sha256(employeeGrant), employeeProofPublicKey, employeeHandoffEnvelope: employeeHandoffEnvelope, employeeHandoffIssuedAt: issuedAt, employeeHandoffExpiresAt: expiresAt } });
       if (updated.count !== 1) throw new Stage1AuthError(409, 'support_code_already_issued', 'A support code has already been issued or the request is no longer approved');
       await tx.auditEvent.create({ data: { homeId: row.homeId, actorType: 'EMPLOYEE', actorId: employee.id, category: 'SECURITY', action: 'support_access_issued', targetType: 'SupportAccessRequest', targetId: row.id, metadata: { ticketId: row.ticketId, scope: row.requestedScope, touchesPropertyInfrastructure: row.touchesPropertyInfrastructure, outcome: 'issued' }, purgeAt: new Date(issuedAt.getTime() + 365 * 24 * 60 * 60 * 1000) } });
     });

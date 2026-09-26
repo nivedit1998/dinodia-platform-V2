@@ -194,9 +194,6 @@ function claimReferenceHash(value, pepper) { return crypto.createHmac('sha256', 
 function canonicalHubRequest({ method, path: requestPath, timestamp, nonce, bodyHash }) {
   return [String(method).toUpperCase(), String(requestPath), String(timestamp), String(nonce), String(bodyHash).toLowerCase()].join('\n');
 }
-function supportProofOfPossessionDigest({ employeeProofHash, serial, ticketId, requestId, codeHash, identityGeneration }) {
-  return sha256(JSON.stringify({ version: 1, employeeProofHash: String(employeeProofHash), serial: String(serial), ticketId: String(ticketId), requestId: String(requestId), codeHash: String(codeHash), identityGeneration: Number(identityGeneration) }));
-}
 function canonicalValue(value) {
   if (Array.isArray(value)) return `[${value.map(canonicalValue).sort().join(',')}]`;
   if (value && typeof value === 'object') return `{${Object.entries(value).sort(([left], [right]) => left.localeCompare(right)).map(([key, item]) => `${JSON.stringify(key)}:${canonicalValue(item)}`).join(',')}}`;
@@ -693,6 +690,43 @@ async function customerAuthorizationChecks() {
   // Next routes. Delivery is observed by token-state, acknowledgement is a
   // separate durable write, and activation is a third exact-version write.
   const machineBase = `http://127.0.0.1:${appPort}`;
+  const createSupportProofOfPossession = createRequire(import.meta.url)(path.join(osRoot, 'src/auth/supportProofOfPossession.js')).createSupportProofOfPossession;
+  async function decryptedHubSupportRedemption({ ticketId, code }) {
+    const deliveredProof = await machineRequest({ base: machineBase, path: '/api/hub-agent/support/v2/proof', machineSecret, body: { serial: identityOne.serialNumber, identityGeneration: identityOne.identityGeneration, ticketId } });
+    if (deliveredProof.response.status !== 200 || !deliveredProof.body.employeeProofEnvelope || !/^[0-9a-f-]{36}$/i.test(deliveredProof.body.requestId || '')) fail(`Machine-authenticated support proof delivery failed (${deliveredProof.response.status}/${deliveredProof.body.errorCode || 'unknown'})`);
+    const decrypted = decryptHubEnvelope(JSON.parse(deliveredProof.body.employeeProofEnvelope), identityOneEncryption.privateKey, 'support-session', 1);
+    const proofPayload = JSON.parse(decrypted);
+    if (proofPayload.version !== 2 || typeof proofPayload.employeeGrant !== 'string' || typeof proofPayload.employeeProofPrivateKey !== 'string') fail('Hub-decrypted support proof payload was malformed');
+    const grantParts = proofPayload.employeeGrant.split('.');
+    if (grantParts.length !== 4 || grantParts[0] !== 'dno1') fail('Hub-decrypted support employee grant was malformed');
+    const grantClaims = JSON.parse(Buffer.from(grantParts[2], 'base64url').toString('utf8'));
+    const proofContext = {
+      serial: identityOne.serialNumber,
+      ticketId,
+      requestId: deliveredProof.body.requestId,
+      employeeId: String(grantClaims.sub),
+      homeId: String(grantClaims.homeId),
+      codeHash: sha256(code),
+      identityGeneration: Number(deliveredProof.body.identityGeneration),
+      nonce: crypto.randomBytes(24).toString('base64url'),
+      proofExpiresAt: Number(grantClaims.exp),
+    };
+    const signature = createSupportProofOfPossession({ ...proofContext, privateKeyPem: proofPayload.employeeProofPrivateKey });
+    proofPayload.employeeProofPrivateKey = '';
+    return {
+      serial: proofContext.serial,
+      identityGeneration: proofContext.identityGeneration,
+      ticketId,
+      requestId: proofContext.requestId,
+      employeeId: proofContext.employeeId,
+      homeId: proofContext.homeId,
+      nonce: proofContext.nonce,
+      proofExpiresAt: proofContext.proofExpiresAt,
+      requestBodyDigest: signature.requestBodyDigest,
+      employeeProofSignature: signature.signature,
+      code,
+    };
+  }
   const resolverChallenge = await machineRequest({ base: machineBase, path: '/api/hub-agent/v2/claim/resolver/challenge', machineSecret: claimMachineSecret, body: { serial: claimIdentity.serialNumber, identityGeneration: claimIdentity.identityGeneration, reference: claimReferenceValue } });
   if (resolverChallenge.response.status !== 200 || !resolverChallenge.body.challengeId || !resolverChallenge.body.challenge) fail(`Permanent-label resolver did not issue a live challenge (${resolverChallenge.response.status})`);
   const resolverProof = { version: 1, serial: claimIdentity.serialNumber, identityGeneration: claimIdentity.identityGeneration, challengeId: resolverChallenge.body.challengeId, challenge: resolverChallenge.body.challenge, resolverGeneration: resolverChallenge.body.resolverGeneration, expiresAt: resolverChallenge.body.expiresAt };
@@ -825,9 +859,10 @@ async function customerAuthorizationChecks() {
   if (tenantNotificationsBefore.response.status !== 200 || tenantNotificationsBefore.body.notifications?.length !== 0) fail('Tenant-private support leaked a homeowner notification side channel');
   const issueResponse = await fetchJson(`${base}/api/v2/support/tickets/${ticketId}/access-requests/${requestId}/issue`, { method: 'POST', headers: { 'x-dinodia-employee-session': supportToken } });
   if (issueResponse.response.status !== 200 || issueResponse.body.code || issueResponse.body.employeeProofEnvelope || !issueResponse.body.supportUrl) fail(`Employee support issue response exposed or omitted bounded handoff (${issueResponse.response.status})`);
-  const supportRow = await prisma.supportAccessRequest.findUnique({ where: { id: requestId }, select: { employeeHandoffHash: true, codeHash: true } });
-  const proofOfPossession = supportProofOfPossessionDigest({ employeeProofHash: supportRow.employeeHandoffHash, serial: identityOne.serialNumber, ticketId, requestId, codeHash: supportRow.codeHash, identityGeneration: identityOne.identityGeneration });
-  const redeemBody = { serial: identityOne.serialNumber, identityGeneration: identityOne.identityGeneration, ticketId, requestId, code: supportCode, employeeProofOfPossession: proofOfPossession };
+  const redeemBody = await decryptedHubSupportRedemption({ ticketId, code: supportCode });
+  if (JSON.stringify(redeemBody).includes('employeeProofPrivateKey') || JSON.stringify(redeemBody).includes('employeeGrant')) fail('Support redemption request exposed decrypted employee proof material');
+  const invalidSupportProof = await machineRequest({ base: machineBase, path: '/api/hub-agent/support/v2/redeem', machineSecret, body: { ...redeemBody, homeId: homeTwo.id } });
+  if (invalidSupportProof.response.status !== 401) fail(`Support redemption accepted a signature after its home context changed (${invalidSupportProof.response.status})`);
   const redeemed = await machineRequest({ base: machineBase, path: '/api/hub-agent/support/v2/redeem', machineSecret, body: redeemBody });
   if (redeemed.response.status !== 200 || redeemed.body.scope !== 'TENANT_SCOPE' || redeemed.body.targetUserId !== account.id || !redeemed.body.areaIds.includes(areaOne.id)) fail(`Machine-authenticated support redemption failed (${redeemed.response.status})`);
   const replayRedeem = await machineRequest({ base: machineBase, path: '/api/hub-agent/support/v2/redeem', machineSecret, body: redeemBody });
@@ -893,9 +928,8 @@ async function customerAuthorizationChecks() {
   if (tenantPropertyApproval.response.status !== 200 || !tenantPropertyApproval.body.oneUseCode) fail(`Tenant permanent-device support approval failed (${tenantPropertyApproval.response.status})`);
   const tenantPropertyIssue = await fetchJson(`${base}/api/v2/support/tickets/${tenantPropertyTicketId}/access-requests/${tenantPropertyRequestId}/issue`, { method: 'POST', headers: { 'x-dinodia-employee-session': propertySupportToken } });
   if (tenantPropertyIssue.response.status !== 200) fail(`Tenant permanent-device support issue failed (${tenantPropertyIssue.response.status})`);
-  const tenantPropertyRow = await prisma.supportAccessRequest.findUnique({ where: { id: tenantPropertyRequestId }, select: { employeeHandoffHash: true, codeHash: true } });
-  const tenantPropertyProof = supportProofOfPossessionDigest({ employeeProofHash: tenantPropertyRow.employeeHandoffHash, serial: identityOne.serialNumber, ticketId: tenantPropertyTicketId, requestId: tenantPropertyRequestId, codeHash: tenantPropertyRow.codeHash, identityGeneration: identityOne.identityGeneration });
-  const tenantPropertyRedeemed = await machineRequest({ base: machineBase, path: '/api/hub-agent/support/v2/redeem', machineSecret, body: { serial: identityOne.serialNumber, identityGeneration: identityOne.identityGeneration, ticketId: tenantPropertyTicketId, requestId: tenantPropertyRequestId, code: tenantPropertyApproval.body.oneUseCode, employeeProofOfPossession: tenantPropertyProof } });
+  const tenantPropertyRedeemBody = await decryptedHubSupportRedemption({ ticketId: tenantPropertyTicketId, code: tenantPropertyApproval.body.oneUseCode });
+  const tenantPropertyRedeemed = await machineRequest({ base: machineBase, path: '/api/hub-agent/support/v2/redeem', machineSecret, body: tenantPropertyRedeemBody });
   if (tenantPropertyRedeemed.response.status !== 200 || tenantPropertyRedeemed.body.scope !== 'TENANT_SCOPE') fail(`Tenant permanent-device support redemption failed (${tenantPropertyRedeemed.response.status})`);
   const tenantPropertyNotification = await fetchJson(`${base}/api/v2/support/notifications`, { headers: { 'x-dinodia-app-token': propertyToken.body.token } });
   if (tenantPropertyNotification.response.status !== 200 || !tenantPropertyNotification.body.notifications?.some((item) => item.ticketId === tenantPropertyTicketId && item.eventType === 'STARTED')) fail('Tenant support touching a permanent property device did not notify the homeowner');
@@ -913,9 +947,8 @@ async function customerAuthorizationChecks() {
   if (propertyApproval.response.status !== 200 || !propertyApproval.body.oneUseCode) fail(`Distinct homeowner property approval failed (${propertyApproval.response.status}/${propertyApproval.body.errorCode || ''})`);
   const propertyIssue = await fetchJson(`${base}/api/v2/support/tickets/${propertyTicketId}/access-requests/${propertyRequestId}/issue`, { method: 'POST', headers: { 'x-dinodia-employee-session': propertySupportToken } });
   if (propertyIssue.response.status !== 200) fail(`Property support issue failed (${propertyIssue.response.status})`);
-  const propertySupportRow = await prisma.supportAccessRequest.findUnique({ where: { id: propertyRequestId }, select: { employeeHandoffHash: true, codeHash: true } });
-  const propertyProofOfPossession = supportProofOfPossessionDigest({ employeeProofHash: propertySupportRow.employeeHandoffHash, serial: identityOne.serialNumber, ticketId: propertyTicketId, requestId: propertyRequestId, codeHash: propertySupportRow.codeHash, identityGeneration: identityOne.identityGeneration });
-  const propertyRedeemed = await machineRequest({ base: machineBase, path: '/api/hub-agent/support/v2/redeem', machineSecret, body: { serial: identityOne.serialNumber, identityGeneration: identityOne.identityGeneration, ticketId: propertyTicketId, requestId: propertyRequestId, code: propertyApproval.body.oneUseCode, employeeProofOfPossession: propertyProofOfPossession } });
+  const propertyRedeemBody = await decryptedHubSupportRedemption({ ticketId: propertyTicketId, code: propertyApproval.body.oneUseCode });
+  const propertyRedeemed = await machineRequest({ base: machineBase, path: '/api/hub-agent/support/v2/redeem', machineSecret, body: propertyRedeemBody });
   if (propertyRedeemed.response.status !== 200 || propertyRedeemed.body.scope !== 'PROPERTY_SCOPE') fail(`Property support redemption failed (${propertyRedeemed.response.status})`);
   const propertyNotification = await fetchJson(`${base}/api/v2/support/notifications`, { headers: { 'x-dinodia-app-token': propertyToken.body.token } });
   if (propertyNotification.response.status !== 200 || !propertyNotification.body.notifications?.some((item) => item.eventType === 'STARTED' && item.ticketId === propertyTicketId)) fail('Property support redemption did not create the homeowner notification');
@@ -945,15 +978,14 @@ async function customerAuthorizationChecks() {
   if (raceApproval.response.status !== 200 || !raceApproval.body.oneUseCode) fail(`Support race approval failed (${raceApproval.response.status})`);
   const raceIssue = await fetchJson(`${base}/api/v2/support/tickets/${raceTicketId}/access-requests/${raceRequestId}/issue`, { method: 'POST', headers: { 'x-dinodia-employee-session': propertySupportToken } });
   if (raceIssue.response.status !== 200) fail(`Support race employee handoff failed (${raceIssue.response.status})`);
-  const raceRow = await prisma.supportAccessRequest.findUniqueOrThrow({ where: { id: raceRequestId }, select: { employeeHandoffHash: true, codeHash: true } });
-  const raceProof = supportProofOfPossessionDigest({ employeeProofHash: raceRow.employeeHandoffHash, serial: identityOne.serialNumber, ticketId: raceTicketId, requestId: raceRequestId, codeHash: raceRow.codeHash, identityGeneration: identityOne.identityGeneration });
+  const raceRedeemBody = await decryptedHubSupportRedemption({ ticketId: raceTicketId, code: raceApproval.body.oneUseCode });
   const closeChallenge = await fetchJson(`${base}/api/v2/security/step-up/challenge`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-app-token': tenantToken.body.token }, body: JSON.stringify({ operationKind: 'support_ticket_close', targetIds: [raceTicketId], value: null }) });
   if (closeChallenge.response.status !== 200) fail(`Support close race step-up challenge failed (${closeChallenge.response.status})`);
   const closeSignature = crypto.sign(null, stepUpChallengeMessage({ challengeId: closeChallenge.body.challengeId, nonce: closeChallenge.body.nonce, operationDigest: closeChallenge.body.operationDigest }), crypto.createPrivateKey(phone.privateKey)).toString('base64url');
   const closeProof = await fetchJson(`${base}/api/v2/security/step-up/issue`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-app-token': tenantToken.body.token }, body: JSON.stringify({ challengeId: closeChallenge.body.challengeId, nonce: closeChallenge.body.nonce, deviceSignature: closeSignature }) });
   if (closeProof.response.status !== 200) fail(`Support close race step-up proof failed (${closeProof.response.status})`);
   const [raceRedeem, raceClose] = await Promise.all([
-    machineRequest({ base: machineBase, path: '/api/hub-agent/support/v2/redeem', machineSecret, body: { serial: identityOne.serialNumber, identityGeneration: identityOne.identityGeneration, ticketId: raceTicketId, requestId: raceRequestId, code: raceApproval.body.oneUseCode, employeeProofOfPossession: raceProof } }),
+    machineRequest({ base: machineBase, path: '/api/hub-agent/support/v2/redeem', machineSecret, body: raceRedeemBody }),
     fetchJson(`${base}/api/v2/support/tickets/${raceTicketId}`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-app-token': tenantToken.body.token }, body: JSON.stringify({ action: 'close', proof: closeProof.body.proof }) }),
   ]);
   if (raceClose.response.status !== 200 || ![200, 401, 403, 409].includes(raceRedeem.response.status)) fail(`Support close/redeem race did not reach a controlled terminal state (${raceClose.response.status}/${raceRedeem.response.status})`);
@@ -1102,6 +1134,25 @@ async function customerAuthorizationChecks() {
     const tokenClaims = JSON.parse(Buffer.from(String(tenantToken.body.token).split('.')[2], 'base64url').toString('utf8'));
     fail(`Authorized command did not reach the safe fake physical adapter (${JSON.stringify({ commandResult, fakePhysicalCommandCount, token: { householdRole: tokenClaims.householdRole, scope: tokenClaims.scope, areaIds: tokenClaims.areaIds, membershipId: tokenClaims.membershipId, hubInstallationId: tokenClaims.hubInstallationId }, entity: { haId: tenantEntity.haId, capability: tenantEntity.entity?.capability, device: { areaId: tenantEntity.device.areaId, metadata: tenantEntity.device.metadata, labelIds: tenantEntity.device.labelIds } } })})`);
   }
+  await hub.store.upsertDevice({
+    id: 'harness-ungranted-area-device', name: 'Harness ungranted area switch', protocol: 'zigbee', areaId: areaTwo.id,
+    state: { state: 'OFF' }, setup: { status: 'ready' },
+    entities: { 'harness-ungranted-area-device:state': { name: 'Unassigned switch', stateKey: 'state', domain: 'switch', category: 'control', writable: true, primary: true, capability: { readable: true, writable: true, primary: true, category: 'control', bindings: [{ serviceId: 'switch.turn_on' }] } } },
+  });
+  tenantSocket.send(JSON.stringify({ id: 3, type: 'call_service', domain: 'switch', service: 'turn_on', target: { entity_id: tenantEntity.haId, area_id: areaTwo.id } }));
+  const mixedSelectorCommand = await wsMessage(tenantSocket, 'mixed-selector command denial');
+  if (mixedSelectorCommand.success || fakePhysicalCommandCount !== 1) fail(`WebSocket mixed an authorized entity with an ungranted area target or caused a device effect (${mixedSelectorCommand.success}/${fakePhysicalCommandCount})`);
+  await hub.store.upsertDevice({
+    id: 'harness-sensitive-control', name: 'Harness sensitive control', protocol: 'stage1_fake', areaId: areaOne.id,
+    state: { state: 'OFF' }, setup: { status: 'ready' },
+    entities: { 'harness-sensitive-control:state': { name: 'Sensitive switch', stateKey: 'state', domain: 'switch', category: 'control', writable: true, primary: true, capability: { readable: true, writable: true, sensitive: true, primary: true, category: 'control', controlId: 'sensitive-power', bindings: [{ serviceId: 'switch.turn_on' }] } } },
+  });
+  const sensitiveEntity = hub.model.entities().find((entity) => entity.device.id === 'harness-sensitive-control');
+  if (!sensitiveEntity) fail('The safe fake sensitive control did not expose its current descriptor');
+  tenantSocket.send(JSON.stringify({ id: 4, type: 'call_service', domain: 'switch', service: 'turn_on', target: { entity_id: sensitiveEntity.haId, controlId: 'sensitive-power' } }));
+  const unsteppedSensitiveCommand = await wsMessage(tenantSocket, 'unstepped sensitive command denial');
+  if (unsteppedSensitiveCommand.success || fakePhysicalCommandCount !== 1) fail(`Sensitive WebSocket command dispatched without a fresh step-up proof (${unsteppedSensitiveCommand.success}/${fakePhysicalCommandCount})`);
+  console.log('[stage1:integration] PASS: mixed-target WebSocket commands and sensitive unstepped commands are denied before fake-device dispatch');
   for (const { role, token } of [
     { role: 'owner', token: propertyToken.body.token },
     { role: 'property manager', token: managerToken.body.token },
@@ -1451,6 +1502,17 @@ async function osChecks() {
   console.log('[stage1:integration] PASS: post-revocation hub sync rejects the previously issued offline grant without a command side effect');
   const platformTenantRead = await fetchJson(`${base}/_dinodia/admin/api/devices`, { headers: { authorization: `Bearer ${customerFixture.tenantToken}` } });
   if (platformTenantRead.response.status !== 200) fail(`A real Platform-issued tenant token was not accepted by Dinodia OS (${platformTenantRead.response.status}/${platformTenantRead.body.errorCode || platformTenantRead.body.error || 'unknown'})`);
+  for (const [role, token] of [['owner', customerFixture.propertyToken], ['property-manager', customerFixture.managerToken]]) {
+    for (const suffix of ['capabilities', 'support-bundle']) {
+      const privateRead = await fetchJson(`${base}/_dinodia/admin/api/devices/${encodeURIComponent('harness-tenant-device')}/${suffix}`, { headers: { authorization: `Bearer ${token}` } });
+      const serialized = JSON.stringify(privateRead.body);
+      if (privateRead.response.status !== 403 || privateRead.body.errorCode !== 'device_scope_denied' || /Harness tenant light|tenantOwnerMembershipId|harness-tenant-device/.test(serialized)) fail(`${role} read of tenant-private ${suffix} was not denied without device data (${privateRead.response.status}/${privateRead.body.errorCode || 'unknown'})`);
+    }
+  }
+  for (const suffix of ['capabilities', 'support-bundle']) {
+    const ownPrivateRead = await fetchJson(`${base}/_dinodia/admin/api/devices/${encodeURIComponent('harness-tenant-device')}/${suffix}`, { headers: { authorization: `Bearer ${customerFixture.tenantToken}` } });
+    if (ownPrivateRead.response.status !== 200) fail(`Tenant could not read its own authorized device ${suffix} (${ownPrivateRead.response.status}/${ownPrivateRead.body.errorCode || 'unknown'})`);
+  }
   const wrongHomeReplay = await fetchJson(`${base}/_dinodia/admin/api/devices`, { headers: { authorization: `Bearer ${customerFixture.ownerToken}` } });
   if (wrongHomeReplay.response.status !== 401) fail(`A Platform token for the other home was accepted by Dinodia OS (${wrongHomeReplay.response.status})`);
   const setup = await fetch(`${base}/setup`, { headers: { host: '127.0.0.1' } });
@@ -1548,6 +1610,18 @@ async function osChecks() {
   });
   if (![401, 403].includes(copiedHandoff.response.status)) fail(`A second browser redeemed a copied handoff (${copiedHandoff.response.status})`);
 
+  // Attribute a genuine OS->Platform prepare rejection separately. The
+  // browser cookie jar remains otherwise valid, but the setup attempt is
+  // deliberately substituted; this must fail before the one-use secret is
+  // fetched or consumed and must leave the real handoff usable.
+  const prepareFailureJar = { ...browserA, dinodia_operator_attempt: `wrong-${crypto.randomUUID()}` };
+  const prepareFailure = await fetchJson(`${base}/_dinodia/setup/operator-session`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', host: osHost, origin: osOrigin, cookie: cookieHeader(prepareFailureJar), 'x-dinodia-setup-csrf': decodeURIComponent(cookieValue(prepareFailureJar, 'dinodia_setup_csrf')) },
+    body: JSON.stringify({ handoffId: launch.body.handoffId }),
+  });
+  if (![401, 403].includes(prepareFailure.response.status) || prepareFailure.body.handoffPhase !== 'prepare' || !/^[a-z0-9_]{1,64}$/.test(String(prepareFailure.body.errorCode || ''))) fail(`OS did not safely attribute the rejected attempt to the prepare phase (${prepareFailure.response.status}/${prepareFailure.body.handoffPhase || 'no-phase'}/${prepareFailure.body.errorCode || 'no-code'})`);
+
   const intendedHandoff = await fetch(`${base}/_dinodia/setup/operator-session`, {
     method: 'POST',
     headers: { 'content-type': 'application/json', host: osHost, origin: osOrigin, cookie: cookieHeader(browserA), 'x-dinodia-setup-csrf': decodeURIComponent(cookieValue(browserA, 'dinodia_setup_csrf')) },
@@ -1611,8 +1685,15 @@ async function osChecks() {
   if (attemptB.response.status !== 200 || !attemptB.body.setupAttemptId) fail(`Independent secure-origin browser could not create its own hub attempt (${attemptB.response.status}/${attemptB.body.error || attemptB.body.errorCode || 'unknown'}; browser=${Boolean(browserB.dinodia_setup_browser)}, csrf=${Boolean(browserB.dinodia_setup_csrf)}, binding=${Boolean(browserB.dinodia_operator_binding)}, attempt=${Boolean(browserB.dinodia_operator_attempt)})`);
   const launchB = await fetchJson(`${platformBase}/api/installer/home-support/homes/${encodeURIComponent(customerFixture.homeOneId)}/os-access/launch`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-employee-session': customerFixture.operatorToken }, body: JSON.stringify({ workflowId: customerFixture.operatorWorkId, setupAttemptId: attemptB.body.setupAttemptId }) });
   if (launchB.response.status !== 200 || !launchB.body.handoffId) fail(`A valid fresh handoff could not be issued for the independent browser (${launchB.response.status})`);
-  const consumeB = await fetchLoopback(`${base}/_dinodia/setup/operator-session`, { method: 'POST', headers: { 'content-type': 'application/json', ...remoteOsHeaders, cookie: cookieHeader(browserB), 'x-dinodia-setup-csrf': decodeURIComponent(cookieValue(browserB, 'dinodia_setup_csrf')) }, body: JSON.stringify({ handoffId: launchB.body.handoffId }) });
-  const consumeBBody = await consumeB.json().catch(() => ({}));
+  const concurrentConsumeResponses = await Promise.all([0, 1].map(() => fetchLoopback(`${base}/_dinodia/setup/operator-session`, { method: 'POST', headers: { 'content-type': 'application/json', ...remoteOsHeaders, cookie: cookieHeader(browserB), 'x-dinodia-setup-csrf': decodeURIComponent(cookieValue(browserB, 'dinodia_setup_csrf')) }, body: JSON.stringify({ handoffId: launchB.body.handoffId }) })));
+  const concurrentConsumeBodies = await Promise.all(concurrentConsumeResponses.map((response) => response.json().catch(() => ({}))));
+  const consumeBIndex = concurrentConsumeResponses.findIndex((response) => response.status === 200 && concurrentConsumeBodies[concurrentConsumeResponses.indexOf(response)]?.ok === true);
+  const rejectedConcurrentIndex = consumeBIndex === 0 ? 1 : 0;
+  if (consumeBIndex < 0 || ![400, 401, 403].includes(concurrentConsumeResponses[rejectedConcurrentIndex].status)
+    || concurrentConsumeBodies[rejectedConcurrentIndex]?.handoffPhase !== 'consume'
+    || !/^[a-z0-9_]{1,64}$/.test(String(concurrentConsumeBodies[rejectedConcurrentIndex]?.errorCode || ''))) fail(`Concurrent duplicate browser messages did not converge to one success and one safely attributed one-use denial (${concurrentConsumeResponses.map((response, index) => `${response.status}:${concurrentConsumeBodies[index]?.handoffPhase || 'no-phase'}`).join('/')})`);
+  const consumeB = concurrentConsumeResponses[consumeBIndex];
+  const consumeBBody = concurrentConsumeBodies[consumeBIndex];
   updateCookieJar(browserB, consumeB);
   if (consumeB.status !== 200 || consumeBBody.ok !== true) fail(`The independent browser's own handoff did not establish its opaque OS session (${consumeB.status})`);
   const secondDeadline = Date.parse(consumeBBody.expiresAt);

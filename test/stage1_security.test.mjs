@@ -31,6 +31,39 @@ test('temporary internal day mode is disabled unless the exact opt-in is present
   assert.equal(internalOperatorDaySessionEnabled({ STAGE1_INTERNAL_OPERATOR_DAY_SESSION: 'true' }), true);
 });
 
+test('the signed one-day OS grant remains valid past recent-auth while flag-off grants keep the short cap', () => {
+  const crypto = createRequire(import.meta.url)('node:crypto');
+  const keys = crypto.generateKeyPairSync('ed25519');
+  const privateKey = keys.privateKey.export({ type: 'pkcs8', format: 'pem' }).toString();
+  const previousPrivateKey = process.env.OPERATOR_SESSION_PRIVATE_KEY;
+  const previousFlag = process.env.STAGE1_INTERNAL_OPERATOR_DAY_SESSION;
+  process.env.OPERATOR_SESSION_PRIVATE_KEY = privateKey;
+  process.env.STAGE1_INTERNAL_OPERATOR_DAY_SESSION = 'true';
+  try {
+    const { createHubBoundOperatorGrant, verifyHubBoundOperatorGrant } = loadTypeScriptModule('src/lib/stage1Operator.ts', {
+      './hubOperatorCredentials': { encryptToHubKey() { throw new Error('not used'); } },
+      './internalOperatorDaySession': {
+        DEFAULT_OPERATOR_SESSION_SECONDS: 900,
+        INTERNAL_OPERATOR_DAY_SESSION_POLICY: 'STAGE1_INTERNAL_OPERATOR_DAY_SESSION',
+        INTERNAL_OPERATOR_SESSION_SECONDS: 86400,
+        internalOperatorDaySessionEnabled: () => process.env.STAGE1_INTERNAL_OPERATOR_DAY_SESSION === 'true',
+        stage1NowMs: () => Date.now(),
+      },
+    });
+    const issuedAt = Date.parse('2026-09-26T12:00:00.000Z');
+    const grant = createHubBoundOperatorGrant({ employeeId: 'employee-1', hubId: 'serial-1', workflowId: 'work-1', scope: ['os:admin'], recentAuthAt: issuedAt, issuedAt, expiresAt: issuedAt + 86_400_000 });
+    const verifyInput = { hubId: 'serial-1', workflowId: 'work-1', requiredScope: 'os:admin', employeeId: 'employee-1' };
+    assert.ok(verifyHubBoundOperatorGrant(grant, verifyInput, issuedAt + 60 * 60 * 1000), 'enabled one-day grant must survive beyond the ordinary five-minute launch-auth window');
+    process.env.STAGE1_INTERNAL_OPERATOR_DAY_SESSION = 'false';
+    assert.equal(verifyHubBoundOperatorGrant(grant, verifyInput, issuedAt + 60 * 60 * 1000), null, 'flag-off verifier must reject an extended grant');
+  } finally {
+    if (previousPrivateKey === undefined) delete process.env.OPERATOR_SESSION_PRIVATE_KEY;
+    else process.env.OPERATOR_SESSION_PRIVATE_KEY = previousPrivateKey;
+    if (previousFlag === undefined) delete process.env.STAGE1_INTERNAL_OPERATOR_DAY_SESSION;
+    else process.env.STAGE1_INTERNAL_OPERATOR_DAY_SESSION = previousFlag;
+  }
+});
+
 test('Stage 1 checker passes against the active repositories', () => {
   const output = execFileSync(process.execPath, ['scripts/check_stage1_security.mjs'], { cwd: root, encoding: 'utf8' });
   assert.match(output, /check:stage1\] OK/);
@@ -68,7 +101,7 @@ test('Stage 1 database migration includes durable privacy and authority objects'
 
 test('readiness requires the completed Stage 1 migration rather than only the baseline', () => {
   assert.match(read('src/app/api/readiness/route.ts'), /REQUIRED_MIGRATION/);
-  assert.match(read('src/lib/foundation.ts'), /20260925230000_r11_operator_mutation_idempotency/);
+  assert.match(read('src/lib/foundation.ts'), /20260926191500_r11_support_possession_proof/);
   assert.match(read('src/lib/foundation.ts'), /REQUIRED_MODEL_COUNT = 44/);
 });
 
@@ -151,23 +184,23 @@ test('Platform step-up operation digest matches the published cross-runtime vect
   assert.equal(osVerifier.digestOperation({ actorId: 'account-1', trustedDeviceId: 'phone-1', trustedSessionId: 'session-1', homeId: 'home-1', membershipId: 'membership-1', hubInstallId: 'hub-1', operation: 'device_sensitive_command', targetIds: ['device-1'], value: osVerifier.descriptorBoundValue({ controlId: 'control-1', temperature: 21 }, { 'device-1': 'descriptor-7' }) }), digest);
 });
 
-test('Platform and Dinodia OS use the same support proof-of-possession vector', () => {
-  const { supportProofOfPossessionDigest } = loadTypeScriptModule('src/lib/stage1Operator.ts', {
+test('support proof requires possession of the decrypted ephemeral signing key and binds its full context', () => {
+  const { supportProofRequestDigest, verifySupportProofSignature } = loadTypeScriptModule('src/lib/stage1Operator.ts', {
     './hubOperatorCredentials': { encryptToHubKey: () => ({}) },
     './internalOperatorDaySession': { DEFAULT_OPERATOR_SESSION_SECONDS: 900, INTERNAL_OPERATOR_SESSION_SECONDS: 86400, INTERNAL_OPERATOR_DAY_SESSION_POLICY: 'STAGE1_INTERNAL_OPERATOR_DAY_SESSION', internalOperatorDaySessionEnabled: () => false, stage1NowMs: () => Date.now() },
   });
-  const input = {
-    employeeProofHash: 'a'.repeat(64),
-    serial: 'din-home-001',
-    ticketId: '11111111-1111-4111-8111-111111111111',
-    requestId: '22222222-2222-4222-8222-222222222222',
-    codeHash: 'b'.repeat(64),
-    identityGeneration: 1,
-  };
-  const expected = '1b02c8aca1f3d4c91ef1af9ec2e2de38a2fb72dcc249d094314b86e3b8673139';
-  assert.equal(supportProofOfPossessionDigest(input), expected);
+  const keys = createRequire(import.meta.url)('node:crypto').generateKeyPairSync('ed25519');
+  const otherKeys = createRequire(import.meta.url)('node:crypto').generateKeyPairSync('ed25519');
+  const privateKey = keys.privateKey.export({ type: 'pkcs8', format: 'pem' }).toString();
+  const publicKey = keys.publicKey.export({ type: 'spki', format: 'pem' }).toString();
+  const otherPublicKey = otherKeys.publicKey.export({ type: 'spki', format: 'pem' }).toString();
+  const input = { serial: 'din-home-001', ticketId: '11111111-1111-4111-8111-111111111111', requestId: '22222222-2222-4222-8222-222222222222', employeeId: 'employee-1', homeId: 'home-1', codeHash: 'b'.repeat(64), identityGeneration: 1, nonce: 'n'.repeat(32), proofExpiresAt: 1790000000 };
   const osProof = requireOsModule('src/auth/supportProofOfPossession.js');
-  assert.equal(osProof.supportProofOfPossessionDigest(input), expected);
+  const signed = osProof.createSupportProofOfPossession({ ...input, privateKeyPem: privateKey });
+  assert.equal(signed.requestBodyDigest, supportProofRequestDigest(input));
+  assert.equal(verifySupportProofSignature({ ...input, requestBodyDigest: signed.requestBodyDigest, signature: signed.signature, publicKey }), true);
+  assert.equal(verifySupportProofSignature({ ...input, homeId: 'different-home', requestBodyDigest: signed.requestBodyDigest, signature: signed.signature, publicKey }), false);
+  assert.equal(verifySupportProofSignature({ ...input, requestBodyDigest: signed.requestBodyDigest, signature: signed.signature, publicKey: otherPublicKey }), false);
 });
 
 test('Platform and Dinodia OS use the same ten-field CloudURL challenge vector', () => {
@@ -274,12 +307,11 @@ test('R4 production paths use opaque browser-bound handoffs, committed claim cle
   assert.match(supportProof, /requestId/);
   assert.match(supportProof, /identityGeneration/);
   assert.doesNotMatch(supportProof, /employeeProofHash/);
-  assert.match(support, /employeeProofOfPossession/);
-  assert.match(support, /supportProofOfPossessionDigest/);
+  assert.match(support, /employeeProofSignature/);
+  assert.match(support, /verifySupportProofSignature/);
   assert.doesNotMatch(support, /employeeProof\s*:/);
   assert.doesNotMatch(support, /verifyHubBoundOperatorGrant/);
-  assert.match(support, /employeeHandoffHash/);
-  assert.match(support, /employeeProofHash: String\(row\.employeeHandoffHash/);
+  assert.doesNotMatch(support, /employeeHandoffHash/);
   assert.match(supportIssue, /employeeHandoffEnvelope/);
   assert.doesNotMatch(supportIssue, /NextResponse\.json\(\{[^\n]*employeeProofEnvelope/);
   assert.doesNotMatch(supportPortal, /employeeProofEnvelope/);
@@ -388,6 +420,9 @@ test('R11 signed CloudURL re-verification is challenge-bound and compare-and-set
   assert.match(setup, /dinodia-operator-session-established/);
   assert.match(setup, /"https:\/\/dinodia-platform-v2\.vercel\.app"/);
   assert.match(installer, /event\.source !== popup \|\| event\.origin !== operatorOrigin/);
+  assert.match(installer, /dinodia-operator-handoff-failed/);
+  assert.match(installer, /handoff during \$\{phase\}/);
+  assert.doesNotMatch(installer, /window\.setInterval\(\(\) => \{ if \(popup\?\.closed\)/);
   assert.match(installer, /The hub did not confirm an authenticated operator session/);
   assert.match(installer, /operator session was verified by the hub/);
   assert.doesNotMatch(installer, /The secure Dinodia OS window opened/);

@@ -93,7 +93,16 @@ export default function InstallerPage() {
           reject(new Error("The hub did not confirm an authenticated operator session. Check the Dinodia OS window before retrying."));
         }, 30_000);
         messageHandler = (event: MessageEvent) => {
-          if (event.source !== popup || event.origin !== operatorOrigin || event.data?.type !== "dinodia-operator-session-established") return;
+          if (event.source !== popup || event.origin !== operatorOrigin) return;
+          if (event.data?.type === "dinodia-operator-handoff-failed") {
+            window.clearTimeout(timeout);
+            window.removeEventListener("message", messageHandler!);
+            const phase = event.data.phase === "prepare" || event.data.phase === "consume" ? event.data.phase : "unknown";
+            const code = typeof event.data.errorCode === "string" && /^[a-z0-9_]{1,64}$/.test(event.data.errorCode) ? event.data.errorCode : "operator_handoff_rejected";
+            reject(new Error(`Dinodia OS rejected the operator handoff during ${phase} (${code}). Check the OS window and retry the launch.`));
+            return;
+          }
+          if (event.data?.type !== "dinodia-operator-session-established") return;
           window.clearTimeout(timeout);
           window.removeEventListener("message", messageHandler!);
           resolve();
@@ -101,11 +110,11 @@ export default function InstallerPage() {
         window.addEventListener("message", messageHandler);
       });
       const deliver = () => { try { popup?.postMessage({ type: "dinodia-operator-handoff", handoffId: body.handoffId }, operatorOrigin); } catch {} };
+      // The popup has already registered its hub-created attempt and is now
+      // waiting for this message. Do not race its one-use consume with periodic
+      // duplicate deliveries.
       deliver();
-      const retry = window.setInterval(() => { if (popup?.closed) { window.clearInterval(retry); return; } deliver(); }, 500);
-      const stopRetry = window.setTimeout(() => window.clearInterval(retry), 15000);
-      try { await sessionEstablished; }
-      finally { window.clearInterval(retry); window.clearTimeout(stopRetry); }
+      await sessionEstablished;
       setActionMessage(`${cloudUrl ? "The secure" : "The private-LAN"} Dinodia OS operator session was verified by the hub.`);
     } catch (caught) { setActionMessage(caught instanceof Error ? caught.message : "The secure Dinodia OS session could not be verified"); }
     finally { setOpening(null); }
