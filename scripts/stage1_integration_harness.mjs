@@ -5,6 +5,7 @@ import path from 'node:path';
 import { createRequire } from 'node:module';
 import { spawn, spawnSync } from 'node:child_process';
 import { createServer } from 'node:http';
+import http from 'node:http';
 import net from 'node:net';
 import { Prisma, PrismaClient } from '@prisma/client';
 import { stage1RouteInventory } from '../test/stage1_route_inventory.mjs';
@@ -42,6 +43,7 @@ let sesShouldFail = false;
 let capturedInvitation;
 let customerFixture;
 let fakePhysicalCommandCount = 0;
+let osHarnessNow = Date.now();
 const outboundTargets = new Set();
 
 function fail(message) { throw new Error(`[stage1:integration] ${message}`); }
@@ -224,7 +226,7 @@ function baseEnv() {
   const operator = keyPair();
   return {
     ...safeProcessEnvironment(),
-    CI: '1', NODE_ENV: 'production', V2_ENVIRONMENT: 'test',
+    CI: '1', NODE_ENV: 'production', V2_ENVIRONMENT: 'test', STAGE1_INTERNAL_OPERATOR_DAY_SESSION: 'true',
     NEXT_TELEMETRY_DISABLED: '1', PRISMA_TELEMETRY_DISABLED: '1', CHECKPOINT_DISABLE: '1',
     NODE_OPTIONS: `--import=${JSON.stringify(path.join(root, 'scripts/stage1_loopback_guard.mjs'))}`,
     STAGE1_OUTBOUND_TARGET_LOG: outboundTargetFile,
@@ -262,15 +264,103 @@ async function fetchJson(url, init = {}) {
   const response = await fetch(url, init);
   return { response, body: await response.json().catch(() => ({})) };
 }
+async function fetchLoopback(url, init = {}) {
+  const target = new URL(url);
+  if (target.protocol !== 'http:' || !['127.0.0.1', 'localhost', '::1'].includes(target.hostname)) fail(`Raw HTTP harness target is not loopback (${target.hostname})`);
+  outboundTargets.add(`${target.protocol}//${target.host}`);
+  return new Promise((resolve, reject) => {
+    const request = http.request({ protocol: target.protocol, hostname: target.hostname, port: target.port, path: `${target.pathname}${target.search}`, method: init.method || 'GET', headers: init.headers || {}, agent: false }, (response) => {
+      const chunks = [];
+      response.on('data', (chunk) => chunks.push(Buffer.from(chunk)));
+      response.on('end', () => {
+        const textBody = Buffer.concat(chunks).toString('utf8');
+        const setCookies = response.headers['set-cookie'] || [];
+        resolve({
+          status: Number(response.statusCode || 0),
+          ok: Number(response.statusCode || 0) >= 200 && Number(response.statusCode || 0) < 300,
+          headers: { get: (name) => { const value = response.headers[String(name).toLowerCase()]; return Array.isArray(value) ? value.join(', ') : value || null; }, getSetCookie: () => [...setCookies] },
+          async json() { return JSON.parse(textBody); },
+          async text() { return textBody; },
+        });
+      });
+    });
+    request.on('error', reject);
+    if (init.body != null) request.write(String(init.body));
+    request.end();
+  });
+}
+async function fetchJsonLoopback(url, init = {}) {
+  const response = await fetchLoopback(url, init);
+  return { response, body: await response.json().catch(() => ({})) };
+}
 async function loginEmployee(base, employee, password) {
   const jar = {};
   const login = await fetchJson(`${base}/api/company/auth/session`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ email: employee.email, password }) });
   updateCookieJar(jar, login.response);
   const token = cookieValue(jar, 'dinodia_employee_session');
   if (login.response.status !== 200 || !token) fail(`Real employee login failed (${login.response.status}/${login.body.errorCode || 'missing-cookie'})`);
-  const session = await prisma.employeeSession.findFirst({ where: { employeeId: employee.id }, orderBy: { createdAt: 'desc' }, select: { id: true } });
+  const session = await prisma.employeeSession.findFirst({ where: { employeeId: employee.id }, orderBy: { createdAt: 'desc' }, select: { id: true, status: true, expiresAt: true, recentAuthenticatedAt: true } });
   if (!session) fail('Real employee login did not create a durable session');
-  return { token, jar, session };
+  let claims;
+  try { claims = JSON.parse(Buffer.from(decodeURIComponent(token).split('.')[2], 'base64url').toString('utf8')); } catch { fail('Real employee login cookie was not a decodable signed session'); }
+  return { token, jar, session, claims, loginBody: login.body, setCookie: String(login.response.headers.get('set-cookie') || '') };
+}
+
+async function employeeSessionPolicyChecks(runEnv) {
+  const base = `http://127.0.0.1:${appPort}`;
+  const employeePassword = `harness-session-policy-${crypto.randomUUID()}`;
+  const employeeEmail = `session-policy-${crypto.randomUUID()}@invalid.test`;
+  const employee = await prisma.companyEmployeeAccount.create({ data: { displayName: 'Session policy boundary fixture', email: employeeEmail, emailNormalized: employeeEmail, role: 'CXO', status: 'ACTIVE', passwordHash: hashPassword(employeePassword) } });
+  try {
+    await stopPlatform();
+    await startPlatform({ ...runEnv, STAGE1_INTERNAL_OPERATOR_DAY_SESSION: 'false' });
+    const ordinary = await loginEmployee(base, employee, employeePassword);
+    if (!ordinary.setCookie.includes('Max-Age=28800') || !/HttpOnly/i.test(ordinary.setCookie) || !/Secure/i.test(ordinary.setCookie) || !/SameSite=Lax/i.test(ordinary.setCookie) || ordinary.claims.exp - ordinary.claims.iat !== 8 * 60 * 60 || ordinary.session.expiresAt.getTime() !== ordinary.claims.exp * 1000 || ordinary.claims.sessionPolicy !== undefined) fail('Policy OFF did not restore the aligned eight-hour Portal cookie, signed token and database expiry');
+    await prisma.employeeSession.update({ where: { id: ordinary.session.id }, data: { recentAuthenticatedAt: new Date(Date.now() - 5 * 60 * 1000 - 1) } });
+    const launchWhileStale = await fetchJson(`${base}/api/installer/home-support/homes/${crypto.randomUUID()}/os-access/launch`, { method: 'POST', headers: { 'content-type': 'application/json', cookie: cookieHeader(ordinary.jar) }, body: '{}' });
+    if (launchWhileStale.response.status !== 401 || launchWhileStale.body.errorCode !== 'recent_authentication_required') fail('Policy OFF did not retain the five-minute recent-auth requirement on secure OS launch');
+    await prisma.employeeSession.deleteMany({ where: { employeeId: employee.id } });
+
+    await stopPlatform();
+    await startPlatform({ ...runEnv, STAGE1_INTERNAL_OPERATOR_DAY_SESSION: 'true' });
+    const extended = await loginEmployee(base, employee, employeePassword);
+    const deadline = extended.session.expiresAt.getTime();
+    if (!extended.setCookie.includes('Max-Age=86400') || !/HttpOnly/i.test(extended.setCookie) || !/Secure/i.test(extended.setCookie) || !/SameSite=Lax/i.test(extended.setCookie) || extended.claims.sessionPolicy !== 'STAGE1_INTERNAL_OPERATOR_DAY_SESSION' || extended.claims.exp - extended.claims.iat !== 24 * 60 * 60 || deadline !== extended.claims.exp * 1000 || Date.parse(extended.loginBody.expiresAt) !== deadline) fail('Policy ON did not give the durable Portal row, signed token, cookie and response one 24-hour absolute deadline');
+    if (JSON.stringify(extended.loginBody).includes(extended.token)) fail('Employee login JSON exposed its reusable signed session');
+
+    const authBoundary = Math.floor(Date.now() / 1000) * 1000;
+    await prisma.employeeSession.update({ where: { id: extended.session.id }, data: { recentAuthenticatedAt: new Date(authBoundary - 5 * 60 * 1000) } });
+    const recentRouteProbe = async (label, instant, expectedRecentDenial) => {
+      await stopPlatform();
+      await startPlatform({ ...runEnv, STAGE1_INTERNAL_OPERATOR_DAY_SESSION: 'true', STAGE1_TEST_NOW_MS: String(instant) });
+      const response = await fetchJson(`${base}/api/installer/home-support/homes/${crypto.randomUUID()}/os-access/rotate`, { method: 'POST', headers: { 'content-type': 'application/json', cookie: cookieHeader(extended.jar), 'idempotency-key': `recent-boundary-${label}-${crypto.randomUUID()}` }, body: JSON.stringify({ workflowId: crypto.randomUUID() }) });
+      const deniedForRecentAuth = response.response.status === 401 && response.body.errorCode === 'recent_authentication_required';
+      if (deniedForRecentAuth !== expectedRecentDenial) fail(`Credential rotation recent-auth boundary ${label} behaved incorrectly (${response.response.status}/${response.body.errorCode || 'none'})`);
+    };
+    await recentRouteProbe('before', authBoundary - 1, false);
+    await recentRouteProbe('exact', authBoundary, false);
+    await recentRouteProbe('after', authBoundary + 1, true);
+    await prisma.employeeSession.update({ where: { id: extended.session.id }, data: { recentAuthenticatedAt: new Date() } });
+
+    const unchangedDeadline = extended.session.expiresAt.getTime();
+    for (const [label, now, expected] of [['immediately-before', deadline - 1, 200], ['exactly-at', deadline, 401], ['immediately-after', deadline + 1, 401]]) {
+      await stopPlatform();
+      await startPlatform({ ...runEnv, STAGE1_INTERNAL_OPERATOR_DAY_SESSION: 'true', STAGE1_TEST_NOW_MS: String(now) });
+      const probe = await fetchJson(`${base}/api/company/auth/session`, { headers: { cookie: cookieHeader(extended.jar) } });
+      if (probe.response.status !== expected) fail(`Portal 24-hour absolute expiry ${label} returned ${probe.response.status}, expected ${expected}`);
+      const durable = await prisma.employeeSession.findUnique({ where: { id: extended.session.id }, select: { expiresAt: true } });
+      if (durable?.expiresAt.getTime() !== unchangedDeadline) fail('Portal status polling or process restart extended the durable absolute deadline');
+    }
+    console.log('[stage1:integration] PASS: real employee login/logout and Platform session route enforce aligned 8-hour OFF and 24-hour ON absolute deadlines; exact 24-hour boundary and launch-only recent-auth exception verified');
+  } finally {
+    await stopPlatform();
+    await prisma.auditEvent.deleteMany({ where: { actorType: 'EMPLOYEE', actorId: employee.id } }).catch(() => {});
+    await prisma.idempotencyRecord.deleteMany({ where: { actorId: employee.id } }).catch(() => {});
+    await prisma.authRateLimitBucket.deleteMany({ where: { bucketKey: { contains: employee.id } } }).catch(() => {});
+    await prisma.employeeSession.deleteMany({ where: { employeeId: employee.id } }).catch(() => {});
+    await prisma.companyEmployeeAccount.delete({ where: { id: employee.id } }).catch(() => {});
+    await startPlatform(runEnv);
+  }
 }
 
 async function startFakeSes() {
@@ -1162,6 +1252,11 @@ async function operatorMutationChecks() {
   const baselineVersion = (await prisma.hubCredentialVersion.aggregate({ where: { hubInstallationId: hubId, purpose: 'operator-credential' }, _max: { version: true } }))._max.version ?? 0;
   const originalHub = await prisma.hubInstallation.findUnique({ where: { id: hubId }, select: { currentOperatorCredentialVersion: true, accessPolicyRevision: true } });
   try {
+    await prisma.employeeSession.update({ where: { id: login.session.id }, data: { recentAuthenticatedAt: new Date(Date.now() - 5 * 60 * 1000 - 1) } });
+    const staleRotate = await post('rotate', `operator-rotate-stale-${crypto.randomUUID()}`, work.id);
+    const staleRevoke = await post('revoke', `operator-revoke-stale-${crypto.randomUUID()}`, work.id, { reason: 'recent-auth policy check' });
+    if (staleRotate.response.status !== 401 || staleRotate.body.errorCode !== 'recent_authentication_required' || staleRevoke.response.status !== 401 || staleRevoke.body.errorCode !== 'recent_authentication_required') fail('The day-session exception leaked into credential rotation or emergency revocation');
+    await prisma.employeeSession.update({ where: { id: login.session.id }, data: { recentAuthenticatedAt: new Date() } });
     const firstKey = `operator-rotate-initial-${crypto.randomUUID()}`;
     const first = await post('rotate', firstKey, work.id);
     if (first.response.status !== 200 || first.body.state !== 'PENDING' || !Number.isInteger(first.body.version)) fail(`Authenticated operator rotation failed (${first.response.status}/${first.body.errorCode || 'unknown'})`);
@@ -1339,6 +1434,10 @@ async function osChecks() {
     body: JSON.stringify({ workflowId: customerFixture.operatorWorkId, setupAttemptId: expiredRegistration.body.setupAttemptId }),
   });
   if (expiredAttemptLaunch.response.status !== 403) fail(`An expired hub-created browser attempt received an operator handoff (${expiredAttemptLaunch.response.status})`);
+  await prisma.employeeSession.update({ where: { id: customerFixture.operatorSessionId }, data: { recentAuthenticatedAt: new Date(Date.now() - 5 * 60 * 1000 - 1) } });
+  // Keep issue times in distinct JWT seconds so this real-session test proves
+  // that the OS deadline starts at handoff, not at Portal login.
+  await sleep(1100);
   const launch = await fetchJson(`${platformBase}/api/installer/home-support/homes/${encodeURIComponent(customerFixture.homeOneId)}/os-access/launch`, {
     method: 'POST',
     headers: { 'content-type': 'application/json', 'x-dinodia-employee-session': customerFixture.operatorToken },
@@ -1352,12 +1451,14 @@ async function osChecks() {
   const missingSecretConsume = await machineRequest({ base: platformBase, path: '/api/hub-agent/operator-session/consume', machineSecret: customerFixture.machineSecret, body: { serial: customerFixture.identityOneSerial, identityGeneration: customerFixture.identityOneGeneration, handoffId: launch.body.handoffId, browserBinding: decodeURIComponent(cookieValue(browserA, 'dinodia_operator_binding')), setupAttemptId: setupAttempt.body.setupAttemptId, phase: 'consume' } });
   if (missingSecretConsume.response.status !== 401 || missingSecretConsume.body.errorCode !== 'handoff_secret_required') fail(`A machine handoff was consumed without proof of its one-use secret (${missingSecretConsume.response.status}/${missingSecretConsume.body.errorCode || 'unknown'})`);
 
-  const setupB = await fetch(`${base}/setup`, { headers: { host: '127.0.0.1' } });
+  const remoteHost = 'harness-one.example.invalid';
+  const remoteOsHeaders = { host: remoteHost, origin: `https://${remoteHost}`, 'x-forwarded-proto': 'https' };
+  const setupB = await fetchLoopback(`${base}/support-access`, { headers: remoteOsHeaders });
   const browserB = {};
   updateCookieJar(browserB, setupB);
-  const copiedHandoff = await fetchJson(`${base}/_dinodia/setup/operator-session`, {
+  const copiedHandoff = await fetchJsonLoopback(`${base}/_dinodia/setup/operator-session`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json', host: osHost, origin: osOrigin, cookie: cookieHeader(browserB), 'x-dinodia-setup-csrf': decodeURIComponent(cookieValue(browserB, 'dinodia_setup_csrf')) },
+    headers: { 'content-type': 'application/json', ...remoteOsHeaders, cookie: cookieHeader(browserB), 'x-dinodia-setup-csrf': decodeURIComponent(cookieValue(browserB, 'dinodia_setup_csrf')) },
     body: JSON.stringify({ handoffId: launch.body.handoffId }),
   });
   if (![401, 403].includes(copiedHandoff.response.status)) fail(`A second browser redeemed a copied handoff (${copiedHandoff.response.status})`);
@@ -1372,23 +1473,116 @@ async function osChecks() {
   if (intendedHandoff.status !== 200 || intendedBody.ok !== true) fail(`The originating browser could not consume the operator handoff (${intendedHandoff.status}/${intendedBody.errorCode || intendedBody.error || 'unknown'})`);
   const intendedSetCookies = typeof intendedHandoff.headers.getSetCookie === 'function' ? intendedHandoff.headers.getSetCookie().join(';') : String(intendedHandoff.headers.get('set-cookie') || '');
   if (!/dinodia_os_operator_session=[^;]+/.test(intendedSetCookies) || !/HttpOnly/i.test(intendedSetCookies)) fail('The originating browser did not receive an HttpOnly OS session cookie');
+  const firstDeadline = Date.parse(intendedBody.expiresAt);
+  const firstMaxAge = Number(intendedSetCookies.match(/Max-Age=(\d+)/i)?.[1]);
+  if (!Number.isFinite(firstDeadline) || firstMaxAge !== 86_400 || firstDeadline - Date.now() > 86_400_000 || firstDeadline - Date.now() < 86_390_000) fail('The OS browser handle/cookie did not receive a bounded absolute 24-hour grant deadline');
   if (/dno1\.|operatorToken|handoffSecret|sessionGrant|DINODIA_ADMIN_TOKEN/i.test(JSON.stringify(intendedBody))) fail('Operator handoff response exposed an OS bearer or reusable secret');
+  const persistedGrantAuthority = await prisma.operatorHandoff.findUnique({ where: { id: launch.body.handoffId }, select: { scope: true } });
+  const authorityScope = persistedGrantAuthority?.scope && typeof persistedGrantAuthority.scope === 'object' ? persistedGrantAuthority.scope : {};
+  const durableAuthorityOk = {
+    jti: /^[A-Za-z0-9_-]{16,128}$/.test(String(authorityScope.operatorJti || '')),
+    credentialVersion: Number.isSafeInteger(Number(authorityScope.credentialVersion)) && Number(authorityScope.credentialVersion) >= 0,
+    generation: Number(authorityScope.identityGeneration) === customerFixture.identityOneGeneration,
+    serial: authorityScope.serialNumber === customerFixture.identityOneSerial,
+  };
+  if (Object.values(durableAuthorityOk).some((value) => !value)) fail(`Consumed handoff did not durably bind grant authority (valid-jti=${durableAuthorityOk.jti}, expected-version=${durableAuthorityOk.credentialVersion}, generation-match=${durableAuthorityOk.generation}, certified-serial-match=${durableAuthorityOk.serial})`);
+  const currentAuthority = await machineRequest({ base: platformBase, path: '/api/hub-agent/operator-session/revalidate', machineSecret: customerFixture.machineSecret, body: { serial: customerFixture.identityOneSerial, identityGeneration: customerFixture.identityOneGeneration, handoffId: launch.body.handoffId, jti: authorityScope.operatorJti, credentialVersion: authorityScope.credentialVersion } });
+  if (currentAuthority.response.status !== 200 || currentAuthority.body.active !== true) fail(`Machine-authenticated operator revalidation rejected the exact consumed grant (${currentAuthority.response.status}/${currentAuthority.body.errorCode || 'unknown'})`);
+  const substitutedJti = await machineRequest({ base: platformBase, path: '/api/hub-agent/operator-session/revalidate', machineSecret: customerFixture.machineSecret, body: { serial: customerFixture.identityOneSerial, identityGeneration: customerFixture.identityOneGeneration, handoffId: launch.body.handoffId, jti: `substitute-${crypto.randomUUID()}`, credentialVersion: authorityScope.credentialVersion } });
+  if (substitutedJti.response.status !== 401) fail(`Machine operator revalidation accepted a substituted grant JTI (${substitutedJti.response.status})`);
   const intendedOsRead = await fetchJson(`${base}/_dinodia/admin/api/devices`, { headers: { host: '127.0.0.1', cookie: cookieHeader(browserA) } });
   if (intendedOsRead.response.status !== 200 || !Array.isArray(intendedOsRead.body.devices)) fail(`The intended browser's HttpOnly handoff session did not authorize a real OS devices read (${intendedOsRead.response.status})`);
   const copiedSessionRead = await fetchJson(`${base}/_dinodia/admin/api/devices`, { headers: { host: '127.0.0.1', cookie: cookieHeader(browserB) } });
   if (copiedSessionRead.response.status !== 401) fail(`A second browser obtained OS access without the originating browser session (${copiedSessionRead.response.status})`);
+  const WebSocket = createRequire(import.meta.url)(path.join(osRoot, 'node_modules/ws'));
+  const endSessionSocket = new WebSocket(`${base.replace('http', 'ws')}/api/websocket`, { headers: { host: '127.0.0.1', origin: 'http://127.0.0.1', cookie: cookieHeader(browserA) } });
+  await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => { endSessionSocket.terminate(); reject(new Error('operator WebSocket did not authenticate before End session')); }, 5000);
+    endSessionSocket.on('message', (value) => { try { const message = JSON.parse(String(value)); if (message.type === 'auth_required') endSessionSocket.send(JSON.stringify({ type: 'auth', access_token: '' })); if (message.type === 'auth_ok') { clearTimeout(timer); resolve(); } } catch {} });
+    endSessionSocket.on('error', (error) => { clearTimeout(timer); reject(error); });
+  });
   const replayHandoff = await fetchJson(`${base}/_dinodia/setup/operator-session`, {
     method: 'POST',
     headers: { 'content-type': 'application/json', host: osHost, origin: osOrigin, cookie: cookieHeader(browserA), 'x-dinodia-setup-csrf': decodeURIComponent(cookieValue(browserA, 'dinodia_setup_csrf')) },
     body: JSON.stringify({ handoffId: launch.body.handoffId }),
   });
   if (![400, 401, 403].includes(replayHandoff.response.status)) fail(`The operator handoff replay was accepted (${replayHandoff.response.status})`);
-  await hub.store.savePlatform({ operatorCredentialStates: [] });
-  const revokedOsRead = await fetchJson(`${base}/_dinodia/admin/api/devices`, { headers: { host: '127.0.0.1', cookie: cookieHeader(browserA) } });
-  if (revokedOsRead.response.status !== 401) fail(`Removing the active operator credential did not revoke the real OS session (${revokedOsRead.response.status})`);
-  console.log('[stage1:integration] PASS: authenticated 200 proves the intended browser session; second browser and revoked credential receive 401 without exposing token material');
 
-  const WebSocket = createRequire(import.meta.url)(path.join(osRoot, 'node_modules/ws'));
+  const endSession = await fetchJson(`${base}/_dinodia/operator-session/end`, { method: 'POST', headers: { host: osHost, origin: osOrigin, cookie: cookieHeader(browserA) } });
+  if (endSession.response.status !== 200 || endSession.body.ok !== true) fail(`The explicit Dinodia OS End session action did not revoke the active session (${endSession.response.status})`);
+  const endedSocketCode = await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => { endSessionSocket.terminate(); reject(new Error('End session left the operator WebSocket active')); }, 2000);
+    endSessionSocket.once('close', (code) => { clearTimeout(timer); resolve(code); });
+  });
+  if (endedSocketCode !== 4401) fail(`End session closed the operator WebSocket with an unexpected code (${endedSocketCode})`);
+  updateCookieJar(browserA, endSession.response);
+  const afterEndSession = await fetchJson(`${base}/_dinodia/admin/api/devices`, { headers: { host: '127.0.0.1', cookie: cookieHeader(browserA) } });
+  if (afterEndSession.response.status !== 401) fail(`Protected OS read remained available after End session (${afterEndSession.response.status})`);
+
+  // Establish a second legitimate handoff in the independent browser so the
+  // absolute-deadline test exercises a live server-held session after the
+  // first browser has explicitly ended its session.
+  const attemptB = await fetchJsonLoopback(`${base}/_dinodia/setup/operator-attempt`, { method: 'POST', headers: { ...remoteOsHeaders, cookie: cookieHeader(browserB), 'x-dinodia-setup-csrf': decodeURIComponent(cookieValue(browserB, 'dinodia_setup_csrf')) } });
+  if (attemptB.response.status !== 200 || !attemptB.body.setupAttemptId) fail(`Independent secure-origin browser could not create its own hub attempt (${attemptB.response.status}/${attemptB.body.error || attemptB.body.errorCode || 'unknown'}; browser=${Boolean(browserB.dinodia_setup_browser)}, csrf=${Boolean(browserB.dinodia_setup_csrf)}, binding=${Boolean(browserB.dinodia_operator_binding)}, attempt=${Boolean(browserB.dinodia_operator_attempt)})`);
+  const launchB = await fetchJson(`${platformBase}/api/installer/home-support/homes/${encodeURIComponent(customerFixture.homeOneId)}/os-access/launch`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-employee-session': customerFixture.operatorToken }, body: JSON.stringify({ workflowId: customerFixture.operatorWorkId, setupAttemptId: attemptB.body.setupAttemptId }) });
+  if (launchB.response.status !== 200 || !launchB.body.handoffId) fail(`A valid fresh handoff could not be issued for the independent browser (${launchB.response.status})`);
+  const consumeB = await fetchLoopback(`${base}/_dinodia/setup/operator-session`, { method: 'POST', headers: { 'content-type': 'application/json', ...remoteOsHeaders, cookie: cookieHeader(browserB), 'x-dinodia-setup-csrf': decodeURIComponent(cookieValue(browserB, 'dinodia_setup_csrf')) }, body: JSON.stringify({ handoffId: launchB.body.handoffId }) });
+  const consumeBBody = await consumeB.json().catch(() => ({}));
+  updateCookieJar(browserB, consumeB);
+  if (consumeB.status !== 200 || consumeBBody.ok !== true) fail(`The independent browser's own handoff did not establish its opaque OS session (${consumeB.status})`);
+  const secondDeadline = Date.parse(consumeBBody.expiresAt);
+  if (!Number.isFinite(secondDeadline) || secondDeadline - Date.now() > 86_400_000 || secondDeadline - Date.now() < 86_390_000) fail('The second OS grant does not carry a single absolute 24-hour deadline');
+  const remoteSetCookies = typeof consumeB.headers.getSetCookie === 'function' ? consumeB.headers.getSetCookie().join(';') : String(consumeB.headers.get('set-cookie') || '');
+  if (!/dinodia_os_operator_session=[^;]+/.test(remoteSetCookies) || !/HttpOnly/i.test(remoteSetCookies) || !/Secure/i.test(remoteSetCookies) || !/SameSite=Strict/i.test(remoteSetCookies)) fail('Secure CloudURL handoff did not issue an HttpOnly/Secure/SameSite OS cookie');
+  const secondRead = await fetchJsonLoopback(`${base}/_dinodia/admin/api/devices`, { headers: { host: remoteHost, 'x-forwarded-proto': 'https', cookie: cookieHeader(browserB) } });
+  if (secondRead.response.status !== 200) fail(`The second browser's own fresh handoff did not authorize a protected OS read (${secondRead.response.status})`);
+  // The two absolute deadlines are independent: advance Platform past the
+  // real Portal token/database deadline while the later-issued OS grant is
+  // still live. Portal must deny while the already-established OS read works.
+  const portalSession = await prisma.employeeSession.findUnique({ where: { id: customerFixture.operatorSessionId }, select: { expiresAt: true } });
+  const portalDeadline = portalSession?.expiresAt.getTime() ?? 0;
+  if (!(portalDeadline > Date.now() && portalDeadline < secondDeadline)) fail(`The fixture did not create independent Portal and later OS deadlines (portalRemaining=${portalDeadline - Date.now()}ms, osRemaining=${secondDeadline - Date.now()}ms)`);
+  osHarnessNow = portalDeadline + 1;
+  await stopPlatform();
+  await startPlatform({ ...env, STAGE1_TEST_NOW_MS: String(portalDeadline + 1) });
+  const expiredPortal = await fetchJson(`${platformBase}/api/company/auth/session`, { headers: { 'x-dinodia-employee-session': customerFixture.operatorToken } });
+  if (expiredPortal.response.status !== 401) fail(`Portal login remained valid after its own 24-hour absolute deadline (${expiredPortal.response.status})`);
+  await hub.syncOperatorBrowserSessions();
+  const afterPortalExpiryRead = await fetchJsonLoopback(`${base}/_dinodia/admin/api/devices`, { headers: { host: remoteHost, 'x-forwarded-proto': 'https', cookie: cookieHeader(browserB) } });
+  if (afterPortalExpiryRead.response.status !== 200) fail(`Natural Portal expiry incorrectly ended the independent OS operator grant (${afterPortalExpiryRead.response.status})`);
+
+  const socket = new WebSocket(`${base.replace('http', 'ws')}/api/websocket`, { headers: { host: remoteHost, origin: `https://${remoteHost}`, 'x-forwarded-proto': 'https', cookie: cookieHeader(browserB) } });
+  await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => { socket.terminate(); reject(new Error('valid operator WebSocket did not authenticate')); }, 5000);
+    socket.on('message', (value) => { try { const message = JSON.parse(String(value)); if (message.type === 'auth_required') socket.send(JSON.stringify({ type: 'auth', access_token: '' })); if (message.type === 'auth_ok') { clearTimeout(timer); resolve(); } } catch {} });
+    socket.on('error', (error) => { clearTimeout(timer); reject(error); });
+  });
+  socket.send(JSON.stringify({ id: 41, type: 'get_states' }));
+  const initialWsRead = await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('authenticated operator WebSocket did not return its protected read')), 5000);
+    socket.on('message', (value) => { try { const message = JSON.parse(String(value)); if (message.id === 41) { clearTimeout(timer); resolve(message); } } catch {} });
+    socket.once('error', reject);
+  });
+  if (initialWsRead?.success !== true) fail('Intended-browser WebSocket could not perform a protected read before session expiry');
+  osHarnessNow = secondDeadline - 1;
+  await hub.syncOperatorBrowserSessions();
+  const beforeOsExpiry = await fetchJsonLoopback(`${base}/_dinodia/admin/api/devices`, { headers: { host: remoteHost, 'x-forwarded-proto': 'https', cookie: cookieHeader(browserB) } });
+  if (beforeOsExpiry.response.status !== 200) fail(`OS protected HTTP read was denied immediately before 24-hour expiry (${beforeOsExpiry.response.status})`);
+  osHarnessNow = secondDeadline;
+  socket.send(JSON.stringify({ id: 42, type: 'get_states' }));
+  await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('operator WebSocket remained open at the exact 24-hour expiry')), 2000);
+    socket.once('close', () => { clearTimeout(timer); resolve(); });
+  });
+  const atOsExpiry = await fetchJsonLoopback(`${base}/_dinodia/admin/api/devices`, { headers: { host: remoteHost, 'x-forwarded-proto': 'https', cookie: cookieHeader(browserB) } });
+  osHarnessNow = secondDeadline + 1;
+  const afterOsExpiry = await fetchJsonLoopback(`${base}/_dinodia/admin/api/devices`, { headers: { host: remoteHost, 'x-forwarded-proto': 'https', cookie: cookieHeader(browserB) } });
+  if (atOsExpiry.response.status !== 401 || afterOsExpiry.response.status !== 401) fail(`OS protected HTTP authority did not end exactly at 24 hours (${atOsExpiry.response.status}/${afterOsExpiry.response.status})`);
+  console.log('[stage1:integration] PASS: real consumed grant is durably JTI-bound; Portal and OS deadlines remain independent; intended and independently handed-off browsers read protected OS data; End session revokes HTTP and closes its WebSocket; HTTP and WebSocket authority stop at the exact 24-hour deadline without exposing bearer material');
+  osHarnessNow = Date.now();
+  await stopPlatform();
+  await startPlatform(env);
+
   await new Promise((resolve, reject) => {
     const socket = new WebSocket(`${base.replace('http', 'ws')}/api/websocket`, { headers: { host: '127.0.0.1' } });
     const timer = setTimeout(() => { socket.terminate(); reject(new Error('unauthenticated OS WebSocket did not close')); }, 5000);
@@ -1494,9 +1688,10 @@ try {
     // This fixture's certified serial is deliberately the same opaque string
     // as its installation UUID; the separate seed above still asserts the
     // Platform grants are bound to the certified serial snapshot.
-    config: { nodeEnv: 'production', v2Environment: 'test', hubId: harnessHubInstallationId, haPort: 0, hubAgentPort: 0, dataDir, dataFile: path.join(dataDir, 'dinodia.json'), backupDir: path.join(dataDir, 'backups'), staticDir: path.join(osRoot, 'public'), operatorPublicKey, appPublicKeys: env.DINODIA_APP_PUBLIC_KEYS, platformApiUrl: 'https://dinodia-platform-v2.vercel.app', nativeAutomationsMode: 'off', hiveEnabled: false, googleNestEnabled: false, cloudflarePublicHostname: '' },
+    config: { nodeEnv: 'production', v2Environment: 'test', stage1InternalOperatorDaySession: true, operatorPolicySyncIntervalMs: 60000, hubId: harnessHubInstallationId, haPort: 0, hubAgentPort: 0, dataDir, dataFile: path.join(dataDir, 'dinodia.json'), backupDir: path.join(dataDir, 'backups'), staticDir: path.join(osRoot, 'public'), operatorPublicKey, appPublicKeys: env.DINODIA_APP_PUBLIC_KEYS, platformApiUrl: 'https://dinodia-platform-v2.vercel.app', nativeAutomationsMode: 'off', hiveEnabled: false, googleNestEnabled: false, cloudflarePublicHostname: 'harness-one.example.invalid' },
     identityBroker: harnessIdentityBroker,
     logger: { error() {}, warn() {}, log() {} },
+    clock: () => osHarnessNow,
     mqttBridge: { start() {}, close() {}, status() { return { configured: false, connected: false }; }, async command() { fakePhysicalCommandCount += 1; } },
     platformSync: { start() {}, stop() {}, status() { return { configured: false }; } },
     cloudflareTunnel: { start() {}, async stop() {}, status() { return { configured: false, connected: false, hostname: '' }; } },
@@ -1504,6 +1699,7 @@ try {
   hub.pairing.apiUrl = `http://127.0.0.1:${appPort}`;
   await new Promise((resolve) => hub.server.listen(0, '127.0.0.1', resolve));
   await platformChecks();
+  await employeeSessionPolicyChecks(env);
   await stopPlatform();
   await startFakeSes();
   const sesEndpoint = `http://127.0.0.1:${sesPort}`;

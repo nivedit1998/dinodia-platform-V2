@@ -43,7 +43,7 @@ export async function GET(request: Request) {
     const employees = employee.role === 'CXO' || employee.role === 'SENIOR_OPERATIONS_MANAGER'
       ? await prisma.companyEmployeeAccount.findMany({ where: { status: 'ACTIVE', role: { in: ['CXO', 'SENIOR_OPERATIONS_MANAGER', 'INSTALLER'] } }, select: { id: true, displayName: true, role: true }, orderBy: { displayName: 'asc' } })
       : [];
-    return NextResponse.json({ ok: true, employee: { id: employee.id, role: employee.role }, workflows: work, employees }, { headers: { 'Cache-Control': 'no-store', Pragma: 'no-cache' } });
+    return NextResponse.json({ ok: true, employee: { id: employee.id, role: employee.role }, sessionExpiresAt: new Date(employee.expiresAt).toISOString(), workflows: work, employees }, { headers: { 'Cache-Control': 'no-store', Pragma: 'no-cache' } });
   } catch (error) {
     return authErrorResponse(error);
   }

@@ -25,7 +25,7 @@ export async function POST(request: Request, context: { params: Promise<{ homeId
         return { hubInstallationId: work.hubInstallationId };
       },
       mutate: async (tx, hub, now) => {
-        const updated = await tx.hubCredentialVersion.updateMany({ where: { hubInstallationId: hub.hubInstallationId, purpose: 'operator-credential', state: { in: ['PENDING', 'DELIVERED', 'ACKNOWLEDGED', 'ACTIVE', 'GRACE'] } }, data: { state: 'REVOKED', revokedAt: now, revokedReason: reason } });
+        const updated = await tx.hubCredentialVersion.updateMany({ where: { hubInstallationId: hub.hubInstallationId, purpose: 'operator-credential', state: { in: ['PENDING', 'DELIVERED', 'ACKNOWLEDGED', 'ACTIVE', 'GRACE'] } }, data: { state: 'REVOKED', revokedAt: now, revokedReason: 'emergency_operator_revocation' } });
         await tx.hubInstallation.update({ where: { id: hub.hubInstallationId }, data: { currentOperatorCredentialVersion: null, accessPolicyRevision: { increment: 1 } } });
         await tx.auditEvent.create({ data: { homeId, actorType: 'EMPLOYEE', actorId: employee.id, category: 'SECURITY', action: 'operator_credentials_revoked', targetType: 'HubInstallation', targetId: hub.hubInstallationId, metadata: { reason, revokedCount: updated.count }, purgeAt: new Date(now.getTime() + 365 * 24 * 60 * 60 * 1000) } });
         return { ok: true, revoked: updated.count, hubInstallationId: hub.hubInstallationId };

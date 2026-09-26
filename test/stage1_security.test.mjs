@@ -22,6 +22,15 @@ function loadTypeScriptModule(relativePath, overrides = {}) {
   return module.exports;
 }
 
+test('temporary internal day mode is disabled unless the exact opt-in is present', () => {
+  const { internalOperatorDaySessionEnabled } = loadTypeScriptModule('src/lib/internalOperatorDaySession.ts');
+  assert.equal(internalOperatorDaySessionEnabled({}), false);
+  assert.equal(internalOperatorDaySessionEnabled({ STAGE1_INTERNAL_OPERATOR_DAY_SESSION: 'false' }), false);
+  assert.equal(internalOperatorDaySessionEnabled({ STAGE1_INTERNAL_OPERATOR_DAY_SESSION: 'TRUE' }), false);
+  assert.equal(internalOperatorDaySessionEnabled({ STAGE1_INTERNAL_OPERATOR_DAY_SESSION: ' true ' }), false);
+  assert.equal(internalOperatorDaySessionEnabled({ STAGE1_INTERNAL_OPERATOR_DAY_SESSION: 'true' }), true);
+});
+
 test('Stage 1 checker passes against the active repositories', () => {
   const output = execFileSync(process.execPath, ['scripts/check_stage1_security.mjs'], { cwd: root, encoding: 'utf8' });
   assert.match(output, /check:stage1\] OK/);
@@ -145,6 +154,7 @@ test('Platform step-up operation digest matches the published cross-runtime vect
 test('Platform and Dinodia OS use the same support proof-of-possession vector', () => {
   const { supportProofOfPossessionDigest } = loadTypeScriptModule('src/lib/stage1Operator.ts', {
     './hubOperatorCredentials': { encryptToHubKey: () => ({}) },
+    './internalOperatorDaySession': { DEFAULT_OPERATOR_SESSION_SECONDS: 900, INTERNAL_OPERATOR_SESSION_SECONDS: 86400, INTERNAL_OPERATOR_DAY_SESSION_POLICY: 'STAGE1_INTERNAL_OPERATOR_DAY_SESSION', internalOperatorDaySessionEnabled: () => false, stage1NowMs: () => Date.now() },
   });
   const input = {
     employeeProofHash: 'a'.repeat(64),
@@ -198,6 +208,7 @@ test('trusted-phone assertions interoperate with Secure Enclave P-256 and preser
 test('operator handoff expiry accepts only timestamps strictly before the bound deadline', () => {
   const { isStrictlyUnexpired } = loadTypeScriptModule('src/lib/stage1Operator.ts', {
     './hubOperatorCredentials': { encryptToHubKey: () => ({}) },
+    './internalOperatorDaySession': { DEFAULT_OPERATOR_SESSION_SECONDS: 900, INTERNAL_OPERATOR_SESSION_SECONDS: 86400, INTERNAL_OPERATOR_DAY_SESSION_POLICY: 'STAGE1_INTERNAL_OPERATOR_DAY_SESSION', internalOperatorDaySessionEnabled: () => false, stage1NowMs: () => Date.now() },
   });
   const now = new Date('2026-09-25T12:00:00.000Z');
   const deadline = new Date(now.getTime() + 60_000);

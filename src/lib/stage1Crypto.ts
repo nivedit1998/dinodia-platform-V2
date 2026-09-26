@@ -19,6 +19,7 @@ export type Stage1Principal = {
   issuedAt: number;
   expiresAt: number;
   recentAuthenticatedAt?: number;
+  sessionPolicy?: string;
 };
 
 export function sha256(value: string): string {
@@ -83,6 +84,7 @@ export function signStage1Token(
     iat: claims.issuedAt,
     exp: claims.expiresAt,
     ...(claims.recentAuthenticatedAt ? { recentAuthenticatedAt: claims.recentAuthenticatedAt } : {}),
+    ...(claims.sessionPolicy ? { sessionPolicy: claims.sessionPolicy } : {}),
   };
   const encodedHeader = encode(header);
   const encodedPayload = encode(payload);
@@ -146,6 +148,7 @@ export function verifyStage1Token(
     issuedAt,
     expiresAt,
     recentAuthenticatedAt: Number.isFinite(Number(payload.recentAuthenticatedAt)) ? Number(payload.recentAuthenticatedAt) : undefined,
+    sessionPolicy: typeof payload.sessionPolicy === 'string' ? payload.sessionPolicy : undefined,
   };
 }
 

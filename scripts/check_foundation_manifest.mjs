@@ -16,15 +16,16 @@ const modifiedFiles = new Set([
   'src/app/loading.tsx', 'src/app/not-found.tsx', 'src/app/page.tsx', 'src/lib/prisma.ts', 'supabase/config.toml',
   'tsconfig.json', 'src/app/api/readiness/route.ts', 'src/app/api/company/auth/bootstrap/complete/route.ts', 'src/app/api/company/auth/session/route.ts',
   'src/app/api/company/auth/bootstrap/route.ts', 'src/app/api/hub-agent/support/v2/redeem/route.ts', 'src/app/api/hub-agent/support/v2/revocation/route.ts', 'src/app/api/hub-agent/v2/pairing/cloud-url/route.ts',
-  'src/app/api/installer/workflows/route.ts', 'src/app/api/installer/hubs/provision/route.ts', 'src/app/api/hub-agent/v2/pairing/challenge/route.ts', 'src/app/api/v2/auth/session/route.ts', 'src/app/api/v2/hub-sessions/route.ts', 'src/app/api/v2/support/tickets/[ticketId]/route.ts', 'src/app/api/v2/support/tickets/[ticketId]/access-requests/[requestId]/approve/route.ts', 'src/app/api/v2/support/tickets/[ticketId]/access-requests/[requestId]/issue/route.ts', 'src/app/api/v2/security/step-up/challenge/route.ts', 'src/app/api/v2/security/step-up/consume/route.ts', 'src/app/api/v2/trusted-devices/[trustedDeviceId]/route.ts', 'src/app/installer/page.tsx', 'src/app/installer/provision/page.tsx', 'src/app/installer/home-support/page.tsx', 'src/lib/foundation.ts', 'src/lib/stage1Auth.ts', 'src/lib/stage1HubAuth.ts',
+  'src/app/api/installer/workflows/route.ts', 'src/app/api/installer/hubs/provision/route.ts', 'src/app/api/hub-agent/v2/pairing/challenge/route.ts', 'src/app/api/v2/auth/session/route.ts', 'src/app/api/v2/hub-sessions/route.ts', 'src/app/api/v2/support/tickets/[ticketId]/route.ts', 'src/app/api/v2/support/tickets/[ticketId]/access-requests/[requestId]/approve/route.ts', 'src/app/api/v2/support/tickets/[ticketId]/access-requests/[requestId]/issue/route.ts', 'src/app/api/v2/security/step-up/challenge/route.ts', 'src/app/api/v2/security/step-up/consume/route.ts', 'src/app/api/v2/trusted-devices/[trustedDeviceId]/route.ts', 'src/app/installer/page.tsx', 'src/app/installer/provision/page.tsx', 'src/app/installer/home-support/page.tsx', 'src/lib/foundation.ts', 'src/lib/stage1Auth.ts', 'src/lib/stage1Crypto.ts', 'src/lib/stage1HubAuth.ts',
   'src/lib/hubOperatorCredentials.ts', 'src/lib/nativeOperations.ts', 'src/lib/sensitiveOperationStepUp.ts', 'src/lib/stage1ClaimContract.ts', 'src/lib/stage1Operator.ts', 'test/foundation_contracts.test.mjs',
-  'test/stage1_security.test.mjs', 'vercel.json',
+  'test/stage1_security.test.mjs', 'test/stage1_route_inventory.mjs', 'vercel.json',
   'src/app/api/installer/home-support/homes/[homeId]/os-access/rotate/route.ts',
   'src/app/api/installer/home-support/homes/[homeId]/os-access/revoke/route.ts',
   'src/app/api/hub-agent/token-state/route.ts',
   'src/app/api/hub-agent/v2/credentials/acknowledge/route.ts',
   'src/app/api/hub-agent/v2/credentials/activate/route.ts',
   'src/app/api/hub-agent/operator-session/consume/route.ts',
+  'src/app/api/hub-agent/operator-session/revalidate/route.ts',
   'src/app/api/installer/home-support/homes/[homeId]/os-access/launch/route.ts',
 ]);
 
@@ -38,7 +39,7 @@ const addedFiles = [
   /^src\/app\/api\/(health|readiness)(?:\/|$)/,
   /^src\/app\/api\/(company|cron|hub-agent|installer|internal|v2)(?:\/|$)/,
   /^src\/app\/(company|installer)(?:\/|$)/,
-  /^src\/lib\/(foundation|foundationContracts|initialCxoInvitation|manufacturingEnrollment|runtimeDatabaseUrl|runtimeTarget|hubOperatorCredentials|idempotentOperatorMutation|operatorRateLimitPolicy|nativeOperations|passwords|rateLimit|serializableTransaction|sensitiveOperationStepUp|stage1Auth|stage1ClaimContract|stage1Crypto|stage1HubAuth|stage1Operator|supportNotifications)\.(mjs|ts)$/,
+  /^src\/lib\/(foundation|foundationContracts|initialCxoInvitation|manufacturingEnrollment|runtimeDatabaseUrl|runtimeTarget|hubOperatorCredentials|idempotentOperatorMutation|operatorRateLimitPolicy|nativeOperations|passwords|rateLimit|serializableTransaction|sensitiveOperationStepUp|stage1Auth|stage1ClaimContract|stage1Crypto|stage1HubAuth|stage1Operator|supportNotifications|internalOperatorDaySession)\.(mjs|ts)$/,
   /^test(?:\/|$)/,
   /^vercel\.json$/,
 ];
