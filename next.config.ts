@@ -41,6 +41,20 @@ const nextConfig: NextConfig = {
 
     return [
       {
+        // Company Portal intentionally opens the paired hub on a separate
+        // origin. Keep that popup in the opener's browsing-context group so
+        // the existing origin-checked, browser-bound postMessage handshake
+        // works in browsers enforcing COOP isolation. This exception is only
+        // on the installer document, not on APIs or customer pages.
+        source: '/installer',
+        headers: [
+          {
+            key: 'Cross-Origin-Opener-Policy',
+            value: 'same-origin-allow-popups',
+          },
+        ],
+      },
+      {
         source: '/:path*',
         headers,
       },

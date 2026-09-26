@@ -407,6 +407,7 @@ test('R11 signed CloudURL re-verification is challenge-bound and compare-and-set
   const dashboard = readOs('public/app.js');
   const setup = readOs('public/setup.js');
   const installer = read('src/app/installer/page.tsx');
+  const nextConfig = read('next.config.ts');
   assert.match(cloud, /hub\.body\.reverifyChallenge !== undefined && typeof hub\.body\.reverifyChallenge !== 'boolean'/);
   assert.match(cloud, /existing\?\.status === 'VERIFIED' && !reverifyChallenge/);
   assert.match(cloud, /challengeHash, status: 'PENDING', expiresAt: \{ gt: new Date\(\) \}/);
@@ -434,6 +435,7 @@ test('R11 signed CloudURL re-verification is challenge-bound and compare-and-set
   assert.match(installer, /The hub did not confirm an authenticated operator session/);
   assert.match(installer, /operator session was verified by the hub/);
   assert.doesNotMatch(installer, /The secure Dinodia OS window opened/);
+  assert.match(nextConfig, /source: '\/installer',[\s\S]*?key: 'Cross-Origin-Opener-Policy',[\s\S]*?value: 'same-origin-allow-popups'/);
 });
 
 test('R11 CloudURL route issues a fresh signed challenge and rejects a replayed remote response', async () => {
