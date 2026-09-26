@@ -1076,7 +1076,12 @@ async function operatorMutationChecks() {
     const firstKey = `operator-rotate-initial-${crypto.randomUUID()}`;
     const first = await post('rotate', firstKey, work.id);
     if (first.response.status !== 200 || first.body.state !== 'PENDING' || !Number.isInteger(first.body.version)) fail(`Authenticated operator rotation failed (${first.response.status}/${first.body.errorCode || 'unknown'})`);
+    const returnedCredentialText = JSON.stringify(first.body);
+    if (/dno_ops_|tokenHash|encryptedDeliveryEnvelope|privateKey|secret/i.test(returnedCredentialText)) fail('Operator rotation response exposed reusable credential material');
     createdVersions.add(first.body.version);
+    const visibleStatus = await fetchJson(`${base}/api/installer/home-support/homes/${encodeURIComponent(homeId)}/os-access/status?workflowId=${encodeURIComponent(work.id)}`, { headers: { cookie: cookieHeader(login.jar) } });
+    if (visibleStatus.response.status !== 200 || visibleStatus.body.credentials?.[0]?.version !== first.body.version || visibleStatus.body.credentials?.[0]?.state !== 'PENDING') fail('Authenticated operator status did not expose the durable lifecycle state');
+    if (/dno_ops_|tokenHash|encryptedDeliveryEnvelope|privateKey|secret/i.test(JSON.stringify(visibleStatus.body))) fail('Operator status response exposed reusable credential material');
     const firstRowCount = await prisma.hubCredentialVersion.count({ where: { hubInstallationId: hubId, purpose: 'operator-credential' } });
     const rateKey = `operator-rotate:${employee.id}:${hubId}`;
     const mutationRecord = await prisma.idempotencyRecord.findUniqueOrThrow({ where: { namespace_keyHash: { namespace: 'operator-rotate:v1', keyHash: sha256(`${employee.id}:${firstKey}`) } }, select: { actorId: true, homeId: true, hubInstallationId: true, requestHash: true } });
