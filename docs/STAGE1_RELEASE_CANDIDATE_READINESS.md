@@ -161,8 +161,8 @@ this file or a deployment ticket.
   Production deployment `dpl_8hjtjMusx6Cm4u8soX4doKbh7tYz`; prior Ready
   deployment `dpl_BgEMjyMhzEDZgNDsh1NACrET1PQn` is the immediate rollback
   target. Earlier deployments were source snapshots rather than clean commits.
-- Dinodia OS source head `c0b4f71795d73bc307abf5518dc34ea0418d1264` plus reviewed
-  source diff; candidate build ID `native-v2-fb5ba1404cd34a79feb649f9`, archive
+- Dinodia OS commit `78c31ce16f822990878bb740d1540db358ff1a70`; candidate build
+  ID `native-v2-fb5ba1404cd34a79feb649f9`, archive
   SHA-256 `f2a30dfd37ae6e696e98391d73c9e115e8f1650d5e068c53681f2b197aefd127`.
   It remains staged; installation and health verification remain pending.
 - Migration `20260925230000_r11_operator_mutation_idempotency`, SHA-256
@@ -175,6 +175,12 @@ this file or a deployment ticket.
   100% version `4ef553c8-1c1a-448f-8783-54aca6ca2b07` (deployment
   `38511013-d158-4783-a541-fa9413a4f244`, created 2026-09-25). No Edge schedule
   or alternate origin was added.
+- iOS Stage 1 reference commit `76eeeebaf6a749be68e1dc6ba6d38590235cc8a6`.
+  On 2026-09-26, `xcodebuild test -project Dinodia.xcodeproj -scheme Dinodia
+  -destination 'platform=iOS Simulator,id=6F327A41-390F-4FD9-8C32-0C606B4D7014'
+  -quiet` passed 111/111 on iPhone 17 Pro Simulator, iOS 26.5. The app was
+  installed/launched on physical Gupta earlier; customer sign-in, physical
+  Face ID/passcode, protected command and WAN acceptance remain unproven.
 - Redacted existing hub/home identifiers and safe effective credential state:
   guarded Production query at approximately 09:55Z showed v4 ACTIVE and v3
   REVOKED; Pi had reported v4 ACTIVE at 09:28Z. No credential value was read.
