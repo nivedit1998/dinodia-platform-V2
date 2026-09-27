@@ -31,6 +31,35 @@ test('temporary internal day mode is disabled unless the exact opt-in is present
   assert.equal(internalOperatorDaySessionEnabled({ STAGE1_INTERNAL_OPERATOR_DAY_SESSION: 'true' }), true);
 });
 
+test('native task registry dispatches business operations and daily lease cleanup to disjoint owners', async () => {
+  const cleanupCalls = [];
+  const { nativeTaskRegistry, runNativeOperations, runNativeMaintenance } = loadTypeScriptModule('src/lib/nativeOperations.ts', {
+    './prisma': { prisma: {
+      supportSession: { findMany: async () => [] },
+      supportAccessRequest: { updateMany: async () => ({ count: 0 }) },
+      homeClaimReservation: { findMany: async () => [] },
+      idempotencyRecord: { deleteMany: async (input) => { cleanupCalls.push(input); return { count: 3 }; } },
+    } },
+    './hubOperatorCredentials': { reconcileCredentialLifecycle: async () => ({ rotated: 0 }) },
+    './stage1ClaimContract': { releaseExpiredClaim: async () => ({ released: false }) },
+    './supportNotifications': { createPropertySupportNotifications: async () => undefined },
+  });
+  assert.deepEqual(nativeTaskRegistry.map(({ taskId, owner }) => [taskId, owner]), [
+    ['operator_credential_lifecycle', 'supabase_pg_cron_two_minute'],
+    ['support_expiry_and_revocation', 'supabase_pg_cron_two_minute'],
+    ['claim_reservation_expiry', 'supabase_pg_cron_two_minute'],
+    ['expired_dispatch_lease_cleanup', 'vercel_hobby_daily'],
+  ]);
+  const now = new Date('2026-09-27T12:00:00Z');
+  const operations = await runNativeOperations(now);
+  assert.deepEqual(operations.tasks, ['operator_credential_lifecycle', 'support_expiry_and_revocation', 'claim_reservation_expiry']);
+  assert.equal(cleanupCalls.length, 0);
+  const maintenance = await runNativeMaintenance(now);
+  assert.deepEqual(maintenance.tasks, ['expired_dispatch_lease_cleanup']);
+  assert.equal(maintenance.expiredDispatcherLeases, 3);
+  assert.deepEqual(cleanupCalls, [{ where: { namespace: 'native-operations-lease', expiresAt: { lte: now } } }]);
+});
+
 test('the signed one-day OS grant remains valid past recent-auth while flag-off grants keep the short cap', () => {
   const crypto = createRequire(import.meta.url)('node:crypto');
   const keys = crypto.generateKeyPairSync('ed25519');
@@ -148,6 +177,7 @@ test('step-up target digests use one canonical representation for issue and cons
   const { targetDigest } = loadTypeScriptModule('src/lib/sensitiveOperationStepUp.ts', {
     './prisma': { prisma: {} },
     './stage1Auth': { Stage1AuthError: class Stage1AuthError extends Error {} },
+    './stepUpProofCodec': loadTypeScriptModule('src/lib/stepUpProofCodec.ts'),
   });
   assert.equal(targetDigest(['device-1', 'entity-1']), targetDigest(['entity-1', 'device-1']));
   assert.equal(targetDigest(['device-1', 'device-1']), targetDigest(['device-1']));
@@ -173,6 +203,7 @@ test('Platform step-up operation digest matches the published cross-runtime vect
   const { operationDigest, descriptorBoundValue } = loadTypeScriptModule('src/lib/sensitiveOperationStepUp.ts', {
     './prisma': { prisma: {} },
     './stage1Auth': { Stage1AuthError: class Stage1AuthError extends Error {} },
+    './stepUpProofCodec': loadTypeScriptModule('src/lib/stepUpProofCodec.ts'),
   });
   const digest = operationDigest({
     actorId: 'account-1', trustedDeviceId: 'phone-1', customerSessionId: 'session-1', homeId: 'home-1', membershipId: 'membership-1', hubInstallationId: 'hub-1',
@@ -225,6 +256,7 @@ test('trusted-phone assertions interoperate with Secure Enclave P-256 and preser
   const { verifyTrustedDeviceAssertion } = loadTypeScriptModule('src/lib/sensitiveOperationStepUp.ts', {
     './prisma': { prisma: {} },
     './stage1Auth': { Stage1AuthError: class Stage1AuthError extends Error { constructor(status, code, message) { super(message); this.status = status; this.code = code; } } },
+    './stepUpProofCodec': loadTypeScriptModule('src/lib/stepUpProofCodec.ts'),
   });
   const input = { nonce: 'nonce-1', challengeId: 'challenge-1', operationDigest: 'digest-1' };
   const message = Buffer.from('DINODIA_STEP_UP_CHALLENGE_V1\nchallenge-1\nnonce-1\ndigest-1', 'utf8');

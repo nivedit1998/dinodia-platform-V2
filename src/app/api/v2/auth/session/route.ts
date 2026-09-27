@@ -8,6 +8,59 @@ import { enforcePersistentRateLimit } from '@/lib/rateLimit';
 
 export const dynamic = 'force-dynamic';
 
+/**
+ * Restore the account-global Native V1 context. This endpoint deliberately
+ * returns memberships, not an implicitly selected home or a hub bearer. The
+ * app must explicitly select (or revalidate its remembered selection) before
+ * calling POST /api/v2/hub-sessions.
+ */
+export async function GET(request: Request) {
+  try {
+    const rawSession = cookieToken(request, 'dinodia_customer_session');
+    if (!rawSession) throw new Stage1AuthError(401, 'customer_session_required', 'A customer session is required');
+    const now = new Date();
+    const session = await prisma.customerSession.findUnique({
+      where: { refreshTokenHash: sha256(rawSession) },
+      select: { id: true, customerAccountId: true, trustedDeviceId: true, trustedDeviceSessionVersion: true, securityVersion: true, revokedAt: true, expiresAt: true },
+    });
+    if (!session || session.revokedAt || session.expiresAt <= now) throw new Stage1AuthError(401, 'customer_session_invalid', 'The customer session is invalid');
+    const [account, trusted, memberships] = await Promise.all([
+      prisma.customerAccount.findUnique({ where: { id: session.customerAccountId }, select: { id: true, status: true, securityVersion: true } }),
+      prisma.trustedDevice.findUnique({ where: { id: session.trustedDeviceId }, select: { id: true, customerAccountId: true, revokedAt: true, sessionVersion: true } }),
+      prisma.homeMembership.findMany({
+        where: { customerAccountId: session.customerAccountId, status: 'ACTIVE' },
+        orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
+        select: {
+          id: true,
+          homeId: true,
+          role: true,
+          accessRevision: true,
+          tenantAreaGrants: { where: { revokedAt: null, area: { status: 'ACTIVE' } }, select: { area: { select: { osAreaId: true } } } },
+        },
+      }),
+    ]);
+    if (!account || account.status !== 'ACTIVE' || account.securityVersion !== session.securityVersion || !trusted || trusted.customerAccountId !== account.id || trusted.revokedAt || trusted.sessionVersion !== session.trustedDeviceSessionVersion) {
+      throw new Stage1AuthError(401, 'customer_session_invalid', 'The customer session is no longer active');
+    }
+    const response = NextResponse.json({
+      schemaVersion: 'dinodia.v1',
+      accountId: account.id,
+      memberships: memberships.map((membership) => ({
+        accountId: account.id,
+        homeId: membership.homeId,
+        homeMembershipId: membership.id,
+        role: membership.role,
+        status: 'active',
+        areaIds: membership.role === 'TENANT' ? membership.tenantAreaGrants.map((grant) => grant.area.osAreaId) : [],
+        revision: membership.accessRevision,
+      })),
+      expiresAt: session.expiresAt.toISOString(),
+    }, { headers: { 'Cache-Control': 'no-store', Pragma: 'no-cache' } });
+    await prisma.customerSession.updateMany({ where: { id: session.id, revokedAt: null, expiresAt: { gt: now } }, data: { lastUsedAt: now } });
+    return response;
+  } catch (error) { return authErrorResponse(error); }
+}
+
 function text(value: unknown, max: number): string {
   const result = String(value ?? '').trim();
   return result.length > max ? '' : result;

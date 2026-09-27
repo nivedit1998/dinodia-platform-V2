@@ -548,7 +548,10 @@ async function tableRowSnapshot() {
 async function protectedRouteDenialChecks(base) {
   const before = await tableRowSnapshot();
   const results = [];
-  for (const [method, template, auth] of stage1RouteInventory.filter(([, , kind]) => !['public', 'public-login', 'capability'].includes(kind))) {
+  // Stage 2 Alexa contract routes deliberately return a fixed 501 without
+  // consulting storage until the later Alexa feature stage. They are not
+  // protected Stage 1 authorities and must not be folded into the 401 matrix.
+  for (const [method, template, auth] of stage1RouteInventory.filter(([, , kind]) => !['public', 'public-login', 'capability', 'public-disabled-feature'].includes(kind))) {
     const route = template.replaceAll(':homeId', '00000000-0000-4000-8000-000000000001')
       .replaceAll(':hubInstallationId', '00000000-0000-4000-8000-000000000001')
       .replaceAll(':ticketId', '00000000-0000-4000-8000-000000000001')
@@ -652,8 +655,35 @@ async function customerAuthorizationChecks() {
   const phoneThumbprint = crypto.createHash('sha256').update(crypto.createPublicKey(phone.publicKey).export({ type: 'spki', format: 'der' })).digest('hex');
   const trustedInstallationId = `harness-phone-${crypto.randomUUID()}`;
   const trusted = await prisma.trustedDevice.create({ data: { customerAccountId: account.id, deviceInstallationId: trustedInstallationId, publicKey: phone.publicKey, publicKeyThumbprint: phoneThumbprint, deviceName: 'Harness phone' } });
-  const rawSession = `harness-customer-session-${crypto.randomUUID()}`;
-  const session = await prisma.customerSession.create({ data: { customerAccountId: account.id, trustedDeviceId: trusted.id, refreshTokenHash: sha256(rawSession), securityVersion: account.securityVersion, trustedDeviceSessionVersion: trusted.sessionVersion, expiresAt: new Date(Date.now() + 60 * 60 * 1000) } });
+  const customerCookieJar = {};
+  const customerLogin = await fetchJson(`${base}/api/v2/session`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ email, password: customerPassword, deviceInstallationId: trustedInstallationId, publicKey: phone.publicKey, deviceName: 'Harness phone', model: 'integration-test', osFamily: 'test', osVersion: 'test' }) });
+  updateCookieJar(customerCookieJar, customerLogin.response);
+  const rawSession = cookieValue(customerCookieJar, 'dinodia_customer_session');
+  const loginReceiptKeys = Object.keys(customerLogin.body || {}).sort().join(',');
+  if (customerLogin.response.status !== 200 || !rawSession || loginReceiptKeys !== 'accountId,expiresAt,ok,sessionId,trustedDeviceId' || Object.hasOwn(customerLogin.body || {}, 'token') || Object.hasOwn(customerLogin.body || {}, 'refreshToken')) fail(`Canonical customer login did not issue only a metadata receipt plus HttpOnly session cookie (${customerLogin.response.status})`);
+  const session = await prisma.customerSession.findFirstOrThrow({ where: { customerAccountId: account.id, trustedDeviceId: trusted.id, revokedAt: null }, orderBy: { createdAt: 'desc' } });
+  const sessionWithoutCookie = await fetchJson(`${base}/api/v2/session`);
+  if (sessionWithoutCookie.response.status !== 401) fail(`Account session restore did not reject a missing customer session (${sessionWithoutCookie.response.status})`);
+  const restoredAccount = await fetchJson(`${base}/api/v2/session`, { headers: { cookie: `dinodia_customer_session=${encodeURIComponent(rawSession)}` } });
+  const restoredMemberships = restoredAccount.body.memberships || [];
+  const restoredTenant = restoredMemberships.find((membership) => membership.homeMembershipId === tenantMembership.id);
+  const restoredOwner = restoredMemberships.find((membership) => membership.homeMembershipId === ownerMembership.id);
+  if (restoredAccount.response.status !== 200 || restoredAccount.body.schemaVersion !== 'dinodia.v1' || restoredAccount.body.accountId !== account.id || restoredMemberships.length !== 2 || restoredTenant?.role !== 'TENANT' || restoredTenant?.areaIds?.length !== 1 || restoredOwner?.role !== 'OWNER' || restoredOwner?.areaIds?.length !== 0 || Object.hasOwn(restoredAccount.body, 'token') || Object.hasOwn(restoredAccount.body, 'hubInstallationId')) fail(`Canonical account restore did not return only this account's active membership context (${restoredAccount.response.status})`);
+  const restoredLegacyPath = await fetchJson(`${base}/api/v2/auth/session`, { headers: { cookie: `dinodia_customer_session=${encodeURIComponent(rawSession)}` } });
+  if (restoredLegacyPath.response.status !== 200 || JSON.stringify(restoredLegacyPath.body) !== JSON.stringify(restoredAccount.body)) fail('The compatibility session path drifted from the canonical account-session DTO');
+  const logoutPhone = keyPair();
+  const logoutInstallationId = `harness-logout-phone-${crypto.randomUUID()}`;
+  const logoutLogin = await fetchJson(`${base}/api/v2/session`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ email, password: customerPassword, deviceInstallationId: logoutInstallationId, publicKey: logoutPhone.publicKey, deviceName: 'Harness logout phone', model: 'integration-test', osFamily: 'test', osVersion: 'test' }) });
+  const logoutJar = {};
+  updateCookieJar(logoutJar, logoutLogin.response);
+  const logoutRawSession = cookieValue(logoutJar, 'dinodia_customer_session');
+  if (logoutLogin.response.status !== 200 || !logoutRawSession) fail(`Canonical customer login did not issue a second test session (${logoutLogin.response.status})`);
+  const logoutRequest = await fetchJson(`${base}/api/v2/session/logout`, { method: 'POST', headers: { cookie: `dinodia_customer_session=${encodeURIComponent(logoutRawSession)}` } });
+  const logoutRow = await prisma.customerSession.findUnique({ where: { refreshTokenHash: sha256(logoutRawSession) }, select: { revokedAt: true } });
+  const afterLogoutRestore = await fetchJson(`${base}/api/v2/session`, { headers: { cookie: `dinodia_customer_session=${encodeURIComponent(logoutRawSession)}` } });
+  if (logoutRequest.response.status !== 200 || !logoutRow?.revokedAt || afterLogoutRestore.response.status !== 401) fail('Canonical logout did not durably revoke its session and deny a subsequent restore');
+  console.log('[stage1:integration] PASS: actual customer login cookie restores the canonical two-home membership context; canonical logout revokes that cookie-backed session durably');
+  console.log('[stage1:integration] PASS: real account-session route restores two role-distinct homes and tenant area grants, denies anonymous restore, and returns no hub bearer');
   const propertyPhone = keyPair();
   const propertyPhoneThumbprint = crypto.createHash('sha256').update(crypto.createPublicKey(propertyPhone.publicKey).export({ type: 'spki', format: 'der' })).digest('hex');
   const propertyTrusted = await prisma.trustedDevice.create({ data: { customerAccountId: propertyAccount.id, deviceInstallationId: `harness-owner-phone-${crypto.randomUUID()}`, publicKey: propertyPhone.publicKey, publicKeyThumbprint: propertyPhoneThumbprint, deviceName: 'Harness homeowner phone' } });
@@ -667,14 +697,23 @@ async function customerAuthorizationChecks() {
   const issue = async (homeId) => fetchJson(`${base}/api/v2/hub-sessions`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-session': rawSession }, body: JSON.stringify({ homeId }) });
   const issueProperty = async () => fetchJson(`${base}/api/v2/hub-sessions`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-session': propertyRawSession }, body: JSON.stringify({ homeId: homeOne.id }) });
   const issueManager = async () => fetchJson(`${base}/api/v2/hub-sessions`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-session': managerRawSession }, body: JSON.stringify({ homeId: homeOne.id }) });
+  const assertHubSession = (result, homeId, membershipId, label) => {
+    const body = result.body || {};
+    const expiresAt = Date.parse(body.expiresAt);
+    const keys = Object.keys(body).sort().join(',');
+    if (result.response.status !== 200 || keys !== 'expiresAt,homeId,membershipId,ok,token' || body.ok !== true || typeof body.token !== 'string' || !body.token || body.token.length > 8192 || body.token === 'TEST_ONLY_PLACEHOLDER_NOT_A_BEARER' || body.homeId !== homeId || body.membershipId !== membershipId || !Number.isFinite(expiresAt) || expiresAt <= Date.now() || expiresAt > Date.now() + 5 * 60 * 1000 + 1000) fail(`${label} did not return the strict five-minute selected-home session contract (${result.response.status})`);
+  };
   const tenantToken = await issue(homeOne.id);
-  if (tenantToken.response.status !== 200 || !tenantToken.body.token) fail(`Tenant hub session was not issued (${tenantToken.response.status})`);
+  assertHubSession(tenantToken, homeOne.id, tenantMembership.id, 'Tenant hub session');
   const ownerToken = await issue(homeTwo.id);
-  if (ownerToken.response.status !== 200 || !ownerToken.body.token) fail(`Second-home owner session was not issued (${ownerToken.response.status})`);
+  assertHubSession(ownerToken, homeTwo.id, ownerMembership.id, 'Second-home owner session');
   const propertyToken = await issueProperty();
-  if (propertyToken.response.status !== 200 || !propertyToken.body.token) fail(`Homeowner session was not issued (${propertyToken.response.status})`);
+  assertHubSession(propertyToken, homeOne.id, propertyMembership.id, 'Homeowner session');
   const managerToken = await issueManager();
-  if (managerToken.response.status !== 200 || !managerToken.body.token) fail(`Property-manager session was not issued (${managerToken.response.status})`);
+  assertHubSession(managerToken, homeOne.id, managerMembership.id, 'Property-manager session');
+  const wrongHomeHubSession = await issue(crypto.randomUUID());
+  const extraFieldHubSession = await fetchJson(`${base}/api/v2/hub-sessions`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-session': rawSession }, body: JSON.stringify({ homeId: homeOne.id, membershipId: tenantMembership.id }) });
+  if (wrongHomeHubSession.response.status !== 403 || Object.hasOwn(wrongHomeHubSession.body || {}, 'token') || extraFieldHubSession.response.status !== 400 || Object.hasOwn(extraFieldHubSession.body || {}, 'token')) fail(`Selected-home session contract mismatch (wrong-home=${wrongHomeHubSession.response.status}/${wrongHomeHubSession.body?.errorCode || 'none'}, extra-field=${extraFieldHubSession.response.status}/${extraFieldHubSession.body?.errorCode || 'none'})`);
   const tenantOffline = await fetchJson(`${base}/api/v2/offline-authorisations`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-app-token': tenantToken.body.token }, body: JSON.stringify({ trustedDeviceId: trusted.id, publicKey: phone.publicKey }) });
   if (tenantOffline.response.status !== 200 || tenantOffline.body.authorisation?.homeId !== homeOne.id) fail(`Tenant offline authority was not scoped to the selected home (${tenantOffline.response.status})`);
   const revocablePhone = keyPair();

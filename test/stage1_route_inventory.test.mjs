@@ -22,7 +22,10 @@ test('Stage 1 method/auth inventory covers every Platform API route exactly', ()
   for (const file of files) {
     const source = fs.readFileSync(file, 'utf8');
     const route = routePath(file);
-    for (const [, method] of source.matchAll(/export\s+(?:async\s+)?function\s+(GET|POST|PUT|PATCH|DELETE)\s*\(/g)) discovered.add(`${method} ${route}`);
+    // Canonical alias routes re-export the same handler with `export const
+    // GET = restore`; inventory those methods exactly like named functions so
+    // compatibility paths cannot evade the auth classification gate.
+    for (const match of source.matchAll(/export\s+(?:(?:async\s+)?function\s+(GET|POST|PUT|PATCH|DELETE)\s*\(|const\s+(GET|POST|PUT|PATCH|DELETE)\s*=)/g)) discovered.add(`${match[1] || match[2]} ${route}`);
   }
   const inventory = stage1RouteInventory.map(([method, route]) => `${method} ${route}`).sort();
   assert.equal(new Set(inventory).size, inventory.length, 'duplicate route/method classification');

@@ -3,6 +3,7 @@
 export const stage1RouteInventory = [
   ['GET', '/api/health', 'public'],
   ['GET', '/api/readiness', 'public'],
+  ['GET', '/api/v2/alexa/discovery', 'public-disabled-feature'],
   ['POST', '/api/company/auth/bootstrap', 'capability'],
   ['POST', '/api/company/auth/bootstrap/complete', 'capability'],
   ['POST', '/api/company/auth/bootstrap/retry', 'capability'],
@@ -12,6 +13,8 @@ export const stage1RouteInventory = [
   ['GET', '/api/company/support/tickets', 'employee'],
   ['GET', '/api/cron/native-maintenance', 'cron'],
   ['POST', '/api/cron/native-operations', 'cron'],
+  ['POST', '/api/v2/alexa/directives', 'public-disabled-feature'],
+  ['POST', '/api/v2/alexa/report-state', 'public-disabled-feature'],
   ['POST', '/api/hub-agent/operator-session/attempt', 'machine'],
   ['POST', '/api/hub-agent/operator-session/consume', 'machine'],
   ['POST', '/api/hub-agent/operator-session/revalidate', 'machine'],
@@ -42,7 +45,12 @@ export const stage1RouteInventory = [
   ['POST', '/api/installer/workflows', 'employee'],
   ['POST', '/api/internal/stage1/claim', 'contract-secret'],
   ['POST', '/api/v2/auth/session', 'public-login'],
+  ['GET', '/api/v2/auth/session', 'customer'],
   ['DELETE', '/api/v2/auth/session', 'customer'],
+  ['GET', '/api/v2/session', 'customer'],
+  ['POST', '/api/v2/session', 'public-login'],
+  ['DELETE', '/api/v2/session', 'customer'],
+  ['POST', '/api/v2/session/logout', 'customer'],
   ['POST', '/api/v2/hub-sessions', 'customer'],
   ['POST', '/api/v2/offline-authorisations', 'customer'],
   ['DELETE', '/api/v2/offline-authorisations', 'customer'],
@@ -60,4 +68,4 @@ export const stage1RouteInventory = [
   ['DELETE', '/api/v2/trusted-devices/:trustedDeviceId', 'customer'],
 ];
 
-export const protectedStage1Routes = stage1RouteInventory.filter(([, , auth]) => !['public', 'public-login', 'capability', 'signed-manufacturing-bootstrap'].includes(auth));
+export const protectedStage1Routes = stage1RouteInventory.filter(([, , auth]) => !['public', 'public-login', 'public-disabled-feature', 'capability', 'signed-manufacturing-bootstrap'].includes(auth));

@@ -2,6 +2,7 @@ import crypto from 'node:crypto';
 import { NextResponse } from 'next/server';
 import { prisma } from './prisma';
 import { headerToken, parsePublicKeys, sha256, verifyStage1Token } from './stage1Crypto';
+import { validateMembership } from './contracts/dinodiaV1';
 import { DEFAULT_EMPLOYEE_SESSION_SECONDS, INTERNAL_EMPLOYEE_SESSION_SECONDS, INTERNAL_OPERATOR_DAY_SESSION_POLICY, internalOperatorDaySessionEnabled, stage1NowMs } from './internalOperatorDaySession';
 
 export class Stage1AuthError extends Error {
@@ -90,6 +91,10 @@ export async function requireCustomer(request: Request): Promise<CustomerPrincip
     : [];
   const currentAreaIds = new Set(currentGrants.map((grant) => grant.areaId));
   if (membership.role === 'TENANT' && verified.areaIds.some((areaId) => !currentAreaIds.has(areaId))) fail(new Stage1AuthError(401, 'area_policy_stale', 'The app session must refresh its current area permissions'));
+  const currentMembershipAreas = membership.role === 'TENANT'
+    ? [...currentAreaIds]
+    : verified.areaIds;
+  if (!validateMembership({ accountId: membership.customerAccountId, homeId: membership.homeId, homeMembershipId: membership.id, role: membership.role, status: 'active', areaIds: currentMembershipAreas, revision: membership.accessRevision })) fail(new Stage1AuthError(401, 'membership_invalid', 'The selected home membership does not satisfy the current Native V2 contract'));
   const hub = await prisma.hubInstallation.findUnique({ where: { id: verified.hubInstallationId }, select: { id: true, homeId: true, accessPolicyRevision: true } });
   const currentPolicyRevision = Math.max(membership.accessRevision, hub?.accessPolicyRevision ?? 0);
   if (!hub || hub.homeId !== verified.homeId || verified.policyRevision !== currentPolicyRevision) fail(new Stage1AuthError(401, 'policy_stale', 'The app session must refresh its home policy'));

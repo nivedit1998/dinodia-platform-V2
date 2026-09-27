@@ -18,7 +18,7 @@ const modifiedFiles = new Set([
   'src/app/api/company/auth/bootstrap/route.ts', 'src/app/api/hub-agent/support/v2/redeem/route.ts', 'src/app/api/hub-agent/support/v2/revocation/route.ts', 'src/app/api/hub-agent/v2/pairing/cloud-url/route.ts',
   'src/app/api/installer/workflows/route.ts', 'src/app/api/installer/hubs/provision/route.ts', 'src/app/api/hub-agent/v2/pairing/challenge/route.ts', 'src/app/api/v2/auth/session/route.ts', 'src/app/api/v2/hub-sessions/route.ts', 'src/app/api/v2/support/tickets/[ticketId]/route.ts', 'src/app/api/v2/support/tickets/[ticketId]/access-requests/[requestId]/approve/route.ts', 'src/app/api/v2/support/tickets/[ticketId]/access-requests/[requestId]/issue/route.ts', 'src/app/api/v2/security/step-up/challenge/route.ts', 'src/app/api/v2/security/step-up/consume/route.ts', 'src/app/api/v2/trusted-devices/[trustedDeviceId]/route.ts', 'src/app/installer/page.tsx', 'src/app/installer/provision/page.tsx', 'src/app/installer/home-support/page.tsx', 'src/lib/foundation.ts', 'src/lib/stage1Auth.ts', 'src/lib/stage1Crypto.ts', 'src/lib/stage1HubAuth.ts',
   'src/lib/hubOperatorCredentials.ts', 'src/lib/nativeOperations.ts', 'src/lib/sensitiveOperationStepUp.ts', 'src/lib/stage1ClaimContract.ts', 'src/lib/stage1Operator.ts', 'test/foundation_contracts.test.mjs',
-  'test/stage1_security.test.mjs', 'test/stage1_route_inventory.mjs', 'vercel.json',
+  'test/stage1_security.test.mjs', 'test/stage1_route_inventory.mjs', 'test/stage1_route_inventory.test.mjs', 'vercel.json',
   'src/app/api/installer/home-support/homes/[homeId]/os-access/rotate/route.ts',
   'src/app/api/installer/home-support/homes/[homeId]/os-access/revoke/route.ts',
   'src/app/api/hub-agent/token-state/route.ts',
@@ -27,19 +27,22 @@ const modifiedFiles = new Set([
   'src/app/api/hub-agent/operator-session/consume/route.ts',
   'src/app/api/hub-agent/operator-session/revalidate/route.ts',
   'src/app/api/installer/home-support/homes/[homeId]/os-access/launch/route.ts',
+  'src/app/api/cron/native-maintenance/route.ts',
 ]);
 
 const addedFiles = [
+  /^contracts(?:\/|$)/,
   /^\.env\.example$/,
   /^(SECURITY_CHECKLIST|phase8-acceptance)\.md$/,
   /^docs\/(FOUNDATION_INTENDED_FILE_MANIFEST|NATIVE_V2_SCHEMA_OWNERSHIP)\.md$/,
   /^prisma\/migrations\/\d+_[^/]+\//,
-  /^scripts\/(check_clean_clone|check_foundation|check_foundation_manifest|check_stage1_security|enrol_manufactured_hub|foundation_db_checks|foundation_invariants|local_database|reset_rc_database|schema_fingerprint|stage1_db_checks|stage1_integration_harness)\.mjs$/,
+  /^scripts\/(check_clean_clone|check_dinodia_contracts|check_foundation|check_foundation_manifest|check_stage1_security|enrol_manufactured_hub|foundation_db_checks|foundation_invariants|local_database|reset_rc_database|schema_fingerprint|stage1_db_checks|stage1_integration_harness|sync_dinodia_contract_fixtures)\.mjs$/,
   /^scripts\/stage1_loopback_guard\.mjs$/,
   /^src\/app\/api\/(health|readiness)(?:\/|$)/,
   /^src\/app\/api\/(company|cron|hub-agent|installer|internal|v2)(?:\/|$)/,
   /^src\/app\/(company|installer)(?:\/|$)/,
-  /^src\/lib\/(foundation|foundationContracts|initialCxoInvitation|manufacturingEnrollment|runtimeDatabaseUrl|runtimeTarget|hubOperatorCredentials|idempotentOperatorMutation|operatorRateLimitPolicy|nativeOperations|passwords|rateLimit|serializableTransaction|sensitiveOperationStepUp|stage1Auth|stage1ClaimContract|stage1Crypto|stage1HubAuth|stage1Operator|supportNotifications|internalOperatorDaySession)\.(mjs|ts)$/,
+  /^src\/lib\/(foundation|foundationContracts|initialCxoInvitation|manufacturingEnrollment|runtimeDatabaseUrl|runtimeTarget|hubOperatorCredentials|idempotentOperatorMutation|operatorRateLimitPolicy|nativeOperations|passwords|rateLimit|serializableTransaction|sensitiveOperationStepUp|stepUpProofCodec|stage1Auth|stage1ClaimContract|stage1Crypto|stage1HubAuth|stage1Operator|supportNotifications|internalOperatorDaySession)\.(mjs|ts)$/,
+  /^src\/lib\/contracts(?:\/|$)/,
   /^test(?:\/|$)/,
   /^vercel\.json$/,
 ];
