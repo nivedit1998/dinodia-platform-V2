@@ -434,6 +434,8 @@ test('R11 signed CloudURL re-verification is challenge-bound and compare-and-set
   assert.doesNotMatch(installer, /window\.setInterval\(\(\) => \{ if \(popup\?\.closed\)/);
   assert.match(installer, /The hub did not confirm an authenticated operator session/);
   assert.match(installer, /operator session was verified by the hub/);
+  assert.match(installer, /window\.open\(operatorUrl, "_blank", "popup,width=860,height=760"\)/);
+  assert.doesNotMatch(installer, /window\.open\(operatorUrl, "dinodia-os-operator"/);
   assert.doesNotMatch(installer, /The secure Dinodia OS window opened/);
   assert.match(nextConfig, /source: '\/installer',[\s\S]*?key: 'Cross-Origin-Opener-Policy',[\s\S]*?value: 'same-origin-allow-popups'/);
 });

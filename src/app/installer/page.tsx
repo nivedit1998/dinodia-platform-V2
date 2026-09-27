@@ -80,7 +80,12 @@ export default function InstallerPage() {
           window.clearTimeout(timeout); window.removeEventListener("message", messageHandler!); resolve(event.data.setupAttemptId);
         };
         window.addEventListener("message", messageHandler);
-        popup = window.open(operatorUrl, "dinodia-os-operator", "popup,width=860,height=760");
+        // Each handoff has a single-use browser attempt. Reusing a named
+        // popup can retain an already-consumed setup page after End session,
+        // leaving the Portal waiting for a new attempt that the stale page
+        // will never register. A fresh top-level context keeps every launch
+        // bound to a newly loaded locked OS page.
+        popup = window.open(operatorUrl, "_blank", "popup,width=860,height=760");
         if (!popup) { window.clearTimeout(timeout); window.removeEventListener("message", messageHandler); reject(new Error("The browser blocked the secure Dinodia OS window. Allow pop-ups and try again.")); }
       });
       const response = await fetch(`/api/installer/home-support/homes/${encodeURIComponent(work.homeId)}/os-access/launch`, { method: "POST", credentials: "same-origin", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ workflowId: work.id, setupAttemptId }) });
