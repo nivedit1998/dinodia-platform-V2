@@ -13,7 +13,7 @@ type Workflow = {
   certifiedSerialNumber: string | null;
   reason: string | null;
   updatedAt: string;
-  hubInstallation?: { baseUrl: string | null; cloudUrl: string | null } | null;
+  hubInstallation?: { secureUrl: string | null; secureVerified: boolean; reachability: "RECENT" | "STALE"; lastSeenAt: string | null; localUrl: string | null; localState: "CURRENT" | "STALE"; localReportedAt: string | null; localRevision: number } | null;
 };
 
 type Employee = { id: string; displayName: string; role: string };
@@ -61,14 +61,12 @@ export default function InstallerPage() {
     return () => document.removeEventListener("visibilitychange", clearWhenHidden);
   }, []);
 
-  async function openHub(work: Workflow) {
+  async function openHub(work: Workflow, accessMode: "secure" | "local") {
     if (!work.homeId || !work.hubInstallationId) return;
     setOpening(work.id); setActionMessage("");
-    const cloudUrl = String(work.hubInstallation?.cloudUrl || "").replace(/\/$/, "");
-    const baseUrl = String(work.hubInstallation?.baseUrl || "").replace(/\/$/, "");
-    const operatorOriginUrl = cloudUrl || baseUrl;
+    const operatorOriginUrl = String(accessMode === "secure" ? work.hubInstallation?.secureUrl || "" : work.hubInstallation?.localUrl || "").replace(/\/$/, "");
     const operatorUrl = operatorOriginUrl ? `${operatorOriginUrl}/support-access` : "";
-    if (!operatorUrl) { setActionMessage("The hub has no verified secure endpoint yet"); setOpening(null); return; }
+    if (!operatorUrl) { setActionMessage(accessMode === "secure" ? "The hub has no verified secure endpoint yet" : "The hub has no fresh local endpoint. Refresh its signed heartbeat while it is on your LAN, then refresh this page."); setOpening(null); return; }
     const operatorOrigin = new URL(operatorUrl).origin;
     let popup: Window | null = null;
     let messageHandler: ((event: MessageEvent) => void) | null = null;
@@ -76,7 +74,14 @@ export default function InstallerPage() {
       const setupAttemptId = await new Promise<string>((resolve, reject) => {
         const timeout = window.setTimeout(() => { if (messageHandler) window.removeEventListener("message", messageHandler); reject(new Error("The locked Dinodia OS browser did not register in time.")); }, 30_000);
         messageHandler = (event: MessageEvent) => {
-          if (event.source !== popup || event.origin !== operatorOrigin || event.data?.type !== "dinodia-operator-attempt" || typeof event.data.setupAttemptId !== "string") return;
+          if (event.source !== popup || event.origin !== operatorOrigin) return;
+          if (event.data?.type === "dinodia-operator-handoff-failed") {
+            window.clearTimeout(timeout); window.removeEventListener("message", messageHandler!);
+            const code = typeof event.data.errorCode === "string" && /^[a-z0-9_]{1,64}$/.test(event.data.errorCode) ? event.data.errorCode : "operator_browser_registration_failed";
+            reject(new Error(`Dinodia OS could not register the originating browser (${code}). Close the OS window and relaunch from the same assigned work.`));
+            return;
+          }
+          if (event.data?.type !== "dinodia-operator-attempt" || typeof event.data.setupAttemptId !== "string") return;
           window.clearTimeout(timeout); window.removeEventListener("message", messageHandler!); resolve(event.data.setupAttemptId);
         };
         window.addEventListener("message", messageHandler);
@@ -88,9 +93,10 @@ export default function InstallerPage() {
         popup = window.open(operatorUrl, "_blank", "popup,width=860,height=760");
         if (!popup) { window.clearTimeout(timeout); window.removeEventListener("message", messageHandler); reject(new Error("The browser blocked the secure Dinodia OS window. Allow pop-ups and try again.")); }
       });
-      const response = await fetch(`/api/installer/home-support/homes/${encodeURIComponent(work.homeId)}/os-access/launch`, { method: "POST", credentials: "same-origin", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ workflowId: work.id, setupAttemptId }) });
+      const response = await fetch(`/api/installer/home-support/homes/${encodeURIComponent(work.homeId)}/os-access/launch`, { method: "POST", credentials: "same-origin", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ workflowId: work.id, setupAttemptId, accessMode }) });
       const body = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(body.error || "The secure Dinodia OS session could not be started");
+      if (typeof body.operatorUrl !== "string" || new URL(body.operatorUrl).origin !== operatorOrigin) throw new Error("The hub endpoint changed while this browser was registering. Close it and launch again.");
       if (!popup) throw new Error("The secure Dinodia OS window is unavailable");
       const sessionEstablished = new Promise<void>((resolve, reject) => {
         const timeout = window.setTimeout(() => {
@@ -122,7 +128,7 @@ export default function InstallerPage() {
       // duplicate deliveries.
       deliver();
       await sessionEstablished;
-      setActionMessage(`${cloudUrl ? "The secure" : "The private-LAN"} Dinodia OS operator session was verified by the hub.`);
+      setActionMessage(`${accessMode === "secure" ? "The secure CloudURL" : "The current private-LAN BaseURL"} Dinodia OS operator session was verified by the hub.`);
     } catch (caught) { setActionMessage(caught instanceof Error ? caught.message : "The secure Dinodia OS session could not be verified"); }
     finally { setOpening(null); }
   }
@@ -209,7 +215,7 @@ export default function InstallerPage() {
       const latestCredential = credentials[0];
       const rotationPending = latestCredential && ["PENDING", "DELIVERED", "ACKNOWLEDGED"].includes(latestCredential.state);
       const operatorBusy = operatorAction === `status:${work.id}` || operatorAction === `rotate:${work.id}`;
-      return <article key={work.id} className="rounded-2xl border border-[var(--border)] bg-[var(--surface)] p-6 shadow-[var(--shadow)]"><div className="flex flex-wrap items-start justify-between gap-4"><div><p className="text-xs font-semibold uppercase tracking-[0.16em] text-[var(--muted)]">{work.publicReference}</p><h2 className="mt-2 text-xl font-semibold">{work.kind}</h2><p className="mt-2 text-[var(--muted)]">{work.reason || "Installation or property work"}</p></div><span className="rounded-full bg-[var(--surface-2)] px-3 py-1 text-sm font-semibold">{work.state}</span></div><div className="mt-5 flex flex-wrap gap-3"><a className="rounded-xl bg-[var(--accent)] px-4 py-3 text-sm font-semibold text-white" href={`/installer/provision?workflowId=${encodeURIComponent(work.id)}`}>Open provisioning</a>{work.hubInstallationId && work.homeId && !work.hubInstallation?.cloudUrl && <button type="button" onClick={() => reserveCloudflare(work)} disabled={reservingCloudflare === work.id} className="rounded-xl border border-[var(--border)] px-4 py-3 text-sm font-semibold disabled:opacity-50">{reservingCloudflare === work.id ? "Reserving secure endpoint…" : "Reserve secure endpoint"}</button>}{work.hubInstallationId && work.homeId && !work.hubInstallation?.cloudUrl && work.hubInstallation?.baseUrl && <button type="button" onClick={() => openHub(work)} disabled={opening === work.id} className="rounded-xl border border-[var(--border)] px-4 py-3 text-sm font-semibold disabled:opacity-50">{opening === work.id ? "Opening local OS…" : "Open local Dinodia OS"}</button>}{work.hubInstallationId && work.homeId && work.hubInstallation?.cloudUrl && <button type="button" onClick={() => openHub(work)} disabled={opening === work.id} className="rounded-xl border border-[var(--border)] px-4 py-3 text-sm font-semibold disabled:opacity-50">{opening === work.id ? "Opening secure OS…" : "Open secure Dinodia OS"}</button>}{work.homeId && <a className="rounded-xl border border-[var(--border)] px-4 py-3 text-sm font-semibold" href={`/installer/home-support?homeId=${encodeURIComponent(work.homeId)}`}>Open home support</a>}</div>
+      return <article key={work.id} className="rounded-2xl border border-[var(--border)] bg-[var(--surface)] p-6 shadow-[var(--shadow)]"><div className="flex flex-wrap items-start justify-between gap-4"><div><p className="text-xs font-semibold uppercase tracking-[0.16em] text-[var(--muted)]">{work.publicReference}</p><h2 className="mt-2 text-xl font-semibold">{work.kind}</h2><p className="mt-2 text-[var(--muted)]">{work.reason || "Installation or property work"}</p>{work.hubInstallation?.secureVerified && <p className="mt-2 text-sm text-[var(--muted)]" role="status">Secure hub identity verified; {work.hubInstallation.reachability === "RECENT" ? "the hub heartbeat is recent." : "the hub is currently unreachable by its signed heartbeat."}</p>}</div><span className="rounded-full bg-[var(--surface-2)] px-3 py-1 text-sm font-semibold">{work.state}</span></div><div className="mt-5 flex flex-wrap gap-3"><a className="rounded-xl bg-[var(--accent)] px-4 py-3 text-sm font-semibold text-white" href={`/installer/provision?workflowId=${encodeURIComponent(work.id)}`}>Open provisioning</a>{work.hubInstallationId && work.homeId && !work.hubInstallation?.secureVerified && <button type="button" onClick={() => reserveCloudflare(work)} disabled={reservingCloudflare === work.id} className="rounded-xl border border-[var(--border)] px-4 py-3 text-sm font-semibold disabled:opacity-50">{reservingCloudflare === work.id ? "Reserving secure endpoint…" : "Reserve secure endpoint"}</button>}{work.hubInstallationId && work.homeId && work.hubInstallation?.secureVerified && <button type="button" onClick={() => openHub(work, "secure")} disabled={opening === work.id} className="rounded-xl border border-[var(--border)] px-4 py-3 text-sm font-semibold disabled:opacity-50">{opening === work.id ? "Opening secure OS…" : "Open secure Dinodia OS"}</button>}{work.hubInstallationId && work.homeId && work.hubInstallation?.localUrl && <button type="button" onClick={() => openHub(work, "local")} disabled={opening === work.id} className="rounded-xl border border-[var(--border)] px-4 py-3 text-sm font-semibold disabled:opacity-50">{opening === work.id ? "Opening local OS…" : "Open local Dinodia OS"}</button>}{work.hubInstallationId && work.homeId && work.hubInstallation?.localState === "STALE" && <span className="self-center text-sm text-[var(--muted)]">Local access is unavailable until the Pi reports a fresh signed LAN endpoint.</span>}{work.homeId && <a className="rounded-xl border border-[var(--border)] px-4 py-3 text-sm font-semibold" href={`/installer/home-support?homeId=${encodeURIComponent(work.homeId)}`}>Open home support</a>}</div>
         {work.homeId && work.hubInstallationId && <section className="mt-6 rounded-xl border border-[var(--border)] p-4" aria-label={`Operator credential status for ${work.publicReference}`}><h3 className="font-semibold">Operator credential</h3><p className="mt-1 text-sm text-[var(--muted)]">Only version and lifecycle state are shown here. The credential is delivered directly to the paired hub and is never displayed in the Portal.</p><div className="mt-3 flex flex-wrap gap-3"><button type="button" onClick={() => refreshOperatorCredentials(work)} disabled={operatorBusy} className="rounded-lg border border-[var(--border)] px-3 py-2 text-sm font-semibold disabled:opacity-50">{operatorAction === `status:${work.id}` ? "Refreshing…" : "Refresh status"}</button>{(employeeRole === "CXO" || employeeRole === "SENIOR_OPERATIONS_MANAGER") && <button type="button" onClick={() => rotateOperatorCredential(work)} disabled={operatorBusy || Boolean(rotationPending)} className="rounded-lg bg-[var(--accent)] px-3 py-2 text-sm font-semibold text-white disabled:opacity-50">{operatorAction === `rotate:${work.id}` ? "Requesting…" : latestCredential ? "Rotate operator credential" : "Issue operator credential"}</button>}</div>{credentials.length > 0 && <ol className="mt-4 grid gap-2">{credentials.map((credential) => <li key={credential.version} className="rounded-lg bg-[var(--surface-2)] p-3 text-sm"><span className="font-semibold">Version {credential.version}: {credential.state}</span><span className="ml-2 text-[var(--muted)]">{credential.activatedAt ? `Active since ${new Date(credential.activatedAt).toLocaleString()}` : credential.acknowledgedAt ? `Acknowledged ${new Date(credential.acknowledgedAt).toLocaleString()}` : credential.deliveredAt ? `Delivered ${new Date(credential.deliveredAt).toLocaleString()}` : `Issued ${new Date(credential.issuedAt).toLocaleString()}`}</span></li>)}</ol>}{operatorStatusMessages[work.id] && <p className="mt-3 text-sm" aria-live="polite" role="status">{operatorStatusMessages[work.id]}</p>}</section>}
       </article>;
     })}</section>}

@@ -22,6 +22,8 @@ const expectedMigrations = [
   '20260925040000_r7_support_notifications',
   '20260925230000_r11_operator_mutation_idempotency',
   '20260926191500_r11_support_possession_proof',
+  '20260927010000_nr3_hub_lan_endpoint_observation',
+  '20260927020000_nr4_operator_endpoint_binding',
 ];
 const expectedModels = new Set([
   'CustomerAccount', 'CompanyEmployeeAccount', 'TrustedDevice', 'CustomerSession', 'PolicyAcceptance', 'AuthChallenge', 'StepUpAuthorization',

@@ -5,6 +5,7 @@ import { authenticateHub } from '@/lib/stage1HubAuth';
 import { encryptOperatorGrant, createHubBoundOperatorGrant, isStrictlyUnexpired } from '@/lib/stage1Operator';
 import { sha256 } from '@/lib/stage1Crypto';
 import { DEFAULT_OPERATOR_SESSION_SECONDS, INTERNAL_OPERATOR_SESSION_SECONDS, internalOperatorDaySessionEnabled, stage1NowMs } from '@/lib/internalOperatorDaySession';
+import { lanEndpointFresh } from '@/lib/lanEndpoint';
 
 export const dynamic = 'force-dynamic';
 
@@ -24,13 +25,29 @@ export async function POST(request: Request) {
       const handoff = await tx.operatorHandoff.findUnique({ where: { id: handoffId }, select: { id: true, employeeId: true, workflowId: true, homeId: true, hubInstallationId: true, operatorBrowserAttemptId: true, setupAttemptId: true, scope: true, expiresAt: true, consumedAt: true, revokedAt: true, browserBindingHash: true, handoffHash: true, handoffEnvelope: true } });
       if (!handoff || handoff.hubInstallationId !== hub.installation.id || handoff.homeId !== hub.installation.homeId || !isStrictlyUnexpired(handoff.expiresAt, now) || handoff.consumedAt || handoff.revokedAt) throw new Stage1AuthError(401, 'handoff_rejected', 'The operator handoff is invalid or expired');
       if (!handoff.operatorBrowserAttemptId) throw new Stage1AuthError(401, 'handoff_attempt_missing', 'The operator handoff has no hub-created browser attempt');
-      const browserAttempt = await tx.operatorBrowserAttempt.findUnique({ where: { id: handoff.operatorBrowserAttemptId }, select: { id: true, attemptId: true, homeId: true, hubInstallationId: true, browserBindingHash: true, expiresAt: true, consumedAt: true, revokedAt: true } });
+      const browserAttempt = await tx.operatorBrowserAttempt.findUnique({ where: { id: handoff.operatorBrowserAttemptId }, select: { id: true, attemptId: true, homeId: true, hubInstallationId: true, browserBindingHash: true, accessMode: true, endpointOrigin: true, endpointRevision: true, expiresAt: true, consumedAt: true, revokedAt: true } });
       if (!browserAttempt || browserAttempt.homeId !== handoff.homeId || browserAttempt.hubInstallationId !== handoff.hubInstallationId || browserAttempt.attemptId !== setupAttemptId || browserAttempt.browserBindingHash !== sha256(browserBinding) || !isStrictlyUnexpired(browserAttempt.expiresAt, now) || browserAttempt.consumedAt || browserAttempt.revokedAt || handoff.browserBindingHash !== browserAttempt.browserBindingHash) throw new Stage1AuthError(401, 'handoff_rejected', 'The operator handoff is not bound to this hub browser');
+      const handoffScope = handoff.scope && typeof handoff.scope === 'object' && !Array.isArray(handoff.scope) ? handoff.scope as Record<string, unknown> : {};
+      const accessMode = String(handoffScope.accessMode ?? '');
+      const endpointOrigin = String(handoffScope.endpointOrigin ?? '');
+      const endpointRevision = Number(handoffScope.endpointRevision);
+      const endpoint = await tx.hubInstallation.findUnique({ where: { id: handoff.hubInstallationId }, select: { baseUrl: true, cloudUrl: true, cloudUrlVerifiedAt: true, remoteVerificationAt: true, lanEndpointRevision: true, lanEndpointReportedAt: true, lanEndpointState: true, lanEndpointIdentityGeneration: true, manufacturingIdentity: { select: { identityGeneration: true, status: true } } } });
+      let currentOrigin = '';
+      if (accessMode === 'secure' && endpoint?.cloudUrl && endpoint.cloudUrlVerifiedAt && endpoint.remoteVerificationAt && endpoint.cloudUrlVerifiedAt <= now && endpoint.remoteVerificationAt <= now) {
+        try { const secure = new URL(endpoint.cloudUrl); if (secure.protocol === 'https:' && secure.pathname === '/' && !secure.search && !secure.hash && !secure.username && !secure.password) currentOrigin = secure.origin; } catch { /* fail closed below */ }
+      } else if (accessMode === 'local' && endpoint?.baseUrl && endpoint.manufacturingIdentity?.status === 'ACTIVE'
+        && endpoint.lanEndpointIdentityGeneration === endpoint.manufacturingIdentity.identityGeneration
+        && endpoint.lanEndpointRevision === endpointRevision
+        && lanEndpointFresh(endpoint.lanEndpointState, endpoint.lanEndpointReportedAt, now.getTime())) {
+        try { const local = new URL(endpoint.baseUrl); if (local.protocol === 'http:' && local.pathname === '/' && !local.search && !local.hash && !local.username && !local.password) currentOrigin = local.origin; } catch { /* fail closed below */ }
+      }
+      if (!currentOrigin || currentOrigin !== endpointOrigin || browserAttempt.accessMode !== accessMode || browserAttempt.endpointOrigin !== endpointOrigin || browserAttempt.endpointRevision !== endpointRevision) {
+        throw new Stage1AuthError(409, 'operator_endpoint_changed', 'The hub endpoint changed after this browser handoff was prepared; launch again');
+      }
       if (phase === 'prepare') return { handoffSecretEnvelope: handoff.handoffEnvelope };
       if (sha256(handoffSecret) !== handoff.handoffHash) throw new Stage1AuthError(401, 'handoff_secret_invalid', 'The one-use operator handoff secret is invalid');
       const work = await tx.companyOperationalWorkItem.findUnique({ where: { id: handoff.workflowId }, select: { id: true, assignedEmployeeId: true, homeId: true, hubInstallationId: true, certifiedSerialNumber: true, state: true, workRevision: true } });
       if (!work || work.assignedEmployeeId !== handoff.employeeId || work.homeId !== handoff.homeId || work.hubInstallationId !== handoff.hubInstallationId || !['ASSIGNED', 'IN_PROGRESS', 'REOPENED'].includes(work.state)) throw new Stage1AuthError(403, 'workflow_revoked', 'The operator workflow is no longer valid');
-      const handoffScope = handoff.scope && typeof handoff.scope === 'object' && !Array.isArray(handoff.scope) ? handoff.scope as Record<string, unknown> : {};
       const employeeSessionId = String(handoffScope.employeeSessionId ?? '');
       const workRevision = Number(handoffScope.workRevision);
       if (!employeeSessionId || !Number.isInteger(workRevision) || workRevision !== work.workRevision || String(handoffScope.serialNumber ?? '') !== hub.identity.serialNumber || Number(handoffScope.identityGeneration) !== Number(hub.identity.identityGeneration) || work.certifiedSerialNumber !== hub.identity.serialNumber) throw new Stage1AuthError(403, 'workflow_authority_stale', 'The operator workflow authority has changed');

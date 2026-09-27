@@ -94,6 +94,30 @@ test('contract boundary fixes roles, management wire values and finite state qua
   assert.equal(replacement.homeId, 'home:opaque-a');
   assert.equal(replacement.nameBasedMergeAllowed, false);
 });
+test('canonical signed LAN endpoint contract keeps private installer routing out of customer DTOs', () => {
+  const schema = ajv.compile({ $ref: `${contract.$id}#/$defs/lanEndpointObservation` });
+  const current = JSON.parse(fs.readFileSync(path.join(root, 'fixtures/lan-endpoint-current.json'), 'utf8'));
+  const unavailable = JSON.parse(fs.readFileSync(path.join(root, 'fixtures/lan-endpoint-unavailable.json'), 'utf8'));
+  const publicAddress = JSON.parse(fs.readFileSync(path.join(root, 'fixtures/invalid/lan-endpoint-public-address.json'), 'utf8'));
+  const extraAuthority = JSON.parse(fs.readFileSync(path.join(root, 'fixtures/invalid/lan-endpoint-extra-authority-field.json'), 'utf8'));
+  assert.equal(schema(current), true, JSON.stringify(schema.errors));
+  assert.equal(schema(unavailable), true, JSON.stringify(schema.errors));
+  assert.equal(schema(publicAddress), false);
+  assert.equal(schema(extraAuthority), false);
+  assert.equal(native.validateLanEndpointObservation(current, 'din-home-001'), true);
+  assert.equal(native.validateLanEndpointObservation(unavailable, 'din-home-001'), true);
+  for (const invalid of [
+    { ...current, discoveryHost: 'dinodia-another-hub.local' },
+    { ...current, baseUrl: 'http://192.168.0.110:8124' },
+    { ...current, baseUrl: 'http://192.168.000.110:8123' },
+    { ...current, baseUrl: 'http://172.17.0.2:8123' },
+    { ...unavailable, baseUrl: 'http://192.168.0.110:8123' },
+    { ...current, revision: 0 },
+  ]) assert.equal(native.validateLanEndpointObservation(invalid, 'din-home-001'), false);
+  assert.equal(contract.$defs.hubInstallation.properties.baseUrl, undefined, 'private installer IP is not exposed in the customer HubInstallation DTO');
+  const openapi = fs.readFileSync(path.join(root, 'openapi.yaml'), 'utf8');
+  assert.match(openapi, /HubLanEndpointObservation:\s*\n\s+\$ref: "\.\/contract\.json#\/\$defs\/lanEndpointObservation"/);
+});
 test('command validation enforces descriptor type, range, step and exact step-up reference', () => {
   const brightness = valid.device.controls.find((control) => control.controlId === 'control:brightness');
   const lock = valid.device.controls.find((control) => control.controlId === 'control:lock');

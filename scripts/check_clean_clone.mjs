@@ -9,6 +9,7 @@ const dockerName = `dinodia-v2-clean-${process.pid}`;
 const dockerPort = process.env.V2_CLEAN_CLONE_PORT || String(55488 + (process.pid % 100));
 const databasePassword = 'local-clean-clone-only';
 const databaseUrl = `postgresql://postgres:${databasePassword}@127.0.0.1:${dockerPort}/dinodia_v2_foundation`;
+const independentDatabaseUrl = `postgresql://postgres:${databasePassword}@127.0.0.1:${dockerPort}/dinodia_v2_foundation_independent`;
 const upgradeDatabaseUrl = `postgresql://postgres:${databasePassword}@127.0.0.1:${dockerPort}/dinodia_v2_foundation_upgrade`;
 let dockerStarted = false;
 
@@ -28,6 +29,12 @@ function run(command, args, options = {}) {
 function runWithInput(command, args, input, options = {}) {
   const result = spawnSync(command, args, { cwd: options.cwd ?? sourceRoot, env: options.env ?? safeProcessEnvironment(), input, stdio: ['pipe', 'inherit', 'inherit'] });
   if (result.status !== 0) throw new Error(`${command} ${args.join(' ')} failed with exit ${result.status ?? 1}`);
+}
+
+function capture(command, args, options = {}) {
+  const result = spawnSync(command, args, { cwd: options.cwd ?? sourceRoot, env: options.env ?? safeProcessEnvironment(), encoding: 'utf8' });
+  if (result.status !== 0) throw new Error(`${command} ${args.join(' ')} failed with exit ${result.status ?? 1}`);
+  return result.stdout;
 }
 
 function git(args) {
@@ -168,6 +175,18 @@ try {
   // release candidate must be safe to restart after an interrupted deploy.
   run('node', ['scripts/assert_v2_target.mjs', '--mode', 'local', '--run-prisma'], { cwd: tempRoot, env: localEnv });
 
+  // Prove a second independent empty PostgreSQL database reaches the same
+  // schema fingerprint after a fresh deployment and an idempotent replay.
+  run('docker', ['exec', dockerName, 'createdb', '-U', 'postgres', 'dinodia_v2_foundation_independent']);
+  const independentEnv = { ...localEnv, DATABASE_URL: independentDatabaseUrl, DIRECT_URL: independentDatabaseUrl };
+  run('npx', ['prisma', 'migrate', 'deploy'], { cwd: tempRoot, env: independentEnv });
+  run('npx', ['prisma', 'migrate', 'deploy'], { cwd: tempRoot, env: independentEnv });
+  run('node', ['scripts/foundation_db_checks.mjs'], { cwd: tempRoot, env: independentEnv });
+  const firstEmptyFingerprint = JSON.parse(capture('node', ['scripts/schema_fingerprint.mjs'], { cwd: tempRoot, env: localEnv })).fingerprint;
+  const secondEmptyFingerprint = JSON.parse(capture('node', ['scripts/schema_fingerprint.mjs'], { cwd: tempRoot, env: independentEnv })).fingerprint;
+  if (!firstEmptyFingerprint || firstEmptyFingerprint !== secondEmptyFingerprint) throw new Error('independent empty PostgreSQL migration proofs produced different schema fingerprints');
+  console.log(`[clean-clone:check] PASS: two independent empty PostgreSQL databases produced the same schema fingerprint ${firstEmptyFingerprint} after fresh and idempotent migration deploys`);
+
   // Independently prove the additive Stage 1 upgrade from the exact committed
   // foundation schema, not merely an empty-database replay. This second DB is
   // created inside the disposable local Docker cluster; parent DATABASE_URL,
@@ -179,7 +198,7 @@ try {
   run('npx', ['prisma', 'migrate', 'resolve', '--applied', '00000000000000_native_v2_lean_foundation'], { cwd: tempRoot, env: upgradeEnv });
   run('npx', ['prisma', 'migrate', 'deploy'], { cwd: tempRoot, env: upgradeEnv });
   run('npx', ['prisma', 'migrate', 'deploy'], { cwd: tempRoot, env: upgradeEnv });
-  console.log('[clean-clone:check] PASS: independent foundation-only PostgreSQL database upgraded through all Stage 1 migrations and reapplied idempotently');
+  console.log('[clean-clone:check] PASS: separate foundation-only PostgreSQL database upgraded through all Stage 1 migrations and reapplied idempotently');
 
   run('npm', ['run', 'check:stage1'], { cwd: tempRoot, env: localEnv });
   run('node', ['scripts/foundation_db_checks.mjs'], { cwd: tempRoot, env: localEnv });

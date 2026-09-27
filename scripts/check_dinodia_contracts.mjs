@@ -112,6 +112,8 @@ for (const required of [
   "analytics-semantics.json",
   "invalid/analytics-invalid-sample.json",
   "hub-cloudurl-verified.json",
+  "lan-endpoint-current.json",
+  "lan-endpoint-unavailable.json",
   "out-of-order-events.json",
   "invalid/wrong-home-envelope.json",
   "invalid/stale-descriptor-command.json",
@@ -196,6 +198,10 @@ const fixtureCases = [
   ["empty-area.json", "area", (v) => v.data, true],
   ["error-home-denied.json", "error", (v) => v, true],
   ["hub-cloudurl-verified.json", "hubInstallation", (v) => v, true],
+  ["lan-endpoint-current.json", "lanEndpointObservation", (v) => v, true],
+  ["lan-endpoint-unavailable.json", "lanEndpointObservation", (v) => v, true],
+  ["invalid/lan-endpoint-public-address.json", "lanEndpointObservation", (v) => v, false],
+  ["invalid/lan-endpoint-extra-authority-field.json", "lanEndpointObservation", (v) => v, false],
   ["invalid/stale-descriptor-command.json", "command", (v) => v.command, true],
   ["invalid/support-ticket-incomplete-home-scope.json", "supportTicket", (v) => v, false],
   ["invalid/tenant-device-wrong-owner.json", "device", (v) => v.device, true],
@@ -335,6 +341,7 @@ const validatorNames = [
   "validateControlState",
   "validateCommandAgainstDevice",
   "effectiveControlQuality",
+  "validateLanEndpointObservation",
 ];
 for (const required of validatorNames)
   if (!api.includes(required))

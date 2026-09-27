@@ -4,6 +4,7 @@ import { authErrorResponse, requireEmployee, requireEmployeeRecentAuth, Stage1Au
 import { enforcePersistentRateLimit } from '@/lib/rateLimit';
 import { sha256 } from '@/lib/stage1Crypto';
 import { Prisma } from '@prisma/client';
+import { lanEndpointFresh } from '@/lib/lanEndpoint';
 
 export const dynamic = 'force-dynamic';
 
@@ -37,13 +38,36 @@ export async function GET(request: Request) {
         notes: true,
         workRevision: true,
         updatedAt: true,
-        hubInstallation: { select: { baseUrl: true, cloudUrl: true } },
+        hubInstallation: { select: { baseUrl: true, cloudUrl: true, cloudUrlVerifiedAt: true, remoteVerificationAt: true, lastSeenAt: true, lanEndpointRevision: true, lanEndpointReportedAt: true, lanEndpointState: true, lanEndpointIdentityGeneration: true, manufacturingIdentity: { select: { identityGeneration: true, status: true } } } },
       },
+    });
+    const observedAt = Date.now();
+    const workflows = work.map(({ hubInstallation, ...item }) => {
+      const secureVerified = Boolean(hubInstallation?.cloudUrl && hubInstallation.cloudUrlVerifiedAt && hubInstallation.remoteVerificationAt
+        && hubInstallation.cloudUrlVerifiedAt.getTime() <= observedAt && hubInstallation.remoteVerificationAt.getTime() <= observedAt);
+      const localFresh = Boolean(hubInstallation
+        && hubInstallation.lanEndpointIdentityGeneration === hubInstallation.manufacturingIdentity?.identityGeneration
+        && hubInstallation.manufacturingIdentity?.status === 'ACTIVE'
+        && lanEndpointFresh(hubInstallation.lanEndpointState, hubInstallation.lanEndpointReportedAt, observedAt));
+      return {
+        ...item,
+        hubInstallation: hubInstallation ? {
+          secureUrl: secureVerified ? hubInstallation.cloudUrl : null,
+          secureVerified,
+          secureVerifiedAt: hubInstallation.remoteVerificationAt?.toISOString() ?? null,
+          reachability: hubInstallation.lastSeenAt && observedAt - hubInstallation.lastSeenAt.getTime() <= 420_000 ? 'RECENT' : 'STALE',
+          lastSeenAt: hubInstallation.lastSeenAt?.toISOString() ?? null,
+          localUrl: localFresh ? hubInstallation.baseUrl : null,
+          localState: localFresh ? 'CURRENT' : 'STALE',
+          localReportedAt: hubInstallation.lanEndpointReportedAt?.toISOString() ?? null,
+          localRevision: hubInstallation.lanEndpointRevision,
+        } : null,
+      };
     });
     const employees = employee.role === 'CXO' || employee.role === 'SENIOR_OPERATIONS_MANAGER'
       ? await prisma.companyEmployeeAccount.findMany({ where: { status: 'ACTIVE', role: { in: ['CXO', 'SENIOR_OPERATIONS_MANAGER', 'INSTALLER'] } }, select: { id: true, displayName: true, role: true }, orderBy: { displayName: 'asc' } })
       : [];
-    return NextResponse.json({ ok: true, employee: { id: employee.id, role: employee.role }, sessionExpiresAt: new Date(employee.expiresAt).toISOString(), workflows: work, employees }, { headers: { 'Cache-Control': 'no-store', Pragma: 'no-cache' } });
+    return NextResponse.json({ ok: true, employee: { id: employee.id, role: employee.role }, sessionExpiresAt: new Date(employee.expiresAt).toISOString(), workflows, employees }, { headers: { 'Cache-Control': 'no-store', Pragma: 'no-cache' } });
   } catch (error) {
     return authErrorResponse(error);
   }

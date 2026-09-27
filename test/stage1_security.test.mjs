@@ -105,6 +105,32 @@ test('native provisioning cannot expose reusable browser credentials', () => {
   assert.match(read('src/app/api/installer/home-support/homes/[homeId]/os-access/launch/route.ts'), /handoffHash|handoff/);
 });
 
+test('LAN endpoint observations are exact, private-only, versioned, and expire at the configured freshness boundary', () => {
+  class StubStage1AuthError extends Error { constructor(status, code, message) { super(message); this.status = status; this.code = code; } }
+  const canonical = loadTypeScriptModule('src/lib/contracts/dinodiaV1.ts');
+  const { validateLanEndpointObservation, lanEndpointFresh } = loadTypeScriptModule('src/lib/lanEndpoint.ts', { './stage1Auth': { Stage1AuthError: StubStage1AuthError }, './contracts/dinodiaV1': canonical });
+  const valid = { version: 1, revision: 7, state: 'CURRENT', baseUrl: 'http://192.168.0.110:8123', discoveryHost: 'dinodia-din-home-001.local' };
+  assert.deepEqual(validateLanEndpointObservation(valid, 'DIN-HOME-001'), valid);
+  assert.deepEqual(validateLanEndpointObservation({ version: 1, revision: 8, state: 'UNAVAILABLE', discoveryHost: 'dinodia-din-home-001.local' }, 'DIN-HOME-001'), { version: 1, revision: 8, state: 'UNAVAILABLE', discoveryHost: 'dinodia-din-home-001.local' });
+  for (const invalid of [
+    { ...valid, extra: true },
+    { ...valid, baseUrl: 'http://8.8.8.8:8123' },
+    { ...valid, baseUrl: 'http://172.17.0.1:8123' },
+    { ...valid, baseUrl: 'http://192.168.0.110:8124' },
+    { ...valid, baseUrl: 'http://192.168.0.110:8123/path' },
+    { ...valid, baseUrl: 'https://192.168.0.110:8123' },
+    { ...valid, discoveryHost: 'dinodia-other.local' },
+    { ...valid, revision: 0 },
+    { ...valid, version: 2 },
+    { version: 1, revision: 8, state: 'UNAVAILABLE', baseUrl: valid.baseUrl, discoveryHost: valid.discoveryHost },
+  ]) assert.throws(() => validateLanEndpointObservation(invalid, 'DIN-HOME-001'), StubStage1AuthError);
+  const report = new Date('2026-09-27T12:00:00.000Z');
+  assert.equal(lanEndpointFresh('CURRENT', report, report.getTime() + 420_000), true);
+  assert.equal(lanEndpointFresh('CURRENT', report, report.getTime() + 420_001), false);
+  assert.equal(lanEndpointFresh('CURRENT', new Date(report.getTime() + 1), report.getTime()), false, 'future receipts are not fresh');
+  assert.equal(lanEndpointFresh('UNAVAILABLE', report, report.getTime()), false);
+});
+
 test('operator handoff proves a one-use secret inside the hub channel', () => {
   const launch = read('src/app/api/installer/home-support/homes/[homeId]/os-access/launch/route.ts');
   const consume = read('src/app/api/hub-agent/operator-session/consume/route.ts');
@@ -130,7 +156,7 @@ test('Stage 1 database migration includes durable privacy and authority objects'
 
 test('readiness requires the completed Stage 1 migration rather than only the baseline', () => {
   assert.match(read('src/app/api/readiness/route.ts'), /REQUIRED_MIGRATION/);
-  assert.match(read('src/lib/foundation.ts'), /20260926191500_r11_support_possession_proof/);
+  assert.match(read('src/lib/foundation.ts'), /20260927020000_nr4_operator_endpoint_binding/);
   assert.match(read('src/lib/foundation.ts'), /REQUIRED_MODEL_COUNT = 44/);
 });
 
@@ -375,17 +401,29 @@ test('R4 production paths use opaque browser-bound handoffs, committed claim cle
   assert.match(resolverHarness, /constantTimeEqual/);
 });
 
-test('installer UI can reserve the durable Cloudflare endpoint before secure OS launch', () => {
+test('installer UI separates verified secure launch from fresh local endpoint launch', () => {
   const installer = read('src/app/installer/page.tsx');
   const launch = read('src/app/api/installer/home-support/homes/[homeId]/os-access/launch/route.ts');
+  const attempt = read('src/app/api/hub-agent/operator-session/attempt/route.ts');
+  const consume = read('src/app/api/hub-agent/operator-session/consume/route.ts');
   assert.match(installer, /cloudflare\/reserve/);
   assert.match(installer, /Reserve secure endpoint/);
-  assert.match(installer, /!work\.hubInstallation\?\.cloudUrl/);
-  assert.match(installer, /work\.hubInstallation\?\.cloudUrl &&/);
+  assert.match(installer, /work\.hubInstallation\?\.secureVerified && <button[\s\S]*openHub\(work, "secure"\)/);
+  assert.match(installer, /work\.hubInstallation\?\.localUrl && <button[\s\S]*openHub\(work, "local"\)/);
+  assert.match(installer, /currently unreachable by its signed heartbeat/);
+  assert.match(installer, /did not confirm an authenticated operator session/);
   assert.match(installer, /Open secure Dinodia OS/);
-  assert.match(launch, /baseUrl: true/);
-  assert.match(launch, /!hub\.cloudUrl && !hub\.baseUrl/);
-  assert.match(launch, /handoff\.cloudUrl \|\| handoff\.baseUrl/);
+  assert.match(launch, /accessMode === 'secure'/);
+  assert.match(launch, /local_endpoint_stale/);
+  assert.match(launch, /hub\.cloudUrlVerifiedAt/);
+  assert.match(launch, /lanEndpointFresh\(hub\.lanEndpointState/);
+  assert.match(launch, /endpointOrigin: operatorOrigin, endpointRevision/);
+  assert.match(attempt, /endpointOrigin !== secureOrigin/);
+  assert.match(attempt, /endpointOrigin !== installation\.baseUrl/);
+  assert.match(attempt, /lanEndpointIdentityGeneration !== installation\.manufacturingIdentity\.identityGeneration/);
+  assert.match(attempt, /lanEndpointFresh\(installation\.lanEndpointState/);
+  assert.match(consume, /handoffScope\.accessMode/);
+  assert.match(consume, /handoffScope\.endpointRevision/);
 });
 
 test('R3 tenant-device and device step-up paths use current membership and descriptor authority', () => {

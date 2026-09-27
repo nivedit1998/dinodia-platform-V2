@@ -651,6 +651,10 @@ model HubInstallation {
   state                            HubLifecycleState @default(PAIRING)
   provisioningRevision             Int               @default(1)
   baseUrl                          String?           @db.VarChar(500)
+  lanEndpointRevision              Int               @default(0)
+  lanEndpointReportedAt            DateTime?
+  lanEndpointState                 String            @default("UNKNOWN") @db.VarChar(24)
+  lanEndpointIdentityGeneration    Int?
   cloudUrl                         String?           @db.VarChar(500)
   cloudUrlVerifiedAt               DateTime?
   cloudflareTunnelId               String?           @db.VarChar(200)
@@ -1157,6 +1161,9 @@ model OperatorBrowserAttempt {
   homeId             String    @db.Uuid
   hubInstallationId  String    @db.Uuid
   browserBindingHash String    @db.VarChar(128)
+  accessMode         String?   @db.VarChar(16)
+  endpointOrigin     String?   @db.VarChar(500)
+  endpointRevision   Int?
   issuedAt           DateTime  @default(now())
   expiresAt          DateTime
   consumedAt         DateTime?

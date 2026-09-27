@@ -21,6 +21,7 @@ export interface NativeEnvelope<T> { schemaVersion: typeof DINODIA_V1; homeId: O
 export interface NativeCommand { commandId: OpaqueId; homeId: OpaqueId; homeMembershipId: OpaqueId; deviceId: OpaqueId; controlId: OpaqueId; descriptorRevision: number; value: unknown; issuedAt: string; idempotencyKey: string; stepUpOperationId?: string|null }
 export interface NativeError { error: { code: string; message: string; requestId: OpaqueId; retryable?: boolean } }
 export interface NativeArea { id: OpaqueId; homeId: OpaqueId; originalName: string; overrideName?: string|null; revision: number; lifecycle: 'active'|'retired' }
+export interface LanEndpointObservation { version: 1; revision: number; state: 'CURRENT'|'UNAVAILABLE'; baseUrl?: string; discoveryHost: string }
 const object = (x: unknown): x is Record<string, unknown> => !!x && typeof x === 'object' && !Array.isArray(x);
 const id = (x: unknown): x is string => typeof x === 'string' && x.trim().length > 0 && x.length <= 160;
 const utcTimestamp = (x: unknown): x is string => typeof x === 'string' && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/.test(x) && Number.isFinite(Date.parse(x));
@@ -44,6 +45,22 @@ function sameJsonValue(a: unknown, b: unknown): boolean {
   if (!object(a) || !object(b)) return false;
   const ak = Object.keys(a).sort(); const bk = Object.keys(b).sort();
   return ak.length === bk.length && ak.every((key, index) => key === bk[index] && sameJsonValue(a[key], b[key]));
+}
+/** Canonical signed hub-heartbeat endpoint DTO; not a customer-visible Home endpoint. */
+export function validateLanEndpointObservation(value: unknown, serial: string, expectedPort = 8123): value is LanEndpointObservation {
+  if (!object(value) || !hasOnlyKeys(value, ['version','revision','state','baseUrl','discoveryHost']) || value.version !== 1
+    || !Number.isSafeInteger(value.revision) || Number(value.revision) < 1 || !id(serial)) return false;
+  const host = `dinodia-${serial.toLowerCase()}.local`;
+  if (value.discoveryHost !== host || !/^dinodia-[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.local$/.test(host)) return false;
+  if (value.state === 'UNAVAILABLE') return !Object.hasOwn(value, 'baseUrl');
+  if (value.state !== 'CURRENT' || typeof value.baseUrl !== 'string') return false;
+  const match = value.baseUrl.match(/^http:\/\/(\d{1,3}(?:\.\d{1,3}){3}):(\d{1,5})$/);
+  if (!match || match[2] !== String(expectedPort)) return false;
+  const octets = match[1].split('.').map(Number);
+  if (octets.length !== 4 || octets.some((part, index) => !Number.isInteger(part) || part < 0 || part > 255 || String(part) !== match[1].split('.')[index])) return false;
+  const [a, b, , last] = octets;
+  if (last === 0 || last === 255 || a === 172 && (b === 17 || b === 18)) return false;
+  return a === 10 || a === 192 && b === 168 || a === 172 && b >= 16 && b <= 31;
 }
 const deviceKeys = ['id','homeId','managementClass','ownerMembershipId','lifecycle','technicalLabel','customerLabel','areaIds','controls','descriptorRevision'];
 const controlKeys = ['schemaVersion','deviceId','surfaceId','controlId','label','group','sortOrder','valueType','interactionKind','semanticRole','readable','writable','automatable','observable','idempotency','confirmationPolicy','riskLevel','stepUpPolicy','constraints','expectedReportingIntervalSeconds','maxStateValiditySeconds','unsupportedReason','catalogRevision'];

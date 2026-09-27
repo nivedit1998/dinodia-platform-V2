@@ -608,7 +608,7 @@ async function customerAuthorizationChecks() {
   // exists. The fixture represents that already-completed prerequisite; the
   // CloudURL protocol itself is tested by the dedicated pairing tests.
   const verifiedAt = new Date(now.getTime() - 1000);
-  const hubOne = await prisma.hubInstallation.create({ data: { id: harnessHubInstallationId, homeId: homeOne.id, manufacturingIdentityId: identityOne.id, serialNumberSnapshot: identityOne.serialNumber, state: 'ACTIVE', cloudUrl: 'https://harness-one.example.invalid', cloudUrlVerifiedAt: verifiedAt, remoteChallengeAt: verifiedAt, remoteVerificationAt: verifiedAt } });
+  const hubOne = await prisma.hubInstallation.create({ data: { id: harnessHubInstallationId, homeId: homeOne.id, manufacturingIdentityId: identityOne.id, serialNumberSnapshot: identityOne.serialNumber, state: 'ACTIVE', baseUrl: 'http://192.168.1.76:8123', cloudUrl: 'https://harness-one.example.invalid', cloudUrlVerifiedAt: verifiedAt, remoteChallengeAt: verifiedAt, remoteVerificationAt: verifiedAt } });
   const hubTwo = await prisma.hubInstallation.create({ data: { homeId: homeTwo.id, manufacturingIdentityId: identityTwo.id, serialNumberSnapshot: identityTwo.serialNumber, state: 'ACTIVE', cloudUrl: 'https://harness-two.example.invalid', cloudUrlVerifiedAt: verifiedAt, remoteChallengeAt: verifiedAt, remoteVerificationAt: verifiedAt } });
   const claimReferenceValue = `harness-permanent-label-${crypto.randomUUID()}`;
   const claimReferenceHashValue = claimReferenceHash(claimReferenceValue, env.CLAIM_REFERENCE_PEPPER);
@@ -1499,8 +1499,10 @@ async function operatorMutationChecks() {
 async function osChecks() {
   const base = `http://127.0.0.1:${hub.server.address().port}`;
   const platformBase = `http://127.0.0.1:${appPort}`;
-  const osHost = new URL(base).host;
-  const osOrigin = `http://${osHost}`;
+  const remoteHost = 'harness-one.example.invalid';
+  const remoteOsHeaders = { host: remoteHost, origin: `https://${remoteHost}`, 'x-forwarded-proto': 'https' };
+  let localHost = '192.168.0.111:8123';
+  let localOsHeaders = { host: localHost, origin: `http://${localHost}` };
   // The production hub uses dinodia-identityd over its restricted Unix
   // socket.  This disposable harness supplies the same narrow broker
   // contract in-process so the real production HTTP path can be exercised
@@ -1528,9 +1530,57 @@ async function osChecks() {
       return { credential: decryptHubEnvelope(input.envelope, customerFixture.identityOneEncryptionPrivateKey, input.purpose, input.version) };
     },
   };
+  let simulatedLanAddress = '192.168.0.110';
+  hub.pairing.getLanEndpoint = () => simulatedLanAddress
+    ? { state: 'CURRENT', address: simulatedLanAddress, interfaceName: 'eth0' }
+    : { state: 'UNAVAILABLE', interfaceName: null };
   // Synchronize signed policy from the actual Platform machine route into the
   // running OS store, including both active and later-revoked phone grants.
-  await hub.pairing.syncNow();
+  await hub.pairing.requestImmediateHeartbeat();
+  let endpointRow = await prisma.hubInstallation.findUniqueOrThrow({ where: { id: customerFixture.hubOneId }, select: { baseUrl: true, lanEndpointRevision: true, lanEndpointReportedAt: true, lanEndpointState: true, lanEndpointIdentityGeneration: true } });
+  if (endpointRow.baseUrl !== 'http://192.168.0.110:8123' || endpointRow.lanEndpointState !== 'CURRENT' || endpointRow.lanEndpointRevision < 1 || endpointRow.lanEndpointIdentityGeneration !== customerFixture.identityOneGeneration) fail('The real signed OS heartbeat did not replace the stale historical LAN endpoint with the current identity-bound endpoint');
+  const signedHeartbeat = async (body, nonce = `harness-endpoint-${crypto.randomUUID()}`) => {
+    const requestPath = '/api/hub-agent/v2/heartbeat';
+    const raw = JSON.stringify(body);
+    const timestamp = String(Date.now());
+    const bodyHash = sha256(raw);
+    const signature = crypto.createHmac('sha256', sha256(customerFixture.machineSecret)).update(canonicalHubRequest({ method: 'POST', path: requestPath, timestamp, nonce, bodyHash }), 'utf8').digest('base64url');
+    const headers = { 'content-type': 'application/json', 'x-dinodia-machine-version': '1', 'x-dinodia-machine-signature': signature, 'x-dinodia-hub-timestamp': timestamp, 'x-dinodia-hub-nonce': nonce, 'x-dinodia-body-sha256': bodyHash };
+    return { result: await fetchJson(`${platformBase}${requestPath}`, { method: 'POST', headers, body: raw }), headers, raw };
+  };
+  await sleep(3);
+  const repeatedEndpoint = await signedHeartbeat({ serial: customerFixture.identityOneSerial, identityGeneration: customerFixture.identityOneGeneration, hubRuntime: { version: 'test-runtime' }, lanEndpoint: { version: 1, revision: endpointRow.lanEndpointRevision, state: 'CURRENT', baseUrl: 'http://192.168.0.110:8123', discoveryHost: `dinodia-${customerFixture.identityOneSerial.toLowerCase()}.local` } });
+  if (repeatedEndpoint.result.response.status !== 200 || repeatedEndpoint.result.body.lanEndpoint?.revision !== endpointRow.lanEndpointRevision) fail(`A fresh-nonce repeat of the same LAN observation was not idempotently acknowledged (${repeatedEndpoint.result.response.status})`);
+  const repeatedReceipt = await prisma.hubInstallation.findUniqueOrThrow({ where: { id: customerFixture.hubOneId }, select: { baseUrl: true, lanEndpointRevision: true, lanEndpointReportedAt: true } });
+  if (repeatedReceipt.baseUrl !== endpointRow.baseUrl || repeatedReceipt.lanEndpointRevision !== endpointRow.lanEndpointRevision || repeatedReceipt.lanEndpointReportedAt <= endpointRow.lanEndpointReportedAt) fail('A same-revision signed heartbeat did not refresh only its durable receipt time');
+  const nextEndpointRevision = repeatedReceipt.lanEndpointRevision + 1;
+  simulatedLanAddress = '192.168.0.111';
+  await hub.pairing.requestImmediateHeartbeat();
+  endpointRow = await prisma.hubInstallation.findUniqueOrThrow({ where: { id: customerFixture.hubOneId }, select: { baseUrl: true, lanEndpointRevision: true, lanEndpointReportedAt: true, lanEndpointState: true } });
+  if (endpointRow.baseUrl !== 'http://192.168.0.111:8123' || endpointRow.lanEndpointRevision !== nextEndpointRevision || endpointRow.lanEndpointState !== 'CURRENT') fail('A simulated DHCP address change did not atomically publish the next LAN endpoint revision');
+  const priorRevision = await signedHeartbeat({ serial: customerFixture.identityOneSerial, identityGeneration: customerFixture.identityOneGeneration, lanEndpoint: { version: 1, revision: nextEndpointRevision - 1, state: 'CURRENT', baseUrl: 'http://192.168.0.110:8123', discoveryHost: `dinodia-${customerFixture.identityOneSerial.toLowerCase()}.local` } });
+  const conflictingRevision = await signedHeartbeat({ serial: customerFixture.identityOneSerial, identityGeneration: customerFixture.identityOneGeneration, lanEndpoint: { version: 1, revision: nextEndpointRevision, state: 'CURRENT', baseUrl: 'http://192.168.0.110:8123', discoveryHost: `dinodia-${customerFixture.identityOneSerial.toLowerCase()}.local` } });
+  const publicAddress = await signedHeartbeat({ serial: customerFixture.identityOneSerial, identityGeneration: customerFixture.identityOneGeneration, lanEndpoint: { version: 1, revision: nextEndpointRevision + 1, state: 'CURRENT', baseUrl: 'http://8.8.8.8:8123', discoveryHost: `dinodia-${customerFixture.identityOneSerial.toLowerCase()}.local` } });
+  if (priorRevision.result.response.status !== 409 || conflictingRevision.result.response.status !== 409 || publicAddress.result.response.status !== 400) fail(`Stale, conflicting or public endpoint reports were not rejected (${priorRevision.result.response.status}/${conflictingRevision.result.response.status}/${publicAddress.result.response.status})`);
+  const afterEndpointDenials = await prisma.hubInstallation.findUniqueOrThrow({ where: { id: customerFixture.hubOneId }, select: { baseUrl: true, lanEndpointRevision: true, lanEndpointState: true } });
+  if (afterEndpointDenials.baseUrl !== endpointRow.baseUrl || afterEndpointDenials.lanEndpointRevision !== endpointRow.lanEndpointRevision || afterEndpointDenials.lanEndpointState !== 'CURRENT') fail('A rejected endpoint observation changed the durable BaseURL or endpoint authority');
+  const replayedHeartbeat = await fetchJson(`${platformBase}/api/hub-agent/v2/heartbeat`, { method: 'POST', headers: repeatedEndpoint.headers, body: repeatedEndpoint.raw });
+  if (replayedHeartbeat.response.status !== 401 || replayedHeartbeat.body.errorCode !== 'hub_nonce_replayed') fail(`Exact signed heartbeat replay was not rejected (${replayedHeartbeat.response.status}/${replayedHeartbeat.body.errorCode})`);
+  const concurrentRevision = endpointRow.lanEndpointRevision + 1;
+  const [concurrentPrior, concurrentNewer] = await Promise.all([
+    signedHeartbeat({ serial: customerFixture.identityOneSerial, identityGeneration: customerFixture.identityOneGeneration, lanEndpoint: { version: 1, revision: endpointRow.lanEndpointRevision, state: 'CURRENT', baseUrl: 'http://192.168.0.111:8123', discoveryHost: `dinodia-${customerFixture.identityOneSerial.toLowerCase()}.local` } }),
+    signedHeartbeat({ serial: customerFixture.identityOneSerial, identityGeneration: customerFixture.identityOneGeneration, lanEndpoint: { version: 1, revision: concurrentRevision, state: 'CURRENT', baseUrl: 'http://192.168.0.112:8123', discoveryHost: `dinodia-${customerFixture.identityOneSerial.toLowerCase()}.local` } }),
+  ]);
+  if (concurrentNewer.result.response.status !== 200 || ![200, 409].includes(concurrentPrior.result.response.status)) fail(`Concurrent out-of-order signed heartbeats did not resolve safely (${concurrentPrior.result.response.status}/${concurrentNewer.result.response.status})`);
+  simulatedLanAddress = '192.168.0.112';
+  await hub.pairing.requestImmediateHeartbeat();
+  endpointRow = await prisma.hubInstallation.findUniqueOrThrow({ where: { id: customerFixture.hubOneId }, select: { baseUrl: true, lanEndpointRevision: true, lanEndpointReportedAt: true, lanEndpointState: true } });
+  if (endpointRow.baseUrl !== 'http://192.168.0.112:8123' || endpointRow.lanEndpointRevision !== concurrentRevision || endpointRow.lanEndpointState !== 'CURRENT') fail('Out-of-order heartbeat race did not converge to the latest signed physical endpoint');
+  localHost = '192.168.0.112:8123';
+  localOsHeaders = { host: localHost, origin: `http://${localHost}` };
+  const afterConcurrentDenials = await prisma.hubInstallation.findUniqueOrThrow({ where: { id: customerFixture.hubOneId }, select: { baseUrl: true, lanEndpointRevision: true, lanEndpointState: true } });
+  if (afterConcurrentDenials.baseUrl !== endpointRow.baseUrl || afterConcurrentDenials.lanEndpointRevision !== endpointRow.lanEndpointRevision) fail('A concurrent stale endpoint report rolled back the current BaseURL');
+  console.log('[stage1:integration] PASS: machine-authenticated heartbeat replaced the old LAN address; same-revision receipts refresh idempotently; DHCP revision, stale/conflict/public denial and nonce replay preserve endpoint authority');
   const syncedOfflineGrants = hub.store.getSecurity().offlineAuthorisations || {};
   if (!syncedOfflineGrants[customerFixture.offlineAuthorisationId] || syncedOfflineGrants[customerFixture.offlineAuthorisationId].userId !== customerFixture.accountId) fail('Platform-signed offline grant did not retain its customer identity on the OS');
   const revokedOsGrant = syncedOfflineGrants[customerFixture.revocableOfflineAuthorisationId];
@@ -1572,10 +1622,11 @@ async function osChecks() {
   // cannot redeem a copied id, and browser A receives only an HttpOnly OS
   // session handle.  No bearer or one-use secret is asserted in any response.
   const browserA = {};
-  updateCookieJar(browserA, setup);
-  const setupAttempt = await fetchJson(`${base}/_dinodia/setup/operator-attempt`, {
+  const secureSetupPage = await fetchLoopback(`${base}/support-access`, { headers: remoteOsHeaders });
+  updateCookieJar(browserA, secureSetupPage);
+  const setupAttempt = await fetchJsonLoopback(`${base}/_dinodia/setup/operator-attempt`, {
     method: 'POST',
-    headers: { host: osHost, origin: osOrigin, cookie: cookieHeader(browserA), 'x-dinodia-setup-csrf': decodeURIComponent(cookieValue(browserA, 'dinodia_setup_csrf')) },
+    headers: { ...remoteOsHeaders, cookie: cookieHeader(browserA), 'x-dinodia-setup-csrf': decodeURIComponent(cookieValue(browserA, 'dinodia_setup_csrf')) },
   });
   if (setupAttempt.response.status !== 200 || setupAttempt.body.setupAttemptId !== decodeURIComponent(cookieValue(browserA, 'dinodia_operator_attempt'))) fail(`Hub-created operator browser attempt was not registered (${setupAttempt.response.status}/${setupAttempt.body.errorCode || setupAttempt.body.error || 'unknown'})`);
   const identityCheck = await prisma.hubManufacturingIdentity.findFirst({ where: { serialNumber: customerFixture.identityOneSerial, identityGeneration: customerFixture.identityOneGeneration }, select: { status: true, serialNumber: true, identityGeneration: true } });
@@ -1585,13 +1636,13 @@ async function osChecks() {
   const wrongHomeLaunch = await fetchJson(`${platformBase}/api/installer/home-support/homes/${encodeURIComponent(customerFixture.homeTwoId)}/os-access/launch`, {
     method: 'POST',
     headers: { 'content-type': 'application/json', 'x-dinodia-employee-session': customerFixture.operatorToken },
-    body: JSON.stringify({ workflowId: customerFixture.operatorWorkId, setupAttemptId: setupAttempt.body.setupAttemptId }),
+    body: JSON.stringify({ workflowId: customerFixture.operatorWorkId, setupAttemptId: setupAttempt.body.setupAttemptId, accessMode: 'secure' }),
   });
   if (wrongHomeLaunch.response.status !== 403) fail(`Operator work was accepted for a different home (${wrongHomeLaunch.response.status})`);
   const wrongAttemptLaunch = await fetchJson(`${platformBase}/api/installer/home-support/homes/${encodeURIComponent(customerFixture.homeOneId)}/os-access/launch`, {
     method: 'POST',
     headers: { 'content-type': 'application/json', 'x-dinodia-employee-session': customerFixture.operatorToken },
-    body: JSON.stringify({ workflowId: customerFixture.operatorWorkId, setupAttemptId: crypto.randomBytes(32).toString('base64url') }),
+    body: JSON.stringify({ workflowId: customerFixture.operatorWorkId, setupAttemptId: crypto.randomBytes(32).toString('base64url'), accessMode: 'secure' }),
   });
   if (wrongAttemptLaunch.response.status !== 403) fail(`An unregistered setup attempt was accepted for operator handoff (${wrongAttemptLaunch.response.status})`);
 
@@ -1603,7 +1654,7 @@ async function osChecks() {
     const wrongEmployeeLaunch = await fetchJson(`${platformBase}/api/installer/home-support/homes/${encodeURIComponent(customerFixture.homeOneId)}/os-access/launch`, {
       method: 'POST',
       headers: { 'content-type': 'application/json', cookie: cookieHeader(wrongEmployeeLogin.jar) },
-      body: JSON.stringify({ workflowId: customerFixture.operatorWorkId, setupAttemptId: setupAttempt.body.setupAttemptId }),
+      body: JSON.stringify({ workflowId: customerFixture.operatorWorkId, setupAttemptId: setupAttempt.body.setupAttemptId, accessMode: 'secure' }),
     });
     if (wrongEmployeeLaunch.response.status !== 403) fail(`A different active employee received an unassigned operator handoff (${wrongEmployeeLaunch.response.status})`);
   } finally {
@@ -1611,19 +1662,19 @@ async function osChecks() {
     await prisma.companyEmployeeAccount.delete({ where: { id: wrongEmployee.id } }).catch(() => {});
   }
 
-  const expiredSetup = await fetch(`${base}/setup`, { headers: { host: '127.0.0.1' } });
+  const expiredSetup = await fetchLoopback(`${base}/support-access`, { headers: remoteOsHeaders });
   const expiredBrowser = {};
   updateCookieJar(expiredBrowser, expiredSetup);
-  const expiredRegistration = await fetchJson(`${base}/_dinodia/setup/operator-attempt`, {
+  const expiredRegistration = await fetchJsonLoopback(`${base}/_dinodia/setup/operator-attempt`, {
     method: 'POST',
-    headers: { host: osHost, origin: osOrigin, cookie: cookieHeader(expiredBrowser), 'x-dinodia-setup-csrf': decodeURIComponent(cookieValue(expiredBrowser, 'dinodia_setup_csrf')) },
+    headers: { ...remoteOsHeaders, cookie: cookieHeader(expiredBrowser), 'x-dinodia-setup-csrf': decodeURIComponent(cookieValue(expiredBrowser, 'dinodia_setup_csrf')) },
   });
   if (expiredRegistration.response.status !== 200 || !expiredRegistration.body.setupAttemptId) fail(`Could not register disposable attempt for expiry denial (${expiredRegistration.response.status})`);
   await prisma.operatorBrowserAttempt.update({ where: { attemptId: expiredRegistration.body.setupAttemptId }, data: { expiresAt: new Date(Date.now() - 1) } });
   const expiredAttemptLaunch = await fetchJson(`${platformBase}/api/installer/home-support/homes/${encodeURIComponent(customerFixture.homeOneId)}/os-access/launch`, {
     method: 'POST',
     headers: { 'content-type': 'application/json', 'x-dinodia-employee-session': customerFixture.operatorToken },
-    body: JSON.stringify({ workflowId: customerFixture.operatorWorkId, setupAttemptId: expiredRegistration.body.setupAttemptId }),
+    body: JSON.stringify({ workflowId: customerFixture.operatorWorkId, setupAttemptId: expiredRegistration.body.setupAttemptId, accessMode: 'secure' }),
   });
   if (expiredAttemptLaunch.response.status !== 403) fail(`An expired hub-created browser attempt received an operator handoff (${expiredAttemptLaunch.response.status})`);
   await prisma.employeeSession.update({ where: { id: customerFixture.operatorSessionId }, data: { recentAuthenticatedAt: new Date(Date.now() - 5 * 60 * 1000 - 1) } });
@@ -1633,7 +1684,7 @@ async function osChecks() {
   const launch = await fetchJson(`${platformBase}/api/installer/home-support/homes/${encodeURIComponent(customerFixture.homeOneId)}/os-access/launch`, {
     method: 'POST',
     headers: { 'content-type': 'application/json', 'x-dinodia-employee-session': customerFixture.operatorToken },
-    body: JSON.stringify({ workflowId: customerFixture.operatorWorkId, setupAttemptId: setupAttempt.body.setupAttemptId }),
+    body: JSON.stringify({ workflowId: customerFixture.operatorWorkId, setupAttemptId: setupAttempt.body.setupAttemptId, accessMode: 'secure' }),
   });
   if (launch.response.status !== 200 || !launch.body.handoffId || launch.body.handoffSecret || launch.body.operatorToken || launch.body.sessionGrant) fail(`Company Portal did not issue an opaque operator handoff (${launch.response.status})`);
   const handoffJson = JSON.stringify(launch.body);
@@ -1643,15 +1694,12 @@ async function osChecks() {
   const missingSecretConsume = await machineRequest({ base: platformBase, path: '/api/hub-agent/operator-session/consume', machineSecret: customerFixture.machineSecret, body: { serial: customerFixture.identityOneSerial, identityGeneration: customerFixture.identityOneGeneration, handoffId: launch.body.handoffId, browserBinding: decodeURIComponent(cookieValue(browserA, 'dinodia_operator_binding')), setupAttemptId: setupAttempt.body.setupAttemptId, phase: 'consume' } });
   if (missingSecretConsume.response.status !== 401 || missingSecretConsume.body.errorCode !== 'handoff_secret_required') fail(`A machine handoff was consumed without proof of its one-use secret (${missingSecretConsume.response.status}/${missingSecretConsume.body.errorCode || 'unknown'})`);
 
-  const remoteHost = 'harness-one.example.invalid';
-  const remoteOsHeaders = { host: remoteHost, origin: `https://${remoteHost}`, 'x-forwarded-proto': 'https' };
-  const localOsHeaders = { host: osHost, origin: osOrigin };
-  const postHandoffStart = (jar, handoffId, originHeaders = localOsHeaders) => fetchJsonLoopback(`${base}/_dinodia/setup/operator-session`, {
+  const postHandoffStart = (jar, handoffId, originHeaders = remoteOsHeaders) => fetchJsonLoopback(`${base}/_dinodia/setup/operator-session`, {
     method: 'POST',
     headers: { 'content-type': 'application/json', ...originHeaders, cookie: cookieHeader(jar), 'x-dinodia-setup-csrf': decodeURIComponent(cookieValue(jar, 'dinodia_setup_csrf')) },
     body: JSON.stringify({ action: 'start', handoffId }),
   });
-  const pollHandoff = async (jar, originHeaders = localOsHeaders, timeoutMs = 15_000) => {
+  const pollHandoff = async (jar, originHeaders = remoteOsHeaders, timeoutMs = 15_000) => {
     const deadline = Date.now() + timeoutMs;
     let result;
     do {
@@ -1729,12 +1777,12 @@ async function osChecks() {
   if (currentAuthority.response.status !== 200 || currentAuthority.body.active !== true) fail(`Machine-authenticated operator revalidation rejected the exact consumed grant (${currentAuthority.response.status}/${currentAuthority.body.errorCode || 'unknown'})`);
   const substitutedJti = await machineRequest({ base: platformBase, path: '/api/hub-agent/operator-session/revalidate', machineSecret: customerFixture.machineSecret, body: { serial: customerFixture.identityOneSerial, identityGeneration: customerFixture.identityOneGeneration, handoffId: launch.body.handoffId, jti: `substitute-${crypto.randomUUID()}`, credentialVersion: authorityScope.credentialVersion } });
   if (substitutedJti.response.status !== 401) fail(`Machine operator revalidation accepted a substituted grant JTI (${substitutedJti.response.status})`);
-  const intendedOsRead = await fetchJson(`${base}/_dinodia/admin/api/devices`, { headers: { host: '127.0.0.1', cookie: cookieHeader(browserA) } });
+  const intendedOsRead = await fetchJsonLoopback(`${base}/_dinodia/admin/api/devices`, { headers: { ...remoteOsHeaders, cookie: cookieHeader(browserA) } });
   if (intendedOsRead.response.status !== 200 || !Array.isArray(intendedOsRead.body.devices)) fail(`The intended browser's HttpOnly handoff session did not authorize a real OS devices read (${intendedOsRead.response.status})`);
-  const copiedSessionRead = await fetchJson(`${base}/_dinodia/admin/api/devices`, { headers: { host: '127.0.0.1', cookie: cookieHeader(browserB) } });
+  const copiedSessionRead = await fetchJsonLoopback(`${base}/_dinodia/admin/api/devices`, { headers: { ...remoteOsHeaders, cookie: cookieHeader(browserB) } });
   if (copiedSessionRead.response.status !== 401) fail(`A second browser obtained OS access without the originating browser session (${copiedSessionRead.response.status})`);
   const WebSocket = createRequire(import.meta.url)(path.join(osRoot, 'node_modules/ws'));
-  const endSessionSocket = new WebSocket(`${base.replace('http', 'ws')}/api/websocket`, { headers: { host: '127.0.0.1', origin: 'http://127.0.0.1', cookie: cookieHeader(browserA) } });
+  const endSessionSocket = new WebSocket(`${base.replace('http', 'ws')}/api/websocket`, { headers: { ...remoteOsHeaders, cookie: cookieHeader(browserA) } });
   await new Promise((resolve, reject) => {
     const timer = setTimeout(() => { endSessionSocket.terminate(); reject(new Error('operator WebSocket did not authenticate before End session')); }, 5000);
     endSessionSocket.on('message', (value) => { try { const message = JSON.parse(String(value)); if (message.type === 'auth_required') endSessionSocket.send(JSON.stringify({ type: 'auth', access_token: '' })); if (message.type === 'auth_ok') { clearTimeout(timer); resolve(); } } catch {} });
@@ -1742,12 +1790,12 @@ async function osChecks() {
   });
   const replayHandoff = await fetchJson(`${base}/_dinodia/setup/operator-session`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json', host: osHost, origin: osOrigin, cookie: cookieHeader(browserA), 'x-dinodia-setup-csrf': decodeURIComponent(cookieValue(browserA, 'dinodia_setup_csrf')) },
+    headers: { 'content-type': 'application/json', ...remoteOsHeaders, cookie: cookieHeader(browserA), 'x-dinodia-setup-csrf': decodeURIComponent(cookieValue(browserA, 'dinodia_setup_csrf')) },
     body: JSON.stringify({ handoffId: launch.body.handoffId }),
   });
   if (![400, 401, 403].includes(replayHandoff.response.status)) fail(`The operator handoff replay was accepted (${replayHandoff.response.status})`);
 
-  const endSession = await fetchJson(`${base}/_dinodia/operator-session/end`, { method: 'POST', headers: { host: osHost, origin: osOrigin, cookie: cookieHeader(browserA) } });
+  const endSession = await fetchJsonLoopback(`${base}/_dinodia/operator-session/end`, { method: 'POST', headers: { ...remoteOsHeaders, cookie: cookieHeader(browserA) } });
   if (endSession.response.status !== 200 || endSession.body.ok !== true) fail(`The explicit Dinodia OS End session action did not revoke the active session (${endSession.response.status})`);
   const endedSocketCode = await new Promise((resolve, reject) => {
     const timer = setTimeout(() => { endSessionSocket.terminate(); reject(new Error('End session left the operator WebSocket active')); }, 2000);
@@ -1755,8 +1803,42 @@ async function osChecks() {
   });
   if (endedSocketCode !== 4401) fail(`End session closed the operator WebSocket with an unexpected code (${endedSocketCode})`);
   updateCookieJar(browserA, endSession.response);
-  const afterEndSession = await fetchJson(`${base}/_dinodia/admin/api/devices`, { headers: { host: '127.0.0.1', cookie: cookieHeader(browserA) } });
+  const afterEndSession = await fetchJsonLoopback(`${base}/_dinodia/admin/api/devices`, { headers: { ...remoteOsHeaders, cookie: cookieHeader(browserA) } });
   if (afterEndSession.response.status !== 401) fail(`Protected OS read remained available after End session (${afterEndSession.response.status})`);
+
+  // Exercise the same machine-created browser authority over the fresh local
+  // BaseURL, even though the disposable OS listener is reached through a
+  // loopback socket. The Host/Origin are the private endpoint recorded by the
+  // signed heartbeat; no production route accepts loopback as a LAN report.
+  const localSetupPage = await fetchLoopback(`${base}/support-access`, { headers: localOsHeaders });
+  const localBrowser = {};
+  updateCookieJar(localBrowser, localSetupPage);
+  const localAttempt = await fetchJsonLoopback(`${base}/_dinodia/setup/operator-attempt`, { method: 'POST', headers: { ...localOsHeaders, cookie: cookieHeader(localBrowser), 'x-dinodia-setup-csrf': decodeURIComponent(cookieValue(localBrowser, 'dinodia_setup_csrf')) } });
+  if (localAttempt.response.status !== 200 || !localAttempt.body.setupAttemptId) fail(`Fresh local endpoint could not register a bound browser attempt (${localAttempt.response.status}/${localAttempt.body.errorCode || 'unknown'})`);
+  const localLaunch = await fetchJson(`${platformBase}/api/installer/home-support/homes/${encodeURIComponent(customerFixture.homeOneId)}/os-access/launch`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-employee-session': customerFixture.operatorToken }, body: JSON.stringify({ workflowId: customerFixture.operatorWorkId, setupAttemptId: localAttempt.body.setupAttemptId, accessMode: 'local' }) });
+  if (localLaunch.response.status !== 200 || localLaunch.body.accessMode !== 'local' || new URL(localLaunch.body.operatorUrl).origin !== `http://${localHost}`) fail(`Portal did not issue the local handoff on the exact current BaseURL (${localLaunch.response.status})`);
+  const localStart = await postHandoffStart(localBrowser, localLaunch.body.handoffId, localOsHeaders);
+  if (localStart.response.status !== 202) fail(`Fresh local-origin handoff was not accepted (${localStart.response.status})`);
+  const localHandoff = await pollHandoff(localBrowser, localOsHeaders);
+  updateCookieJar(localBrowser, localHandoff.response);
+  if (localHandoff.response.status !== 200 || localHandoff.body.state !== 'established') fail(`Fresh local-origin operator handoff did not establish (${localHandoff.response.status}/${localHandoff.body.errorCode || 'unknown'})`);
+  const localProtectedRead = await fetchJsonLoopback(`${base}/_dinodia/admin/api/devices`, { headers: { ...localOsHeaders, cookie: cookieHeader(localBrowser) } });
+  if (localProtectedRead.response.status !== 200) fail(`Fresh BaseURL handoff did not authorize a protected OS read (${localProtectedRead.response.status})`);
+  const localEnd = await fetchJsonLoopback(`${base}/_dinodia/operator-session/end`, { method: 'POST', headers: { ...localOsHeaders, cookie: cookieHeader(localBrowser) } });
+  const localAfterEnd = await fetchJsonLoopback(`${base}/_dinodia/admin/api/devices`, { headers: { ...localOsHeaders, cookie: cookieHeader(localBrowser) } });
+  if (localEnd.response.status !== 200 || localAfterEnd.response.status !== 401) fail('Local BaseURL session did not revoke before expiry');
+  simulatedLanAddress = '';
+  await hub.pairing.requestImmediateHeartbeat();
+  const unavailableEndpoint = await prisma.hubInstallation.findUniqueOrThrow({ where: { id: customerFixture.hubOneId }, select: { baseUrl: true, lanEndpointRevision: true, lanEndpointState: true } });
+  if (unavailableEndpoint.lanEndpointState !== 'UNAVAILABLE' || unavailableEndpoint.baseUrl !== 'http://192.168.0.112:8123') fail('An unavailable signed LAN observation erased history or remained advertised as current');
+  const endpointWorkflowList = await fetchJson(`${platformBase}/api/installer/workflows`, { headers: { 'x-dinodia-employee-session': customerFixture.operatorToken } });
+  const endpointWorkflow = endpointWorkflowList.body.workflows?.find((item) => item.id === customerFixture.operatorWorkId);
+  if (endpointWorkflowList.response.status !== 200 || endpointWorkflow?.hubInstallation?.localUrl !== null || endpointWorkflow?.hubInstallation?.localState !== 'STALE' || endpointWorkflow?.hubInstallation?.secureVerified !== true) fail('Portal exposed an unavailable historic BaseURL or lost its independent verified CloudURL state');
+  simulatedLanAddress = '192.168.0.112';
+  await hub.pairing.requestImmediateHeartbeat();
+  const recoveredEndpoint = await prisma.hubInstallation.findUniqueOrThrow({ where: { id: customerFixture.hubOneId }, select: { baseUrl: true, lanEndpointRevision: true, lanEndpointState: true } });
+  if (recoveredEndpoint.lanEndpointState !== 'CURRENT' || recoveredEndpoint.lanEndpointRevision !== unavailableEndpoint.lanEndpointRevision + 1 || recoveredEndpoint.baseUrl !== 'http://192.168.0.112:8123') fail('Signed LAN endpoint did not recover with a new revision after interface availability returned');
+  console.log('[stage1:integration] PASS: secure CloudURL and fresh LAN BaseURL each bind an originating browser, authorize protected reads, and support explicit session end');
 
   // Establish a second legitimate handoff in the independent browser so the
   // absolute-deadline test exercises a live server-held session after the
@@ -1766,7 +1848,7 @@ async function osChecks() {
   updateCookieJar(browserC, setupC);
   const attemptB = await fetchJsonLoopback(`${base}/_dinodia/setup/operator-attempt`, { method: 'POST', headers: { ...remoteOsHeaders, cookie: cookieHeader(browserC), 'x-dinodia-setup-csrf': decodeURIComponent(cookieValue(browserC, 'dinodia_setup_csrf')) } });
   if (attemptB.response.status !== 200 || !attemptB.body.setupAttemptId) fail(`Independent secure-origin browser could not create its own hub attempt (${attemptB.response.status}/${attemptB.body.error || attemptB.body.errorCode || 'unknown'}; browser=${Boolean(browserC.dinodia_setup_browser)}, csrf=${Boolean(browserC.dinodia_setup_csrf)}, binding=${Boolean(browserC.dinodia_operator_binding)}, attempt=${Boolean(browserC.dinodia_operator_attempt)})`);
-  const launchB = await fetchJson(`${platformBase}/api/installer/home-support/homes/${encodeURIComponent(customerFixture.homeOneId)}/os-access/launch`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-employee-session': customerFixture.operatorToken }, body: JSON.stringify({ workflowId: customerFixture.operatorWorkId, setupAttemptId: attemptB.body.setupAttemptId }) });
+  const launchB = await fetchJson(`${platformBase}/api/installer/home-support/homes/${encodeURIComponent(customerFixture.homeOneId)}/os-access/launch`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-employee-session': customerFixture.operatorToken }, body: JSON.stringify({ workflowId: customerFixture.operatorWorkId, setupAttemptId: attemptB.body.setupAttemptId, accessMode: 'secure' }) });
   if (launchB.response.status !== 200 || !launchB.body.handoffId) fail(`A valid fresh handoff could not be issued for the independent browser (${launchB.response.status})`);
   operatorHandoffFetchDelayMs = 250;
   const platformCallsBeforeDuplicateB = operatorHandoffPlatformRequestCount;
