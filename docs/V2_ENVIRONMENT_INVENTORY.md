@@ -61,7 +61,7 @@ Supabase Vault must contain these named secrets for the optional Supabase-owned 
 | Variable | Owner | Secret | Environments | Purpose |
 |---|---|---:|---|---|
 | `FOUNDATION_SCHEMA_FINGERPRINT` | Platform | No | rc/production | Expected reviewed schema object fingerprint |
-| `FOUNDATION_MIGRATION_CHECKSUM` | Platform | No | rc/production | Exact SHA-256 checksum of the deployed native baseline migration |
+| `FOUNDATION_MIGRATION_CHECKSUM` | Platform | No | rc/production | Exact SHA-256 checksum of `REQUIRED_MIGRATION`, the latest migration required by this deployed candidate |
 | `FOUNDATION_SOURCE_FINGERPRINT` | Platform | No | rc/production | Safe fingerprint of the intended source snapshot; health exposes only its short prefix |
 
 ## Rules
