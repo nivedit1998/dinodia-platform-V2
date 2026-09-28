@@ -1,7 +1,8 @@
 import crypto from 'node:crypto';
 import { NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
-import { requireCustomer, Stage1AuthError, authErrorResponse } from '@/lib/stage1Auth';
+import { nativeV1ErrorResponse } from '@/lib/contracts/nativeV1Error';
+import { requireCustomer, Stage1AuthError } from '@/lib/stage1Auth';
 
 export const dynamic = 'force-dynamic';
 
@@ -20,7 +21,7 @@ export async function POST(request: Request) {
     const thumbprint = suppliedThumbprint;
     const row = await prisma.offlineMembershipAuthorisation.upsert({ where: { trustedDeviceId_membershipId_hubInstallationId: { trustedDeviceId: customer.trustedDeviceId, membershipId: customer.membershipId, hubInstallationId: customer.hubInstallationId } }, create: { trustedDeviceId: customer.trustedDeviceId, membershipId: customer.membershipId, homeId: customer.homeId, hubInstallationId: customer.hubInstallationId, publicKey, publicKeyThumbprint: thumbprint, areaIds: grants.map((grant) => grant.areaId), scopes: ['tenant:device-command'], policyRevision: customer.policyRevision }, update: { publicKey, publicKeyThumbprint: thumbprint, areaIds: grants.map((grant) => grant.areaId), scopes: ['tenant:device-command'], policyRevision: customer.policyRevision, revokedAt: null, revokeReason: null } });
     return NextResponse.json({ ok: true, authorisation: { id: row.id, homeId: row.homeId, membershipId: row.membershipId, trustedDeviceId: row.trustedDeviceId, areaIds: row.areaIds, scopes: row.scopes, policyRevision: row.policyRevision } }, { headers: { 'Cache-Control': 'no-store', Pragma: 'no-cache' } });
-  } catch (error) { return authErrorResponse(error); }
+  } catch (error) { return nativeV1ErrorResponse(error); }
 }
 
 export async function DELETE(request: Request) {
@@ -28,5 +29,5 @@ export async function DELETE(request: Request) {
     const customer = await requireCustomer(request);
     const revoked = await prisma.offlineMembershipAuthorisation.updateMany({ where: { trustedDeviceId: customer.trustedDeviceId, membershipId: customer.membershipId, revokedAt: null }, data: { revokedAt: new Date(), revokeReason: 'customer_removed_local_authority' } });
     return NextResponse.json({ ok: true, revoked: revoked.count }, { headers: { 'Cache-Control': 'no-store', Pragma: 'no-cache' } });
-  } catch (error) { return authErrorResponse(error); }
+  } catch (error) { return nativeV1ErrorResponse(error); }
 }

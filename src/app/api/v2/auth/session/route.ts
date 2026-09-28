@@ -1,7 +1,8 @@
 import crypto from 'node:crypto';
 import { NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
-import { authErrorResponse, recordFailedAuthentication, Stage1AuthError, cookieToken } from '@/lib/stage1Auth';
+import { nativeV1ErrorResponse } from '@/lib/contracts/nativeV1Error';
+import { recordFailedAuthentication, Stage1AuthError, cookieToken } from '@/lib/stage1Auth';
 import { verifyPassword } from '@/lib/passwords';
 import { constantTimeEqual, randomSecret, sha256 } from '@/lib/stage1Crypto';
 import { enforcePersistentRateLimit } from '@/lib/rateLimit';
@@ -35,7 +36,7 @@ export async function GET(request: Request) {
           homeId: true,
           role: true,
           accessRevision: true,
-          tenantAreaGrants: { where: { revokedAt: null, area: { status: 'ACTIVE' } }, select: { area: { select: { osAreaId: true } } } },
+          tenantAreaGrants: { where: { revokedAt: null, area: { status: 'ACTIVE' } }, select: { areaId: true, homeId: true } },
         },
       }),
     ]);
@@ -51,14 +52,14 @@ export async function GET(request: Request) {
         homeMembershipId: membership.id,
         role: membership.role,
         status: 'active',
-        areaIds: membership.role === 'TENANT' ? membership.tenantAreaGrants.map((grant) => grant.area.osAreaId) : [],
+        areaIds: membership.role === 'TENANT' ? membership.tenantAreaGrants.filter((grant) => grant.homeId === membership.homeId).map((grant) => grant.areaId) : [],
         revision: membership.accessRevision,
       })),
       expiresAt: session.expiresAt.toISOString(),
     }, { headers: { 'Cache-Control': 'no-store', Pragma: 'no-cache' } });
     await prisma.customerSession.updateMany({ where: { id: session.id, revokedAt: null, expiresAt: { gt: now } }, data: { lastUsedAt: now } });
     return response;
-  } catch (error) { return authErrorResponse(error); }
+  } catch (error) { return nativeV1ErrorResponse(error); }
 }
 
 function text(value: unknown, max: number): string {
@@ -105,7 +106,7 @@ export async function POST(request: Request) {
     const response = NextResponse.json({ ok: true, accountId: account.id, sessionId: session.id, trustedDeviceId: session.trustedDeviceId, expiresAt: session.expiresAt }, { headers: { 'Cache-Control': 'no-store', Pragma: 'no-cache' } });
     response.headers.append('Set-Cookie', `dinodia_customer_session=${encodeURIComponent(rawSession)}; HttpOnly; SameSite=Strict; Secure; Path=/; Max-Age=${30 * 24 * 60 * 60}`);
     return response;
-  } catch (error) { return authErrorResponse(error); }
+  } catch (error) { return nativeV1ErrorResponse(error); }
 }
 
 export async function DELETE(request: Request) {
@@ -116,5 +117,5 @@ export async function DELETE(request: Request) {
     const response = NextResponse.json({ ok: true }, { headers: { 'Cache-Control': 'no-store' } });
     response.headers.append('Set-Cookie', 'dinodia_customer_session=; HttpOnly; SameSite=Strict; Secure; Path=/; Max-Age=0');
     return response;
-  } catch (error) { return authErrorResponse(error); }
+  } catch (error) { return nativeV1ErrorResponse(error); }
 }

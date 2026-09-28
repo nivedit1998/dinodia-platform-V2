@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
-import { requireCustomer, Stage1AuthError, authErrorResponse } from '@/lib/stage1Auth';
+import { nativeV1ErrorResponse } from '@/lib/contracts/nativeV1Error';
+import { requireCustomer, Stage1AuthError } from '@/lib/stage1Auth';
 import { consumeStepUp } from '@/lib/sensitiveOperationStepUp';
 
 export const dynamic = 'force-dynamic';
@@ -20,5 +21,5 @@ export async function DELETE(request: Request, context: { params: Promise<{ trus
       await tx.offlineMembershipAuthorisation.updateMany({ where: { trustedDeviceId, revokedAt: null }, data: { revokedAt: new Date(), revokeReason: 'trusted_device_removed' } });
     });
     return NextResponse.json({ ok: true, trustedDeviceId, accountWide: true }, { headers: { 'Cache-Control': 'no-store', Pragma: 'no-cache' } });
-  } catch (error) { return authErrorResponse(error); }
+  } catch (error) { return nativeV1ErrorResponse(error); }
 }

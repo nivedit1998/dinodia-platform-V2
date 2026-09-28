@@ -57,6 +57,11 @@ test('session receipt and selected-home bearer have separate strict, bounded con
   assert.equal(native.validateCustomerHubSession({ ...syntheticHubSession, expiresAt: '2026-09-27T10:05:02Z' }, expected, now), false);
   assert.equal(native.validateCustomerHubSession({ ...syntheticHubSession, token: '' }, expected, now), false);
   assert.equal(native.validateCustomerHubSession({ ...syntheticHubSession, extra: true }, expected, now), false);
+  for (const origin of ['http://dinodia-fixture-hub.dinodiasmartliving.com', 'https://other.example/dinodia', 'https://user@dinodia-fixture-hub.dinodiasmartliving.com', 'https://dinodia-fixture-hub.dinodiasmartliving.com:8443']) {
+    assert.equal(native.validateCustomerHubSession({ ...syntheticHubSession, hubEndpoint: { state: 'verified_cloud', origin } }, expected, now), false, `untrusted hub origin ${origin}`);
+  }
+  assert.equal(native.validateCustomerHubSession({ ...syntheticHubSession, hubEndpoint: { state: 'unavailable', origin: 'https://dinodia-fixture-hub.dinodiasmartliving.com' } }, expected, now), false, 'unavailable endpoint cannot carry an origin');
+  assert.equal(native.validateCustomerHubSession({ ...syntheticHubSession, hubEndpoint: { state: 'verified_cloud', origin: 'https://dinodia-fixture-hub.dinodiasmartliving.com', extra: true } }, expected, now), false, 'endpoint authority fields are exact');
 });
 test('offline home candidates are exact-account, tenant-only and fresh before an exact-home challenge', () => {
   const schema = ajv.compile({ $ref: `${contract.$id}#/$defs/offlineHomeSelection` });

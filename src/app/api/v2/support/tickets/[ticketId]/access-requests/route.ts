@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
-import { requireEmployee, Stage1AuthError, authErrorResponse } from '@/lib/stage1Auth';
+import { nativeV1ErrorResponse } from '@/lib/contracts/nativeV1Error';
+import { requireEmployee, Stage1AuthError } from '@/lib/stage1Auth';
 
 export const dynamic = 'force-dynamic';
 
@@ -48,5 +49,5 @@ export async function POST(request: Request, context: { params: Promise<{ ticket
     const touchesPropertyInfrastructure = requestedScope === 'PROPERTY_SCOPE' || targetDevices.some((device) => device.managementClass === 'PROPERTY_DEVICE');
     const requestRow = await prisma.supportAccessRequest.create({ data: { ticketId, requestedByEmployeeId: employee.id, homeId: ticket.homeId, hubInstallationId: hub.id, requestedScope, targetMembershipId, targetUserId, canonicalAreaIds: areaIds, targetIds, touchesPropertyInfrastructure }, select: { id: true, status: true, requestedScope: true, touchesPropertyInfrastructure: true, createdAt: true } });
     return NextResponse.json({ ok: true, accessRequest: requestRow }, { status: 201, headers: { 'Cache-Control': 'no-store', Pragma: 'no-cache' } });
-  } catch (error) { return authErrorResponse(error); }
+  } catch (error) { return nativeV1ErrorResponse(error); }
 }

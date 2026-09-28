@@ -2,9 +2,22 @@ import crypto from 'node:crypto';
 import { NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
 import { signStage1Token } from '@/lib/stage1Crypto';
-import { Stage1AuthError, authErrorResponse, cookieToken } from '@/lib/stage1Auth';
+import { nativeV1ErrorResponse } from '@/lib/contracts/nativeV1Error';
+import { Stage1AuthError, cookieToken } from '@/lib/stage1Auth';
 
 export const dynamic = 'force-dynamic';
+
+function verifiedHubEndpoint(hub: { cloudUrl: string | null; cloudUrlVerifiedAt: Date | null; remoteVerificationAt: Date | null; reservedHostname: string | null }, now: Date) {
+  if (!hub.cloudUrl || !hub.cloudUrlVerifiedAt || !hub.remoteVerificationAt || !hub.reservedHostname || hub.cloudUrlVerifiedAt > now || hub.remoteVerificationAt > now) return { state: 'unavailable' as const };
+  try {
+    const url = new URL(hub.cloudUrl);
+    const hostname = hub.reservedHostname.toLowerCase();
+    if (url.protocol !== 'https:' || url.hostname.toLowerCase() !== hostname || url.username || url.password || url.port || url.pathname !== '/' && url.pathname !== '' || url.search || url.hash || !/^dinodia-[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.dinodiasmartliving\.com$/.test(hostname)) return { state: 'unavailable' as const };
+    return { state: 'verified_cloud' as const, origin: url.origin };
+  } catch {
+    return { state: 'unavailable' as const };
+  }
+}
 
 export async function POST(request: Request) {
   try {
@@ -25,13 +38,14 @@ export async function POST(request: Request) {
     if (!account || account.status !== 'ACTIVE' || session.securityVersion !== account.securityVersion || !trusted || trusted.customerAccountId !== account.id || trusted.revokedAt || session.trustedDeviceSessionVersion !== trusted.sessionVersion) throw new Stage1AuthError(401, 'customer_session_invalid', 'The customer session is no longer active');
     const membership = await prisma.homeMembership.findFirst({ where: { customerAccountId: session.customerAccountId, homeId, status: 'ACTIVE' }, select: { id: true, role: true, homeId: true, accessRevision: true } });
     if (!membership) throw new Stage1AuthError(403, 'home_membership_forbidden', 'The current account is not authorised for that home');
-    const hub = await prisma.hubInstallation.findFirst({ where: { homeId, state: { in: ['PAIRING', 'ACTIVE', 'MAINTENANCE'] } }, select: { id: true, homeId: true, accessPolicyRevision: true } });
+    const hub = await prisma.hubInstallation.findFirst({ where: { homeId, state: { in: ['PAIRING', 'ACTIVE', 'MAINTENANCE'] } }, select: { id: true, homeId: true, accessPolicyRevision: true, cloudUrl: true, cloudUrlVerifiedAt: true, remoteVerificationAt: true, reservedHostname: true } });
     if (!hub) throw new Stage1AuthError(503, 'home_hub_unavailable', 'The selected home hub is not available');
-    const grants = membership.role === 'TENANT' ? await prisma.tenantAreaGrant.findMany({ where: { membershipId: membership.id, revokedAt: null, area: { status: 'ACTIVE' } }, select: { areaId: true } }) : [];
+    const grants = membership.role === 'TENANT' ? await prisma.tenantAreaGrant.findMany({ where: { membershipId: membership.id, homeId, revokedAt: null, area: { status: 'ACTIVE' } }, select: { areaId: true } }) : [];
     const now = Math.floor(Date.now() / 1000);
+    const hubEndpoint = verifiedHubEndpoint(hub, new Date(now * 1000));
     const privatePem = String(process.env.DINODIA_APP_SESSION_PRIVATE_KEY ?? '').replaceAll('\\n', '\n');
     if (!privatePem) throw new Stage1AuthError(503, 'app_auth_unconfigured', 'App session authentication is not configured');
     const token = signStage1Token('customer', { id: account.id, sessionId: session.id, homeId: hub.homeId, membershipId: membership.id, trustedDeviceId: trusted.id, hubInstallationId: hub.id, role: membership.role, areaIds: grants.map((grant) => grant.areaId), scopes: membership.role === 'TENANT' ? ['tenant:device-command'] : ['property:read'], policyRevision: Math.max(membership.accessRevision, hub.accessPolicyRevision), issuedAt: now, expiresAt: now + 5 * 60 }, crypto.createPrivateKey(privatePem));
-    return NextResponse.json({ ok: true, token, expiresAt: new Date((now + 5 * 60) * 1000).toISOString(), homeId: hub.homeId, membershipId: membership.id }, { headers: { 'Cache-Control': 'no-store', Pragma: 'no-cache' } });
-  } catch (error) { return authErrorResponse(error); }
+    return NextResponse.json({ ok: true, token, expiresAt: new Date((now + 5 * 60) * 1000).toISOString(), homeId: hub.homeId, membershipId: membership.id, hubEndpoint }, { headers: { 'Cache-Control': 'no-store', Pragma: 'no-cache' } });
+  } catch (error) { return nativeV1ErrorResponse(error); }
 }

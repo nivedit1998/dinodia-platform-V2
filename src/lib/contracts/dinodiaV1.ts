@@ -11,7 +11,8 @@ export type UIState = 'restoring_session' | 'loading' | 'ready' | 'empty' | 'sta
 export interface MembershipContext { accountId: OpaqueId; homeId: OpaqueId; homeMembershipId: OpaqueId; role: MembershipRole; status: 'active'|'suspended'|'removed'; areaIds: OpaqueId[]; revision: number }
 export interface AccountSessionContext { schemaVersion: typeof DINODIA_V1; accountId: OpaqueId; memberships: MembershipContext[]; expiresAt: string }
 export interface CustomerSessionReceipt { ok: true; accountId: OpaqueId; sessionId: OpaqueId; trustedDeviceId: OpaqueId; expiresAt: string }
-export interface CustomerHubSession { ok: true; token: string; expiresAt: string; homeId: OpaqueId; membershipId: OpaqueId }
+export type CustomerHubEndpoint = { state: 'verified_cloud'; origin: string } | { state: 'unavailable' };
+export interface CustomerHubSession { ok: true; token: string; expiresAt: string; homeId: OpaqueId; membershipId: OpaqueId; hubEndpoint: CustomerHubEndpoint }
 export interface OfflineHomeCandidate { schemaVersion: typeof DINODIA_V1; grantId: OpaqueId; accountId: OpaqueId; homeId: OpaqueId; homeMembershipId: OpaqueId; trustedDeviceId: OpaqueId; role: 'TENANT'; areaIds: OpaqueId[]; membershipRevision: number; issuedAt: string; expiresAt: string|null }
 export interface OfflineHomeSelection { schemaVersion: typeof DINODIA_V1; accountId: OpaqueId; generatedAt: string; state: 'offline'; candidates: OfflineHomeCandidate[] }
 export interface NativeControl { schemaVersion: 1; deviceId: OpaqueId; surfaceId?: OpaqueId|null; controlId: OpaqueId; label: string; group?: string|null; sortOrder: number; valueType: ValueType; interactionKind: InteractionKind; semanticRole: string; readable: boolean; writable: boolean; automatable: boolean; observable: boolean; idempotency: 'set_value'|'invoke_once'|'none'; confirmationPolicy: 'none'|'matching_observation'|'explicit_user'|'step_up'; riskLevel: 'low'|'normal'|'sensitive'|'critical'; stepUpPolicy: 'none'|'required'; catalogRevision: number; expectedReportingIntervalSeconds?: number; maxStateValiditySeconds?: number; constraints?: Record<string, unknown>; unsupportedReason?: string|null }
@@ -104,7 +105,17 @@ export function validateCustomerSessionReceipt(value: unknown, now = Date.now())
 }
 /** The short-lived hub bearer is accepted only for its exact selected membership and home. */
 export function validateCustomerHubSession(value: unknown, expected: { homeId: string; membershipId: string }, now = Date.now()): value is CustomerHubSession {
-  if (!object(value) || !hasOnlyKeys(value, ['ok','token','expiresAt','homeId','membershipId']) || value.ok !== true || typeof value.token !== 'string' || value.token.length < 1 || value.token.length > 8192 || value.token === 'TEST_ONLY_PLACEHOLDER_NOT_A_BEARER' || !utcTimestamp(value.expiresAt) || !id(expected.homeId) || !id(expected.membershipId) || value.homeId !== expected.homeId || value.membershipId !== expected.membershipId) return false;
+  if (!object(value) || !hasOnlyKeys(value, ['ok','token','expiresAt','homeId','membershipId','hubEndpoint']) || value.ok !== true || typeof value.token !== 'string' || value.token.length < 1 || value.token.length > 8192 || value.token === 'TEST_ONLY_PLACEHOLDER_NOT_A_BEARER' || !utcTimestamp(value.expiresAt) || !id(expected.homeId) || !id(expected.membershipId) || value.homeId !== expected.homeId || value.membershipId !== expected.membershipId) return false;
+  const endpoint = value.hubEndpoint;
+  if (!object(endpoint)) return false;
+  if (endpoint.state === 'unavailable') {
+    if (!hasOnlyKeys(endpoint, ['state'])) return false;
+  } else if (endpoint.state === 'verified_cloud') {
+    if (!hasOnlyKeys(endpoint, ['state','origin']) || typeof endpoint.origin !== 'string') return false;
+    let parsed: URL;
+    try { parsed = new URL(endpoint.origin); } catch { return false; }
+    if (parsed.protocol !== 'https:' || parsed.username || parsed.password || parsed.port || parsed.pathname !== '/' && parsed.pathname !== '' || parsed.search || parsed.hash || parsed.origin !== endpoint.origin || !/^dinodia-[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.dinodiasmartliving\.com$/.test(parsed.hostname)) return false;
+  } else return false;
   const expiresAt = Date.parse(value.expiresAt);
   return expiresAt > now && expiresAt <= now + 5 * 60 * 1000 + 1000;
 }

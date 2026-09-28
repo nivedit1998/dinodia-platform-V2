@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
-import { requireCustomer, authErrorResponse } from '@/lib/stage1Auth';
+import { nativeV1ErrorResponse } from '@/lib/contracts/nativeV1Error';
+import { requireCustomer } from '@/lib/stage1Auth';
 
 export const dynamic = 'force-dynamic';
 
@@ -15,5 +16,5 @@ export async function GET(request: Request) {
       select: { id: true, ticketId: true, eventType: true, createdAt: true },
     });
     return NextResponse.json({ ok: true, notifications }, { headers: { 'Cache-Control': 'no-store', Pragma: 'no-cache' } });
-  } catch (error) { return authErrorResponse(error); }
+  } catch (error) { return nativeV1ErrorResponse(error); }
 }

@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 import { NextResponse } from 'next/server';
-import { assertCustomerCanCommand, requireCustomer, Stage1AuthError, authErrorResponse } from '@/lib/stage1Auth';
+import { nativeV1ErrorResponse } from '@/lib/contracts/nativeV1Error';
+import { assertCustomerCanCommand, requireCustomer, Stage1AuthError } from '@/lib/stage1Auth';
 import { ALLOWED_OPERATIONS, descriptorBoundValue, operationDigest, targetDigest } from '@/lib/sensitiveOperationStepUp';
 import { prisma } from '@/lib/prisma';
 import { canonicalStepUpDescriptor } from '@/lib/stage1HubAuth';
@@ -75,7 +76,7 @@ export async function POST(request: Request) {
     const now = new Date();
     const challenge = await prisma.stepUpChallenge.create({ data: { customerAccountId: customer.id, customerSessionId: customer.sessionId, trustedDeviceId: customer.trustedDeviceId, homeId: customer.homeId, membershipId: customer.membershipId, hubInstallationId: customer.hubInstallationId, operationKind, targetDigest: targetDigest(targetIds), normalizedValueDigest: digest, policyRevision: customer.policyRevision, nonceHash: crypto.createHash('sha256').update(nonce, 'utf8').digest('hex'), issuedAt: now, expiresAt: new Date(now.getTime() + 60_000) }, select: { id: true, expiresAt: true } });
     return NextResponse.json({ ok: true, challengeId: challenge.id, nonce, operationDigest: digest, expiresAt: challenge.expiresAt }, { headers: { 'Cache-Control': 'no-store', Pragma: 'no-cache' } });
-  } catch (error) { return authErrorResponse(error); }
+  } catch (error) { return nativeV1ErrorResponse(error); }
 }
 
 export async function DELETE(request: Request) {
@@ -87,5 +88,5 @@ export async function DELETE(request: Request) {
     const cancelled = await prisma.stepUpChallenge.updateMany({ where: { id: challengeId, customerAccountId: customer.id, customerSessionId: customer.sessionId, trustedDeviceId: customer.trustedDeviceId, consumedAt: null, cancelledAt: null }, data: { cancelledAt: new Date() } });
     if (cancelled.count !== 1) throw new Stage1AuthError(409, 'step_up_challenge_unavailable', 'The challenge is already consumed, cancelled or unavailable');
     return NextResponse.json({ ok: true, cancelled: true }, { headers: { 'Cache-Control': 'no-store', Pragma: 'no-cache' } });
-  } catch (error) { return authErrorResponse(error); }
+  } catch (error) { return nativeV1ErrorResponse(error); }
 }

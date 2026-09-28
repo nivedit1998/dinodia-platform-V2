@@ -30,6 +30,7 @@ const appPort = await findFreePort();
 const sesPort = await findFreePort();
 const databasePassword = 'stage1-integration-only';
 const harnessHubInstallationId = '00000000-0000-4000-8000-000000000001';
+const harnessCloudHostname = 'dinodia-harness-one.dinodiasmartliving.com';
 const databaseUrl = `postgresql://postgres:${databasePassword}@127.0.0.1:${dbPort}/dinodia_stage1`;
 const migration = fs.readdirSync(path.join(root, 'prisma/migrations')).sort().at(-1);
 const migrationChecksum = crypto.createHash('sha256').update(fs.readFileSync(path.join(root, 'prisma/migrations', migration, 'migration.sql'))).digest('hex');
@@ -608,8 +609,8 @@ async function customerAuthorizationChecks() {
   // exists. The fixture represents that already-completed prerequisite; the
   // CloudURL protocol itself is tested by the dedicated pairing tests.
   const verifiedAt = new Date(now.getTime() - 1000);
-  const hubOne = await prisma.hubInstallation.create({ data: { id: harnessHubInstallationId, homeId: homeOne.id, manufacturingIdentityId: identityOne.id, serialNumberSnapshot: identityOne.serialNumber, state: 'ACTIVE', baseUrl: 'http://192.168.1.76:8123', cloudUrl: 'https://harness-one.example.invalid', cloudUrlVerifiedAt: verifiedAt, remoteChallengeAt: verifiedAt, remoteVerificationAt: verifiedAt } });
-  const hubTwo = await prisma.hubInstallation.create({ data: { homeId: homeTwo.id, manufacturingIdentityId: identityTwo.id, serialNumberSnapshot: identityTwo.serialNumber, state: 'ACTIVE', cloudUrl: 'https://harness-two.example.invalid', cloudUrlVerifiedAt: verifiedAt, remoteChallengeAt: verifiedAt, remoteVerificationAt: verifiedAt } });
+  const hubOne = await prisma.hubInstallation.create({ data: { id: harnessHubInstallationId, homeId: homeOne.id, manufacturingIdentityId: identityOne.id, serialNumberSnapshot: identityOne.serialNumber, state: 'ACTIVE', baseUrl: 'http://192.168.1.76:8123', cloudUrl: 'https://dinodia-harness-one.dinodiasmartliving.com', reservedHostname: 'dinodia-harness-one.dinodiasmartliving.com', cloudUrlVerifiedAt: verifiedAt, remoteChallengeAt: verifiedAt, remoteVerificationAt: verifiedAt } });
+  const hubTwo = await prisma.hubInstallation.create({ data: { homeId: homeTwo.id, manufacturingIdentityId: identityTwo.id, serialNumberSnapshot: identityTwo.serialNumber, state: 'ACTIVE', cloudUrl: 'https://dinodia-harness-two.dinodiasmartliving.com', reservedHostname: 'dinodia-harness-two.dinodiasmartliving.com', cloudUrlVerifiedAt: verifiedAt, remoteChallengeAt: verifiedAt, remoteVerificationAt: verifiedAt } });
   const claimReferenceValue = `harness-permanent-label-${crypto.randomUUID()}`;
   const claimReferenceHashValue = claimReferenceHash(claimReferenceValue, env.CLAIM_REFERENCE_PEPPER);
   const claimIdentitySigning = keyPair();
@@ -663,14 +664,21 @@ async function customerAuthorizationChecks() {
   if (customerLogin.response.status !== 200 || !rawSession || loginReceiptKeys !== 'accountId,expiresAt,ok,sessionId,trustedDeviceId' || Object.hasOwn(customerLogin.body || {}, 'token') || Object.hasOwn(customerLogin.body || {}, 'refreshToken')) fail(`Canonical customer login did not issue only a metadata receipt plus HttpOnly session cookie (${customerLogin.response.status})`);
   const session = await prisma.customerSession.findFirstOrThrow({ where: { customerAccountId: account.id, trustedDeviceId: trusted.id, revokedAt: null }, orderBy: { createdAt: 'desc' } });
   const sessionWithoutCookie = await fetchJson(`${base}/api/v2/session`);
-  if (sessionWithoutCookie.response.status !== 401) fail(`Account session restore did not reject a missing customer session (${sessionWithoutCookie.response.status})`);
+  if (sessionWithoutCookie.response.status !== 401 || sessionWithoutCookie.body.error?.code !== 'AUTH_REQUIRED' || !sessionWithoutCookie.body.error?.requestId || Object.hasOwn(sessionWithoutCookie.body, 'errorCode')) fail(`Account session restore did not return the canonical Native V1 authentication error (${sessionWithoutCookie.response.status})`);
   const restoredAccount = await fetchJson(`${base}/api/v2/session`, { headers: { cookie: `dinodia_customer_session=${encodeURIComponent(rawSession)}` } });
   const restoredMemberships = restoredAccount.body.memberships || [];
   const restoredTenant = restoredMemberships.find((membership) => membership.homeMembershipId === tenantMembership.id);
   const restoredOwner = restoredMemberships.find((membership) => membership.homeMembershipId === ownerMembership.id);
-  if (restoredAccount.response.status !== 200 || restoredAccount.body.schemaVersion !== 'dinodia.v1' || restoredAccount.body.accountId !== account.id || restoredMemberships.length !== 2 || restoredTenant?.role !== 'TENANT' || restoredTenant?.areaIds?.length !== 1 || restoredOwner?.role !== 'OWNER' || restoredOwner?.areaIds?.length !== 0 || Object.hasOwn(restoredAccount.body, 'token') || Object.hasOwn(restoredAccount.body, 'hubInstallationId')) fail(`Canonical account restore did not return only this account's active membership context (${restoredAccount.response.status})`);
+  if (restoredAccount.response.status !== 200 || restoredAccount.body.schemaVersion !== 'dinodia.v1' || restoredAccount.body.accountId !== account.id || restoredMemberships.length !== 2 || restoredTenant?.role !== 'TENANT' || JSON.stringify(restoredTenant?.areaIds) !== JSON.stringify([areaOne.id]) || restoredTenant?.areaIds?.includes(areaOne.osAreaId) || restoredOwner?.role !== 'OWNER' || restoredOwner?.areaIds?.length !== 0 || Object.hasOwn(restoredAccount.body, 'token') || Object.hasOwn(restoredAccount.body, 'hubInstallationId')) fail(`Canonical account restore did not return only canonical Platform Area UUIDs for this account's active membership context (${restoredAccount.response.status})`);
   const restoredLegacyPath = await fetchJson(`${base}/api/v2/auth/session`, { headers: { cookie: `dinodia_customer_session=${encodeURIComponent(rawSession)}` } });
   if (restoredLegacyPath.response.status !== 200 || JSON.stringify(restoredLegacyPath.body) !== JSON.stringify(restoredAccount.body)) fail('The compatibility session path drifted from the canonical account-session DTO');
+  const sessionExpiry = session.expiresAt;
+  await prisma.customerSession.update({ where: { id: session.id }, data: { expiresAt: new Date(Date.now() - 1) } });
+  const expiredRestore = await fetchJson(`${base}/api/v2/session`, { headers: { cookie: `dinodia_customer_session=${encodeURIComponent(rawSession)}` } });
+  if (expiredRestore.response.status !== 401 || expiredRestore.body.error?.code !== 'TOKEN_EXPIRED' || !expiredRestore.body.error?.requestId || Object.hasOwn(expiredRestore.body, 'errorCode')) fail('Expired customer session did not return the canonical TOKEN_EXPIRED envelope');
+  await prisma.customerSession.update({ where: { id: session.id }, data: { expiresAt: sessionExpiry } });
+  const disabledAlexa = await fetchJson(`${base}/api/v2/alexa/discovery`);
+  if (disabledAlexa.response.status !== 501 || disabledAlexa.body.error?.code !== 'FEATURE_NOT_ENABLED' || !disabledAlexa.body.error?.requestId) fail('Disabled Stage 12 route did not retain the canonical fail-closed error envelope');
   const logoutPhone = keyPair();
   const logoutInstallationId = `harness-logout-phone-${crypto.randomUUID()}`;
   const logoutLogin = await fetchJson(`${base}/api/v2/session`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ email, password: customerPassword, deviceInstallationId: logoutInstallationId, publicKey: logoutPhone.publicKey, deviceName: 'Harness logout phone', model: 'integration-test', osFamily: 'test', osVersion: 'test' }) });
@@ -697,23 +705,33 @@ async function customerAuthorizationChecks() {
   const issue = async (homeId) => fetchJson(`${base}/api/v2/hub-sessions`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-session': rawSession }, body: JSON.stringify({ homeId }) });
   const issueProperty = async () => fetchJson(`${base}/api/v2/hub-sessions`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-session': propertyRawSession }, body: JSON.stringify({ homeId: homeOne.id }) });
   const issueManager = async () => fetchJson(`${base}/api/v2/hub-sessions`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-session': managerRawSession }, body: JSON.stringify({ homeId: homeOne.id }) });
-  const assertHubSession = (result, homeId, membershipId, label) => {
+  const assertHubSession = (result, homeId, membershipId, label, expectedOrigin) => {
     const body = result.body || {};
     const expiresAt = Date.parse(body.expiresAt);
     const keys = Object.keys(body).sort().join(',');
-    if (result.response.status !== 200 || keys !== 'expiresAt,homeId,membershipId,ok,token' || body.ok !== true || typeof body.token !== 'string' || !body.token || body.token.length > 8192 || body.token === 'TEST_ONLY_PLACEHOLDER_NOT_A_BEARER' || body.homeId !== homeId || body.membershipId !== membershipId || !Number.isFinite(expiresAt) || expiresAt <= Date.now() || expiresAt > Date.now() + 5 * 60 * 1000 + 1000) fail(`${label} did not return the strict five-minute selected-home session contract (${result.response.status})`);
+    if (result.response.status !== 200 || keys !== 'expiresAt,homeId,hubEndpoint,membershipId,ok,token' || body.ok !== true || typeof body.token !== 'string' || !body.token || body.token.length > 8192 || body.token === 'TEST_ONLY_PLACEHOLDER_NOT_A_BEARER' || body.homeId !== homeId || body.membershipId !== membershipId || body.hubEndpoint?.state !== 'verified_cloud' || body.hubEndpoint?.origin !== expectedOrigin || !Number.isFinite(expiresAt) || expiresAt <= Date.now() || expiresAt > Date.now() + 5 * 60 * 1000 + 1000) fail(`${label} did not return the strict five-minute selected-home session and its exact verified endpoint contract (${result.response.status})`);
   };
   const tenantToken = await issue(homeOne.id);
-  assertHubSession(tenantToken, homeOne.id, tenantMembership.id, 'Tenant hub session');
+  assertHubSession(tenantToken, homeOne.id, tenantMembership.id, 'Tenant hub session', 'https://dinodia-harness-one.dinodiasmartliving.com');
+  const originalCloudUrl = hubOne.cloudUrl;
+  await prisma.hubInstallation.update({ where: { id: hubOne.id }, data: { cloudUrl: 'http://dinodia-harness-one.dinodiasmartliving.com' } });
+  const unverifiedEndpoint = await issue(homeOne.id);
+  if (unverifiedEndpoint.response.status !== 200 || unverifiedEndpoint.body.hubEndpoint?.state !== 'unavailable' || Object.hasOwn(unverifiedEndpoint.body.hubEndpoint || {}, 'origin')) fail('Selected-home session exposed a non-HTTPS hub endpoint');
+  await prisma.hubInstallation.update({ where: { id: hubOne.id }, data: { cloudUrl: originalCloudUrl } });
+  console.log('[stage2:integration] PASS: selected-home session returns only the exact verified CloudURL origin; malformed/non-HTTPS endpoint state is explicitly unavailable');
+  const noSessionHubToken = await fetchJson(`${base}/api/v2/hub-sessions`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ homeId: homeOne.id }) });
+  if (noSessionHubToken.response.status !== 401 || noSessionHubToken.body.error?.code !== 'AUTH_REQUIRED' || Object.hasOwn(noSessionHubToken.body, 'errorCode')) fail('Hub session issuance did not use the canonical authentication boundary');
+  const tenantClaims = JSON.parse(Buffer.from(tenantToken.body.token.split('.')[2], 'base64url').toString('utf8'));
+  if (JSON.stringify(tenantClaims.areaIds) !== JSON.stringify([areaOne.id]) || tenantClaims.areaIds.includes(areaOne.osAreaId) || Object.hasOwn(tenantClaims, 'areaBindings') || Object.hasOwn(tenantClaims, 'osAreaId')) fail('Customer bearer did not contain only canonical Area IDs and leaked no private hub alias');
   const ownerToken = await issue(homeTwo.id);
-  assertHubSession(ownerToken, homeTwo.id, ownerMembership.id, 'Second-home owner session');
+  assertHubSession(ownerToken, homeTwo.id, ownerMembership.id, 'Second-home owner session', 'https://dinodia-harness-two.dinodiasmartliving.com');
   const propertyToken = await issueProperty();
-  assertHubSession(propertyToken, homeOne.id, propertyMembership.id, 'Homeowner session');
+  assertHubSession(propertyToken, homeOne.id, propertyMembership.id, 'Homeowner session', 'https://dinodia-harness-one.dinodiasmartliving.com');
   const managerToken = await issueManager();
-  assertHubSession(managerToken, homeOne.id, managerMembership.id, 'Property-manager session');
+  assertHubSession(managerToken, homeOne.id, managerMembership.id, 'Property-manager session', 'https://dinodia-harness-one.dinodiasmartliving.com');
   const wrongHomeHubSession = await issue(crypto.randomUUID());
   const extraFieldHubSession = await fetchJson(`${base}/api/v2/hub-sessions`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-session': rawSession }, body: JSON.stringify({ homeId: homeOne.id, membershipId: tenantMembership.id }) });
-  if (wrongHomeHubSession.response.status !== 403 || Object.hasOwn(wrongHomeHubSession.body || {}, 'token') || extraFieldHubSession.response.status !== 400 || Object.hasOwn(extraFieldHubSession.body || {}, 'token')) fail(`Selected-home session contract mismatch (wrong-home=${wrongHomeHubSession.response.status}/${wrongHomeHubSession.body?.errorCode || 'none'}, extra-field=${extraFieldHubSession.response.status}/${extraFieldHubSession.body?.errorCode || 'none'})`);
+  if (wrongHomeHubSession.response.status !== 403 || wrongHomeHubSession.body.error?.code !== 'SCOPE_DENIED' || Object.hasOwn(wrongHomeHubSession.body || {}, 'token') || extraFieldHubSession.response.status !== 400 || extraFieldHubSession.body.error?.code !== 'VALIDATION_FAILED' || Object.hasOwn(extraFieldHubSession.body || {}, 'token')) fail(`Selected-home session contract mismatch (wrong-home=${wrongHomeHubSession.response.status}/${wrongHomeHubSession.body?.error?.code || 'none'}, extra-field=${extraFieldHubSession.response.status}/${extraFieldHubSession.body?.error?.code || 'none'})`);
   const tenantOffline = await fetchJson(`${base}/api/v2/offline-authorisations`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-app-token': tenantToken.body.token }, body: JSON.stringify({ trustedDeviceId: trusted.id, publicKey: phone.publicKey }) });
   if (tenantOffline.response.status !== 200 || tenantOffline.body.authorisation?.homeId !== homeOne.id) fail(`Tenant offline authority was not scoped to the selected home (${tenantOffline.response.status})`);
   const revocablePhone = keyPair();
@@ -1076,13 +1094,13 @@ async function customerAuthorizationChecks() {
   // The token returned above is the actual Platform-issued app token. Bind the
   // disposable OS instance to the same installation lineage and exercise the
   // OS HTTP authorization path, not just the issuer route.
-  await hub.store.savePlatform({ hubInstallId: hubOne.id, policyRevision: 0 });
-  await hub.store.saveArea({ name: 'Tenant area' }, areaOne.id);
+  await hub.store.savePlatform({ hubInstallId: hubOne.id, policyRevision: 0, areaBindings: [{ areaId: areaOne.id, hubAreaId: areaOne.osAreaId }, { areaId: areaTwo.id, hubAreaId: areaTwo.osAreaId }] });
+  await hub.store.saveArea({ name: 'Tenant area' }, areaOne.osAreaId);
   await hub.store.upsertDevice({
     id: 'harness-tenant-device',
     name: 'Harness tenant light',
     protocol: 'zigbee',
-    areaId: areaOne.id,
+    areaId: areaOne.osAreaId,
     labelIds: ['tenant_device'],
     metadata: { label: 'tenant_device', tenantOwnerMembershipId: tenantMembership.id },
     state: { state: 'OFF' },
@@ -1180,15 +1198,15 @@ async function customerAuthorizationChecks() {
     fail(`Authorized command did not reach the safe fake physical adapter (${JSON.stringify({ commandResult, fakePhysicalCommandCount, token: { householdRole: tokenClaims.householdRole, scope: tokenClaims.scope, areaIds: tokenClaims.areaIds, membershipId: tokenClaims.membershipId, hubInstallationId: tokenClaims.hubInstallationId }, entity: { haId: tenantEntity.haId, capability: tenantEntity.entity?.capability, device: { areaId: tenantEntity.device.areaId, metadata: tenantEntity.device.metadata, labelIds: tenantEntity.device.labelIds } } })})`);
   }
   await hub.store.upsertDevice({
-    id: 'harness-ungranted-area-device', name: 'Harness ungranted area switch', protocol: 'zigbee', areaId: areaTwo.id,
+    id: 'harness-ungranted-area-device', name: 'Harness ungranted area switch', protocol: 'zigbee', areaId: areaTwo.osAreaId,
     state: { state: 'OFF' }, setup: { status: 'ready' },
     entities: { 'harness-ungranted-area-device:state': { name: 'Unassigned switch', stateKey: 'state', domain: 'switch', category: 'control', writable: true, primary: true, capability: { readable: true, writable: true, primary: true, category: 'control', bindings: [{ serviceId: 'switch.turn_on' }] } } },
   });
-  tenantSocket.send(JSON.stringify({ id: 3, type: 'call_service', domain: 'switch', service: 'turn_on', target: { entity_id: tenantEntity.haId, area_id: areaTwo.id } }));
+  tenantSocket.send(JSON.stringify({ id: 3, type: 'call_service', domain: 'switch', service: 'turn_on', target: { entity_id: tenantEntity.haId, area_id: areaTwo.osAreaId } }));
   const mixedSelectorCommand = await wsMessage(tenantSocket, 'mixed-selector command denial');
   if (mixedSelectorCommand.success || fakePhysicalCommandCount !== 1) fail(`WebSocket mixed an authorized entity with an ungranted area target or caused a device effect (${mixedSelectorCommand.success}/${fakePhysicalCommandCount})`);
   await hub.store.upsertDevice({
-    id: 'harness-sensitive-control', name: 'Harness sensitive control', protocol: 'stage1_fake', areaId: areaOne.id,
+    id: 'harness-sensitive-control', name: 'Harness sensitive control', protocol: 'stage1_fake', areaId: areaOne.osAreaId,
     state: { state: 'OFF' }, setup: { status: 'ready' },
     entities: { 'harness-sensitive-control:state': { name: 'Sensitive switch', stateKey: 'state', domain: 'switch', category: 'control', writable: true, primary: true, capability: { readable: true, writable: true, sensitive: true, primary: true, category: 'control', controlId: 'sensitive-power', bindings: [{ serviceId: 'switch.turn_on' }] } } },
   });
@@ -1218,7 +1236,7 @@ async function customerAuthorizationChecks() {
   }
 
   await hub.store.upsertDevice({
-    id: 'harness-tenant-device', name: 'Harness tenant light', protocol: 'zigbee', areaId: areaTwo.id,
+    id: 'harness-tenant-device', name: 'Harness tenant light', protocol: 'zigbee', areaId: areaTwo.osAreaId,
     labelIds: ['tenant_device'], metadata: { label: 'tenant_device', tenantOwnerMembershipId: tenantMembership.id }, state: { state: 'OFF' }, setup: { status: 'ready' },
     entities: { 'harness-tenant-device:state': { name: 'Harness tenant light', stateKey: 'state', domain: 'switch', category: 'control', writable: true, primary: true, capability: { readable: true, writable: true, primary: true, category: 'control', bindings: [{ serviceId: 'switch.turn_on' }] } } },
   });
@@ -1226,7 +1244,7 @@ async function customerAuthorizationChecks() {
   const movedDeviceCommand = await wsMessage(tenantSocket, 'moved tenant device command');
   if (movedDeviceCommand.success || fakePhysicalCommandCount !== 1) fail('Tenant command remained allowed after its device moved outside the granted area');
   await hub.store.upsertDevice({
-    id: 'harness-tenant-device', name: 'Harness tenant light', protocol: 'zigbee', areaId: areaOne.id,
+    id: 'harness-tenant-device', name: 'Harness tenant light', protocol: 'zigbee', areaId: areaOne.osAreaId,
     labelIds: ['tenant_device'], metadata: { label: 'tenant_device', tenantOwnerMembershipId: tenantMembership.id }, state: { state: 'OFF' }, setup: { status: 'ready' },
     entities: { 'harness-tenant-device:state': { name: 'Harness tenant light', stateKey: 'state', domain: 'switch', category: 'control', writable: true, primary: true, capability: { readable: true, writable: true, primary: true, category: 'control', bindings: [{ serviceId: 'switch.turn_on' }, { serviceId: 'switch.turn_off' }, { serviceId: 'switch.toggle' }] } } },
   });
@@ -1234,7 +1252,7 @@ async function customerAuthorizationChecks() {
     id: 'harness-tenant-device',
     name: 'Harness tenant light',
     protocol: 'zigbee',
-    areaId: areaOne.id,
+    areaId: areaOne.osAreaId,
     labelIds: ['tenant_device'],
     metadata: { label: 'tenant_device', tenantOwnerMembershipId: tenantMembership.id },
     state: { state: 'OFF' },
@@ -1259,7 +1277,7 @@ async function customerAuthorizationChecks() {
   const policyClosure = await policyClosed;
   if (policyClosure.code !== 4401) fail(`Policy revision did not close the authenticated WebSocket (${policyClosure.code})`);
   await hub.store.upsertDevice({
-    id: 'harness-tenant-device', name: 'Harness tenant light', protocol: 'zigbee', areaId: areaOne.id,
+    id: 'harness-tenant-device', name: 'Harness tenant light', protocol: 'zigbee', areaId: areaOne.osAreaId,
     labelIds: ['tenant_device'], metadata: { label: 'tenant_device', tenantOwnerMembershipId: tenantMembership.id }, state: { state: 'OFF' }, setup: { status: 'ready' },
     entities: { 'harness-tenant-device:state': { name: 'Harness tenant light', stateKey: 'state', domain: 'switch', category: 'control', writable: true, primary: true, capability: { readable: true, writable: true, primary: true, category: 'control', bindings: [{ serviceId: 'switch.turn_on' }, { serviceId: 'switch.turn_off' }, { serviceId: 'switch.toggle' }] } } },
   });
@@ -1339,9 +1357,9 @@ async function customerAuthorizationChecks() {
   const revokedDeviceLogin = await fetchJson(`${platformBase}/api/v2/auth/session`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ email, password: customerPassword, deviceInstallationId: revocableInstallationId, publicKey: revocablePhone.publicKey, deviceName: 'Harness revoked phone re-login', model: 'integration-test', osFamily: 'test', osVersion: 'test' }) });
   const revokedDeviceAfterLogin = await prisma.trustedDevice.findUniqueOrThrow({ where: { id: revocableTrustedDevice.id }, select: { revokedAt: true, publicKeyThumbprint: true, sessionVersion: true } });
   const revokedDeviceSessionCount = await prisma.customerSession.count({ where: { trustedDeviceId: revocableTrustedDevice.id } });
-  if (revokedDeviceLogin.response.status !== 403 || revokedDeviceLogin.body.errorCode !== 'trusted_device_revoked' || !revokedDeviceAfterLogin.revokedAt || revokedDeviceAfterLogin.publicKeyThumbprint !== revocablePhoneThumbprint || revokedDeviceSessionCount !== 1) fail('Ordinary password login silently restored a revoked trusted phone or created a new session');
+  if (revokedDeviceLogin.response.status !== 403 || revokedDeviceLogin.body.error?.code !== 'AUTH_REQUIRED' || !revokedDeviceLogin.body.error?.requestId || !revokedDeviceAfterLogin.revokedAt || revokedDeviceAfterLogin.publicKeyThumbprint !== revocablePhoneThumbprint || revokedDeviceSessionCount !== 1) fail('Ordinary password login silently restored a revoked trusted phone or created a new session');
   const changedIdentityLogin = await fetchJson(`${platformBase}/api/v2/auth/session`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ email, password: customerPassword, deviceInstallationId: trustedInstallationId, publicKey: revocablePhone.publicKey, deviceName: 'Harness substituted phone key', model: 'integration-test', osFamily: 'test', osVersion: 'test' }) });
-  if (changedIdentityLogin.response.status !== 409 || changedIdentityLogin.body.errorCode !== 'trusted_device_identity_changed') fail(`An active installation ID silently replaced its signing key (${changedIdentityLogin.response.status})`);
+  if (changedIdentityLogin.response.status !== 409 || changedIdentityLogin.body.error?.code !== 'SCOPE_DENIED' || !changedIdentityLogin.body.error?.requestId) fail(`An active installation ID silently replaced its signing key (${changedIdentityLogin.response.status})`);
   while (hub.pairing.syncing) await new Promise((resolve) => setTimeout(resolve, 10));
   hub.pairing.nextRetryAt = 0;
   let callbackRevocation = null;
@@ -1368,7 +1386,7 @@ async function customerAuthorizationChecks() {
   const operatorSession = operatorLogin.session;
   const operatorToken = operatorLogin.token;
   const operatorWork = await prisma.companyOperationalWorkItem.create({ data: { publicReference: `DIN-${sha256(`handoff-${crypto.randomUUID()}`).slice(0, 16).toUpperCase()}`, kind: 'INITIAL_HUB_INSTALLATION', state: 'ASSIGNED', homeId: homeOne.id, hubInstallationId: hubOne.id, certifiedSerialNumber: identityOne.serialNumber, assignedEmployeeId: operatorEmployee.id, createdByEmployeeId: operatorEmployee.id, reason: 'Disposable browser-bound operator handoff test' } });
-  customerFixture = { accountId: account.id, sessionId: session.id, trustedDeviceId: trusted.id, trustedPhonePrivateKey: phone.privateKey, offlineAuthorisationId: tenantOffline.body.authorisation.id, revocableTrustedDeviceId: revocableTrustedDevice.id, revocableRawSession, revocablePhonePrivateKey: revocablePhone.privateKey, revocableOfflineAuthorisationId: revocableOffline.body.authorisation.id, propertyAccountId: propertyAccount.id, propertySessionId: propertySession.id, propertyTrustedDeviceId: propertyTrusted.id, managerAccountId: managerAccount.id, managerMembershipId: managerMembership.id, managerSessionId: managerSession.id, managerTrustedDeviceId: managerTrusted.id, homeOneId: homeOne.id, homeTwoId: homeTwo.id, hubOneId: hubOne.id, hubTwoId: hubTwo.id, identityOneId: identityOne.id, identityTwoId: identityTwo.id, tenantDeviceId: tenantDevice.id, machineSecret, tenantMembershipId: tenantMembership.id, ownerMembershipId: ownerMembership.id, propertyMembershipId: propertyMembership.id, areaOneId: areaOne.id, areaTwoId: areaTwo.id, tenantToken: tenantToken.body.token, ownerToken: ownerToken.body.token, propertyToken: propertyToken.body.token, managerToken: managerToken.body.token, ticketId, stepUpTicketId, identityOneSigningPrivateKey: identityOneSigning.privateKey, identityOneSigningPublicKey: identityOneSigning.publicKey, identityOneEncryptionPrivateKey: identityOneEncryption.privateKey, identityOneEncryptionPublicKey: identityOneEncryption.publicKey, identityOneSerial: identityOne.serialNumber, identityOneGeneration: identityOne.identityGeneration, operatorEmployeeId: operatorEmployee.id, operatorSessionId: operatorSession.id, operatorWorkId: operatorWork.id, operatorToken };
+  customerFixture = { accountId: account.id, sessionId: session.id, trustedDeviceId: trusted.id, trustedPhonePrivateKey: phone.privateKey, customerSessionSecret: rawSession, offlineAuthorisationId: tenantOffline.body.authorisation.id, revocableTrustedDeviceId: revocableTrustedDevice.id, revocableRawSession, revocablePhonePrivateKey: revocablePhone.privateKey, revocableOfflineAuthorisationId: revocableOffline.body.authorisation.id, propertyAccountId: propertyAccount.id, propertySessionId: propertySession.id, propertyTrustedDeviceId: propertyTrusted.id, managerAccountId: managerAccount.id, managerMembershipId: managerMembership.id, managerSessionId: managerSession.id, managerTrustedDeviceId: managerTrusted.id, homeOneId: homeOne.id, homeTwoId: homeTwo.id, hubOneId: hubOne.id, hubTwoId: hubTwo.id, identityOneId: identityOne.id, identityTwoId: identityTwo.id, tenantDeviceId: tenantDevice.id, machineSecret, tenantMembershipId: tenantMembership.id, ownerMembershipId: ownerMembership.id, propertyMembershipId: propertyMembership.id, areaOneId: areaOne.id, areaOneOsId: areaOne.osAreaId, areaTwoId: areaTwo.id, areaTwoOsId: areaTwo.osAreaId, tenantToken: tenantToken.body.token, ownerToken: ownerToken.body.token, propertyToken: propertyToken.body.token, managerToken: managerToken.body.token, ticketId, stepUpTicketId, identityOneSigningPrivateKey: identityOneSigning.privateKey, identityOneSigningPublicKey: identityOneSigning.publicKey, identityOneEncryptionPrivateKey: identityOneEncryption.privateKey, identityOneEncryptionPublicKey: identityOneEncryption.publicKey, identityOneSerial: identityOne.serialNumber, identityOneGeneration: identityOne.identityGeneration, operatorEmployeeId: operatorEmployee.id, operatorSessionId: operatorSession.id, operatorWorkId: operatorWork.id, operatorToken };
 }
 
 async function operatorMutationChecks() {
@@ -1499,7 +1517,9 @@ async function operatorMutationChecks() {
 async function osChecks() {
   const base = `http://127.0.0.1:${hub.server.address().port}`;
   const platformBase = `http://127.0.0.1:${appPort}`;
-  const remoteHost = 'harness-one.example.invalid';
+  // Match the exact verified reserved hostname seeded for hub one. The
+  // operator-attempt route intentionally rejects a caller-selected origin.
+  const remoteHost = harnessCloudHostname;
   const remoteOsHeaders = { host: remoteHost, origin: `https://${remoteHost}`, 'x-forwarded-proto': 'https' };
   let localHost = '192.168.0.111:8123';
   let localOsHeaders = { host: localHost, origin: `http://${localHost}` };
@@ -1537,6 +1557,12 @@ async function osChecks() {
   // Synchronize signed policy from the actual Platform machine route into the
   // running OS store, including both active and later-revoked phone grants.
   await hub.pairing.requestImmediateHeartbeat();
+  const synchronizedAreaBindings = hub.store.getPlatform().areaBindings;
+  const sortedAreaBindings = [...synchronizedAreaBindings].sort((left, right) => left.areaId.localeCompare(right.areaId));
+  const expectedAreaBindings = [
+    { areaId: customerFixture.areaOneId, hubAreaId: customerFixture.areaOneOsId },
+  ].sort((left, right) => left.areaId.localeCompare(right.areaId));
+  if (JSON.stringify(sortedAreaBindings) !== JSON.stringify(expectedAreaBindings)) fail('Machine-authenticated token-state did not synchronize the canonical Area UUID to private OS alias mapping');
   let endpointRow = await prisma.hubInstallation.findUniqueOrThrow({ where: { id: customerFixture.hubOneId }, select: { baseUrl: true, lanEndpointRevision: true, lanEndpointReportedAt: true, lanEndpointState: true, lanEndpointIdentityGeneration: true } });
   if (endpointRow.baseUrl !== 'http://192.168.0.110:8123' || endpointRow.lanEndpointState !== 'CURRENT' || endpointRow.lanEndpointRevision < 1 || endpointRow.lanEndpointIdentityGeneration !== customerFixture.identityOneGeneration) fail('The real signed OS heartbeat did not replace the stale historical LAN endpoint with the current identity-bound endpoint');
   const signedHeartbeat = async (body, nonce = `harness-endpoint-${crypto.randomUUID()}`) => {
@@ -1597,6 +1623,23 @@ async function osChecks() {
   console.log('[stage1:integration] PASS: post-revocation hub sync rejects the previously issued offline grant without a command side effect');
   const platformTenantRead = await fetchJson(`${base}/_dinodia/admin/api/devices`, { headers: { authorization: `Bearer ${customerFixture.tenantToken}` } });
   if (platformTenantRead.response.status !== 200) fail(`A real Platform-issued tenant token was not accepted by Dinodia OS (${platformTenantRead.response.status}/${platformTenantRead.body.errorCode || platformTenantRead.body.error || 'unknown'})`);
+  const freshNativeSession = await fetchJson(`${platformBase}/api/v2/hub-sessions`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-session': customerFixture.customerSessionSecret }, body: JSON.stringify({ homeId: customerFixture.homeOneId }) });
+  if (freshNativeSession.response.status !== 200 || !freshNativeSession.body.token) fail(`Real customer login could not refresh a selected-home token for Native V1 HTTP (${freshNativeSession.response.status}/${freshNativeSession.body.error?.code || 'unknown'})`);
+  const nativeDeviceRead = await fetchJson(`${base}/api/dinodia/v1/devices`, { headers: { authorization: `Bearer ${freshNativeSession.body.token}` } });
+  const nativeTenantDevice = nativeDeviceRead.body.data?.find((device) => device.id === 'harness-tenant-device');
+  if (nativeDeviceRead.response.status !== 200 || !nativeTenantDevice || nativeTenantDevice.managementClass !== 'tenant_device' || nativeTenantDevice.ownerMembershipId !== customerFixture.tenantMembershipId || JSON.stringify(nativeTenantDevice.areaIds) !== JSON.stringify([customerFixture.areaOneId]) || nativeTenantDevice.areaIds.includes(customerFixture.areaOneOsId)) fail(`Native V1 OS read did not serialize only the canonical Platform Area UUID for a private device (${nativeDeviceRead.response.status}/${nativeDeviceRead.body?.error?.code || nativeDeviceRead.body?.errorCode || 'no-code'}/${JSON.stringify(nativeTenantDevice?.areaIds || null)})`);
+  const nativeControl = nativeTenantDevice.controls.find((control) => control.writable && control.valueType === 'boolean');
+  if (!nativeControl) fail('The safe fixture device did not expose a writable boolean Native V1 control');
+  const nativeCommand = { commandId: `command-${crypto.randomUUID()}`, homeId: customerFixture.homeOneId, homeMembershipId: customerFixture.tenantMembershipId, deviceId: nativeTenantDevice.id, controlId: nativeControl.controlId, descriptorRevision: nativeTenantDevice.descriptorRevision, value: true, issuedAt: new Date().toISOString(), idempotencyKey: `native-area-${crypto.randomUUID()}` };
+  const physicalBeforeNative = fakePhysicalCommandCount;
+  const acceptedNativeCommand = await fetchJson(`${base}/api/dinodia/v1/commands`, { method: 'POST', headers: { authorization: `Bearer ${freshNativeSession.body.token}`, 'content-type': 'application/json', 'idempotency-key': nativeCommand.idempotencyKey }, body: JSON.stringify(nativeCommand) });
+  if (acceptedNativeCommand.response.status !== 202 || fakePhysicalCommandCount !== physicalBeforeNative + 1) fail(`Native V1 command through a canonical-ID DTO did not dispatch exactly once (${acceptedNativeCommand.response.status}/${fakePhysicalCommandCount - physicalBeforeNative})`);
+  const wrongHomeCommand = { ...nativeCommand, commandId: `command-${crypto.randomUUID()}`, homeId: customerFixture.homeTwoId, idempotencyKey: `native-wrong-home-${crypto.randomUUID()}` };
+  const deniedNativeCommand = await fetchJson(`${base}/api/dinodia/v1/commands`, { method: 'POST', headers: { authorization: `Bearer ${freshNativeSession.body.token}`, 'content-type': 'application/json', 'idempotency-key': wrongHomeCommand.idempotencyKey }, body: JSON.stringify(wrongHomeCommand) });
+  if (deniedNativeCommand.response.status !== 403 || deniedNativeCommand.body.error?.code !== 'HOME_MISMATCH' || fakePhysicalCommandCount !== physicalBeforeNative + 1) fail('Wrong-home Native V1 command was not denied before fake-device dispatch');
+  const ownerNativeRead = await fetchJson(`${base}/api/dinodia/v1/devices`, { headers: { authorization: `Bearer ${customerFixture.propertyToken}` } });
+  if (ownerNativeRead.response.status !== 403 || ownerNativeRead.body.error?.code !== 'SCOPE_DENIED' || JSON.stringify(ownerNativeRead.body).includes('Harness tenant light') || fakePhysicalCommandCount !== physicalBeforeNative + 1) fail('Property-role Native V1 OS read was not denied without private device bytes');
+  console.log('[stage2:integration] PASS: real customer login -> canonical membership Area UUID -> selected-home token -> machine-synchronized private hub alias -> Native V1 OS read and safe command; wrong-home and owner denials caused zero extra effects');
   for (const [role, token] of [['owner', customerFixture.propertyToken], ['property-manager', customerFixture.managerToken]]) {
     for (const suffix of ['capabilities', 'support-bundle']) {
       const privateRead = await fetchJson(`${base}/_dinodia/admin/api/devices/${encodeURIComponent('harness-tenant-device')}/${suffix}`, { headers: { authorization: `Bearer ${token}` } });
@@ -2019,7 +2062,7 @@ try {
     // This fixture's certified serial is deliberately the same opaque string
     // as its installation UUID; the separate seed above still asserts the
     // Platform grants are bound to the certified serial snapshot.
-    config: { nodeEnv: 'production', v2Environment: 'test', stage1InternalOperatorDaySession: true, operatorPolicySyncIntervalMs: 60000, hubId: harnessHubInstallationId, haPort: 0, hubAgentPort: 0, dataDir, dataFile: path.join(dataDir, 'dinodia.json'), backupDir: path.join(dataDir, 'backups'), staticDir: path.join(osRoot, 'public'), operatorPublicKey, appPublicKeys: env.DINODIA_APP_PUBLIC_KEYS, platformApiUrl: 'https://dinodia-platform-v2.vercel.app', nativeAutomationsMode: 'off', hiveEnabled: false, googleNestEnabled: false, cloudflarePublicHostname: 'harness-one.example.invalid' },
+    config: { nodeEnv: 'production', v2Environment: 'test', stage1InternalOperatorDaySession: true, operatorPolicySyncIntervalMs: 60000, hubId: harnessHubInstallationId, haPort: 0, hubAgentPort: 0, dataDir, dataFile: path.join(dataDir, 'dinodia.json'), backupDir: path.join(dataDir, 'backups'), staticDir: path.join(osRoot, 'public'), operatorPublicKey, appPublicKeys: env.DINODIA_APP_PUBLIC_KEYS, platformApiUrl: 'https://dinodia-platform-v2.vercel.app', nativeAutomationsMode: 'off', hiveEnabled: false, googleNestEnabled: false, cloudflarePublicHostname: harnessCloudHostname },
     identityBroker: harnessIdentityBroker,
     logger: { error() {}, warn() {}, log() {} },
     clock: () => osHarnessNow,

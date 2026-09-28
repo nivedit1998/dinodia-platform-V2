@@ -1,7 +1,8 @@
 import { NextResponse } from 'next/server';
 import crypto from 'node:crypto';
 import { prisma } from '@/lib/prisma';
-import { requireEmployeeRecentAuth, Stage1AuthError, authErrorResponse } from '@/lib/stage1Auth';
+import { nativeV1ErrorResponse } from '@/lib/contracts/nativeV1Error';
+import { requireEmployeeRecentAuth, Stage1AuthError } from '@/lib/stage1Auth';
 import { sha256 } from '@/lib/stage1Crypto';
 import { createHubBoundOperatorGrant, encryptOperatorGrant, supportRedeemDigest } from '@/lib/stage1Operator';
 
@@ -37,5 +38,5 @@ export async function POST(request: Request, context: { params: Promise<{ ticket
     // envelope for the authenticated hub to fetch over its machine channel;
     // never put it in a browser/API response.
     return NextResponse.json({ ok: true, requestId: row.id, status: 'ISSUED', supportUrl: `${hub.cloudUrl.replace(/\/$/, '')}/support-access`, codeExpiresAt: expiresAt }, { headers: { 'Cache-Control': 'no-store', Pragma: 'no-cache' } });
-  } catch (error) { return authErrorResponse(error); }
+  } catch (error) { return nativeV1ErrorResponse(error); }
 }

@@ -90,7 +90,7 @@ export async function requireCustomer(request: Request): Promise<CustomerPrincip
     ? await prisma.tenantAreaGrant.findMany({ where: { membershipId: membership.id, homeId: membership.homeId, revokedAt: null, area: { status: 'ACTIVE' } }, select: { areaId: true } })
     : [];
   const currentAreaIds = new Set(currentGrants.map((grant) => grant.areaId));
-  if (membership.role === 'TENANT' && verified.areaIds.some((areaId) => !currentAreaIds.has(areaId))) fail(new Stage1AuthError(401, 'area_policy_stale', 'The app session must refresh its current area permissions'));
+  if (membership.role === 'TENANT' && (verified.areaIds.some((areaId) => !currentAreaIds.has(areaId)) || new Set(verified.areaIds).size !== verified.areaIds.length || currentAreaIds.size !== verified.areaIds.length)) fail(new Stage1AuthError(401, 'area_policy_stale', 'The app session must refresh its current area permissions'));
   const currentMembershipAreas = membership.role === 'TENANT'
     ? [...currentAreaIds]
     : verified.areaIds;

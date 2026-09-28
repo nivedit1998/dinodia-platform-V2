@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
-import { requireCustomer, Stage1AuthError, authErrorResponse } from '@/lib/stage1Auth';
+import { nativeV1ErrorResponse } from '@/lib/contracts/nativeV1Error';
+import { requireCustomer, Stage1AuthError } from '@/lib/stage1Auth';
 import { consumeStepUp } from '@/lib/sensitiveOperationStepUp';
 import { createPropertySupportNotifications } from '@/lib/supportNotifications';
 
@@ -35,5 +36,5 @@ export async function POST(request: Request, context: { params: Promise<{ ticket
       await tx.auditEvent.create({ data: { homeId: row.homeId, actorType: 'CUSTOMER', actorId: customer.id, category: 'SECURITY', action: 'support_access_revoked', targetType: 'SupportAccessRequest', targetId: requestId, metadata: { ticketId, scope: 'PROPERTY_SCOPE', outcome: 'revoked', hubAcknowledgementPending: sessions.length > 0 }, purgeAt: new Date(now.getTime() + 365 * 24 * 60 * 60 * 1000) } });
     });
     return NextResponse.json({ ok: true, requestId, status: 'REVOKED', message: 'Property support access revoked — waiting for hub confirmation' }, { headers: { 'Cache-Control': 'no-store', Pragma: 'no-cache' } });
-  } catch (error) { return authErrorResponse(error); }
+  } catch (error) { return nativeV1ErrorResponse(error); }
 }

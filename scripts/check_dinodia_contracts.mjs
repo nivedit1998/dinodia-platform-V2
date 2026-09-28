@@ -230,6 +230,7 @@ const semanticOnlyFixturePaths = new Set([
   "multi-channel-mixed-controls.json",
   "out-of-order-events.json",
   "replacement-hub.json",
+  "stage2-decision-matrix.json",
 ]);
 const indexedFixturePaths = new Set([...fixtureCases.map(([filename]) => filename), ...semanticOnlyFixturePaths]);
 if (indexedFixturePaths.size !== fixtureFiles.length) {
@@ -274,6 +275,30 @@ if (movedDevice.areaAssignment.revision <= movedDevice.history.priorAssignmentRe
 const replacementHub = JSON.parse(fs.readFileSync(path.join(fixtureRoot, "replacement-hub.json"), "utf8"));
 if (replacementHub.hubInstallationId === replacementHub.previousHubInstallationId || replacementHub.nameBasedMergeAllowed !== false)
   throw new Error("Hub replacement must use a new installation identity and prohibit name-based merge");
+const decisionMatrix = JSON.parse(fs.readFileSync(path.join(fixtureRoot, "stage2-decision-matrix.json"), "utf8"));
+const decisionMatrixValid = decisionMatrix.schemaVersion === contract.contractVersion &&
+  decisionMatrix.identity.customerIsEmployee === false && decisionMatrix.identity.activeOwnerMembershipIds.length === 1 &&
+  decisionMatrix.identity.activeManagerMembershipIds.length > 1 && decisionMatrix.identity.membershipCreatedForPendingInvitation === false &&
+  new Set(decisionMatrix.property.areas.map((area) => area.id)).size === 2 &&
+  new Set(decisionMatrix.property.areas.map((area) => area.floorplanShapeId)).size === 2 &&
+  decisionMatrix.property.areas.every((area) => area.overrideName === "Bedroom") &&
+  decisionMatrix.property.fullGrantCombinedAreaIds.length === 2 && decisionMatrix.property.partialGrantCombinedAreaIds.length === 1 &&
+  decisionMatrix.tenantPrivacy.visibleToMembershipIds.length === 1 && decisionMatrix.tenantPrivacy.visibleToMembershipIds[0] === decisionMatrix.tenantPrivacy.ownerMembershipId &&
+  [decisionMatrix.tenantPrivacy.ownerCanRead, decisionMatrix.tenantPrivacy.managerCanRead, decisionMatrix.tenantPrivacy.otherTenantCanRead, decisionMatrix.tenantPrivacy.labelChangesAuthority].every((value) => value === false) &&
+  decisionMatrix.replacement.homeIdPreserved === true && decisionMatrix.replacement.areaIdsPreserved === true && decisionMatrix.replacement.previousHubInstallationId !== decisionMatrix.replacement.currentHubInstallationId && decisionMatrix.replacement.previousDeviceId !== decisionMatrix.replacement.replacementDeviceId && decisionMatrix.replacement.nameBasedMergeAllowed === false && decisionMatrix.replacement.previousHistoryRewritten === false && decisionMatrix.replacement.previousHistoryRetained === true &&
+  decisionMatrix.support.categories.join(",") === contract.$defs.supportTicket.properties.category.enum.join(",") && decisionMatrix.support.privateTenantDeviceTicketVisibleToOwner === false && decisionMatrix.support.privateTenantDeviceTicketNotifiesOwner === false && decisionMatrix.support.infrastructureTicketNotifiesOwner === true && decisionMatrix.support.infrastructureNoticeContainsTenantPrivateDetails === false && decisionMatrix.support.sameApproverRequiredForSafetyConfirmation === true && decisionMatrix.support.closedTicketRevokesAuthorityImmediately === true && decisionMatrix.support.offlineHubAcknowledgementCanRemainPending === true &&
+  decisionMatrix.claim.firstVerifiedEmailWins === true && decisionMatrix.claim.reservationSeconds === 1800 && decisionMatrix.claim.qualifyingRequiredSaveCanExtend === true && decisionMatrix.claim.duplicateOrNoOpCanExtend === false && decisionMatrix.claim.transferClaimExpiresByTime === false && decisionMatrix.claim.unfinishedPropertyDataDeletedOnRelease === true &&
+  decisionMatrix.notification.mandatorySecurityIgnoresQuietHours === true && decisionMatrix.notification.optionalEnabledEventMayDefer === true && decisionMatrix.notification.tenantDeviceAudience === "owning_membership_only" && decisionMatrix.notification.smsEnabled === false && decisionMatrix.notification.inboxEnabled === false && decisionMatrix.notification.deliveryReceiptGrantsAuthority === false &&
+  decisionMatrix.controls.labelCanCreateCapability === false && decisionMatrix.controls.descriptorRevisionRequiredForWrite === true && decisionMatrix.controls.staleOrOfflineCommandAllowed === false && decisionMatrix.controls.securityControlRequiresAppStepUp === true && decisionMatrix.controls.securityControlAutomatable === false && decisionMatrix.controls.securityControlAlexaExposed === false &&
+  decisionMatrix.automation.bundleContainsHomeAndRevision === true && decisionMatrix.automation.saveRequiresCurrentRevision === true && decisionMatrix.automation.staleRevisionIsRejectedWithoutMerge === true && decisionMatrix.automation.appOnlySecurityControlEligible === false && decisionMatrix.automation.presentationLabelsGrantCapability === false &&
+  decisionMatrix.alexa.activeMembershipRole === "TENANT" && decisionMatrix.alexa.selectedAreaIdsAreAuthoritative === true && decisionMatrix.alexa.ownTenantDeviceEligible === true && decisionMatrix.alexa.otherTenantDeviceEligible === false && decisionMatrix.alexa.appOnlySecurityControlEligible === false && decisionMatrix.alexa.exposureGenerationMonotonic === true &&
+  decisionMatrix.trustedDevice.removalRevokesAccountInstallation === true && decisionMatrix.trustedDevice.offlineReenrollmentAllowed === false && decisionMatrix.trustedDevice.removalAcknowledgementMayRemainPending === true &&
+  decisionMatrix.provisioning.hubOwnsCapabilityDescriptors === true && decisionMatrix.provisioning.platformOwnsMembershipAuthority === true && decisionMatrix.provisioning.cloudUrlIndependentlyVerified === true && decisionMatrix.provisioning.manufacturingRootPrivateKeyOnHub === false &&
+  decisionMatrix.roomQr.oneHomeClaimAuthority === true && decisionMatrix.roomQr.claimReservationFirstWins === true && decisionMatrix.roomQr.installerSetupPresentationIsCustomerClaim === false && decisionMatrix.roomQr.roomQrRetriesCreateAlternativeClaims === false &&
+  decisionMatrix.notifications.audienceRecomputedFromCurrentAuthority === true && decisionMatrix.notifications.channels.join(",") === "push,verified_email" && decisionMatrix.notifications.smsEnabled === false && decisionMatrix.notifications.inboxEnabled === false && decisionMatrix.notifications.deduplicatedByEventAndRecipient === true && decisionMatrix.notifications.deliveryReceiptGrantsAuthority === false && decisionMatrix.notifications.retryHoursMaximum === 24 &&
+  Object.values(decisionMatrix.offline).every((value) => value === true || value === false) && decisionMatrix.offline.previouslyEnrolledTrustedInstallationRequired === true && decisionMatrix.offline.exactHomeAndMembershipBound === true && decisionMatrix.offline.signedExactHomeChallengeRequired === true && decisionMatrix.offline.scopeCanWiden === false && decisionMatrix.offline.policyAppliedBeforeConnected === true &&
+  decisionMatrix.analytics.validityDeadlineInclusive === false && decisionMatrix.analytics.expiredQuality === "unknown" && decisionMatrix.analytics.targetTemperatureCountsAsActivity === false && decisionMatrix.analytics.periodAggregation === "average_contributing_device_samples" && decisionMatrix.analytics.hourAggregation === "sum_selected_devices" && decisionMatrix.analytics.summaryAggregation === "average_displayed_buckets";
+if (!decisionMatrixValid) throw new Error("Stage 2 authority, privacy, lifecycle, offline or presentation decision fixture conflicts with the canonical contract");
 const mixedChannels = JSON.parse(fs.readFileSync(path.join(fixtureRoot, "multi-channel-mixed-controls.json"), "utf8"));
 if (!mixedChannels.channels.length || mixedChannels.channels.some((channel) => channel.deviceId !== mixedChannels.channels[0].deviceId || channel.controls.some((control) => !["boolean", "number", "option", "text", "invoke"].includes(control.valueType) || !["power", "brightness", "active_heat_demand", "active_heat_production", "target_temperature", "ambient_temperature", "opening_percentage", "connectivity", "security_lock", "lock_state", "operating_mode", "position", "volume", "color", "state", "unknown"].includes(control.semanticRole))))
   throw new Error("Mixed-channel controls must retain one device identity and known canonical semantic/value types");
@@ -489,6 +514,40 @@ for (const [pointer, expected] of requiredDecisions) {
   if (JSON.stringify(actual) !== JSON.stringify(expected))
     throw new Error(`Missing or conflicting frozen decision: ${pointer}`);
 }
+if (
+  decisionMatrix.claim.reservationSeconds !== decisions.homeLifecycle.claimReservationSeconds ||
+  decisionMatrix.notification.tenantDeviceAudience !== decisions.notifications.tenantDeviceEventAudience ||
+  decisionMatrix.controls.securityControlRequiresAppStepUp !== decisions.controlPolicy.appOnlySecurityManualStepUp ||
+  decisionMatrix.controls.securityControlAutomatable !== decisions.controlPolicy.appOnlySecurityAutomation ||
+  decisionMatrix.controls.securityControlAlexaExposed !== decisions.controlPolicy.appOnlySecurityAlexa ||
+  decisionMatrix.automation.appOnlySecurityControlEligible !== decisions.controlPolicy.appOnlySecurityAutomation ||
+  decisionMatrix.automation.presentationLabelsGrantCapability !== decisions.controlPolicy.labelAuthority ||
+  decisionMatrix.alexa.activeMembershipRole !== decisions.alexa.activeMembershipRole ||
+  decisionMatrix.alexa.selectedAreaIdsAreAuthoritative !== decisions.alexa.selectedAreaIdsAreAuthoritative ||
+  decisionMatrix.alexa.ownTenantDeviceEligible !== decisions.alexa.tenantDeviceEligibleOnlyForOwningMembership ||
+  decisionMatrix.alexa.otherTenantDeviceEligible === decisions.alexa.tenantDeviceEligibleOnlyForOwningMembership ||
+  decisionMatrix.alexa.appOnlySecurityControlEligible === decisions.alexa.appOnlySecurityControlsExcludedRegardlessOfClientFlags ||
+  decisionMatrix.alexa.exposureGenerationMonotonic !== decisions.alexa.exposureGeneration.includes("monotonic") ||
+  decisionMatrix.trustedDevice.removalRevokesAccountInstallation !== decisions.offlineAuthority.trustedDeviceRemovalAccountWide ||
+  decisionMatrix.trustedDevice.offlineReenrollmentAllowed !== decisions.offlineAuthority.offlineEnrollmentAllowed ||
+  decisionMatrix.trustedDevice.removalAcknowledgementMayRemainPending !== decisions.offlineAuthority.hubRevocationAcknowledgementMayRemainPending ||
+  decisionMatrix.provisioning.hubOwnsCapabilityDescriptors !== decisions.provisioning.hubOwnsDiscoveryAndCapabilityDescriptors ||
+  decisionMatrix.provisioning.platformOwnsMembershipAuthority !== decisions.provisioning.platformOwnsHomeMembershipAndCloudProjection ||
+  decisionMatrix.provisioning.cloudUrlIndependentlyVerified !== decisions.provisioning.cloudUrlMustBeIndependentlyVerified ||
+  decisionMatrix.provisioning.manufacturingRootPrivateKeyOnHub !== decisions.provisioning.manufacturingRootPrivateKeyOnHub ||
+  decisionMatrix.roomQr.claimReservationFirstWins !== decisions.homeLifecycle.claimReservationFirstWins ||
+  decisionMatrix.notifications.audienceRecomputedFromCurrentAuthority !== decisions.notifications.audienceFromCurrentAuthority ||
+  decisionMatrix.notifications.channels.join(",") !== decisions.notifications.deliveryChannels.join(",") ||
+  decisionMatrix.notifications.smsEnabled !== decisions.notifications.sms ||
+  decisionMatrix.notifications.inboxEnabled !== decisions.notifications.inbox ||
+  decisionMatrix.notifications.deduplicatedByEventAndRecipient !== decisions.notifications.deduplicateByEventAndRecipient ||
+  decisionMatrix.notifications.deliveryReceiptGrantsAuthority === decisions.notifications.deliveryReceiptIsNotAuthority ||
+  decisionMatrix.notifications.retryHoursMaximum !== decisions.notifications.deliveryRetryHoursMaximum ||
+  decisionMatrix.offline.previouslyEnrolledTrustedInstallationRequired !== decisions.offlineAuthority.requiresPreviouslyEnrolledTrustedInstallation ||
+  decisionMatrix.offline.exactHomeAndMembershipBound !== decisions.offlineAuthority.bindsExactHomeAndMembership ||
+  decisionMatrix.offline.scopeCanWiden === decisions.offlineAuthority.scopeCannotWidenOffline ||
+  decisionMatrix.offline.policyAppliedBeforeConnected !== decisions.offlineAuthority.applyRevocationAndCurrentPolicyBeforeConnected
+) throw new Error("Stage 2 decision fixture diverges from the authoritative decision register");
 const expectedNativeTasks = [
   { taskId: "operator_credential_lifecycle", owner: "supabase_pg_cron_two_minute" },
   { taskId: "support_expiry_and_revocation", owner: "supabase_pg_cron_two_minute" },
@@ -554,9 +613,42 @@ if (
   !matrix.includes("stage2TaskAllocation")
 )
   throw new Error("Static-to-live screen/action registry is incomplete or contains TBC");
-const screenKeys = [...matrix.matchAll(/^\| `([^`]+)` \|/gm)].map((match) => match[1]);
+const registerHeading = "## Screen, field, action and state register";
+const registerStart = matrix.indexOf(registerHeading);
+const registerEnd = matrix.indexOf("\n### Fixed native task registry", registerStart + registerHeading.length);
+if (registerStart < 0 || registerEnd < 0)
+  throw new Error("Static-to-live screen/action register section is missing or unterminated");
+const registerText = matrix.slice(registerStart + registerHeading.length, registerEnd);
+const splitMarkdownRow = (line) => {
+  const cells = [];
+  let current = "";
+  let inCode = false;
+  for (let index = 1; index < line.length - 1; index += 1) {
+    const character = line[index];
+    if (character === "`") inCode = !inCode;
+    if (character === "|" && !inCode) {
+      cells.push(current.trim());
+      current = "";
+    } else current += character;
+  }
+  cells.push(current.trim());
+  return cells;
+};
+const registerRows = registerText
+  .split(/\r?\n/)
+  .filter((line) => /^\| `[^`]+` \|/.test(line))
+  .map((line) => ({ line, cells: splitMarkdownRow(line) }));
+const screenKeys = registerRows.map(({ cells }) => cells[0].replace(/^`|`$/g, ""));
 if (new Set(screenKeys).size !== screenKeys.length)
   throw new Error("Static-to-live screen/action register contains duplicate stable keys");
+if (registerRows.length < 50)
+  throw new Error(`Static-to-live screen/action register is incomplete: ${registerRows.length} rows`);
+for (const { line, cells } of registerRows) {
+  if (cells.length !== 6 || cells.some((cell) => !cell))
+    throw new Error(`Static-to-live screen/action row must define all six contract columns: ${line}`);
+  if (!/(?:Stages? \d+|all stages)/i.test(cells[5]) || cells[5].length < 16)
+    throw new Error(`Static-to-live screen/action row must name an owning stage and fixture reference: ${line}`);
+}
 for (const key of [
   "auth.owner.sign_in", "auth.owner.registration", "home.claim.scan", "home.claim.manual_code",
   "home.claim.retained_address", "home.claim.lost_reference", "owner.home.deregister",
@@ -603,6 +695,9 @@ for (const [repo, relative] of [
   )
     throw new Error(`Consumer contract bundle drift: ${repo}`);
 }
+const iosPrototypeMatrix = path.resolve(root, "../dinodia-ios-app-V2/Dinodia/DebugFixtures/V2_STATIC_TO_LIVE_MATRIX.md");
+if (fs.readFileSync(iosPrototypeMatrix, "utf8") !== matrix)
+  throw new Error("iOS DEBUG contract prototype matrix differs from the canonical Platform matrix");
 console.log(
   `dinodia.v1 schemas=${schemas.size} JSON fixtures=${fixtureFiles.length} runtime validators=${validatorNames.length}; Alexa projection valid and non-tenant rejected`,
 );

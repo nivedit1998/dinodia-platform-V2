@@ -1,5 +1,6 @@
 import { NextResponse } from 'next/server';
-import { assertCustomerCanCommand, requireCustomer, Stage1AuthError, authErrorResponse } from '@/lib/stage1Auth';
+import { nativeV1ErrorResponse } from '@/lib/contracts/nativeV1Error';
+import { assertCustomerCanCommand, requireCustomer, Stage1AuthError } from '@/lib/stage1Auth';
 import { prisma } from '@/lib/prisma';
 import { consumeStepUp, descriptorBoundValue } from '@/lib/sensitiveOperationStepUp';
 
@@ -31,5 +32,5 @@ export async function POST(request: Request) {
     }
     const result = await consumeStepUp({ proof, customerAccountId: customer.id, customerSessionId: customer.sessionId, trustedDeviceId: customer.trustedDeviceId, homeId: customer.homeId, membershipId: customer.membershipId, hubInstallationId: customer.hubInstallationId, operationKind, targetIds, value: operationValue, policyRevision: customer.policyRevision });
     return NextResponse.json(result, { headers: { 'Cache-Control': 'no-store', Pragma: 'no-cache' } });
-  } catch (error) { return authErrorResponse(error); }
+  } catch (error) { return nativeV1ErrorResponse(error); }
 }

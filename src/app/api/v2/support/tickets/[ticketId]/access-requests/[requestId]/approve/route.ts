@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
-import { requireCustomer, Stage1AuthError, authErrorResponse } from '@/lib/stage1Auth';
+import { nativeV1ErrorResponse } from '@/lib/contracts/nativeV1Error';
+import { requireCustomer, Stage1AuthError } from '@/lib/stage1Auth';
 import { consumeStepUp } from '@/lib/sensitiveOperationStepUp';
 import { randomSecret, sha256 } from '@/lib/stage1Crypto';
 
@@ -40,5 +41,5 @@ export async function POST(request: Request, context: { params: Promise<{ ticket
     // Platform stores the hash and the hub later supplies the code over its
     // machine-authenticated local support surface.
     return NextResponse.json({ ok: true, requestId: row.id, status: approve ? 'APPROVED' : 'DENIED', ...(oneUseCode ? { oneUseCode, codeExpiresAt } : {}) }, { headers: { 'Cache-Control': 'no-store', Pragma: 'no-cache' } });
-  } catch (error) { return authErrorResponse(error); }
+  } catch (error) { return nativeV1ErrorResponse(error); }
 }

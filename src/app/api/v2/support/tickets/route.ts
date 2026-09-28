@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
-import { requireCustomer, Stage1AuthError, authErrorResponse } from '@/lib/stage1Auth';
+import { nativeV1ErrorResponse } from '@/lib/contracts/nativeV1Error';
+import { requireCustomer, Stage1AuthError } from '@/lib/stage1Auth';
 import { randomSecret } from '@/lib/stage1Crypto';
 
 export const dynamic = 'force-dynamic';
@@ -15,5 +16,5 @@ export async function POST(request: Request) {
     const publicReference = `DNO-${randomSecret(9).toUpperCase()}`.slice(0, 20);
     const ticket = await prisma.supportTicket.create({ data: { publicReference, customerAccountId: customer.id, homeId: customer.homeId, selectedMembershipId: customer.membershipId, category, description }, select: { id: true, publicReference: true, status: true, createdAt: true } });
     return NextResponse.json({ ok: true, ticket }, { status: 201, headers: { 'Cache-Control': 'no-store', Pragma: 'no-cache' } });
-  } catch (error) { return authErrorResponse(error); }
+  } catch (error) { return nativeV1ErrorResponse(error); }
 }

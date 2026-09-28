@@ -21,4 +21,7 @@ for (const [repo, relative] of repos) {
   for (const [name, bytes] of files) hash.update(name).update('\0').update(bytes).update('\0');
   fs.writeFileSync(path.join(target, 'manifest.json'), JSON.stringify({ contractVersion: 'dinodia.v1', bundleSha256: hash.digest('hex') }, null, 2) + '\n');
 }
-console.log(`Synchronized dinodia.v1 schemas and fixtures to ${repos.length} consumers`);
+const iosPrototype = path.resolve(platform, '../dinodia-ios-app-V2/Dinodia/DebugFixtures');
+fs.mkdirSync(iosPrototype, { recursive: true });
+fs.copyFileSync(path.join(source, 'V2_STATIC_TO_LIVE_MATRIX.md'), path.join(iosPrototype, 'V2_STATIC_TO_LIVE_MATRIX.md'));
+console.log(`Synchronized dinodia.v1 schemas and fixtures to ${repos.length} consumers and the DEBUG-only iOS prototype`);
