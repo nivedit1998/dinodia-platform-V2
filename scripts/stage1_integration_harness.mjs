@@ -88,6 +88,16 @@ function loadOperatorLifecycleService() {
   new Function('require', 'module', 'exports', compiled)(localRequire, loaded, loaded.exports);
   return loaded.exports;
 }
+function loadNativeV1Contract() {
+  const require = createRequire(import.meta.url);
+  const ts = require('typescript');
+  const source = fs.readFileSync(path.join(root, 'src/lib/contracts/dinodiaV1.ts'), 'utf8');
+  const compiled = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText;
+  const loaded = { exports: {} };
+  new Function('module', 'exports', compiled)(loaded, loaded.exports);
+  return loaded.exports;
+}
+const nativeV1Contract = loadNativeV1Contract();
 function assertParentCredentialsAreNotForwarded() {
   const fakeParent = {
     ...process.env,
@@ -657,11 +667,16 @@ async function customerAuthorizationChecks() {
   const trustedInstallationId = `harness-phone-${crypto.randomUUID()}`;
   const trusted = await prisma.trustedDevice.create({ data: { customerAccountId: account.id, deviceInstallationId: trustedInstallationId, publicKey: phone.publicKey, publicKeyThumbprint: phoneThumbprint, deviceName: 'Harness phone' } });
   const customerCookieJar = {};
+  const sessionCountBeforeMalformedLogin = await prisma.customerSession.count({ where: { customerAccountId: account.id } });
+  const malformedLogin = await fetchJson(`${base}/api/v2/session`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ email, password: customerPassword, deviceInstallationId: trustedInstallationId, publicKey: phone.publicKey, deviceName: 'Harness phone', model: 'integration-test', osFamily: 'test', osVersion: 'test', extraAuthority: true }) });
+  const sessionCountAfterMalformedLogin = await prisma.customerSession.count({ where: { customerAccountId: account.id } });
+  if (malformedLogin.response.status !== 400 || malformedLogin.body.error?.code !== 'VALIDATION_FAILED' || sessionCountAfterMalformedLogin !== sessionCountBeforeMalformedLogin) fail('Actual customer login route accepted an extra authority field or created session state after DTO denial');
+  console.log('[stage2:integration] PASS: actual customer login rejects unknown authority fields before creating a session');
   const customerLogin = await fetchJson(`${base}/api/v2/session`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ email, password: customerPassword, deviceInstallationId: trustedInstallationId, publicKey: phone.publicKey, deviceName: 'Harness phone', model: 'integration-test', osFamily: 'test', osVersion: 'test' }) });
   updateCookieJar(customerCookieJar, customerLogin.response);
   const rawSession = cookieValue(customerCookieJar, 'dinodia_customer_session');
   const loginReceiptKeys = Object.keys(customerLogin.body || {}).sort().join(',');
-  if (customerLogin.response.status !== 200 || !rawSession || loginReceiptKeys !== 'accountId,expiresAt,ok,sessionId,trustedDeviceId' || Object.hasOwn(customerLogin.body || {}, 'token') || Object.hasOwn(customerLogin.body || {}, 'refreshToken')) fail(`Canonical customer login did not issue only a metadata receipt plus HttpOnly session cookie (${customerLogin.response.status})`);
+  if (customerLogin.response.status !== 200 || !rawSession || loginReceiptKeys !== 'accountId,expiresAt,ok,sessionId,trustedDeviceId' || Object.hasOwn(customerLogin.body || {}, 'token') || Object.hasOwn(customerLogin.body || {}, 'refreshToken') || !nativeV1Contract.validateCustomerSessionReceipt(customerLogin.body)) fail(`Canonical customer login did not issue a valid metadata receipt plus HttpOnly session cookie (${customerLogin.response.status})`);
   const session = await prisma.customerSession.findFirstOrThrow({ where: { customerAccountId: account.id, trustedDeviceId: trusted.id, revokedAt: null }, orderBy: { createdAt: 'desc' } });
   const sessionWithoutCookie = await fetchJson(`${base}/api/v2/session`);
   if (sessionWithoutCookie.response.status !== 401 || sessionWithoutCookie.body.error?.code !== 'AUTH_REQUIRED' || !sessionWithoutCookie.body.error?.requestId || Object.hasOwn(sessionWithoutCookie.body, 'errorCode')) fail(`Account session restore did not return the canonical Native V1 authentication error (${sessionWithoutCookie.response.status})`);
@@ -669,7 +684,7 @@ async function customerAuthorizationChecks() {
   const restoredMemberships = restoredAccount.body.memberships || [];
   const restoredTenant = restoredMemberships.find((membership) => membership.homeMembershipId === tenantMembership.id);
   const restoredOwner = restoredMemberships.find((membership) => membership.homeMembershipId === ownerMembership.id);
-  if (restoredAccount.response.status !== 200 || restoredAccount.body.schemaVersion !== 'dinodia.v1' || restoredAccount.body.accountId !== account.id || restoredMemberships.length !== 2 || restoredTenant?.role !== 'TENANT' || JSON.stringify(restoredTenant?.areaIds) !== JSON.stringify([areaOne.id]) || restoredTenant?.areaIds?.includes(areaOne.osAreaId) || restoredOwner?.role !== 'OWNER' || restoredOwner?.areaIds?.length !== 0 || Object.hasOwn(restoredAccount.body, 'token') || Object.hasOwn(restoredAccount.body, 'hubInstallationId')) fail(`Canonical account restore did not return only canonical Platform Area UUIDs for this account's active membership context (${restoredAccount.response.status})`);
+  if (restoredAccount.response.status !== 200 || !nativeV1Contract.validateAccountSessionContext(restoredAccount.body) || restoredAccount.body.accountId !== account.id || restoredMemberships.length !== 2 || restoredTenant?.role !== 'TENANT' || JSON.stringify(restoredTenant?.areaIds) !== JSON.stringify([areaOne.id]) || restoredTenant?.areaIds?.includes(areaOne.osAreaId) || restoredOwner?.role !== 'OWNER' || restoredOwner?.areaIds?.length !== 0 || Object.hasOwn(restoredAccount.body, 'token') || Object.hasOwn(restoredAccount.body, 'hubInstallationId')) fail(`Canonical account restore did not return only canonical Platform Area UUIDs for this account's active membership context (${restoredAccount.response.status})`);
   const restoredLegacyPath = await fetchJson(`${base}/api/v2/auth/session`, { headers: { cookie: `dinodia_customer_session=${encodeURIComponent(rawSession)}` } });
   if (restoredLegacyPath.response.status !== 200 || JSON.stringify(restoredLegacyPath.body) !== JSON.stringify(restoredAccount.body)) fail('The compatibility session path drifted from the canonical account-session DTO');
   const sessionExpiry = session.expiresAt;
@@ -689,7 +704,7 @@ async function customerAuthorizationChecks() {
   const logoutRequest = await fetchJson(`${base}/api/v2/session/logout`, { method: 'POST', headers: { cookie: `dinodia_customer_session=${encodeURIComponent(logoutRawSession)}` } });
   const logoutRow = await prisma.customerSession.findUnique({ where: { refreshTokenHash: sha256(logoutRawSession) }, select: { revokedAt: true } });
   const afterLogoutRestore = await fetchJson(`${base}/api/v2/session`, { headers: { cookie: `dinodia_customer_session=${encodeURIComponent(logoutRawSession)}` } });
-  if (logoutRequest.response.status !== 200 || !logoutRow?.revokedAt || afterLogoutRestore.response.status !== 401) fail('Canonical logout did not durably revoke its session and deny a subsequent restore');
+  if (logoutRequest.response.status !== 200 || !nativeV1Contract.validateCustomerSessionLogoutReceipt(logoutRequest.body) || !logoutRow?.revokedAt || afterLogoutRestore.response.status !== 401) fail('Canonical logout did not return the exact receipt, durably revoke its session and deny a subsequent restore');
   console.log('[stage1:integration] PASS: actual customer login cookie restores the canonical two-home membership context; canonical logout revokes that cookie-backed session durably');
   console.log('[stage1:integration] PASS: real account-session route restores two role-distinct homes and tenant area grants, denies anonymous restore, and returns no hub bearer');
   const propertyPhone = keyPair();
@@ -709,7 +724,7 @@ async function customerAuthorizationChecks() {
     const body = result.body || {};
     const expiresAt = Date.parse(body.expiresAt);
     const keys = Object.keys(body).sort().join(',');
-    if (result.response.status !== 200 || keys !== 'expiresAt,homeId,hubEndpoint,membershipId,ok,token' || body.ok !== true || typeof body.token !== 'string' || !body.token || body.token.length > 8192 || body.token === 'TEST_ONLY_PLACEHOLDER_NOT_A_BEARER' || body.homeId !== homeId || body.membershipId !== membershipId || body.hubEndpoint?.state !== 'verified_cloud' || body.hubEndpoint?.origin !== expectedOrigin || !Number.isFinite(expiresAt) || expiresAt <= Date.now() || expiresAt > Date.now() + 5 * 60 * 1000 + 1000) fail(`${label} did not return the strict five-minute selected-home session and its exact verified endpoint contract (${result.response.status})`);
+    if (result.response.status !== 200 || keys !== 'expiresAt,homeId,hubEndpoint,membershipId,ok,token' || body.ok !== true || typeof body.token !== 'string' || !body.token || body.token.length > 8192 || body.token === 'TEST_ONLY_PLACEHOLDER_NOT_A_BEARER' || body.homeId !== homeId || body.membershipId !== membershipId || body.hubEndpoint?.state !== 'verified_cloud' || body.hubEndpoint?.origin !== expectedOrigin || !Number.isFinite(expiresAt) || expiresAt <= Date.now() || expiresAt > Date.now() + 5 * 60 * 1000 + 1000 || !nativeV1Contract.validateCustomerHubSession(body, { homeId, membershipId })) fail(`${label} did not return a canonical five-minute selected-home session and its exact verified endpoint contract (${result.response.status})`);
   };
   const tenantToken = await issue(homeOne.id);
   assertHubSession(tenantToken, homeOne.id, tenantMembership.id, 'Tenant hub session', 'https://dinodia-harness-one.dinodiasmartliving.com');
@@ -842,7 +857,9 @@ async function customerAuthorizationChecks() {
   const scheduledReservation = await fetchJson(`${machineBase}/api/internal/stage1/claim`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-stage1-contract-secret': env.STAGE1_CONTRACT_SECRET }, body: JSON.stringify({ action: 'redeem', reference: claimReferenceValue, customerAccountId: scheduledAccount.id }) });
   if (scheduledReservation.response.status !== 200) fail(`Scheduled claim reservation could not be created (${scheduledReservation.response.status})`);
   await prisma.homeClaimReservation.update({ where: { id: scheduledReservation.body.reservationId }, data: { createdAt: new Date(Date.now() - 2000), expiresAt: new Date(Date.now() - 1000) } });
-  const scheduledRun = await fetchJson(`${machineBase}/api/cron/native-operations`, { method: 'POST', headers: { authorization: `Bearer ${env.CRON_SECRET}` } });
+  const scheduledRuns = await Promise.all([0, 1].map(() => fetchJson(`${machineBase}/api/cron/native-operations`, { method: 'POST', headers: { authorization: `Bearer ${env.CRON_SECRET}` } })));
+  const scheduledRun = scheduledRuns.find((result) => result.response.status === 200);
+  if (!scheduledRun || scheduledRuns.filter((result) => result.response.status === 202 && result.body.skipped === 'already_running').length !== 1) fail(`Concurrent real PostgreSQL dispatcher requests did not elect exactly one lease holder (${scheduledRuns.map((result) => result.response.status).join(',')})`);
   if (scheduledRun.response.status !== 200 || Number(scheduledRun.body.releasedClaims) < 1) fail(`Shared native-operations dispatcher did not release the expired claim (${scheduledRun.response.status}/${JSON.stringify(scheduledRun.body)})`);
   if (Number(scheduledRun.body.credentials?.rotated) < 1) fail(`The shared native-operations dispatcher did not rotate an operator credential past its 60-minute issue deadline (${JSON.stringify(scheduledRun.body.credentials)})`);
   const automaticallyRotated = await prisma.hubCredentialVersion.findFirst({ where: { hubInstallationId: hubOne.id, purpose: 'operator-credential', version: 2 }, select: { state: true, issuedAt: true } });
@@ -906,13 +923,24 @@ async function customerAuthorizationChecks() {
   const supportLogin = await loginEmployee(base, supportEmployee, supportPassword);
   const supportSession = supportLogin.session;
   const supportToken = supportLogin.token;
-  const ticketResponse = await fetchJson(`${base}/api/v2/support/tickets`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-app-token': tenantToken.body.token }, body: JSON.stringify({ category: 'HARNESS', description: 'Disposable tenant-private support test' }) });
-  if (ticketResponse.response.status !== 201) fail(`Customer support ticket creation failed (${ticketResponse.response.status})`);
+  const ticketCountBeforeInvalidCategory = await prisma.supportTicket.count({ where: { customerAccountId: account.id } });
+  const invalidCategoryTicket = await fetchJson(`${base}/api/v2/support/tickets`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-app-token': tenantToken.body.token }, body: JSON.stringify({ category: 'HARNESS_PRIVATE', description: 'Must be rejected before persistence' }) });
+  const ticketCountAfterInvalidCategory = await prisma.supportTicket.count({ where: { customerAccountId: account.id } });
+  if (invalidCategoryTicket.response.status !== 400 || ticketCountAfterInvalidCategory !== ticketCountBeforeInvalidCategory) fail('The support route accepted an undeclared category or persisted a denied ticket');
+  const ticketResponse = await fetchJson(`${base}/api/v2/support/tickets`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-app-token': tenantToken.body.token }, body: JSON.stringify({ category: 'ACCESS_OR_PERMISSIONS', description: 'Disposable tenant-private support test' }) });
+  if (ticketResponse.response.status !== 201 || ticketResponse.body.ticket?.status !== 'OPEN' || !ticketResponse.body.ticket?.createdAt) fail(`Customer support ticket creation failed its canonical receipt (${ticketResponse.response.status})`);
   const ticketId = ticketResponse.body.ticket?.id;
   await prisma.supportTicket.update({ where: { id: ticketId }, data: { assignedEmployeeId: supportEmployee.id } });
+  const supportRequestCountBeforeDuplicates = await prisma.supportAccessRequest.count({ where: { ticketId } });
+  const duplicateSupportScope = await fetchJson(`${base}/api/v2/support/tickets/${ticketId}/access-requests`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-employee-session': supportToken }, body: JSON.stringify({ requestedScope: 'TENANT_SCOPE', targetMembershipId: tenantMembership.id, areaIds: [areaOne.id, areaOne.id], targetIds: [] }) });
+  const supportRequestCountAfterDuplicates = await prisma.supportAccessRequest.count({ where: { ticketId } });
+  if (duplicateSupportScope.response.status !== 400 || supportRequestCountAfterDuplicates !== supportRequestCountBeforeDuplicates) fail('Duplicate scoped-support targets were accepted or persisted');
   const accessResponse = await fetchJson(`${base}/api/v2/support/tickets/${ticketId}/access-requests`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-employee-session': supportToken }, body: JSON.stringify({ requestedScope: 'TENANT_SCOPE', targetMembershipId: tenantMembership.id, areaIds: [areaOne.id], targetIds: [] }) });
   if (accessResponse.response.status !== 201 || accessResponse.body.accessRequest?.touchesPropertyInfrastructure !== false) fail(`Tenant-private support request was not scoped privately (${accessResponse.response.status})`);
   const requestId = accessResponse.body.accessRequest.id;
+  const implicitSupportDecision = await fetchJson(`${base}/api/v2/support/tickets/${ticketId}/access-requests/${requestId}/approve`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-app-token': tenantToken.body.token }, body: JSON.stringify({}) });
+  const stillRequested = await prisma.supportAccessRequest.findUniqueOrThrow({ where: { id: requestId }, select: { status: true } });
+  if (implicitSupportDecision.response.status !== 400 || stillRequested.status !== 'REQUESTED') fail('An omitted support decision was interpreted as approval or changed durable state');
   const approval = await fetchJson(`${base}/api/v2/support/tickets/${ticketId}/access-requests/${requestId}/approve`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-app-token': tenantToken.body.token }, body: JSON.stringify({ approve: true }) });
   if (approval.response.status !== 200 || !approval.body.oneUseCode) fail(`Tenant support approval did not issue a one-use customer code (${approval.response.status})`);
   const supportCode = approval.body.oneUseCode;
@@ -947,6 +975,19 @@ async function customerAuthorizationChecks() {
   await prisma.supportSession.deleteMany({ where: { accessRequestId: requestId } });
   await prisma.supportAccessRequest.delete({ where: { id: requestId } });
   await prisma.supportTicket.delete({ where: { id: ticketId } });
+
+  const denialTicketResponse = await fetchJson(`${base}/api/v2/support/tickets`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-app-token': tenantToken.body.token }, body: JSON.stringify({ category: 'OTHER', description: 'Disposable support denial test' }) });
+  if (denialTicketResponse.response.status !== 201) fail(`Support denial test ticket was not created (${denialTicketResponse.response.status})`);
+  const denialTicketId = denialTicketResponse.body.ticket.id;
+  await prisma.supportTicket.update({ where: { id: denialTicketId }, data: { assignedEmployeeId: supportEmployee.id } });
+  const denialRequestResponse = await fetchJson(`${base}/api/v2/support/tickets/${denialTicketId}/access-requests`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-employee-session': supportToken }, body: JSON.stringify({ requestedScope: 'TENANT_SCOPE', targetMembershipId: tenantMembership.id, areaIds: [areaOne.id], targetIds: [] }) });
+  if (denialRequestResponse.response.status !== 201) fail(`Support denial request was not created (${denialRequestResponse.response.status})`);
+  const denialRequestId = denialRequestResponse.body.accessRequest.id;
+  const denialDecision = await fetchJson(`${base}/api/v2/support/tickets/${denialTicketId}/access-requests/${denialRequestId}/approve`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-app-token': tenantToken.body.token }, body: JSON.stringify({ approve: false }) });
+  const deniedRow = await prisma.supportAccessRequest.findUniqueOrThrow({ where: { id: denialRequestId }, select: { status: true, codeHash: true } });
+  if (denialDecision.response.status !== 200 || denialDecision.body.status !== 'DENIED' || denialDecision.body.oneUseCode !== undefined || deniedRow.status !== 'DENIED' || deniedRow.codeHash !== null) fail('Explicit support denial issued or persisted an approval code');
+  await prisma.supportAccessRequest.delete({ where: { id: denialRequestId } });
+  await prisma.supportTicket.delete({ where: { id: denialTicketId } });
   await prisma.employeeSession.delete({ where: { id: supportSession.id } });
   await prisma.companyEmployeeAccount.delete({ where: { id: supportEmployee.id } });
 
@@ -955,10 +996,11 @@ async function customerAuthorizationChecks() {
   // confirmation. Property access creates a durable owner notification;
   // tenant-private access above created none.
   const propertyDevice = await prisma.nativeDevice.create({ data: { homeId: homeOne.id, hubInstallationId: hubOne.id, osDeviceId: `harness-property-device-${crypto.randomUUID()}`, originalName: 'Harness property light', technicalLabel: 'property_device', managementClass: 'PROPERTY_DEVICE', deviceType: 'light', lifecycle: 'INSTALLED' } });
-  const tenantDevice = await prisma.nativeDevice.create({ data: { homeId: homeOne.id, hubInstallationId: hubOne.id, osDeviceId: 'harness-tenant-device', originalName: 'Harness tenant light', technicalLabel: 'tenant_device', managementClass: 'TENANT_DEVICE', deviceType: 'light', ownerMembershipId: tenantMembership.id, descriptorRevision: 1, descriptorDigest: 'descriptor-1', lifecycle: 'DISCOVERED' } });
+  const tenantDescriptorDigest = crypto.createHash('sha256').update('harness-tenant-descriptor-v1').digest('hex');
+  const tenantDevice = await prisma.nativeDevice.create({ data: { homeId: homeOne.id, hubInstallationId: hubOne.id, osDeviceId: 'harness-tenant-device', originalName: 'Harness tenant light', technicalLabel: 'tenant_device', managementClass: 'TENANT_DEVICE', deviceType: 'light', ownerMembershipId: tenantMembership.id, descriptorRevision: 1, descriptorDigest: tenantDescriptorDigest, lifecycle: 'DISCOVERED' } });
   await prisma.deviceAreaAssignment.create({ data: { deviceId: tenantDevice.id, areaId: areaOne.id, homeId: homeOne.id, source: 'HARNESS', actorType: 'SYSTEM' } });
   await prisma.nativeDevice.update({ where: { id: tenantDevice.id }, data: { lifecycle: 'INSTALLED' } });
-  const propertyTicketResponse = await fetchJson(`${base}/api/v2/support/tickets`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-app-token': tenantToken.body.token }, body: JSON.stringify({ category: 'HARNESS_PROPERTY', description: 'Disposable property support test' }) });
+  const propertyTicketResponse = await fetchJson(`${base}/api/v2/support/tickets`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-app-token': tenantToken.body.token }, body: JSON.stringify({ category: 'HUB_OR_CONNECTION', description: 'Disposable property support test' }) });
   if (propertyTicketResponse.response.status !== 201) fail(`Property support ticket creation failed (${propertyTicketResponse.response.status})`);
   const propertyTicketId = propertyTicketResponse.body.ticket.id;
   // The employee was deleted with the tenant-private ticket above; create a
@@ -980,7 +1022,7 @@ async function customerAuthorizationChecks() {
   // tenant scope and never exposing tenant-private metadata. Use a separate
   // ticket so the partial unique index for one open request per ticket/scope
   // remains part of the test rather than being bypassed.
-  const tenantPropertyTicketResponse = await fetchJson(`${base}/api/v2/support/tickets`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-app-token': tenantToken.body.token }, body: JSON.stringify({ category: 'HARNESS_TENANT_PROPERTY_DEVICE', description: 'Disposable tenant permanent-device support test' }) });
+  const tenantPropertyTicketResponse = await fetchJson(`${base}/api/v2/support/tickets`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-app-token': tenantToken.body.token }, body: JSON.stringify({ category: 'DEVICE_PROBLEM', description: 'Disposable tenant permanent-device support test' }) });
   if (tenantPropertyTicketResponse.response.status !== 201) fail(`Tenant permanent-device support ticket creation failed (${tenantPropertyTicketResponse.response.status})`);
   const tenantPropertyTicketId = tenantPropertyTicketResponse.body.ticket.id;
   await prisma.supportTicket.update({ where: { id: tenantPropertyTicketId }, data: { assignedEmployeeId: propertySupportEmployee.id } });
@@ -1030,7 +1072,7 @@ async function customerAuthorizationChecks() {
   // Race customer closure against the real machine-authenticated redemption
   // route. Regardless of which serializable transaction wins, closure must
   // leave no active support session and the one-use request must be revoked.
-  const raceTicketResponse = await fetchJson(`${base}/api/v2/support/tickets`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-app-token': tenantToken.body.token }, body: JSON.stringify({ category: 'HARNESS_SUPPORT_RACE', description: 'Disposable close versus redeem race' }) });
+  const raceTicketResponse = await fetchJson(`${base}/api/v2/support/tickets`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-app-token': tenantToken.body.token }, body: JSON.stringify({ category: 'OTHER', description: 'Disposable close versus redeem race' }) });
   if (raceTicketResponse.response.status !== 201) fail(`Support race ticket creation failed (${raceTicketResponse.response.status})`);
   const raceTicketId = raceTicketResponse.body.ticket.id;
   await prisma.supportTicket.update({ where: { id: raceTicketId }, data: { assignedEmployeeId: propertySupportEmployee.id } });
@@ -1074,14 +1116,14 @@ async function customerAuthorizationChecks() {
   // Exercise the real trusted-phone challenge/issue/consume path with a
   // non-device sensitive operation. The signature is the disposable phone's
   // Ed25519 key, standing in for the iOS LocalAuthentication-gated assertion.
-  const stepUpTicket = await fetchJson(`${base}/api/v2/support/tickets`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-app-token': tenantToken.body.token }, body: JSON.stringify({ category: 'STEP_UP_HARNESS', description: 'Disposable step-up close test' }) });
+  const stepUpTicket = await fetchJson(`${base}/api/v2/support/tickets`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-app-token': tenantToken.body.token }, body: JSON.stringify({ category: 'OTHER', description: 'Disposable step-up close test' }) });
   if (stepUpTicket.response.status !== 201) fail(`Step-up ticket creation failed (${stepUpTicket.response.status})`);
   const stepUpTicketId = stepUpTicket.body.ticket.id;
   const challenge = await fetchJson(`${base}/api/v2/security/step-up/challenge`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-app-token': tenantToken.body.token }, body: JSON.stringify({ operationKind: 'support_ticket_close', targetIds: [stepUpTicketId], value: null }) });
   if (challenge.response.status !== 200 || !challenge.body.challengeId) fail(`Trusted-phone step-up challenge was not issued (${challenge.response.status})`);
   const cancelledChallenge = await fetchJson(`${base}/api/v2/security/step-up/challenge`, { method: 'DELETE', headers: { 'content-type': 'application/json', 'x-dinodia-app-token': tenantToken.body.token }, body: JSON.stringify({ challengeId: challenge.body.challengeId }) });
   if (cancelledChallenge.response.status !== 200) fail(`Trusted-phone challenge cancellation failed (${cancelledChallenge.response.status})`);
-  const cancelledIssue = await fetchJson(`${base}/api/v2/security/step-up/issue`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-app-token': tenantToken.body.token }, body: JSON.stringify({ challengeId: challenge.body.challengeId, nonce: challenge.body.nonce, deviceSignature: 'cancelled' }) });
+  const cancelledIssue = await fetchJson(`${base}/api/v2/security/step-up/issue`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-app-token': tenantToken.body.token }, body: JSON.stringify({ challengeId: challenge.body.challengeId, nonce: challenge.body.nonce, deviceSignature: 'A'.repeat(64) }) });
   if (cancelledIssue.response.status !== 403) fail(`Cancelled trusted-phone challenge was accepted (${cancelledIssue.response.status})`);
   const liveChallenge = await fetchJson(`${base}/api/v2/security/step-up/challenge`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-app-token': tenantToken.body.token }, body: JSON.stringify({ operationKind: 'support_ticket_close', targetIds: [stepUpTicketId], value: null }) });
   const phoneSignature = crypto.sign(null, stepUpChallengeMessage({ challengeId: liveChallenge.body.challengeId, nonce: liveChallenge.body.nonce, operationDigest: liveChallenge.body.operationDigest }), crypto.createPrivateKey(phone.privateKey)).toString('base64url');
@@ -1143,7 +1185,7 @@ async function customerAuthorizationChecks() {
   const descriptorValue = { state: 'ON' };
   const descriptorControlId = String(tenantEntity.entity.id);
   const descriptorAttestedValue = { ...descriptorValue, controlId: descriptorControlId };
-  const descriptorOperationValue = descriptorBoundValue(descriptorAttestedValue, { [tenantDevice.id]: 'descriptor-1' });
+  const descriptorOperationValue = descriptorBoundValue(descriptorAttestedValue, { [tenantDevice.id]: tenantDescriptorDigest });
   const descriptor = {
     version: 1,
     serial: identityOne.serialNumber,
@@ -1158,14 +1200,14 @@ async function customerAuthorizationChecks() {
     targetIds: descriptorTargetIds,
     controlId: descriptorControlId,
     descriptorRevision: 1,
-    descriptorDigest: 'descriptor-1',
+    descriptorDigest: tenantDescriptorDigest,
     operationDigest: operationDigest({ actorId: account.id, trustedDeviceId: trusted.id, customerSessionId: session.id, homeId: homeOne.id, membershipId: tenantMembership.id, hubInstallationId: hubOne.id, operationKind: 'device_sensitive_command', targetIds: descriptorTargetIds, value: descriptorOperationValue }),
     nonce: `descriptor-${crypto.randomUUID()}`,
     issuedAt: Date.now(),
   };
   descriptor.hubSignature = await hub.pairing.signStepUpDescriptor(descriptor);
   const descriptorChallenge = await fetchJson(`${base}/api/v2/security/step-up/challenge`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-app-token': tenantToken.body.token }, body: JSON.stringify({ operationKind: 'device_sensitive_command', targetIds: descriptorTargetIds, value: descriptorValue, descriptorAttestation: descriptor }) });
-  if (descriptorChallenge.response.status !== 200 || !descriptorChallenge.body.challengeId) fail(`OS bounded step-up descriptor was not accepted by Platform (${descriptorChallenge.response.status}/${descriptorChallenge.body.errorCode || descriptorChallenge.body.error || ''})`);
+  if (descriptorChallenge.response.status !== 200 || !descriptorChallenge.body.challengeId) fail(`OS bounded step-up descriptor was not accepted by Platform (${descriptorChallenge.response.status}/${descriptorChallenge.body.errorCode || descriptorChallenge.body.error?.code || 'no_error_code'})`);
   const descriptorCancelled = await fetchJson(`${base}/api/v2/security/step-up/challenge`, { method: 'DELETE', headers: { 'content-type': 'application/json', 'x-dinodia-app-token': tenantToken.body.token }, body: JSON.stringify({ challengeId: descriptorChallenge.body.challengeId }) });
   if (descriptorCancelled.response.status !== 200) fail(`The accepted descriptor challenge could not be cancelled safely (${descriptorCancelled.response.status})`);
   const WebSocket = createRequire(import.meta.url)(path.join(osRoot, 'node_modules', 'ws'));
@@ -1348,6 +1390,10 @@ async function customerAuthorizationChecks() {
   const removalSignature = crypto.sign(null, stepUpChallengeMessage({ challengeId: removalChallenge.body.challengeId, nonce: removalChallenge.body.nonce, operationDigest: removalChallenge.body.operationDigest }), crypto.createPrivateKey(phone.privateKey)).toString('base64url');
   const removalProof = await fetchJson(`${platformBase}/api/v2/security/step-up/issue`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-app-token': tenantToken.body.token }, body: JSON.stringify({ challengeId: removalChallenge.body.challengeId, nonce: removalChallenge.body.nonce, deviceSignature: removalSignature }) });
   if (removalProof.response.status !== 200) fail(`Trusted-device removal proof failed (${removalProof.response.status})`);
+  const malformedRemoval = await fetchJson(`${platformBase}/api/v2/trusted-devices/${revocableTrustedDevice.id}`, { method: 'DELETE', headers: { 'content-type': 'application/json', 'x-dinodia-app-token': tenantToken.body.token, 'x-dinodia-step-up-proof': removalProof.body.proof }, body: JSON.stringify({ proof: removalProof.body.proof, accountId: 'attacker-selected-account' }) });
+  const beforeRejectedRemoval = await prisma.trustedDevice.findUniqueOrThrow({ where: { id: revocableTrustedDevice.id }, select: { revokedAt: true } });
+  const beforeRejectedGrant = await prisma.offlineMembershipAuthorisation.findUniqueOrThrow({ where: { id: revocableOffline.body.authorisation.id }, select: { revokedAt: true } });
+  if (malformedRemoval.response.status !== 400 || malformedRemoval.body.error?.code !== 'VALIDATION_FAILED' || beforeRejectedRemoval.revokedAt || beforeRejectedGrant.revokedAt) fail(`Malformed trusted-device removal was not rejected before durable effects (${malformedRemoval.response.status})`);
   const removedDevice = await fetchJson(`${platformBase}/api/v2/trusted-devices/${revocableTrustedDevice.id}`, { method: 'DELETE', headers: { 'content-type': 'application/json', 'x-dinodia-app-token': tenantToken.body.token }, body: JSON.stringify({ proof: removalProof.body.proof }) });
   if (removedDevice.response.status !== 200 || removedDevice.body.accountWide !== true) fail(`Real account-wide trusted-device removal failed (${removedDevice.response.status})`);
   const revokedGrantRow = await prisma.offlineMembershipAuthorisation.findUnique({ where: { id: revocableOffline.body.authorisation.id }, select: { revokedAt: true, revokeReason: true } });

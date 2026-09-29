@@ -22,6 +22,9 @@ const modifiedFiles = new Set([
   'src/app/api/installer/home-support/homes/[homeId]/os-access/rotate/route.ts',
   'src/app/api/installer/home-support/homes/[homeId]/os-access/revoke/route.ts',
   'contracts/dinodia-v1/contract.json', 'contracts/dinodia-v1/decisions.json', 'contracts/dinodia-v1/openapi.yaml', 'contracts/dinodia-v1/V2_STATIC_TO_LIVE_MATRIX.md', 'contracts/dinodia-v1/fixtures/customer-hub-session-test-only.json',
+  'contracts/dinodia-v1/fixtures/stage2-decision-matrix.json',
+  'contracts/dinodia-v1/fixtures/analytics-semantics.json',
+  'contracts/dinodia-v1/fixtures/unknown-interaction-kind.json',
   'src/lib/lanEndpoint.ts', 'src/lib/contracts/dinodiaV1.ts', 'test/dinodia_contract.test.mjs',
   'src/app/api/hub-agent/token-state/route.ts',
   'src/app/api/v2/offline-authorisations/route.ts',
@@ -38,6 +41,7 @@ const modifiedFiles = new Set([
   'src/app/api/hub-agent/operator-session/revalidate/route.ts',
   'src/app/api/installer/home-support/homes/[homeId]/os-access/launch/route.ts',
   'src/app/api/cron/native-maintenance/route.ts',
+  'src/app/api/cron/native-operations/route.ts',
 ]);
 
 const addedFiles = [

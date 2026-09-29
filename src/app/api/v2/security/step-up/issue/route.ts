@@ -2,18 +2,27 @@ import { NextResponse } from 'next/server';
 import { nativeV1ErrorResponse } from '@/lib/contracts/nativeV1Error';
 import { requireCustomer, Stage1AuthError } from '@/lib/stage1Auth';
 import { issueStepUp } from '@/lib/sensitiveOperationStepUp';
+import { validateStepUpIssueRequest, validateStepUpProofReceipt } from '@/lib/contracts/dinodiaV1';
 
 export const dynamic = 'force-dynamic';
 
 export async function POST(request: Request) {
   try {
     const customer = await requireCustomer(request);
-    const body = await request.json() as Record<string, unknown>;
-    const challengeId = String(body.challengeId ?? '').trim();
-    if (!challengeId) throw new Stage1AuthError(400, 'step_up_fields_invalid', 'A server-issued challenge is required');
-    const assertionSignature = String(body.deviceSignature ?? request.headers.get('x-dinodia-device-signature') ?? '');
-    const assertionNonce = String(body.nonce ?? request.headers.get('x-dinodia-step-up-nonce') ?? '');
+    const body = await request.json().catch(() => null) as Record<string, unknown> | null;
+    const normalized = body && typeof body === 'object' && !Array.isArray(body) ? {
+      challengeId: body.challengeId,
+      nonce: body.nonce ?? request.headers.get('x-dinodia-step-up-nonce'),
+      deviceSignature: body.deviceSignature ?? request.headers.get('x-dinodia-device-signature'),
+    } : body;
+    if (!normalized || !validateStepUpIssueRequest(normalized)) throw new Stage1AuthError(400, 'step_up_fields_invalid', 'A valid server-issued challenge, nonce and device assertion are required');
+    const checked = normalized as { challengeId: string; nonce: string; deviceSignature: string };
+    const challengeId = checked.challengeId;
+    const assertionSignature = checked.deviceSignature;
+    const assertionNonce = checked.nonce;
     const result = await issueStepUp({ customerAccountId: customer.id, customerSessionId: customer.sessionId, trustedDeviceId: customer.trustedDeviceId, trustedDevicePublicKey: customer.trustedDevicePublicKey, assertionSignature, assertionNonce, challengeId });
-    return NextResponse.json({ ok: true, ...result }, { headers: { 'Cache-Control': 'no-store', Pragma: 'no-cache' } });
+    const receipt = { ok: true, ...result, expiresAt: result.expiresAt.toISOString() };
+    if (!validateStepUpProofReceipt(receipt)) throw new Stage1AuthError(500, 'native_v1_contract_invalid', 'The step-up proof response failed contract validation');
+    return NextResponse.json(receipt, { headers: { 'Cache-Control': 'no-store', Pragma: 'no-cache' } });
   } catch (error) { return nativeV1ErrorResponse(error); }
 }

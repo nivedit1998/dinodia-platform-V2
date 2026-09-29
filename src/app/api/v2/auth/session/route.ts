@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 import { NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
+import { boundedContractText, validateAccountSessionContext, validateCustomerSessionLoginRequest, validateCustomerSessionLogoutReceipt, validateCustomerSessionReceipt } from '@/lib/contracts/dinodiaV1';
 import { nativeV1ErrorResponse } from '@/lib/contracts/nativeV1Error';
 import { recordFailedAuthentication, Stage1AuthError, cookieToken } from '@/lib/stage1Auth';
 import { verifyPassword } from '@/lib/passwords';
@@ -43,7 +44,7 @@ export async function GET(request: Request) {
     if (!account || account.status !== 'ACTIVE' || account.securityVersion !== session.securityVersion || !trusted || trusted.customerAccountId !== account.id || trusted.revokedAt || trusted.sessionVersion !== session.trustedDeviceSessionVersion) {
       throw new Stage1AuthError(401, 'customer_session_invalid', 'The customer session is no longer active');
     }
-    const response = NextResponse.json({
+    const accountContext = {
       schemaVersion: 'dinodia.v1',
       accountId: account.id,
       memberships: memberships.map((membership) => ({
@@ -56,29 +57,32 @@ export async function GET(request: Request) {
         revision: membership.accessRevision,
       })),
       expiresAt: session.expiresAt.toISOString(),
-    }, { headers: { 'Cache-Control': 'no-store', Pragma: 'no-cache' } });
+    };
+    if (!validateAccountSessionContext(accountContext)) {
+      throw new Stage1AuthError(500, 'native_v1_contract_invalid', 'The account session response failed contract validation');
+    }
+    const response = NextResponse.json(accountContext, { headers: { 'Cache-Control': 'no-store', Pragma: 'no-cache' } });
     await prisma.customerSession.updateMany({ where: { id: session.id, revokedAt: null, expiresAt: { gt: now } }, data: { lastUsedAt: now } });
     return response;
   } catch (error) { return nativeV1ErrorResponse(error); }
 }
 
-function text(value: unknown, max: number): string {
-  const result = String(value ?? '').trim();
-  return result.length > max ? '' : result;
-}
-
 export async function POST(request: Request) {
   try {
-    const body = await request.json() as Record<string, unknown>;
-    const email = text(body.email, 320).toLowerCase();
-    const password = String(body.password ?? '');
-    const deviceInstallationId = text(body.deviceInstallationId, 160);
-    const publicKey = text(body.publicKey, 4096);
-    const deviceName = text(body.deviceName, 160);
-    if (!email || !password || !deviceInstallationId || !publicKey || !deviceName) {
-      await recordFailedAuthentication('customer_login_failed', email || 'missing-email');
+    const body = await request.json() as unknown;
+    if (!validateCustomerSessionLoginRequest(body)) {
+      const attemptedEmail = body && typeof body === 'object' && !Array.isArray(body)
+        ? boundedContractText((body as Record<string, unknown>).email, 320).toLowerCase()
+        : '';
+      await recordFailedAuthentication('customer_login_failed', attemptedEmail || 'missing-email');
       throw new Stage1AuthError(400, 'customer_login_fields_invalid', 'Email, password and trusted-device details are required');
     }
+    const input = body;
+    const email = input.email.trim().toLowerCase();
+    const password = input.password;
+    const deviceInstallationId = input.deviceInstallationId.trim();
+    const publicKey = input.publicKey;
+    const deviceName = input.deviceName.trim();
     await enforcePersistentRateLimit(`customer-login:${sha256(email)}`, 8, 15 * 60 * 1000);
     try { crypto.createPublicKey(publicKey); } catch { throw new Stage1AuthError(400, 'trusted_device_key_invalid', 'The trusted-device public key is invalid'); }
     const account = await prisma.customerAccount.findUnique({ where: { emailNormalized: email }, select: { id: true, status: true, emailVerifiedAt: true, passwordHash: true, securityVersion: true } });
@@ -91,7 +95,7 @@ export async function POST(request: Request) {
     const session = await prisma.$transaction(async (tx) => {
       const trusted = await tx.trustedDevice.upsert({
         where: { customerAccountId_deviceInstallationId: { customerAccountId: account.id, deviceInstallationId } },
-        create: { customerAccountId: account.id, deviceInstallationId, publicKey, publicKeyThumbprint: thumbprint, deviceName, model: text(body.model, 160) || null, osFamily: text(body.osFamily, 80) || null, osVersion: text(body.osVersion, 80) || null },
+        create: { customerAccountId: account.id, deviceInstallationId, publicKey, publicKeyThumbprint: thumbprint, deviceName, model: boundedContractText(input.model, 160) || null, osFamily: boundedContractText(input.osFamily, 80) || null, osVersion: boundedContractText(input.osVersion, 80) || null },
         // Ordinary password login cannot silently re-enrol a removed phone or
         // replace the key already bound to an installation identity.
         update: { deviceName, lastUsedAt: new Date(), sessionVersion: { increment: 1 } },
@@ -103,7 +107,11 @@ export async function POST(request: Request) {
       await tx.auditEvent.create({ data: { actorType: 'CUSTOMER', actorId: account.id, category: 'SECURITY', action: 'customer_login_succeeded', targetType: 'CustomerSession', targetId: created.id, metadata: { trustedDeviceId: trusted.id, outcome: 'succeeded' }, purgeAt: new Date(Date.now() + 365 * 24 * 60 * 60 * 1000) } });
       return { ...created, trustedDeviceId: trusted.id };
     });
-    const response = NextResponse.json({ ok: true, accountId: account.id, sessionId: session.id, trustedDeviceId: session.trustedDeviceId, expiresAt: session.expiresAt }, { headers: { 'Cache-Control': 'no-store', Pragma: 'no-cache' } });
+    const receipt = { ok: true, accountId: account.id, sessionId: session.id, trustedDeviceId: session.trustedDeviceId, expiresAt: session.expiresAt.toISOString() };
+    if (!validateCustomerSessionReceipt(receipt)) {
+      throw new Stage1AuthError(500, 'native_v1_contract_invalid', 'The customer session receipt failed contract validation');
+    }
+    const response = NextResponse.json(receipt, { headers: { 'Cache-Control': 'no-store', Pragma: 'no-cache' } });
     response.headers.append('Set-Cookie', `dinodia_customer_session=${encodeURIComponent(rawSession)}; HttpOnly; SameSite=Strict; Secure; Path=/; Max-Age=${30 * 24 * 60 * 60}`);
     return response;
   } catch (error) { return nativeV1ErrorResponse(error); }
@@ -114,7 +122,9 @@ export async function DELETE(request: Request) {
     const rawSession = request.headers.get('x-dinodia-session') || cookieToken(request, 'dinodia_customer_session');
     if (!rawSession) throw new Stage1AuthError(401, 'customer_session_required', 'A customer session is required');
     await prisma.customerSession.updateMany({ where: { refreshTokenHash: sha256(rawSession), revokedAt: null }, data: { revokedAt: new Date(), revokeReason: 'customer_logout' } });
-    const response = NextResponse.json({ ok: true }, { headers: { 'Cache-Control': 'no-store' } });
+    const receipt = { ok: true as const };
+    if (!validateCustomerSessionLogoutReceipt(receipt)) throw new Stage1AuthError(500, 'native_v1_contract_invalid', 'The customer logout receipt failed contract validation');
+    const response = NextResponse.json(receipt, { headers: { 'Cache-Control': 'no-store' } });
     response.headers.append('Set-Cookie', 'dinodia_customer_session=; HttpOnly; SameSite=Strict; Secure; Path=/; Max-Age=0');
     return response;
   } catch (error) { return nativeV1ErrorResponse(error); }

@@ -6,16 +6,18 @@ import { ALLOWED_OPERATIONS, descriptorBoundValue, operationDigest, targetDigest
 import { prisma } from '@/lib/prisma';
 import { canonicalStepUpDescriptor } from '@/lib/stage1HubAuth';
 import { canonicalHubRequest, sha256 } from '@/lib/stage1Crypto';
+import { validateStepUpCancellationRequest, validateStepUpChallengeReceipt, validateStepUpChallengeRequest } from '@/lib/contracts/dinodiaV1';
 
 export const dynamic = 'force-dynamic';
 
 export async function POST(request: Request) {
   try {
     const customer = await requireCustomer(request);
-    const body = await request.json() as Record<string, unknown>;
+    const body = await request.json().catch(() => null) as Record<string, unknown> | null;
+    if (!body || !validateStepUpChallengeRequest(body)) throw new Stage1AuthError(400, 'step_up_fields_invalid', 'A supported operation and unique targets are required');
     const operationKind = String(body.operationKind ?? '').trim();
-    const targetIds = Array.isArray(body.targetIds) ? [...new Set(body.targetIds.map(String).filter(Boolean))].slice(0, 20) : [];
-    if (!ALLOWED_OPERATIONS.has(operationKind) || !targetIds.length) throw new Stage1AuthError(400, 'step_up_fields_invalid', 'A supported operation and target are required');
+    const targetIds = body.targetIds as string[];
+    if (!ALLOWED_OPERATIONS.has(operationKind)) throw new Stage1AuthError(400, 'step_up_fields_invalid', 'A supported operation and target are required');
     const value = body.value ?? null;
     let operationValue: unknown = value;
     if (operationKind === 'device_sensitive_command' || operationKind === 'heating_sensitive_command') {
@@ -50,7 +52,9 @@ export async function POST(request: Request) {
       const now = new Date();
       try {
         const challenge = await prisma.stepUpChallenge.create({ data: { customerAccountId: customer.id, customerSessionId: customer.sessionId, trustedDeviceId: customer.trustedDeviceId, homeId: customer.homeId, membershipId: customer.membershipId, hubInstallationId: customer.hubInstallationId, operationKind, targetDigest: targetDigest(targetIds), normalizedValueDigest: digest, policyRevision: customer.policyRevision, nonceHash: crypto.createHash('sha256').update(nonce, 'utf8').digest('hex'), hubDescriptorNonceHash, issuedAt: now, expiresAt: new Date(now.getTime() + 60_000) }, select: { id: true, expiresAt: true } });
-        return NextResponse.json({ ok: true, challengeId: challenge.id, nonce, operationDigest: digest, expiresAt: challenge.expiresAt }, { headers: { 'Cache-Control': 'no-store', Pragma: 'no-cache' } });
+        const receipt = { ok: true, challengeId: challenge.id, nonce, operationDigest: digest, expiresAt: challenge.expiresAt.toISOString() };
+        if (!validateStepUpChallengeReceipt(receipt)) throw new Stage1AuthError(500, 'native_v1_contract_invalid', 'The step-up challenge response failed contract validation');
+        return NextResponse.json(receipt, { headers: { 'Cache-Control': 'no-store', Pragma: 'no-cache' } });
       } catch (error) { if (error && typeof error === 'object' && 'code' in error && (error as { code?: string }).code === 'P2002') throw new Stage1AuthError(403, 'step_up_descriptor_replayed', 'The hub descriptor challenge has already been used'); throw error; }
     }
     if (operationKind === 'support_access_approve') {
@@ -75,14 +79,17 @@ export async function POST(request: Request) {
     const nonce = crypto.randomBytes(32).toString('base64url');
     const now = new Date();
     const challenge = await prisma.stepUpChallenge.create({ data: { customerAccountId: customer.id, customerSessionId: customer.sessionId, trustedDeviceId: customer.trustedDeviceId, homeId: customer.homeId, membershipId: customer.membershipId, hubInstallationId: customer.hubInstallationId, operationKind, targetDigest: targetDigest(targetIds), normalizedValueDigest: digest, policyRevision: customer.policyRevision, nonceHash: crypto.createHash('sha256').update(nonce, 'utf8').digest('hex'), issuedAt: now, expiresAt: new Date(now.getTime() + 60_000) }, select: { id: true, expiresAt: true } });
-    return NextResponse.json({ ok: true, challengeId: challenge.id, nonce, operationDigest: digest, expiresAt: challenge.expiresAt }, { headers: { 'Cache-Control': 'no-store', Pragma: 'no-cache' } });
+    const receipt = { ok: true, challengeId: challenge.id, nonce, operationDigest: digest, expiresAt: challenge.expiresAt.toISOString() };
+    if (!validateStepUpChallengeReceipt(receipt)) throw new Stage1AuthError(500, 'native_v1_contract_invalid', 'The step-up challenge response failed contract validation');
+    return NextResponse.json(receipt, { headers: { 'Cache-Control': 'no-store', Pragma: 'no-cache' } });
   } catch (error) { return nativeV1ErrorResponse(error); }
 }
 
 export async function DELETE(request: Request) {
   try {
     const customer = await requireCustomer(request);
-    const body = await request.json().catch(() => ({})) as Record<string, unknown>;
+    const body = await request.json().catch(() => null) as Record<string, unknown> | null;
+    if (!body || !validateStepUpCancellationRequest(body)) throw new Stage1AuthError(400, 'step_up_fields_invalid', 'A valid challenge identifier is required');
     const challengeId = String(body.challengeId ?? '').trim();
     if (!challengeId) throw new Stage1AuthError(400, 'step_up_fields_invalid', 'A challenge is required');
     const cancelled = await prisma.stepUpChallenge.updateMany({ where: { id: challengeId, customerAccountId: customer.id, customerSessionId: customer.sessionId, trustedDeviceId: customer.trustedDeviceId, consumedAt: null, cancelledAt: null }, data: { cancelledAt: new Date() } });

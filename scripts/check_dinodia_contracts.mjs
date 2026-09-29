@@ -1,11 +1,21 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { createRequire } from "node:module";
 import crypto from "node:crypto";
 import Ajv2020 from "ajv/dist/2020.js";
 import yaml from "js-yaml";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const require = createRequire(import.meta.url);
+const osContractRuntime = require(path.resolve(root, "../Dinodia OS/src/contracts/dinodiaV1.js"));
+const osAnalyticsRuntime = require(path.resolve(root, "../Dinodia OS/src/contracts/analyticsV1.js"));
+const typescript = require("typescript");
+const platformContractSource = fs.readFileSync(path.join(root, "src/lib/contracts/dinodiaV1.ts"), "utf8");
+const platformContractModule = { exports: {} };
+const platformContractCompiled = typescript.transpileModule(platformContractSource, { compilerOptions: { module: typescript.ModuleKind.CommonJS, target: typescript.ScriptTarget.ES2022 } }).outputText;
+new Function("module", "exports", platformContractCompiled)(platformContractModule, platformContractModule.exports);
+const platformContractRuntime = platformContractModule.exports;
 const contract = JSON.parse(
   fs.readFileSync(
     path.join(root, "contracts/dinodia-v1/contract.json"),
@@ -16,6 +26,7 @@ if (contract.contractVersion !== "dinodia.v1")
   throw new Error("Contract version mismatch");
 const ajv = new Ajv2020({ allErrors: true, strict: false });
 ajv.addFormat("date-time", /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/);
+ajv.addFormat("email", /^[^\s@]+@[^\s@]+\.[^\s@]+$/);
 ajv.addSchema(contract);
 const schemas = new Map();
 const definitionValidator = (name) => ajv.compile({ $ref: `${contract.$id}#/$defs/${name}` });
@@ -98,8 +109,20 @@ const collectFixtures = (directory) => {
 collectFixtures(fixtureRoot);
 for (const required of [
   "multi-channel-mixed-controls.json",
+  "customer-label-unicode-boundaries.json",
+  "bounded-string-unicode-semantics.json",
+  "notification-delivery-is-not-authority.json",
+  "offline-scope-widening.json",
+  "support-private-notification.json",
+  "support-lifecycle.json",
+  "prototype-scenarios.json",
+  "index.json",
   "control-catalog-change.json",
   "unknown-interaction-kind.json",
+  "invalid/area-negative-revision.json",
+  "invalid/control-state-boolean-string.json",
+  "invalid/writable-unreadable-control.json",
+  "invalid/unknown-interaction-commandable.json",
   "stale-and-unavailable-control-state.json",
   "empty-area.json",
   "duplicate-display-names.json",
@@ -110,6 +133,11 @@ for (const required of [
   "claim-first-wins.json",
   "notification-security-mandatory.json",
   "analytics-semantics.json",
+  "account-relationship-lifecycle.json",
+  "claim-lifecycle.json",
+  "invitation-lifecycle.json",
+  "transfer-lifecycle.json",
+  "notification-lifecycle.json",
   "invalid/analytics-invalid-sample.json",
   "hub-cloudurl-verified.json",
   "lan-endpoint-current.json",
@@ -209,6 +237,8 @@ const fixtureCases = [
   ["invalid/wrong-home-envelope.json", "envelope", (v) => v, true],
   ["invitation-pending-no-membership.json", "membershipInvitation", (v) => v, true],
   ["multi-control-device.json", "device", (v) => v.device, true],
+  ["selected-tenant-property-device.json", "device", (v) => v.device, true],
+  ["selected-tenant-private-device.json", "device", (v) => v.device, true],
   ["multi-home-memberships.json", "membership", (v) => ({ accountId: v.accountId, ...v.memberships[0] }), true],
   ["notification-security-mandatory.json", "notification", (v) => v, true],
   ["override-area-name.json", "override", (v) => v, true],
@@ -219,17 +249,36 @@ const fixtureCases = [
   ["support-code-exchange-test-only.json", "supportCodeExchange", (v) => v, true],
   ["support-session-revoked.json", "supportSession", (v) => v, true],
   ["support-ticket-private.json", "supportTicket", (v) => v, true],
+  ["invalid/area-negative-revision.json", "area", (v) => v, false],
+  ["invalid/control-state-boolean-string.json", "controlState", (v) => v.data, true],
   ["ui-state-offline.json", "uiState", (v) => v, true],
-  ["unknown-interaction-kind.json", "device", (v) => v.device, false],
+  ["unknown-interaction-kind.json", "device", (v) => v.device, true],
 ];
 const semanticOnlyFixturePaths = new Set([
+  "account-relationship-lifecycle.json",
   "analytics-semantics.json",
+  "claim-lifecycle.json",
+  "invitation-lifecycle.json",
   "invalid/analytics-invalid-sample.json",
+  "invalid/writable-unreadable-control.json",
+  "invalid/unknown-interaction-commandable.json",
   "duplicate-display-names.json",
+  "notification-delivery-is-not-authority.json",
+  "offline-scope-widening.json",
+  "support-private-notification.json",
+  "support-lifecycle.json",
+  "transfer-lifecycle.json",
+  "index.json",
   "moved-device.json",
   "multi-channel-mixed-controls.json",
+  "customer-label-unicode-boundaries.json",
+  "bounded-string-unicode-semantics.json",
+  "hub-heartbeat-freshness.json",
+  "notification-lifecycle.json",
   "out-of-order-events.json",
   "replacement-hub.json",
+  "room-qr-lifecycle.json",
+  "prototype-scenarios.json",
   "stage2-decision-matrix.json",
 ]);
 const indexedFixturePaths = new Set([...fixtureCases.map(([filename]) => filename), ...semanticOnlyFixturePaths]);
@@ -244,6 +293,93 @@ for (const [filename, schemaName, select, expectedValid] of fixtureCases) {
   if (actualValid !== expectedValid)
     throw new Error(`Fixture ${filename} expected ${expectedValid ? "valid" : "invalid"} ${schemaName}; got ${actualValid}: ${JSON.stringify(validator?.errors)}`);
 }
+const unreadableMutation = JSON.parse(fs.readFileSync(path.join(fixtureRoot, "invalid/writable-unreadable-control.json"), "utf8"));
+const unreadableSource = JSON.parse(fs.readFileSync(path.join(fixtureRoot, unreadableMutation.sourceFixture.replace(/^fixtures\//, "")), "utf8"));
+const unreadableDevice = structuredClone(unreadableSource.device);
+const unreadableControl = unreadableDevice.controls.find((control) => control.controlId === unreadableMutation.mutation.controlId);
+if (!unreadableControl) throw new Error("Writable/unreadable negative fixture references a missing control");
+Object.assign(unreadableControl, unreadableMutation.mutation);
+if (definitionValidator("device")(unreadableDevice) || platformContractRuntime.validateNativeDevice(unreadableDevice) || osContractRuntime.validateDevice(unreadableDevice, { homeId: unreadableDevice.homeId, homeMembershipId: "membership:owner-a", role: "OWNER", areaIds: unreadableDevice.areaIds }))
+  throw new Error("Writable-but-unreadable control was accepted by a canonical schema/runtime consumer");
+const unknownSafeFixture = JSON.parse(fs.readFileSync(path.join(fixtureRoot, "unknown-interaction-kind.json"), "utf8"));
+if (!definitionValidator("device")(unknownSafeFixture.device) || !platformContractRuntime.validateNativeDevice(unknownSafeFixture.device) || !osContractRuntime.validateDevice(unknownSafeFixture.device, { homeId: unknownSafeFixture.device.homeId, homeMembershipId: "membership:owner-a", role: "OWNER", areaIds: unknownSafeFixture.device.areaIds }))
+  throw new Error("Safe unknown interaction must remain valid read-only metadata across schema, Platform and OS");
+const unknownCommandable = JSON.parse(fs.readFileSync(path.join(fixtureRoot, "invalid/unknown-interaction-commandable.json"), "utf8"));
+const unknownSource = JSON.parse(fs.readFileSync(path.join(fixtureRoot, unknownCommandable.sourceFixture.replace(/^fixtures\//, "")), "utf8"));
+const unsafeUnknownDevice = structuredClone(unknownSource.device);
+const unsafeUnknownControl = unsafeUnknownDevice.controls.find((control) => control.controlId === unknownCommandable.controlId);
+if (!unsafeUnknownControl) throw new Error("Unknown-interaction negative fixture references a missing control");
+Object.assign(unsafeUnknownControl, unknownCommandable.mutation);
+if (definitionValidator("device")(unsafeUnknownDevice) || platformContractRuntime.validateNativeDevice(unsafeUnknownDevice) || osContractRuntime.validateDevice(unsafeUnknownDevice, { homeId: unsafeUnknownDevice.homeId, homeMembershipId: "membership:owner-a", role: "OWNER", areaIds: unsafeUnknownDevice.areaIds }))
+  throw new Error("Unknown interaction with write authority was accepted by a canonical schema/runtime consumer");
+const labelBoundaryFixture = JSON.parse(fs.readFileSync(path.join(fixtureRoot, "customer-label-unicode-boundaries.json"), "utf8"));
+if (labelBoundaryFixture.schemaVersion !== contract.contractVersion || labelBoundaryFixture.countingUnit !== "unicode_code_points" || labelBoundaryFixture.maximumPublicCodePoints !== 40 || labelBoundaryFixture.authority !== "presentation_only")
+  throw new Error("Customer label fixture must freeze a presentation-only 40 Unicode-code-point boundary");
+for (const item of labelBoundaryFixture.cases) {
+  const raw = typeof item.value === "string" ? item.value : String(item.repeat || "").repeat(Number(item.repeatCount || 0));
+  const projected = raw.length === 0 ? null : Array.from(raw).slice(0, labelBoundaryFixture.maximumPublicCodePoints).join("");
+  const projectedCodePoints = projected === null ? 0 : Array.from(projected).length;
+  const expectedRepeatedUnits = item.repeat && item.projectedRepeatCount !== undefined ? item.repeat.repeat(item.projectedRepeatCount) : undefined;
+  if (item.projected !== undefined && projected !== item.projected || expectedRepeatedUnits !== undefined && projected !== expectedRepeatedUnits || projectedCodePoints !== item.projectedCodePoints)
+    throw new Error(`Customer label projection mismatch: ${item.id}`);
+  const candidate = { ...valid.device, customerLabel: raw };
+  const expected = item.wireValid === true;
+  const schemaAccepted = Boolean(schemas.get("device")(candidate));
+  const platformAccepted = platformContractRuntime.validateNativeDevice(candidate);
+  const osAccepted = osContractRuntime.validateDevice(candidate, { homeId: candidate.homeId, homeMembershipId: "membership:owner-a", role: "OWNER", areaIds: candidate.areaIds });
+  if (schemaAccepted !== expected || platformAccepted !== expected || osAccepted !== expected)
+    throw new Error(`Customer label bound differs across schema, Platform and OS: ${item.id}`);
+}
+const boundedStringFixture = JSON.parse(fs.readFileSync(path.join(fixtureRoot, "bounded-string-unicode-semantics.json"), "utf8"));
+if (boundedStringFixture.schemaVersion !== contract.contractVersion || boundedStringFixture.lengthUnit !== "unicode_code_points" || !Array.isArray(boundedStringFixture.boundaryCases) || !Array.isArray(boundedStringFixture.combiningSequenceCases))
+  throw new Error("Bounded string fixture must freeze JSON Schema Unicode-code-point semantics");
+const repeatedCodePoints = (item, count) => item.repeat.repeat(count);
+const commandBound = JSON.parse(fs.readFileSync(path.join(fixtureRoot, "command-valid.json"), "utf8"));
+const areaBound = { id: "area:living", homeId: valid.device.homeId, originalName: "Living", overrideName: null, revision: 1, lifecycle: "active" };
+for (const item of [...boundedStringFixture.boundaryCases, ...boundedStringFixture.combiningSequenceCases]) {
+  const at = repeatedCodePoints(item, item.validRepeatCount);
+  const over = repeatedCodePoints(item, item.invalidRepeatCount);
+  const outcomes = [];
+  if (item.field === "opaqueId") {
+    const withId = (id) => ({ ...valid.device, id, controls: valid.device.controls.map((control) => ({ ...control, deviceId: id })) });
+    outcomes.push([platformContractRuntime.validateNativeDevice(withId(at)), osContractRuntime.validateDevice(withId(at))]);
+    outcomes.push([platformContractRuntime.validateNativeDevice(withId(over)), osContractRuntime.validateDevice(withId(over))]);
+  } else if (item.field === "areaName") {
+    outcomes.push([platformContractRuntime.validateNativeArea({ ...areaBound, originalName: at }), osContractRuntime.validateArea({ ...areaBound, originalName: at }, areaBound.homeId)]);
+    outcomes.push([platformContractRuntime.validateNativeArea({ ...areaBound, originalName: over }), osContractRuntime.validateArea({ ...areaBound, originalName: over }, areaBound.homeId)]);
+  } else if (item.field === "controlLabel") {
+    const withLabel = (label) => ({ ...valid.device, controls: valid.device.controls.map((control, index) => index ? control : { ...control, label }) });
+    outcomes.push([platformContractRuntime.validateNativeDevice(withLabel(at)), osContractRuntime.validateDevice(withLabel(at))]);
+    outcomes.push([platformContractRuntime.validateNativeDevice(withLabel(over)), osContractRuntime.validateDevice(withLabel(over))]);
+  } else if (item.field === "constraintUnit" || item.field === "optionLabel") {
+    const withConstraintText = (value) => ({ ...valid.device, controls: [{ ...valid.device.controls[0], valueType: "option", interactionKind: "picker", constraints: { unit: item.field === "constraintUnit" ? value : "mode", options: [{ value: "on", label: item.field === "optionLabel" ? value : "On" }] } }] });
+    outcomes.push([platformContractRuntime.validateNativeDevice(withConstraintText(at)), osContractRuntime.validateDevice(withConstraintText(at))]);
+    outcomes.push([platformContractRuntime.validateNativeDevice(withConstraintText(over)), osContractRuntime.validateDevice(withConstraintText(over))]);
+  } else if (item.field === "textCommand" || item.field === "idempotencyKey") {
+    const control = { ...valid.device.controls[0], valueType: item.field === "textCommand" ? "text" : "boolean", interactionKind: item.field === "textCommand" ? "text_input" : "toggle" };
+    const device = { ...valid.device, controls: [control] };
+    const makeCommand = (value, idempotencyKey) => ({ ...commandBound, homeId: device.homeId, deviceId: device.id, controlId: control.controlId, descriptorRevision: device.descriptorRevision, value, idempotencyKey });
+    const validValue = item.field === "textCommand" ? at : true;
+    const invalidValue = item.field === "textCommand" ? over : true;
+    const validKey = item.field === "idempotencyKey" ? at : commandBound.idempotencyKey;
+    const invalidKey = item.field === "idempotencyKey" ? over : commandBound.idempotencyKey;
+    outcomes.push([platformContractRuntime.validateCommandAgainstDevice(makeCommand(validValue, validKey), device, control, commandBound.homeMembershipId), osContractRuntime.validateCommand(makeCommand(validValue, validKey), device, control, commandBound.homeMembershipId)]);
+    outcomes.push([platformContractRuntime.validateCommandAgainstDevice(makeCommand(invalidValue, invalidKey), device, control, commandBound.homeMembershipId), osContractRuntime.validateCommand(makeCommand(invalidValue, invalidKey), device, control, commandBound.homeMembershipId)]);
+    if (item.invalidMinimumRepeatCount !== undefined) {
+      const tooShort = makeCommand(true, repeatedCodePoints(item, item.invalidMinimumRepeatCount));
+      if (platformContractRuntime.validateCommandAgainstDevice(tooShort, device, control, commandBound.homeMembershipId) || osContractRuntime.validateCommand(tooShort, device, control, commandBound.homeMembershipId))
+        throw new Error(`Unicode idempotency minimum mismatch: ${item.id}`);
+    }
+  }
+  const expected = [[true, true], [false, false]];
+  if (JSON.stringify(outcomes) !== JSON.stringify(expected)) throw new Error(`Unicode bounded-string semantics drift across Platform/OS: ${item.id} ${JSON.stringify(outcomes)}`);
+}
+const invalidBooleanState = JSON.parse(fs.readFileSync(path.join(fixtureRoot, "invalid/control-state-boolean-string.json"), "utf8")).data;
+const booleanDevice = valid.device;
+const booleanControl = booleanDevice.controls.find((control) => control.valueType === "boolean");
+if (!booleanControl || platformContractRuntime.validateControlState(invalidBooleanState, booleanDevice, booleanControl) ||
+    osContractRuntime.validateControlState(invalidBooleanState, booleanDevice, booleanControl))
+  throw new Error("A structurally valid string-valued state must be rejected by both Platform and OS against its boolean descriptor");
 const duplicateAreas = JSON.parse(fs.readFileSync(path.join(fixtureRoot, "duplicate-display-names.json"), "utf8"));
 if (!duplicateAreas.areas.every((area) => definitionValidator("area")({ ...area, homeId: duplicateAreas.homeId })) || new Set(duplicateAreas.areas.map((area) => area.id)).size !== duplicateAreas.areas.length)
   throw new Error("Duplicate display names must remain valid distinct canonical area identities");
@@ -276,29 +412,312 @@ const replacementHub = JSON.parse(fs.readFileSync(path.join(fixtureRoot, "replac
 if (replacementHub.hubInstallationId === replacementHub.previousHubInstallationId || replacementHub.nameBasedMergeAllowed !== false)
   throw new Error("Hub replacement must use a new installation identity and prohibit name-based merge");
 const decisionMatrix = JSON.parse(fs.readFileSync(path.join(fixtureRoot, "stage2-decision-matrix.json"), "utf8"));
-const decisionMatrixValid = decisionMatrix.schemaVersion === contract.contractVersion &&
-  decisionMatrix.identity.customerIsEmployee === false && decisionMatrix.identity.activeOwnerMembershipIds.length === 1 &&
-  decisionMatrix.identity.activeManagerMembershipIds.length > 1 && decisionMatrix.identity.membershipCreatedForPendingInvitation === false &&
-  new Set(decisionMatrix.property.areas.map((area) => area.id)).size === 2 &&
-  new Set(decisionMatrix.property.areas.map((area) => area.floorplanShapeId)).size === 2 &&
-  decisionMatrix.property.areas.every((area) => area.overrideName === "Bedroom") &&
-  decisionMatrix.property.fullGrantCombinedAreaIds.length === 2 && decisionMatrix.property.partialGrantCombinedAreaIds.length === 1 &&
-  decisionMatrix.tenantPrivacy.visibleToMembershipIds.length === 1 && decisionMatrix.tenantPrivacy.visibleToMembershipIds[0] === decisionMatrix.tenantPrivacy.ownerMembershipId &&
-  [decisionMatrix.tenantPrivacy.ownerCanRead, decisionMatrix.tenantPrivacy.managerCanRead, decisionMatrix.tenantPrivacy.otherTenantCanRead, decisionMatrix.tenantPrivacy.labelChangesAuthority].every((value) => value === false) &&
-  decisionMatrix.replacement.homeIdPreserved === true && decisionMatrix.replacement.areaIdsPreserved === true && decisionMatrix.replacement.previousHubInstallationId !== decisionMatrix.replacement.currentHubInstallationId && decisionMatrix.replacement.previousDeviceId !== decisionMatrix.replacement.replacementDeviceId && decisionMatrix.replacement.nameBasedMergeAllowed === false && decisionMatrix.replacement.previousHistoryRewritten === false && decisionMatrix.replacement.previousHistoryRetained === true &&
-  decisionMatrix.support.categories.join(",") === contract.$defs.supportTicket.properties.category.enum.join(",") && decisionMatrix.support.privateTenantDeviceTicketVisibleToOwner === false && decisionMatrix.support.privateTenantDeviceTicketNotifiesOwner === false && decisionMatrix.support.infrastructureTicketNotifiesOwner === true && decisionMatrix.support.infrastructureNoticeContainsTenantPrivateDetails === false && decisionMatrix.support.sameApproverRequiredForSafetyConfirmation === true && decisionMatrix.support.closedTicketRevokesAuthorityImmediately === true && decisionMatrix.support.offlineHubAcknowledgementCanRemainPending === true &&
-  decisionMatrix.claim.firstVerifiedEmailWins === true && decisionMatrix.claim.reservationSeconds === 1800 && decisionMatrix.claim.qualifyingRequiredSaveCanExtend === true && decisionMatrix.claim.duplicateOrNoOpCanExtend === false && decisionMatrix.claim.transferClaimExpiresByTime === false && decisionMatrix.claim.unfinishedPropertyDataDeletedOnRelease === true &&
-  decisionMatrix.notification.mandatorySecurityIgnoresQuietHours === true && decisionMatrix.notification.optionalEnabledEventMayDefer === true && decisionMatrix.notification.tenantDeviceAudience === "owning_membership_only" && decisionMatrix.notification.smsEnabled === false && decisionMatrix.notification.inboxEnabled === false && decisionMatrix.notification.deliveryReceiptGrantsAuthority === false &&
-  decisionMatrix.controls.labelCanCreateCapability === false && decisionMatrix.controls.descriptorRevisionRequiredForWrite === true && decisionMatrix.controls.staleOrOfflineCommandAllowed === false && decisionMatrix.controls.securityControlRequiresAppStepUp === true && decisionMatrix.controls.securityControlAutomatable === false && decisionMatrix.controls.securityControlAlexaExposed === false &&
-  decisionMatrix.automation.bundleContainsHomeAndRevision === true && decisionMatrix.automation.saveRequiresCurrentRevision === true && decisionMatrix.automation.staleRevisionIsRejectedWithoutMerge === true && decisionMatrix.automation.appOnlySecurityControlEligible === false && decisionMatrix.automation.presentationLabelsGrantCapability === false &&
-  decisionMatrix.alexa.activeMembershipRole === "TENANT" && decisionMatrix.alexa.selectedAreaIdsAreAuthoritative === true && decisionMatrix.alexa.ownTenantDeviceEligible === true && decisionMatrix.alexa.otherTenantDeviceEligible === false && decisionMatrix.alexa.appOnlySecurityControlEligible === false && decisionMatrix.alexa.exposureGenerationMonotonic === true &&
-  decisionMatrix.trustedDevice.removalRevokesAccountInstallation === true && decisionMatrix.trustedDevice.offlineReenrollmentAllowed === false && decisionMatrix.trustedDevice.removalAcknowledgementMayRemainPending === true &&
-  decisionMatrix.provisioning.hubOwnsCapabilityDescriptors === true && decisionMatrix.provisioning.platformOwnsMembershipAuthority === true && decisionMatrix.provisioning.cloudUrlIndependentlyVerified === true && decisionMatrix.provisioning.manufacturingRootPrivateKeyOnHub === false &&
-  decisionMatrix.roomQr.oneHomeClaimAuthority === true && decisionMatrix.roomQr.claimReservationFirstWins === true && decisionMatrix.roomQr.installerSetupPresentationIsCustomerClaim === false && decisionMatrix.roomQr.roomQrRetriesCreateAlternativeClaims === false &&
-  decisionMatrix.notifications.audienceRecomputedFromCurrentAuthority === true && decisionMatrix.notifications.channels.join(",") === "push,verified_email" && decisionMatrix.notifications.smsEnabled === false && decisionMatrix.notifications.inboxEnabled === false && decisionMatrix.notifications.deduplicatedByEventAndRecipient === true && decisionMatrix.notifications.deliveryReceiptGrantsAuthority === false && decisionMatrix.notifications.retryHoursMaximum === 24 &&
-  Object.values(decisionMatrix.offline).every((value) => value === true || value === false) && decisionMatrix.offline.previouslyEnrolledTrustedInstallationRequired === true && decisionMatrix.offline.exactHomeAndMembershipBound === true && decisionMatrix.offline.signedExactHomeChallengeRequired === true && decisionMatrix.offline.scopeCanWiden === false && decisionMatrix.offline.policyAppliedBeforeConnected === true &&
-  decisionMatrix.analytics.validityDeadlineInclusive === false && decisionMatrix.analytics.expiredQuality === "unknown" && decisionMatrix.analytics.targetTemperatureCountsAsActivity === false && decisionMatrix.analytics.periodAggregation === "average_contributing_device_samples" && decisionMatrix.analytics.hourAggregation === "sum_selected_devices" && decisionMatrix.analytics.summaryAggregation === "average_displayed_buckets";
-if (!decisionMatrixValid) throw new Error("Stage 2 authority, privacy, lifecycle, offline or presentation decision fixture conflicts with the canonical contract");
+const prototypeScenarios = JSON.parse(fs.readFileSync(path.join(fixtureRoot, "prototype-scenarios.json"), "utf8"));
+const requiredPrototypeFlows = ["support", "invitation", "room-qr", "property-actions", "area-edit", "quiet-hours", "trusted-device", "access-request", "descriptor-change", "claim", "recovery", "management-activity", "installation-request"];
+const knownPrototypeRoles = new Set(["Homeowner", "Property manager", "Tenant"]);
+if (prototypeScenarios.schemaVersion !== contract.contractVersion ||
+    JSON.stringify(Object.keys(prototypeScenarios.flows ?? {}).sort()) !== JSON.stringify([...requiredPrototypeFlows].sort()))
+  throw new Error("Rendered prototype scenario fixture must define every required flow exactly once");
+for (const [flowId, flow] of Object.entries(prototypeScenarios.flows)) {
+  if (typeof flow.initialOutcome !== "string" || !flow.initialOutcome.trim() || !Array.isArray(flow.actions) || flow.actions.length === 0)
+    throw new Error(`Rendered prototype flow has no initial outcome or actions: ${flowId}`);
+  const ids = new Set();
+  for (const action of flow.actions) {
+    if (typeof action.id !== "string" || !action.id.trim() || ids.has(action.id) ||
+        typeof action.label !== "string" || !action.label.trim() ||
+        typeof action.outcome !== "string" || !action.outcome.trim() ||
+        action.allowedRoles !== undefined && (!Array.isArray(action.allowedRoles) || action.allowedRoles.length === 0 || action.allowedRoles.some((role) => !knownPrototypeRoles.has(role))))
+      throw new Error(`Rendered prototype scenario is malformed or repeats an action: ${flowId}`);
+    ids.add(action.id);
+  }
+}
+const prototypeAction = (flow, action) => prototypeScenarios.flows[flow].actions.find((candidate) => candidate.id === action);
+if (!prototypeAction("invitation", "accept").outcome.includes("membership must then be revalidated") ||
+    !prototypeAction("invitation", "resend").outcome.includes("old link and projection are invalidated") ||
+    !prototypeAction("invitation", "expire").outcome.includes("exact deadline") ||
+    !prototypeAction("property-actions", "active-tenant-successor").outcome.includes("Denied before mutation") ||
+    !prototypeAction("property-actions", "verified-staff-replace").outcome.includes("non-expiring transfer claim") ||
+    !prototypeAction("property-actions", "alternate-replay").outcome.includes("cannot complete a second transfer") ||
+    !prototypeAction("room-qr", "unclaimed-home").outcome.includes("no access request or membership") ||
+    !prototypeAction("property-actions", "offline-deregister").outcome.includes("pending hub acknowledgement") ||
+    !prototypeAction("claim", "noop-save").outcome.includes("No extension") ||
+    !prototypeAction("recovery", "expired-proof").outcome.includes("no customer session") ||
+    !prototypeAction("support", "private-request").outcome.includes("property owner is not notified") ||
+    !prototypeAction("quiet-hours", "receipt").outcome.includes("grants no membership") ||
+    prototypeAction("property-actions", "transfer").allowedRoles?.join(",") !== "Homeowner" ||
+    prototypeAction("area-edit", "current").allowedRoles?.join(",") !== "Homeowner,Property manager")
+  throw new Error("Rendered prototype scenarios contradict invitation, claim, support, privacy or role authority decisions");
+if (!prototypeAction("claim", "required-save").outcome.includes("exactly 30 minutes") ||
+    prototypeAction("claim", "required-save").outcome.includes("extends once"))
+  throw new Error("Claim prototype must model each successful required save as a fresh 30-minute deadline; it is not a one-extension allowance");
+// The decision matrix is fixture input for rendered review, not proof that its
+// boolean expectations are true. Execute the overlapping identity, area,
+// tenant-privacy and command cases against the real OS contract validators.
+const matrixOwnerIds = decisionMatrix.identity.activeOwnerMembershipIds;
+const matrixManagerIds = decisionMatrix.identity.activeManagerMembershipIds;
+if (decisionMatrix.schemaVersion !== contract.contractVersion || matrixOwnerIds.length !== 1 || matrixManagerIds.length < 2 ||
+    new Set([...matrixOwnerIds, ...matrixManagerIds]).size !== matrixOwnerIds.length + matrixManagerIds.length)
+  throw new Error("Decision fixture must describe exactly one distinct owner and multiple manager memberships");
+const decisionMemberships = [
+  ...matrixOwnerIds.map((homeMembershipId) => ({ accountId: decisionMatrix.identity.accountId, homeId: decisionMatrix.property.homeId, homeMembershipId, role: "OWNER", status: "active", areaIds: duplicateAreas.areas.map((area) => area.id), revision: 1 })),
+  ...matrixManagerIds.map((homeMembershipId) => ({ accountId: decisionMatrix.identity.accountId, homeId: decisionMatrix.property.homeId, homeMembershipId, role: "PROPERTY_MANAGER", status: "active", areaIds: duplicateAreas.areas.map((area) => area.id), revision: 1 })),
+];
+if (!decisionMemberships.every((membership) => osContractRuntime.validateMembership(membership, membership.homeId)))
+  throw new Error("Decision fixture owner/manager memberships must decode through the OS runtime");
+const pendingInvitation = JSON.parse(fs.readFileSync(path.join(fixtureRoot, "invitation-pending-no-membership.json"), "utf8"));
+if (!definitionValidator("membershipInvitation")(pendingInvitation) || pendingInvitation.state !== "pending" || pendingInvitation.membershipId !== null)
+  throw new Error("Pending invitation must validate without creating membership authority");
+const invitationLifecycle = JSON.parse(fs.readFileSync(path.join(fixtureRoot, "invitation-lifecycle.json"), "utf8"));
+const invitationInitial = invitationLifecycle.initial;
+const invitationIssued = Date.parse(invitationInitial.issuedAt);
+const invitationExpiry = Date.parse(invitationInitial.expiresAt);
+if (invitationLifecycle.lifetimeSeconds !== 604800 || invitationExpiry - invitationIssued !== 604800_000 ||
+    invitationInitial.state !== "pending" || invitationInitial.membershipId !== null || invitationInitial.areaIds.length < 1 ||
+    invitationLifecycle.roleRules.tenantRequiresAtLeastOneCanonicalArea !== true || invitationLifecycle.roleRules.managerAreaIds.length !== 0 ||
+    invitationLifecycle.credentialDelivery.tenantInitialPasswordServerGenerated !== true || invitationLifecycle.credentialDelivery.homeownerReceivesPlaintextTenantPassword !== false ||
+    invitationLifecycle.credentialDelivery.deliveryReceiptCreatesMembership !== false)
+  throw new Error("Invitation must use its exact seven-day lifetime, create no pending membership, require tenant area scope, and avoid homeowner plaintext credentials");
+const allowedInvitationProjectionKeys = new Set(["fullPostcode", "proposedRole", "inviterDisplayLabel", "issuedAt", "expiresAt", "forbiddenKeys"]);
+if (Object.keys(invitationLifecycle.recipientProjection).some((key) => !allowedInvitationProjectionKeys.has(key)) ||
+    invitationLifecycle.recipientProjection.forbiddenKeys.some((key) => key in invitationLifecycle.recipientProjection) ||
+    invitationLifecycle.recipientProjection.expiresAt !== invitationInitial.expiresAt)
+  throw new Error("Pre-acceptance invitation projection disclosed property details or drifted from the durable expiry");
+for (const scenario of invitationLifecycle.cases) {
+  const at = Date.parse(scenario.at);
+  const recipient = scenario.authenticatedAccountId === invitationInitial.recipientAccountId;
+  const verified = recipient && scenario.emailVerified === true;
+  const beforeDeadline = at < invitationExpiry;
+  const expected = !recipient ? "INVITATION_RECIPIENT_MISMATCH"
+    : !verified ? "EMAIL_VERIFICATION_REQUIRED"
+      : !scenario.explicitAccept ? "INVITATION_PENDING"
+        : !beforeDeadline ? "INVITATION_EXPIRED"
+          : scenario.authorityRevalidated === true ? "MEMBERSHIP_ACTIVE" : "INVITATION_PENDING";
+  const membership = expected === "MEMBERSHIP_ACTIVE" ? "membership:recipient-home" : null;
+  if (scenario.expected !== expected || scenario.membershipId !== membership)
+    throw new Error(`Invitation transition semantics mismatch: ${scenario.id}`);
+}
+const resend = invitationLifecycle.resend;
+if (resend.newGeneration !== resend.oldGeneration + 1 || Date.parse(resend.newExpiresAt) - Date.parse(resend.resentAt) !== invitationLifecycle.lifetimeSeconds * 1000 ||
+    resend.oldLinkOutcome !== "INVITATION_REPLACED" || resend.oldRecipientProjectionVisible !== false || resend.oldMembershipCreated !== false || resend.newCommunicationOnly !== true ||
+    invitationLifecycle.resultCommunication.expiryNotificationSent !== false || invitationLifecycle.resultCommunication.resendSendsOnlyNewGeneration !== true ||
+    invitationLifecycle.resultCommunication.acceptAndDeclineDeduplicatedPush !== true || invitationLifecycle.resultCommunication.acceptAndDeclineVerifiedEmail !== true)
+  throw new Error("Invitation resend/expiry/result communications must invalidate the old generation and avoid expiry notification noise");
+const transferLifecycle = JSON.parse(fs.readFileSync(path.join(fixtureRoot, "transfer-lifecycle.json"), "utf8"));
+const transferClaim = transferLifecycle.activeClaim;
+if (transferClaim.state !== "active" || transferClaim.expiresAt !== null || Date.parse(transferClaim.validatedAt) - Date.parse(transferClaim.createdAt) < 10 * 365 * 24 * 60 * 60 * 1000 || transferClaim.concurrentTransferAllowed !== false ||
+    new Set(transferLifecycle.presentations).size !== 3 || transferLifecycle.presentations.length !== 3 ||
+    !transferLifecycle.presentations.includes("permanent_hub_qr_with_live_lan_challenge"))
+  throw new Error("Transfer must remain one non-expiring claim across its three mutually invalidating presentations");
+const transferCases = new Map(transferLifecycle.cases.map((scenario) => [scenario.id, scenario]));
+const tenantSuccessor = transferCases.get("active-tenant-successor");
+const managerCancel = transferCases.get("manager-cancel");
+const ownerCancel = transferCases.get("owner-cancel");
+const staffReplace = transferCases.get("verified-staff-replace");
+const consume = transferCases.get("consume-one-presentation");
+const alternateReplay = transferCases.get("retry-other-presentation");
+if (!tenantSuccessor || tenantSuccessor.expected !== "ACTIVE_TENANT_SUCCESSOR_DENIED" || tenantSuccessor.mutation !== false ||
+    !managerCancel || managerCancel.expected !== "SCOPE_DENIED" || managerCancel.mutation !== false ||
+    !ownerCancel || ownerCancel.expected !== "CANCELLED" || ownerCancel.mutation !== true ||
+    !staffReplace || staffReplace.actorMembershipId !== "employee:senior-ops" || staffReplace.verifiedStaff !== true || staffReplace.expected !== "REPLACED" ||
+    !consume || consume.expected !== "TRANSFERRED" || consume.mutation !== true ||
+    !alternateReplay || alternateReplay.after !== consume.id || alternateReplay.expected !== "CLAIM_ALREADY_CONSUMED" || alternateReplay.mutation !== false)
+  throw new Error("Transfer lifecycle must enforce active-tenant, owner/staff authority, one presentation consumption and replay denial");
+const transferCompletion = transferLifecycle.completion;
+if (transferCompletion.formerOwnerRemoved !== true || transferCompletion.allPreExistingManagersRemoved !== true ||
+    transferCompletion.activeTenantMembershipIdsPreserved.length < 1 || transferCompletion.canonicalAreaIdsPreserved.length < 1 ||
+    transferCompletion.permanentDeviceIdsPreserved.length < 1 || transferCompletion.inProgressPermanentInstallationRequestPreserved !== true ||
+    transferCompletion.pendingTenantAndManagerInvitationsCancelled !== true || transferCompletion.pendingRoomQrRequestsCancelled !== true ||
+    transferCompletion.pendingAndActivePropertySupportRevoked !== true || transferCompletion.proposedSuccessorNotifiedBeforeCompletion !== false ||
+    transferCompletion.outgoingOwnerAndRemovedManagersNotified !== true || transferCompletion.historyRewritten !== false)
+  throw new Error("Transfer completion failed its household-preservation, grant-removal or notification privacy contract");
+const notificationLifecycle = JSON.parse(fs.readFileSync(path.join(fixtureRoot, "notification-lifecycle.json"), "utf8"));
+if (notificationLifecycle.schemaVersion !== contract.contractVersion || notificationLifecycle.defaults.quietHoursEnabled !== false ||
+    notificationLifecycle.defaults.mandatoryEventsDisableable !== false ||
+    JSON.stringify(notificationLifecycle.roleCatalogues.owner) !== JSON.stringify(["hub_availability", "permanent_device_outages", "new_permanent_devices", "tenant_access_requests", "installation_updates", "automation_activity"]) ||
+    JSON.stringify(notificationLifecycle.roleCatalogues.propertyManager) !== JSON.stringify(notificationLifecycle.roleCatalogues.owner) ||
+    JSON.stringify(notificationLifecycle.roleCatalogues.tenant) !== JSON.stringify(["hub_availability", "permanent_device_outages_in_authorized_areas", "own_tenant_device_outages", "new_permanent_devices_in_authorized_areas", "automation_failure_or_skipped_run", "access_request_decisions"]) ||
+    notificationLifecycle.propertyManagerPreferenceAuthority !== "original_homeowner_final_selection")
+  throw new Error("Notification preference defaults or role-specific catalogue differ from the frozen contract");
+for (const scenario of notificationLifecycle.cases) {
+  if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(scenario.localTime) || typeof scenario.enabled !== "boolean" ||
+      typeof scenario.quietHoursEnabled !== "boolean" || typeof scenario.mandatory !== "boolean")
+    throw new Error(`Notification case lacks a well-formed local time or explicit preference state: ${scenario.id}`);
+  const expected = scenario.mandatory ? "delivered-immediately"
+    : !scenario.enabled ? "not-sent"
+      : scenario.quietHoursEnabled && scenario.localTime < "07:00" ? "deferred-individually-until-quiet-hours-end"
+        : "delivered-once";
+  if (scenario.expected !== expected) throw new Error(`Notification quiet-hours or mandatory-family transition mismatch: ${scenario.id}`);
+}
+const privateNotificationAudience = notificationLifecycle.audienceCases.find(({ id }) => id === "private-tenant-device");
+const infrastructureNotificationAudience = notificationLifecycle.audienceCases.find(({ id }) => id === "property-infrastructure");
+if (!privateNotificationAudience || JSON.stringify(privateNotificationAudience.candidates.filter((candidate) => candidate === privateNotificationAudience.currentMembershipId)) !== JSON.stringify(privateNotificationAudience.expectedRecipients) ||
+    privateNotificationAudience.privateDetailsInOwnerNotice !== false || !infrastructureNotificationAudience ||
+    JSON.stringify(infrastructureNotificationAudience.expectedGenericRecipients) !== JSON.stringify([...decisionMatrix.identity.activeOwnerMembershipIds, ...decisionMatrix.identity.activeManagerMembershipIds]) ||
+    infrastructureNotificationAudience.tenantPrivateDetailsIncluded !== false)
+  throw new Error("Notification audience leaks a private tenant ticket or omits generic property-infrastructure recipients");
+const notificationDedupe = notificationLifecycle.deduplication;
+const deliveries = notificationDedupe.sameEventRecipientChannelDeliveries;
+const deliveryIds = deliveries.map((delivery) => delivery.deliveryId);
+const deliveryKeys = new Set(deliveries.map((delivery) => notificationDedupe.keyFields.map((field) => delivery[field]).join("|")));
+const duplicateAttemptCount = deliveries.length - deliveryKeys.size;
+if (JSON.stringify(notificationDedupe.keyFields) !== JSON.stringify(["eventId", "recipientId", "channel"]) ||
+    deliveries.some((delivery) => typeof delivery.deliveryId !== "string" || delivery.deliveryId.length === 0 || notificationDedupe.keyFields.some((field) => typeof delivery[field] !== "string" || delivery[field].length === 0) || !notificationDedupe.channels.includes(delivery.channel)) ||
+    new Set(deliveryIds).size !== deliveryIds.length || notificationDedupe.expectedDeliveryCount !== deliveryKeys.size ||
+    notificationDedupe.expectedRetrySuppressionCount !== duplicateAttemptCount ||
+    notificationDedupe.receiptCreatesAuthority !== false || notificationDedupe.receiptCreatesMembership !== false ||
+    JSON.stringify(notificationDedupe.channels) !== JSON.stringify(["push", "verified_email"]))
+  throw new Error("Notification retry must deduplicate per event/recipient/channel and a receipt must grant no authority");
+const accountRelationshipLifecycle = JSON.parse(fs.readFileSync(path.join(fixtureRoot, "account-relationship-lifecycle.json"), "utf8"));
+const retainedRelationshipKinds = new Set(accountRelationshipLifecycle.retainedRelationshipKinds);
+const nonRetainingKinds = new Set(accountRelationshipLifecycle.nonRetainingKinds);
+if (accountRelationshipLifecycle.schemaVersion !== contract.contractVersion || retainedRelationshipKinds.size !== 4 || nonRetainingKinds.size !== 6 ||
+    accountRelationshipLifecycle.tenantSelfRemoval.removesOnlySelectedMembership !== true ||
+    accountRelationshipLifecycle.tenantSelfRemoval.preservesOtherHomeMemberships !== true ||
+    accountRelationshipLifecycle.tenantSelfRemoval.preservesOtherTrustedInstallations !== true)
+  throw new Error("Account relationship lifecycle does not preserve scoped removal and account-global identity decisions");
+for (const scenario of accountRelationshipLifecycle.cases) {
+  if (scenario.remainingRelationships.some((kind) => !retainedRelationshipKinds.has(kind) && !nonRetainingKinds.has(kind)))
+    throw new Error(`Account cleanup scenario uses an unclassified relationship kind: ${scenario.id}`);
+  const hasLiveRelationship = scenario.remainingRelationships.some((kind) => retainedRelationshipKinds.has(kind));
+  const expected = hasLiveRelationship ? "ACCOUNT_RETAINED" : "ACCOUNT_AND_ACCOUNT_SCOPED_STATE_DELETED";
+  if (scenario.expected !== expected) throw new Error(`Final-valid-relationship deletion rule failed: ${scenario.id}`);
+}
+const accountCleanup = accountRelationshipLifecycle.finalCleanup;
+if (accountCleanup.deleteSessions !== true || accountCleanup.deleteTrustedDeviceCredentials !== true ||
+    accountCleanup.deleteAccountScopedCachesAndPreferences !== true || accountCleanup.closeBoundOpenSupportTickets !== true ||
+    accountCleanup.retainOnlyRedactedReceiptMonths !== 12 || accountCleanup.supportTicketKeepsAccountAlive !== false ||
+    accountCleanup.freshReentryRequiresRegistrationAndEmailVerification !== true || accountCleanup.reuseDeletedIdentityWithoutRegistration !== false)
+  throw new Error("Final account cleanup/re-entry differs from frozen relationship, ticket retention or identity policy");
+
+const roomQrLifecycle = JSON.parse(fs.readFileSync(path.join(fixtureRoot, "room-qr-lifecycle.json"), "utf8"));
+if (roomQrLifecycle.schemaVersion !== contract.contractVersion || roomQrLifecycle.credential.onePerCanonicalOriginalArea !== true ||
+    roomQrLifecycle.credential.emptyAreaAllowed !== true || roomQrLifecycle.credential.lifetime !== "until_disabled_or_replaced" ||
+    roomQrLifecycle.credential.replacementInvalidatesOldPresentation !== true || roomQrLifecycle.credential.replacementChangesExistingGrants !== false ||
+    roomQrLifecycle.request.emailVerificationRequiredBeforeOwnerVisibility !== true || roomQrLifecycle.request.lifetimeSeconds !== 7 * 24 * 60 * 60 ||
+    roomQrLifecycle.request.latestValidPendingRequestWins !== true || roomQrLifecycle.request.grantIsExactlyRequestedCanonicalArea !== true ||
+    roomQrLifecycle.request.rejectionCooldownSeconds !== 0 || roomQrLifecycle.request.ownerlessQrRequestPersists !== false ||
+    roomQrLifecycle.request.retiredAreaQrEnabled !== false)
+  throw new Error("Room QR credential, request visibility, grant scope or expiry differs from the frozen contract");
+for (const scenario of roomQrLifecycle.cases) {
+  let expected;
+  if (scenario.areaLifecycle === "retired") expected = "AREA_NOT_AVAILABLE";
+  else if (scenario.activeOwnerExists === false) expected = "NO_DURABLE_REQUEST";
+  else if (scenario.elapsedSeconds === roomQrLifecycle.request.lifetimeSeconds) expected = "REQUEST_EXPIRED";
+  else if (scenario.previousState === "REJECTED" && scenario.elapsedSeconds === 0) expected = "NEW_REQUEST_ALLOWED";
+  else if (!scenario.emailVerified) expected = "WAITING_FOR_EMAIL_VERIFICATION";
+  else if (scenario.approved === true) expected = "MEMBERSHIP_ACTIVE";
+  else expected = "PENDING_OWNER_DECISION";
+  if (scenario.expected !== expected || (scenario.membershipCreated === true && expected !== "MEMBERSHIP_ACTIVE") ||
+      (typeof scenario.membershipCreated === "boolean" && scenario.membershipCreated !== (expected === "MEMBERSHIP_ACTIVE")) ||
+      (expected === "NO_DURABLE_REQUEST" && scenario.persistedRequest !== false) ||
+      (expected === "WAITING_FOR_EMAIL_VERIFICATION" && scenario.ownerVisible !== false) ||
+      (scenario.grantedAreaIds && scenario.grantedAreaIds.some((id) => id !== scenario.requestedAreaId)))
+    throw new Error(`Room QR lifecycle, request visibility, exact-area grant or terminal rejection mismatch: ${scenario.id}`);
+}
+
+const decisionAreas = duplicateAreas.areas.map((area) => ({ ...area, homeId: duplicateAreas.homeId }));
+if (!decisionAreas.every((area) => osContractRuntime.validateArea(area, duplicateAreas.homeId)) ||
+    new Set(decisionAreas.map((area) => area.id)).size !== decisionAreas.length ||
+    new Set(decisionAreas.map((area) => area.overrideName.trim().toLowerCase())).size !== 1)
+  throw new Error("Same-name areas must decode as distinct canonical IDs under the OS runtime");
+const tenantOwnerContext = { ...invalidTenant.context, homeMembershipId: invalidTenant.device.ownerMembershipId, role: "TENANT", areaIds: invalidTenant.device.areaIds };
+if (!osContractRuntime.validateDevice(invalidTenant.device, tenantOwnerContext))
+  throw new Error("The exact owning tenant membership must decode its private device");
+for (const deniedContext of [
+  { ...tenantOwnerContext, role: "OWNER" },
+  { ...tenantOwnerContext, role: "PROPERTY_MANAGER" },
+  { ...tenantOwnerContext, homeMembershipId: "membership:tenant-other" },
+  { ...tenantOwnerContext, areaIds: [] },
+  { ...tenantOwnerContext, homeMembershipId: "membership:tenant-other", areaIds: ["area:private"] },
+]) if (osContractRuntime.validateDevice(invalidTenant.device, deniedContext))
+  throw new Error("OS runtime exposed a tenant-private device to a non-owner, wrong role or ungranted area");
+const labelMutation = { ...invalidTenant.device, customerLabel: "Owner bedroom" };
+if (osContractRuntime.validateDevice(labelMutation, { ...tenantOwnerContext, homeMembershipId: "membership:tenant-other" }))
+  throw new Error("Changing a presentation label must not grant tenant-device authority");
+const privateTicket = JSON.parse(fs.readFileSync(path.join(fixtureRoot, "support-ticket-private.json"), "utf8"));
+const claimReservation = JSON.parse(fs.readFileSync(path.join(fixtureRoot, "claim-first-wins.json"), "utf8"));
+const mandatoryNotification = JSON.parse(fs.readFileSync(path.join(fixtureRoot, "notification-security-mandatory.json"), "utf8"));
+if (!definitionValidator("supportTicket")(privateTicket) || !definitionValidator("claimReservation")(claimReservation) ||
+    Date.parse(claimReservation.expiresAt) - Date.parse(claimReservation.createdAt) !== 1800_000 ||
+    !definitionValidator("notification")(mandatoryNotification) || mandatoryNotification.kind !== "security" || mandatoryNotification.mandatory !== true)
+  throw new Error("Support, exact claim-reservation duration or mandatory-security notification fixture is invalid");
+const privateSupportScenario = JSON.parse(fs.readFileSync(path.join(fixtureRoot, "support-private-notification.json"), "utf8"));
+if (!definitionValidator("supportTicket")(privateTicket) || privateSupportScenario.ticket.homeMembershipId !== privateTicket.homeMembershipId ||
+    JSON.stringify(privateSupportScenario.recipientCandidates.filter((recipient) => recipient === privateSupportScenario.ticket.homeMembershipId)) !== JSON.stringify(privateSupportScenario.expectedPrivateRecipients) ||
+    privateSupportScenario.expectedPrivateRecipients.includes("membership:owner-a"))
+  throw new Error("Executable private-support recipient projection disclosed a tenant-device ticket to its owner");
+const supportLifecycle = JSON.parse(fs.readFileSync(path.join(fixtureRoot, "support-lifecycle.json"), "utf8"));
+const canonicalSupportCategories = contract.$defs.supportTicket.properties.category.enum;
+if (JSON.stringify(supportLifecycle.categories) !== JSON.stringify(canonicalSupportCategories))
+  throw new Error("Support lifecycle must exercise the complete canonical seven-category enum in order");
+const privateSupport = supportLifecycle.privateTenantOnly;
+const privateRecipients = privateSupport.recipientCandidates.filter((recipient) => recipient === privateSupport.ticketMembershipId);
+if (privateSupport.scope !== "tenant_device_only" || privateSupport.homeId !== "home:tenant-property" ||
+    privateSupport.ticketId !== "ticket:tenant-private" ||
+    privateSupport.ticketMembershipId !== "membership:tenant-property" || JSON.stringify(privateRecipients) !== JSON.stringify(privateSupport.expectedRecipients) ||
+    privateSupport.ownerNotice !== false || privateSupport.tenantPrivateDetailsInOwnerNotice !== false)
+  throw new Error("Tenant-private-only support must project solely to its owning tenant without an owner side channel");
+const infrastructureSupport = supportLifecycle.propertyInfrastructure;
+const genericInfrastructureRecipients = infrastructureSupport.recipientCandidates.filter((recipient) => recipient !== supportLifecycle.privateTenantOnly.ticketMembershipId);
+const expectedInfrastructureRecipients = [...decisionMatrix.identity.activeOwnerMembershipIds, ...decisionMatrix.identity.activeManagerMembershipIds];
+if (infrastructureSupport.homeId !== decisionMatrix.property.homeId ||
+    JSON.stringify(infrastructureSupport.expectedGenericLifecycleRecipients) !== JSON.stringify(expectedInfrastructureRecipients) ||
+    !infrastructureSupport.recipientCandidates.includes("membership:tenant-property") ||
+    infrastructureSupport.touchesPropertyInfrastructure !== true ||
+    JSON.stringify(genericInfrastructureRecipients) !== JSON.stringify(infrastructureSupport.expectedGenericLifecycleRecipients) ||
+    infrastructureSupport.noticeContainsTenantPrivateDeviceId !== false || infrastructureSupport.noticeContainsTenantPrivateTicketText !== false)
+  throw new Error("Property-support lifecycle must notify authorized property recipients generically without private tenant detail");
+const approval = supportLifecycle.approval;
+const issuedAt = Date.parse(approval.codeIssuedAt);
+const expiresAt = Date.parse(approval.codeExpiresAt);
+const approvedAt = Date.parse(approval.approvedAt);
+const sessionExpiresAt = Date.parse(approval.sessionExpiresAt);
+if (expiresAt - issuedAt !== approval.codeLifetimeSeconds * 1000 || approval.codeLifetimeSeconds !== 600 ||
+    approvedAt >= expiresAt || sessionExpiresAt - approvedAt !== approval.maxSessionSeconds * 1000 || approval.maxSessionSeconds !== 1800 ||
+    approval.proofMustBeDerivedFromStoredHash !== false || approval.oneUseCodeAndProofConsumedAtomically !== true ||
+    JSON.stringify(approval.proofBoundFields) !== JSON.stringify(["employeeId", "ticketId", "requestId", "homeId", "hubInstallationId", "identityGeneration", "nonce", "codeExpiresAt", "bodyDigest"]) ||
+    ["wrongEmployeeDenied", "wrongTicketDenied", "wrongHomeDenied", "wrongHubDenied", "wrongGenerationDenied", "replayDenied"].some((key) => approval[key] !== true))
+  throw new Error("Support one-use code/proof must bind the exact request context, expire at ten minutes and cap the approved lease at thirty minutes");
+for (const boundary of supportLifecycle.approvalBoundaryCases) {
+  const at = Date.parse(boundary.at);
+  const expected = at < expiresAt ? "eligible-for-customer-approval" : "SUPPORT_CODE_EXPIRED";
+  if (boundary.expected !== expected) throw new Error(`Support code exact-expiry boundary mismatch: ${boundary.id}`);
+}
+if (supportLifecycle.safetyAction.firstApproverMembershipId !== "membership:tenant-property" ||
+    supportLifecycle.safetyAction.firstApproverMembershipId !== supportLifecycle.safetyAction.secondConfirmationMembershipId ||
+    supportLifecycle.safetyAction.differentApproverDenied !== true || supportLifecycle.safetyAction.sameApproverRequired !== true ||
+    supportLifecycle.safetyAction.missingSecondConfirmationDenied !== true)
+  throw new Error("Safety-sensitive support work requires a second confirmation from the same approving membership");
+const supportClosure = supportLifecycle.closure;
+if (supportClosure.ticketState !== "CLOSED" || supportClosure.cloudAuthorityRevokedImmediately !== true ||
+    supportClosure.hubAcknowledgement !== "pending" || supportClosure.pendingHubAcknowledgementPermitsRenewal !== false ||
+    supportClosure.closedTimelineRetentionMonths !== 12 || supportClosure.ticketPreservesOtherwiseRelationshipFreeAccount !== false)
+  throw new Error("Customer close must revoke cloud authority immediately, remain closed while hub ack is pending, and not retain an otherwise relationship-free account");
+const deliveryReceiptScenario = JSON.parse(fs.readFileSync(path.join(fixtureRoot, "notification-delivery-is-not-authority.json"), "utf8"));
+const createsMembership = (invitation) => invitation.state === "accepted" && typeof invitation.membershipId === "string" && invitation.membershipId.length > 0;
+if (deliveryReceiptScenario.receipt.deliveryState !== "sent" || createsMembership(deliveryReceiptScenario.invitation))
+  throw new Error("Notification delivery receipt must not create membership or access authority");
+const offlineWidening = JSON.parse(fs.readFileSync(path.join(fixtureRoot, "offline-scope-widening.json"), "utf8"));
+const offlineScopeAllowed = (grant, requested) => grant.accountId === requested.accountId && grant.homeId === requested.homeId &&
+  grant.homeMembershipId === requested.homeMembershipId && grant.trustedDeviceId === requested.trustedDeviceId &&
+  requested.areaIds.every((areaId) => grant.areaIds.includes(areaId));
+if (offlineScopeAllowed(offlineWidening.grant, offlineWidening.requested))
+  throw new Error("Offline authority adapter accepted a widened area scope");
+for (const [pointer, expected] of [
+  ["support.privateTenantDeviceTicketNotifiesOwner", false],
+  ["notification.deliveryReceiptGrantsAuthority", false],
+  ["offline.scopeCanWiden", false],
+]) {
+  const actual = pointer.split(".").reduce((value, key) => value?.[key], decisionMatrix);
+  if (actual !== expected) throw new Error(`Contradictory executable decision fixture: ${pointer}`);
+}
+const matrixStepUpControl = valid.device.controls.find((control) => control.semanticRole === "security_lock");
+const matrixStepUpCommandFixture = JSON.parse(fs.readFileSync(path.join(fixtureRoot, "command-valid.json"), "utf8"));
+const matrixStepUpCommand = { ...matrixStepUpCommandFixture, controlId: matrixStepUpControl?.controlId, descriptorRevision: valid.device.descriptorRevision, value: false };
+delete matrixStepUpCommand.stepUpOperationId;
+if (!matrixStepUpControl || osContractRuntime.validateCommand(matrixStepUpCommand, valid.device, matrixStepUpControl, matrixStepUpCommandFixture.homeMembershipId) ||
+    !osContractRuntime.validateCommand({ ...matrixStepUpCommand, stepUpOperationId: "operation:fixture-bound" }, valid.device, matrixStepUpControl, matrixStepUpCommandFixture.homeMembershipId))
+  throw new Error("OS runtime must reject app-only security control commands without exact step-up and accept the bound proof reference");
 const mixedChannels = JSON.parse(fs.readFileSync(path.join(fixtureRoot, "multi-channel-mixed-controls.json"), "utf8"));
 if (!mixedChannels.channels.length || mixedChannels.channels.some((channel) => channel.deviceId !== mixedChannels.channels[0].deviceId || channel.controls.some((control) => !["boolean", "number", "option", "text", "invoke"].includes(control.valueType) || !["power", "brightness", "active_heat_demand", "active_heat_production", "target_temperature", "ambient_temperature", "opening_percentage", "connectivity", "security_lock", "lock_state", "operating_mode", "position", "volume", "color", "state", "unknown"].includes(control.semanticRole))))
   throw new Error("Mixed-channel controls must retain one device identity and known canonical semantic/value types");
@@ -307,23 +726,50 @@ const analyticsNow = Date.parse(analyticsSemantics.now);
 if (analyticsSemantics.schemaVersion !== contract.contractVersion || analyticsSemantics.activityCases.length < 10)
   throw new Error("Analytics semantic fixture must cover canonical dinodia.v1 activity boundaries");
 for (const item of analyticsSemantics.activityCases) {
-  const deadline = Date.parse(item.validUntil);
-  const signals = item.signals || {};
-  const actual = item.quality !== "fresh" || !Number.isFinite(deadline) || deadline <= analyticsNow ? "unknown" :
-    item.category === "light" ? (signals.powerOn === true || typeof signals.brightness === "number" && signals.brightness > 0 ? "on" : signals.powerOn === false || signals.brightness === 0 ? "off" : "unknown") :
-    item.category === "radiator" ? (typeof signals.activeHeatDemand === "boolean" ? signals.activeHeatDemand ? "on" : "off" : "unknown") :
-    item.category === "boiler" ? (typeof signals.activeHeatProduction === "boolean" ? signals.activeHeatProduction ? "on" : "off" : "unknown") : "unknown";
+  const actual = osAnalyticsRuntime.classifyActivityV1(item, analyticsNow);
   if (actual !== item.expected) throw new Error(`Analytics activity semantic mismatch: ${item.id}`);
 }
+const aggregation = analyticsSemantics.aggregation;
 for (const key of ["periodSamples", "periodExpected", "hourSamples", "hourExpected", "displayedBuckets"])
-  if (!Array.isArray(analyticsSemantics.aggregation[key])) throw new Error(`Analytics fixture is missing ${key}`);
+  if (!Array.isArray(aggregation[key])) throw new Error(`Analytics fixture is missing ${key}`);
+if (!aggregation.summaryExpected || typeof aggregation.summaryExpected !== "object" || Array.isArray(aggregation.summaryExpected))
+  throw new Error("Analytics fixture is missing summaryExpected");
+if (JSON.stringify(osAnalyticsRuntime.averageContributingSamplesV1(aggregation.periodSamples)) !== JSON.stringify(aggregation.periodExpected))
+  throw new Error("OS period analytics differs from the canonical contributing-sample fixture");
+if (JSON.stringify(osAnalyticsRuntime.sumSelectedDevicesPerHourV1(aggregation.hourSamples)) !== JSON.stringify(aggregation.hourExpected))
+  throw new Error("OS hourly analytics differs from the canonical selected-device fixture");
+if (JSON.stringify(osAnalyticsRuntime.averageDisplayedBucketsV1(aggregation.displayedBuckets)) !== JSON.stringify(aggregation.summaryExpected))
+  throw new Error("OS analytics summary differs from the canonical displayed-bucket fixture");
+for (const [periodName, buckets] of Object.entries(aggregation.periodFilterBuckets ?? {})) {
+  const selected = aggregation.periodSamples.filter((sample) => buckets.includes(sample.bucket));
+  const actual = osAnalyticsRuntime.averageContributingSamplesV1(selected);
+  if (JSON.stringify(actual) !== JSON.stringify(aggregation.periodSelectionExpected?.[periodName]))
+    throw new Error(`Analytics filter/drilldown expectation differs for ${periodName}`);
+}
 const invalidAnalyticsSample = JSON.parse(fs.readFileSync(path.join(fixtureRoot, "invalid/analytics-invalid-sample.json"), "utf8"));
-if (invalidAnalyticsSample.schemaVersion !== contract.contractVersion || invalidAnalyticsSample.expected !== "reject" || invalidAnalyticsSample.sample.onMinutes >= 0)
+if (invalidAnalyticsSample.schemaVersion !== contract.contractVersion || invalidAnalyticsSample.expected !== "reject")
   throw new Error("Invalid analytics sample must be a negative semantic fixture");
+let invalidAnalyticsRejected = false;
+try { osAnalyticsRuntime.averageContributingSamplesV1([invalidAnalyticsSample.sample]); }
+catch (error) { invalidAnalyticsRejected = error instanceof TypeError; }
+if (!invalidAnalyticsRejected) throw new Error("OS analytics runtime did not reject the invalid semantic sample");
 const wrongHome = JSON.parse(fs.readFileSync(path.join(fixtureRoot, "invalid/wrong-home-envelope.json"), "utf8"));
 const wrongHomeEnvelope = definitionValidator("envelope");
 if (!wrongHomeEnvelope(wrongHome))
   throw new Error("Wrong-home envelope must remain structurally valid and be rejected by selected-home authorization");
+if (osContractRuntime.validateEnvelope(wrongHome, "home:opaque-a"))
+  throw new Error("OS selected-home envelope validator accepted the wrong-home semantic fixture");
+const privateTenantDevice = JSON.parse(fs.readFileSync(path.join(fixtureRoot, "invalid/tenant-device-wrong-owner.json"), "utf8"));
+if (osContractRuntime.validateDevice(privateTenantDevice.device, { ...privateTenantDevice.context, role: "TENANT", areaIds: privateTenantDevice.device.areaIds }))
+  throw new Error("OS runtime accepted another tenant's private device fixture");
+const commandFixture = JSON.parse(fs.readFileSync(path.join(fixtureRoot, "command-valid.json"), "utf8"));
+const canonicalDevice = valid.device;
+const commandControl = canonicalDevice.controls.find((control) => control.controlId === commandFixture.controlId);
+if (!commandControl || !osContractRuntime.validateCommand(commandFixture, canonicalDevice, commandControl, commandFixture.homeMembershipId))
+  throw new Error("OS runtime rejected the canonical valid command fixture");
+const staleCommandFixture = JSON.parse(fs.readFileSync(path.join(fixtureRoot, "invalid/stale-descriptor-command.json"), "utf8"));
+if (osContractRuntime.validateCommand({ ...commandFixture, descriptorRevision: staleCommandFixture.command.descriptorRevision }, canonicalDevice, commandControl, commandFixture.homeMembershipId))
+  throw new Error("OS runtime accepted the stale descriptor command fixture");
 const unknownRequired = JSON.parse(fs.readFileSync(path.join(fixtureRoot, "invalid/unknown-required-version.json"), "utf8"));
 if (wrongHomeEnvelope(unknownRequired)) throw new Error("Unknown required contract version was accepted");
 const supportTicketValidator = definitionValidator("supportTicket");
@@ -335,9 +781,55 @@ if (staleCommand.command.descriptorRevision === staleCommand.currentDescriptorRe
 const claim = JSON.parse(fs.readFileSync(path.join(fixtureRoot, "claim-first-wins.json"), "utf8"));
 if (claim.state !== "reserved" || claim.firstWins !== true || Date.parse(claim.expiresAt) - Date.parse(claim.createdAt) !== 30 * 60 * 1000)
   throw new Error("Claim first-wins fixture disagrees with the frozen exact reservation window");
+const claimLifecycle = JSON.parse(fs.readFileSync(path.join(fixtureRoot, "claim-lifecycle.json"), "utf8"));
+const claimState = structuredClone(claimLifecycle.initial);
+const appliedClaimMutations = new Set();
+if (!claimState.emailVerified || claimLifecycle.competingClaim.winnerRemains !== claimState.claimantAccountId || claimLifecycle.competingClaim.expectedOutcome !== "non_identifying_unavailable")
+  throw new Error("Claim reservation must be won by the first verified claimant and hide competing claimant identity");
+for (const event of claimLifecycle.events) {
+  const at = Date.parse(event.at);
+  const expires = Date.parse(claimState.expiresAt);
+  if (!Number.isFinite(at) || !Number.isFinite(expires)) throw new Error("Claim lifecycle fixture contains an invalid timestamp");
+  if (claimState.state === "reserved" && at >= expires) claimState.state = "expired";
+  if (claimState.state === "reserved" && event.kind === "required_save" && event.success === true && event.changed === true) {
+    if (appliedClaimMutations.has(event.idempotencyKey)) {
+      // Exact retries return the durable result; they never move the deadline again.
+    } else {
+      appliedClaimMutations.add(event.idempotencyKey);
+      claimState.expiresAt = new Date(at + 1800_000).toISOString();
+      claimState.revision += 1;
+    }
+  }
+  if (event.expectedState && claimState.state !== event.expectedState || event.expectedExpiresAt && Date.parse(claimState.expiresAt) !== Date.parse(event.expectedExpiresAt) || event.expectedRevision !== undefined && claimState.revision !== event.expectedRevision)
+    throw new Error(`Claim lifecycle transition mismatch at ${event.eventId}`);
+}
+for (const cleanup of claimLifecycle.cleanupCases) {
+  const relationshipCount = Object.values(cleanup.relationships).reduce((sum, count) => sum + count, 0);
+  const result = relationshipCount > 0
+    ? { account: "retained", sessionsRevoked: false, trustedDevicesRevoked: false }
+    : { account: "deleted", sessionsRevoked: true, trustedDevicesRevoked: true };
+  if (JSON.stringify(result) !== JSON.stringify(cleanup.expected)) throw new Error("Claim expiry must use the universal final-relationship account cleanup rule");
+}
 const membershipFixture = JSON.parse(fs.readFileSync(path.join(fixtureRoot, "multi-home-memberships.json"), "utf8"));
 if (membershipFixture.memberships.length < 2 || new Set(membershipFixture.memberships.map((m) => m.homeId)).size !== membershipFixture.memberships.length || new Set(membershipFixture.memberships.map((m) => m.homeMembershipId)).size !== membershipFixture.memberships.length)
   throw new Error("Multi-home membership fixture does not prove distinct per-home authority");
+const joinedSession = JSON.parse(fs.readFileSync(path.join(fixtureRoot, "account-session-two-homes.json"), "utf8"));
+for (const fixtureName of ["selected-tenant-property-device.json", "selected-tenant-private-device.json"]) {
+  const joined = JSON.parse(fs.readFileSync(path.join(fixtureRoot, fixtureName), "utf8"));
+  const context = joined.context;
+  const membership = joinedSession.memberships.find((candidate) => candidate.homeMembershipId === context.homeMembershipId);
+  if (!membership || membership.accountId !== context.accountId || membership.homeId !== context.homeId || membership.role !== context.role || membership.status !== "active" || membership.homeId !== joined.device.homeId || !joined.device.areaIds.every((areaId) => membership.areaIds.includes(areaId)))
+    throw new Error(`Prototype device fixture is not joined to its active account/home/area membership: ${fixtureName}`);
+  if (!platformContractRuntime.validateNativeDevice(joined.device, { homeId: context.homeId, homeMembershipId: context.homeMembershipId, role: context.role, areaIds: context.areaIds }) ||
+      !osContractRuntime.validateDevice(joined.device, { homeId: context.homeId, homeMembershipId: context.homeMembershipId, role: context.role, areaIds: context.areaIds }))
+    throw new Error(`Joined tenant prototype fixture must decode in Platform and OS: ${fixtureName}`);
+  if (joined.device.managementClass === "tenant_device") {
+    if (!platformContractRuntime.validateNativeDevice(joined.device, { homeId: context.homeId, homeMembershipId: context.homeMembershipId, role: "TENANT", areaIds: context.areaIds }) ||
+        osContractRuntime.validateDevice(joined.device, { homeId: context.homeId, homeMembershipId: "membership:tenant-other", role: "TENANT", areaIds: context.areaIds }) ||
+        osContractRuntime.validateDevice(joined.device, { homeId: context.homeId, homeMembershipId: context.homeMembershipId, role: "OWNER", areaIds: context.areaIds }))
+      throw new Error("Joined tenant-private fixture must allow only its owning tenant membership");
+  }
+}
 for (const [schemaName, filename, select] of [
   ["envelope", "empty-area.json", (fixture) => fixture],
   ["controlState", "stale-and-unavailable-control-state.json", (fixture) => fixture.data],
@@ -346,7 +838,7 @@ for (const [schemaName, filename, select] of [
 ]) {
   const example = JSON.parse(fs.readFileSync(path.join(fixtureRoot, filename), "utf8"));
   const validator = definitionValidator(schemaName);
-  const expected = filename.includes("unknown-interaction") || filename.includes("unknown-required-version") ? false : true;
+  const expected = filename.includes("unknown-required-version") ? false : true;
   if (Boolean(validator?.(select(example))) !== expected)
     throw new Error(`Fixture ${filename} disagrees with ${schemaName} validity`);
 }
@@ -355,6 +847,8 @@ const api = fs.readFileSync(
   "utf8",
 );
 const validatorNames = [
+  "validateCustomerSessionLoginRequest",
+  "validateCustomerSessionLogoutReceipt",
   "validateNativeDevice",
   "validateMembership",
   "validateAccountSessionContext",
@@ -366,6 +860,7 @@ const validatorNames = [
   "validateControlState",
   "validateCommandAgainstDevice",
   "effectiveControlQuality",
+  "effectiveHubOnlineState",
   "validateLanEndpointObservation",
 ];
 for (const required of validatorNames)
@@ -378,6 +873,9 @@ if (customerHubSession.token !== "TEST_ONLY_PLACEHOLDER_NOT_A_BEARER" || JSON.st
 const platformAuth = fs.readFileSync(path.join(root, "src/lib/stage1Auth.ts"), "utf8");
 if (!platformAuth.includes("validateMembership") || !platformAuth.includes("./contracts/dinodiaV1"))
   throw new Error("Platform authentication boundary is not using the canonical membership validator");
+const customerLoginRoute = fs.readFileSync(path.join(root, "src/app/api/v2/auth/session/route.ts"), "utf8");
+if (!customerLoginRoute.includes("validateCustomerSessionLoginRequest(body)"))
+  throw new Error("The actual customer login route must validate its canonical request DTO before processing credentials");
 const osRoot = path.resolve(root, "../Dinodia OS");
 const osServer = fs.readFileSync(path.join(osRoot, "src/server.js"), "utf8");
 if (!osServer.includes('require("./contracts/dinodiaV1")') || !osServer.includes("serializeNativeDevice") || !osServer.includes('pathname === "/api/dinodia/v1/commands"'))
@@ -386,8 +884,23 @@ const iosRoot = path.resolve(root, "../dinodia-ios-app-V2");
 const iosMapping = fs.readFileSync(path.join(iosRoot, "Dinodia/LiveContracts/DinodiaV1Mapping.swift"), "utf8");
 const iosComposition = fs.readFileSync(path.join(iosRoot, "Dinodia/ContentView.swift"), "utf8");
 const iosSessionShell = fs.readFileSync(path.join(iosRoot, "Dinodia/LiveContracts/DinodiaV1SessionShell.swift"), "utf8");
-if (!iosMapping.includes("decodeDeviceMetadata") || !iosMapping.includes("decodeOfflineHomeSelection") || !iosMapping.includes("validate(_ command: DinodiaV1Command") || !iosSessionShell.includes("activateAfterExactHomeChallenge") || !iosComposition.includes("DinodiaV1ProductionRootView()") || !iosComposition.includes("Stage2ContractUnavailableView()") || !iosComposition.includes("#if DEBUG") || !iosComposition.includes("StaticPreviewApplicationRoot()"))
+const iosProject = fs.readFileSync(path.join(iosRoot, "Dinodia.xcodeproj/project.pbxproj"), "utf8");
+if (!iosMapping.includes("decodeDeviceMetadata") || !iosMapping.includes("decodeOfflineHomeSelection") || !iosMapping.includes("decodeCanonicalError") || !iosMapping.includes("decodeCustomerSessionLogoutReceipt") || !iosMapping.includes("DinodiaV1ErrorCode") || !iosMapping.includes("validate(_ command: DinodiaV1Command") || !iosSessionShell.includes("activateAfterExactHomeChallenge") || !iosSessionShell.includes("decodeCustomerSessionLogoutReceipt") || !iosComposition.includes("DinodiaV1ProductionRootView()") || !iosComposition.includes("Stage2ContractUnavailableView()") || !iosComposition.includes("#if DEBUG") || !iosComposition.includes("StaticPreviewApplicationRoot()"))
   throw new Error("iOS must expose the canonical metadata/command adapter and keep static composition behind a debug-only preview gate");
+if (iosProject.includes("DebugFixtures in Resources") || !iosProject.includes('if [ \\"$CONFIGURATION\\" = \\"Debug\\" ]') || !iosProject.includes("Copy Stage 2 fixtures in Debug builds only") || !iosProject.includes('ditto \\"$SRCROOT/Dinodia/DebugFixtures\\"'))
+  throw new Error("Synthetic Stage 2 prototype fixtures must be copied into the app bundle only by the Debug-only build phase");
+const prototypeSource = fs.readFileSync(path.join(iosRoot, "Dinodia/LiveContracts/Stage2ContractPrototypeView.swift"), "utf8");
+const fixtureSyncSource = fs.readFileSync(path.join(root, "scripts/sync_dinodia_contract_fixtures.mjs"), "utf8");
+const fixtureCopyBlock = fixtureSyncSource.match(/const iosPrototypeFixtures[\s\S]*?for \(const fixture of \[([\s\S]*?)\]\)/);
+if (!fixtureCopyBlock) throw new Error("The DEBUG-only prototype fixture-copy inventory could not be resolved");
+const copiedPrototypeFixtures = new Set([...fixtureCopyBlock[1].matchAll(/'([^']+\.json)'/g)].map((match) => path.basename(match[1], ".json")));
+const prototypeFixtureReferences = new Set([...prototypeSource.matchAll(/Stage2PrototypeFixtures\.object\(\"([^\"]+)\"\)/g)].map((match) => match[1]));
+for (const fixtureName of prototypeFixtureReferences) {
+  const canonicalPath = path.join(fixtureRoot, `${fixtureName}.json`);
+  const debugPath = path.join(iosRoot, "Dinodia/DebugFixtures/DinodiaV1/fixtures", `${fixtureName}.json`);
+  if (!copiedPrototypeFixtures.has(fixtureName) || !fs.existsSync(canonicalPath) || !fs.existsSync(debugPath))
+    throw new Error(`DEBUG prototype fixture is missing from canonical source or synchronization inventory: ${fixtureName}`);
+}
 const alexaRoot = path.resolve(root, "../dinodia-alexa-skill-V2");
 const alexaRuntime = fs.readFileSync(path.join(alexaRoot, "src/index.ts"), "utf8");
 const alexaAdapter = fs.readFileSync(path.join(alexaRoot, "src/dinodiaV1.ts"), "utf8");
@@ -454,15 +967,38 @@ if (
   throw new Error(
     "Frozen decision register diverges from the Stage 2 contract",
   );
+const hubFreshness = JSON.parse(fs.readFileSync(path.join(fixtureRoot, "hub-heartbeat-freshness.json"), "utf8"));
+const hubFreshnessNow = Date.parse(hubFreshness.now);
+if (hubFreshness.schemaVersion !== contract.contractVersion ||
+    hubFreshness.heartbeatCadenceSeconds !== decisions.limits.heartbeatSeconds ||
+    hubFreshness.onlineThroughSeconds !== decisions.limits.hubOnlineSeconds ||
+    hubFreshness.cases.length < 8 ||
+    hubFreshness.cases.some((scenario) => platformContractRuntime.effectiveHubOnlineState(scenario.lastHeartbeatAt, hubFreshnessNow) !== scenario.expected))
+  throw new Error("Heartbeat cadence, inclusive 420-second online boundary or conservative invalid-time behavior diverged from the executable fixture");
+const indexedNotificationLifecycle = JSON.parse(fs.readFileSync(path.join(fixtureRoot, "notification-lifecycle.json"), "utf8"));
+if (decisions.notifications?.deduplicateByEventRecipientAndChannel !== true ||
+    JSON.stringify(decisions.notifications?.deduplicationKeyFields) !== JSON.stringify(indexedNotificationLifecycle.deduplication.keyFields) ||
+    decisions.notifications?.quietHoursDefaultEnabled !== indexedNotificationLifecycle.defaults.quietHoursEnabled ||
+    decisions.notifications?.mandatorySecurityEventsIgnoreQuietHours !== true ||
+    decisions.notifications?.deliveryChannels?.join("|") !== indexedNotificationLifecycle.deduplication.channels.join("|"))
+  throw new Error("Notification fixture, frozen decision register and delivery-channel idempotency semantics disagree");
 const requiredDecisions = [
   ["identityLifecycle.activeOwnerMaximumPerHome", 1],
+  ["identityAndLifecycle.finalRelationshipDeletionCleansAccount", true],
+  ["identityLifecycle.accountDeletionRemovesFinalRelationshipOnly", true],
   ["identityLifecycle.invitationCreatesMembership", false],
   ["identityLifecycle.deviceIdentityMergeRequiresProtocolEvidence", true],
   ["homeLifecycle.claimReservationSeconds", 1800],
+  ["homeLifecycle.roomQrRetryDays", 7],
+  ["retentionAndOperations.anonymousSecurityReceiptMonths", 12],
+  ["retentionAndOperations.roomRequestDays", 7],
   ["homeLifecycle.retainedAddressRequiresExplicitConfirmation", true],
   ["homeLifecycle.offlineDeregistrationRemainsPendingUntilAcknowledged", true],
   ["areaAuthority.areaWireNames", ["originalName", "overrideName"]],
   ["controlPolicy.labelAuthority", false],
+  ["controlPolicy.customerLabelLengthUnit", "unicode_code_points"],
+  ["controlPolicy.customerLabelMaximumCodePoints", 40],
+  ["controlPolicy.boundedStringLengthUnit", "unicode_code_points"],
   ["controlPolicy.currentDescriptorRequiredForWrites", true],
   ["controlPolicy.appOnlySecurityAlexa", false],
   ["uiStates.staleOrOfflineCommandsAllowed", false],
@@ -514,40 +1050,10 @@ for (const [pointer, expected] of requiredDecisions) {
   if (JSON.stringify(actual) !== JSON.stringify(expected))
     throw new Error(`Missing or conflicting frozen decision: ${pointer}`);
 }
-if (
-  decisionMatrix.claim.reservationSeconds !== decisions.homeLifecycle.claimReservationSeconds ||
-  decisionMatrix.notification.tenantDeviceAudience !== decisions.notifications.tenantDeviceEventAudience ||
-  decisionMatrix.controls.securityControlRequiresAppStepUp !== decisions.controlPolicy.appOnlySecurityManualStepUp ||
-  decisionMatrix.controls.securityControlAutomatable !== decisions.controlPolicy.appOnlySecurityAutomation ||
-  decisionMatrix.controls.securityControlAlexaExposed !== decisions.controlPolicy.appOnlySecurityAlexa ||
-  decisionMatrix.automation.appOnlySecurityControlEligible !== decisions.controlPolicy.appOnlySecurityAutomation ||
-  decisionMatrix.automation.presentationLabelsGrantCapability !== decisions.controlPolicy.labelAuthority ||
-  decisionMatrix.alexa.activeMembershipRole !== decisions.alexa.activeMembershipRole ||
-  decisionMatrix.alexa.selectedAreaIdsAreAuthoritative !== decisions.alexa.selectedAreaIdsAreAuthoritative ||
-  decisionMatrix.alexa.ownTenantDeviceEligible !== decisions.alexa.tenantDeviceEligibleOnlyForOwningMembership ||
-  decisionMatrix.alexa.otherTenantDeviceEligible === decisions.alexa.tenantDeviceEligibleOnlyForOwningMembership ||
-  decisionMatrix.alexa.appOnlySecurityControlEligible === decisions.alexa.appOnlySecurityControlsExcludedRegardlessOfClientFlags ||
-  decisionMatrix.alexa.exposureGenerationMonotonic !== decisions.alexa.exposureGeneration.includes("monotonic") ||
-  decisionMatrix.trustedDevice.removalRevokesAccountInstallation !== decisions.offlineAuthority.trustedDeviceRemovalAccountWide ||
-  decisionMatrix.trustedDevice.offlineReenrollmentAllowed !== decisions.offlineAuthority.offlineEnrollmentAllowed ||
-  decisionMatrix.trustedDevice.removalAcknowledgementMayRemainPending !== decisions.offlineAuthority.hubRevocationAcknowledgementMayRemainPending ||
-  decisionMatrix.provisioning.hubOwnsCapabilityDescriptors !== decisions.provisioning.hubOwnsDiscoveryAndCapabilityDescriptors ||
-  decisionMatrix.provisioning.platformOwnsMembershipAuthority !== decisions.provisioning.platformOwnsHomeMembershipAndCloudProjection ||
-  decisionMatrix.provisioning.cloudUrlIndependentlyVerified !== decisions.provisioning.cloudUrlMustBeIndependentlyVerified ||
-  decisionMatrix.provisioning.manufacturingRootPrivateKeyOnHub !== decisions.provisioning.manufacturingRootPrivateKeyOnHub ||
-  decisionMatrix.roomQr.claimReservationFirstWins !== decisions.homeLifecycle.claimReservationFirstWins ||
-  decisionMatrix.notifications.audienceRecomputedFromCurrentAuthority !== decisions.notifications.audienceFromCurrentAuthority ||
-  decisionMatrix.notifications.channels.join(",") !== decisions.notifications.deliveryChannels.join(",") ||
-  decisionMatrix.notifications.smsEnabled !== decisions.notifications.sms ||
-  decisionMatrix.notifications.inboxEnabled !== decisions.notifications.inbox ||
-  decisionMatrix.notifications.deduplicatedByEventAndRecipient !== decisions.notifications.deduplicateByEventAndRecipient ||
-  decisionMatrix.notifications.deliveryReceiptGrantsAuthority === decisions.notifications.deliveryReceiptIsNotAuthority ||
-  decisionMatrix.notifications.retryHoursMaximum !== decisions.notifications.deliveryRetryHoursMaximum ||
-  decisionMatrix.offline.previouslyEnrolledTrustedInstallationRequired !== decisions.offlineAuthority.requiresPreviouslyEnrolledTrustedInstallation ||
-  decisionMatrix.offline.exactHomeAndMembershipBound !== decisions.offlineAuthority.bindsExactHomeAndMembership ||
-  decisionMatrix.offline.scopeCanWiden === decisions.offlineAuthority.scopeCannotWidenOffline ||
-  decisionMatrix.offline.policyAppliedBeforeConnected !== decisions.offlineAuthority.applyRevocationAndCurrentPolicyBeforeConnected
-) throw new Error("Stage 2 decision fixture diverges from the authoritative decision register");
+// `stage2-decision-matrix.json` is review/prototype input only. Its declared
+// expected booleans are deliberately not accepted as evidence here: executable
+// identity, privacy, command, claim and notification cases above exercise the
+// owning validators and adapters instead.
 const expectedNativeTasks = [
   { taskId: "operator_credential_lifecycle", owner: "supabase_pg_cron_two_minute" },
   { taskId: "support_expiry_and_revocation", owner: "supabase_pg_cron_two_minute" },
@@ -556,6 +1062,8 @@ const expectedNativeTasks = [
 ];
 if (JSON.stringify(decisions.sync.nativeTaskRegistry) !== JSON.stringify(expectedNativeTasks))
   throw new Error("Native task registry is incomplete or assigns work to multiple schedule owners");
+if (decisions.sync.taskLeaseSeconds !== 180 || decisions.sync.taskFailureIsolation !== true)
+  throw new Error("Operational dispatcher must use a 180-second non-overlap lease and isolate independent task failures");
 const expectedStage2Allocation = [
   { taskId: "healthAndIncidentQualification", dispatcher: "operations", primaryPath: "signed_heartbeat_or_incident_ingestion", implementationStage: 4 },
   { taskId: "deliveryAndEnforcement", dispatcher: "operations", primaryPath: "durable_outbox_and_hub_sync", implementationStage: 3 },
@@ -643,6 +1151,35 @@ if (new Set(screenKeys).size !== screenKeys.length)
   throw new Error("Static-to-live screen/action register contains duplicate stable keys");
 if (registerRows.length < 50)
   throw new Error(`Static-to-live screen/action register is incomplete: ${registerRows.length} rows`);
+const fixtureIndex = JSON.parse(fs.readFileSync(path.join(fixtureRoot, "index.json"), "utf8"));
+const indexedKeys = Object.keys(fixtureIndex.screenFixtures ?? {}).sort();
+if (fixtureIndex.schemaVersion !== contract.contractVersion || JSON.stringify(indexedKeys) !== JSON.stringify([...screenKeys].sort()))
+  throw new Error("Fixture index must resolve every and only registered screen/action key");
+for (const [screenKey, references] of Object.entries(fixtureIndex.screenFixtures)) {
+  if (!Array.isArray(references) || references.length === 0 || new Set(references).size !== references.length)
+    throw new Error(`Screen/action has no unique fixture references: ${screenKey}`);
+  for (const reference of references) {
+    if (typeof reference !== "string" || !reference.startsWith("fixtures/"))
+      throw new Error(`Fixture index reference must be an exact fixtures/ path for ${screenKey}: ${String(reference)}`);
+    const target = path.join(fixtureRoot, reference.replace(/^fixtures\//, ""));
+    if (!target.startsWith(`${fixtureRoot}${path.sep}`) || !fs.existsSync(target) || !target.endsWith(".json"))
+      throw new Error(`Unresolved exact fixture reference for ${screenKey}: ${reference}`);
+    JSON.parse(fs.readFileSync(target, "utf8"));
+  }
+}
+const expectedTaskFixtureIds = expectedNativeTasks.map(({ taskId }) => taskId).sort();
+if (JSON.stringify(Object.keys(fixtureIndex.taskFixtures ?? {}).sort()) !== JSON.stringify(expectedTaskFixtureIds))
+  throw new Error("Fixture index must resolve every and only active native scheduler task");
+for (const [taskId, references] of Object.entries(fixtureIndex.taskFixtures)) {
+  if (!Array.isArray(references) || references.length === 0) throw new Error(`Scheduler task lacks fixture evidence: ${taskId}`);
+  for (const reference of references) {
+    if (typeof reference !== "string" || !reference.startsWith("fixtures/"))
+      throw new Error(`Task fixture index reference must be an exact fixtures/ path for ${taskId}: ${String(reference)}`);
+    const target = path.join(fixtureRoot, reference.replace(/^fixtures\//, ""));
+    if (!target.startsWith(`${fixtureRoot}${path.sep}`) || !fs.existsSync(target) || !target.endsWith(".json"))
+      throw new Error(`Unresolved task fixture reference for ${taskId}: ${reference}`);
+  }
+}
 for (const { line, cells } of registerRows) {
   if (cells.length !== 6 || cells.some((cell) => !cell))
     throw new Error(`Static-to-live screen/action row must define all six contract columns: ${line}`);
@@ -699,5 +1236,5 @@ const iosPrototypeMatrix = path.resolve(root, "../dinodia-ios-app-V2/Dinodia/Deb
 if (fs.readFileSync(iosPrototypeMatrix, "utf8") !== matrix)
   throw new Error("iOS DEBUG contract prototype matrix differs from the canonical Platform matrix");
 console.log(
-  `dinodia.v1 schemas=${schemas.size} JSON fixtures=${fixtureFiles.length} runtime validators=${validatorNames.length}; Alexa projection valid and non-tenant rejected`,
+  `dinodia.v1 schemas=${schemas.size} JSON fixtures=${fixtureFiles.length} runtime validators=${validatorNames.length}; Alexa schema and tenant-role negatives enforced`,
 );

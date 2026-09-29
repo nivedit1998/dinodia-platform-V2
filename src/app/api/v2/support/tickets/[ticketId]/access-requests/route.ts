@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
 import { nativeV1ErrorResponse } from '@/lib/contracts/nativeV1Error';
 import { requireEmployee, Stage1AuthError } from '@/lib/stage1Auth';
+import { validateSupportAccessRequestCreateReceipt, validateSupportAccessRequestCreateRequest } from '@/lib/contracts/dinodiaV1';
 
 export const dynamic = 'force-dynamic';
 
@@ -9,8 +10,9 @@ export async function POST(request: Request, context: { params: Promise<{ ticket
   try {
     const employee = await requireEmployee(request, ['CXO', 'SENIOR_OPERATIONS_MANAGER', 'INSTALLER', 'SENIOR_CUSTOMER_SUPPORT']);
     const { ticketId } = await context.params;
-    const body = await request.json() as Record<string, unknown>;
-    const requestedScope = String(body.requestedScope ?? '').trim() as 'TENANT_SCOPE' | 'PROPERTY_SCOPE';
+    const body = await request.json().catch(() => null) as Record<string, unknown> | null;
+    if (!body || !validateSupportAccessRequestCreateRequest(body)) throw new Stage1AuthError(400, 'support_request_fields_invalid', 'The scoped support request has invalid fields');
+    const requestedScope = String(body.requestedScope) as 'TENANT_SCOPE' | 'PROPERTY_SCOPE';
     const targetMembershipId = body.targetMembershipId == null ? null : String(body.targetMembershipId);
     const areaIds = Array.isArray(body.areaIds) ? body.areaIds.map(String).slice(0, 100) : [];
     const targetIds = Array.isArray(body.targetIds) ? body.targetIds.map(String).slice(0, 100) : [];
@@ -48,6 +50,8 @@ export async function POST(request: Request, context: { params: Promise<{ ticket
       : null;
     const touchesPropertyInfrastructure = requestedScope === 'PROPERTY_SCOPE' || targetDevices.some((device) => device.managementClass === 'PROPERTY_DEVICE');
     const requestRow = await prisma.supportAccessRequest.create({ data: { ticketId, requestedByEmployeeId: employee.id, homeId: ticket.homeId, hubInstallationId: hub.id, requestedScope, targetMembershipId, targetUserId, canonicalAreaIds: areaIds, targetIds, touchesPropertyInfrastructure }, select: { id: true, status: true, requestedScope: true, touchesPropertyInfrastructure: true, createdAt: true } });
-    return NextResponse.json({ ok: true, accessRequest: requestRow }, { status: 201, headers: { 'Cache-Control': 'no-store', Pragma: 'no-cache' } });
+    const receipt = { ok: true, accessRequest: { ...requestRow, createdAt: requestRow.createdAt.toISOString() } };
+    if (!validateSupportAccessRequestCreateReceipt(receipt)) throw new Stage1AuthError(500, 'native_v1_contract_invalid', 'The scoped support request response failed contract validation');
+    return NextResponse.json(receipt, { status: 201, headers: { 'Cache-Control': 'no-store', Pragma: 'no-cache' } });
   } catch (error) { return nativeV1ErrorResponse(error); }
 }

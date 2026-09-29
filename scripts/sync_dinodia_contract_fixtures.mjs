@@ -24,4 +24,35 @@ for (const [repo, relative] of repos) {
 const iosPrototype = path.resolve(platform, '../dinodia-ios-app-V2/Dinodia/DebugFixtures');
 fs.mkdirSync(iosPrototype, { recursive: true });
 fs.copyFileSync(path.join(source, 'V2_STATIC_TO_LIVE_MATRIX.md'), path.join(iosPrototype, 'V2_STATIC_TO_LIVE_MATRIX.md'));
+const iosPrototypeFixtures = path.join(iosPrototype, 'DinodiaV1/fixtures');
+fs.mkdirSync(iosPrototypeFixtures, { recursive: true });
+for (const fixture of [
+  'account-session-two-homes.json',
+  'account-relationship-lifecycle.json',
+  'automation-full-bundle.json',
+  'analytics-semantics.json',
+  'commissioning-expired.json',
+  'duplicate-display-names.json',
+  'hub-cloudurl-verified.json',
+  'invitation-pending-no-membership.json',
+  'invalid/tenant-device-wrong-owner.json',
+  'multi-control-device.json',
+  'offline-home-selection.json',
+  'prototype-scenarios.json',
+  'room-qr-lifecycle.json',
+  'claim-first-wins.json',
+  'claim-lifecycle.json',
+  'stage2-decision-matrix.json',
+  'selected-tenant-property-device.json',
+  'selected-tenant-private-device.json',
+  'support-ticket-private.json',
+  'support-lifecycle.json',
+  'invitation-lifecycle.json',
+  'transfer-lifecycle.json',
+  'notification-lifecycle.json',
+]) {
+  const target = path.join(iosPrototypeFixtures, fixture);
+  fs.mkdirSync(path.dirname(target), { recursive: true });
+  fs.copyFileSync(path.join(source, 'fixtures', fixture), target);
+}
 console.log(`Synchronized dinodia.v1 schemas and fixtures to ${repos.length} consumers and the DEBUG-only iOS prototype`);

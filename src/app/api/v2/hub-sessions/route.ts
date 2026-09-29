@@ -2,6 +2,7 @@ import crypto from 'node:crypto';
 import { NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
 import { signStage1Token } from '@/lib/stage1Crypto';
+import { validateCustomerHubSession } from '@/lib/contracts/dinodiaV1';
 import { nativeV1ErrorResponse } from '@/lib/contracts/nativeV1Error';
 import { Stage1AuthError, cookieToken } from '@/lib/stage1Auth';
 
@@ -46,6 +47,10 @@ export async function POST(request: Request) {
     const privatePem = String(process.env.DINODIA_APP_SESSION_PRIVATE_KEY ?? '').replaceAll('\\n', '\n');
     if (!privatePem) throw new Stage1AuthError(503, 'app_auth_unconfigured', 'App session authentication is not configured');
     const token = signStage1Token('customer', { id: account.id, sessionId: session.id, homeId: hub.homeId, membershipId: membership.id, trustedDeviceId: trusted.id, hubInstallationId: hub.id, role: membership.role, areaIds: grants.map((grant) => grant.areaId), scopes: membership.role === 'TENANT' ? ['tenant:device-command'] : ['property:read'], policyRevision: Math.max(membership.accessRevision, hub.accessPolicyRevision), issuedAt: now, expiresAt: now + 5 * 60 }, crypto.createPrivateKey(privatePem));
-    return NextResponse.json({ ok: true, token, expiresAt: new Date((now + 5 * 60) * 1000).toISOString(), homeId: hub.homeId, membershipId: membership.id, hubEndpoint }, { headers: { 'Cache-Control': 'no-store', Pragma: 'no-cache' } });
+    const response = { ok: true, token, expiresAt: new Date((now + 5 * 60) * 1000).toISOString(), homeId: hub.homeId, membershipId: membership.id, hubEndpoint };
+    if (!validateCustomerHubSession(response, { homeId: hub.homeId, membershipId: membership.id })) {
+      throw new Stage1AuthError(500, 'native_v1_contract_invalid', 'The selected-home session response failed contract validation');
+    }
+    return NextResponse.json(response, { headers: { 'Cache-Control': 'no-store', Pragma: 'no-cache' } });
   } catch (error) { return nativeV1ErrorResponse(error); }
 }

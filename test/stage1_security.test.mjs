@@ -36,7 +36,7 @@ test('native task registry dispatches business operations and daily lease cleanu
   const { nativeTaskRegistry, runNativeOperations, runNativeMaintenance } = loadTypeScriptModule('src/lib/nativeOperations.ts', {
     './prisma': { prisma: {
       supportSession: { findMany: async () => [] },
-      supportAccessRequest: { updateMany: async () => ({ count: 0 }) },
+      supportAccessRequest: { findMany: async () => [], updateMany: async () => ({ count: 0 }) },
       homeClaimReservation: { findMany: async () => [] },
       idempotencyRecord: { deleteMany: async (input) => { cleanupCalls.push(input); return { count: 3 }; } },
     } },
@@ -58,6 +58,149 @@ test('native task registry dispatches business operations and daily lease cleanu
   assert.deepEqual(maintenance.tasks, ['expired_dispatch_lease_cleanup']);
   assert.equal(maintenance.expiredDispatcherLeases, 3);
   assert.deepEqual(cleanupCalls, [{ where: { namespace: 'native-operations-lease', expiresAt: { lte: now } } }]);
+});
+
+test('native task registry rejects unknown tasks, duplicate tasks and dual-owner drift', () => {
+  const { nativeTaskRegistry, validateNativeTaskRegistry } = loadTypeScriptModule('src/lib/nativeOperations.ts', {
+    './prisma': { prisma: {} },
+    './hubOperatorCredentials': { reconcileCredentialLifecycle: async () => ({}) },
+    './stage1ClaimContract': { releaseExpiredClaim: async () => ({ released: false }) },
+    './supportNotifications': { createPropertySupportNotifications: async () => undefined },
+  });
+  assert.equal(validateNativeTaskRegistry(nativeTaskRegistry), true);
+  assert.throws(() => validateNativeTaskRegistry([...nativeTaskRegistry, { taskId: 'future_stage_task', owner: 'supabase_pg_cron_two_minute' }]), /unregistered/);
+  assert.throws(() => validateNativeTaskRegistry([...nativeTaskRegistry, nativeTaskRegistry[0]]), /duplicate/);
+  assert.throws(() => validateNativeTaskRegistry(nativeTaskRegistry.map((task) => task.taskId === 'claim_reservation_expiry' ? { ...task, owner: 'vercel_hobby_daily' } : task)), /misowned/);
+  assert.throws(() => validateNativeTaskRegistry(nativeTaskRegistry.slice(0, -1)), /incomplete/);
+});
+
+test('native operations route rejects wrong scheduler secrets before lease or task dispatch', async () => {
+  let leases = 0;
+  let dispatched = 0;
+  const { POST } = loadTypeScriptModule('src/app/api/cron/native-operations/route.ts', {
+    'next/server': { NextResponse: { json: (body, init) => Response.json(body, init) } },
+    '@/lib/nativeOperations': {
+      acquireOperationsLease: async () => { leases += 1; return true; },
+      runNativeOperations: async () => { dispatched += 1; return { tasks: [], failedTasks: [] }; },
+    },
+  });
+  const previousSecret = process.env.CRON_SECRET;
+  process.env.CRON_SECRET = 'disposable-stage2-cron-secret';
+  try {
+    const anonymous = await POST(new Request('http://127.0.0.1/api/cron/native-operations', { method: 'POST' }));
+    const wrong = await POST(new Request('http://127.0.0.1/api/cron/native-operations', { method: 'POST', headers: { authorization: 'Bearer wrong' } }));
+    assert.equal(anonymous.status, 401);
+    assert.equal(wrong.status, 401);
+    assert.equal(leases, 0, 'unauthorized schedule calls must not acquire a lease');
+    assert.equal(dispatched, 0, 'unauthorized schedule calls must not reach registered tasks');
+    const authorized = await POST(new Request('http://127.0.0.1/api/cron/native-operations', { method: 'POST', headers: { authorization: `Bearer ${process.env.CRON_SECRET}` } }));
+    assert.equal(authorized.status, 200);
+    assert.equal(leases, 1);
+    assert.equal(dispatched, 1);
+  } finally {
+    if (previousSecret === undefined) delete process.env.CRON_SECRET;
+    else process.env.CRON_SECRET = previousSecret;
+  }
+});
+
+test('daily maintenance route is the separate GET owner and rejects wrong scheduler secrets', async () => {
+  let leases = 0;
+  let cleanup = 0;
+  const { GET } = loadTypeScriptModule('src/app/api/cron/native-maintenance/route.ts', {
+    'next/server': { NextResponse: { json: (body, init) => Response.json(body, init) } },
+    '@/lib/nativeOperations': {
+      acquireOperationsLease: async (name) => { assert.equal(name, 'native-maintenance'); leases += 1; return true; },
+      runNativeMaintenance: async () => { cleanup += 1; return { tasks: ['expired_dispatch_lease_cleanup'], expiredDispatcherLeases: 1 }; },
+    },
+  });
+  const previousSecret = process.env.CRON_SECRET;
+  process.env.CRON_SECRET = 'disposable-stage2-maintenance-secret';
+  try {
+    const anonymous = await GET(new Request('http://127.0.0.1/api/cron/native-maintenance'));
+    const wrong = await GET(new Request('http://127.0.0.1/api/cron/native-maintenance', { headers: { authorization: 'Bearer wrong' } }));
+    assert.equal(anonymous.status, 401);
+    assert.equal(wrong.status, 401);
+    assert.equal(leases, 0);
+    assert.equal(cleanup, 0);
+    const authorized = await GET(new Request('http://127.0.0.1/api/cron/native-maintenance', { headers: { authorization: `Bearer ${process.env.CRON_SECRET}` } }));
+    assert.equal(authorized.status, 200);
+    assert.equal(leases, 1);
+    assert.equal(cleanup, 1);
+  } finally {
+    if (previousSecret === undefined) delete process.env.CRON_SECRET;
+    else process.env.CRON_SECRET = previousSecret;
+  }
+});
+
+test('native dispatcher uses one atomic bounded lease and isolates task failures', async () => {
+  const lease = { expiresAt: new Date('2026-09-27T12:03:00Z') };
+  const leaseCalls = [];
+  let supportTaskReached = false;
+  let claimTaskReached = false;
+  const { acquireOperationsLease, runNativeOperations } = loadTypeScriptModule('src/lib/nativeOperations.ts', {
+    './prisma': { prisma: {
+      idempotencyRecord: {
+        updateMany: async ({ where, data }) => {
+          leaseCalls.push({ where, data });
+          if (lease.expiresAt <= where.expiresAt.lte) { lease.expiresAt = data.expiresAt; return { count: 1 }; }
+          return { count: 0 };
+        },
+        create: async ({ data }) => { if (lease.expiresAt > new Date('2026-09-27T12:00:00Z')) throw new Error('unique lease exists'); lease.expiresAt = data.expiresAt; },
+      },
+      supportSession: { findMany: async () => { supportTaskReached = true; throw new Error('isolated support database error'); } },
+      supportAccessRequest: { updateMany: async () => ({ count: 0 }) },
+      homeClaimReservation: { findMany: async () => { claimTaskReached = true; return []; } },
+    } },
+    './hubOperatorCredentials': { reconcileCredentialLifecycle: async () => { throw new Error('credential task failure'); } },
+    './stage1ClaimContract': { releaseExpiredClaim: async () => ({ released: false }) },
+    './supportNotifications': { createPropertySupportNotifications: async () => undefined },
+  });
+  const start = new Date('2026-09-27T12:00:00Z');
+  assert.equal(await acquireOperationsLease('native-operations', start), false, 'an existing live lease denies overlap');
+  assert.equal(leaseCalls[0].where.keyHash, 'native-operations', 'lease identity must not roll by minute bucket');
+  assert.equal(leaseCalls[0].data.expiresAt.getTime() - start.getTime(), 180_000);
+
+  const result = await runNativeOperations(start);
+  assert.ok(supportTaskReached);
+  assert.ok(claimTaskReached, 'claim cleanup continues after independent task failures');
+  assert.deepEqual(result.failedTasks.sort(), ['operator_credential_lifecycle', 'support_expiry_and_revocation']);
+
+  let occupied = false;
+  const concurrentModule = loadTypeScriptModule('src/lib/nativeOperations.ts', {
+    './prisma': { prisma: { idempotencyRecord: {
+      updateMany: async () => ({ count: 0 }),
+      create: async () => { if (occupied) throw new Error('unique lease'); occupied = true; },
+    } } },
+    './hubOperatorCredentials': { reconcileCredentialLifecycle: async () => ({}) },
+    './stage1ClaimContract': { releaseExpiredClaim: async () => ({ released: false }) },
+    './supportNotifications': { createPropertySupportNotifications: async () => undefined },
+  });
+  const outcomes = await Promise.all(Array.from({ length: 8 }, () => concurrentModule.acquireOperationsLease('native-operations', start)));
+  assert.equal(outcomes.filter(Boolean).length, 1, 'concurrent dispatchers must have one lease winner');
+});
+
+test('native expiry handlers use stable bounded oldest-first batches and conditional updates', async () => {
+  const queries = [];
+  const { NATIVE_OPERATION_BATCH_LIMIT, runNativeOperations } = loadTypeScriptModule('src/lib/nativeOperations.ts', {
+    './prisma': { prisma: {
+      supportSession: { findMany: async (query) => { queries.push(['support', query]); return []; } },
+      supportAccessRequest: { findMany: async (query) => { queries.push(['request', query]); return [{ id: 'request:1' }]; }, updateMany: async (query) => { queries.push(['request-update', query]); return { count: 1 }; } },
+      homeClaimReservation: { findMany: async (query) => { queries.push(['claim', query]); return []; } },
+    } },
+    './hubOperatorCredentials': { reconcileCredentialLifecycle: async () => ({ rotated: 0 }) },
+    './stage1ClaimContract': { releaseExpiredClaim: async () => ({ released: false }) },
+    './supportNotifications': { createPropertySupportNotifications: async () => undefined },
+  });
+  assert.equal(NATIVE_OPERATION_BATCH_LIMIT, 100);
+  const result = await runNativeOperations(new Date('2026-09-29T12:00:00Z'));
+  assert.deepEqual(result.failedTasks, []);
+  assert.equal(result.expiredRequests, 1);
+  for (const [task, query] of queries.filter(([, query]) => query?.take !== undefined)) {
+    assert.equal(query.take, NATIVE_OPERATION_BATCH_LIMIT, `${task} must cap each dispatcher invocation`);
+    assert.equal(query.orderBy?.expiresAt?.toLowerCase?.() ?? query.orderBy?.codeExpiresAt?.toLowerCase?.(), 'asc', `${task} must process oldest expiry first`);
+  }
+  const conditionalUpdate = queries.find(([task]) => task === 'request-update')?.[1];
+  assert.deepEqual(conditionalUpdate?.where, { id: 'request:1', status: { in: ['REQUESTED', 'APPROVED', 'ISSUED'] }, codeExpiresAt: { lte: new Date('2026-09-29T12:00:00Z') } });
 });
 
 test('the signed one-day OS grant remains valid past recent-auth while flag-off grants keep the short cap', () => {

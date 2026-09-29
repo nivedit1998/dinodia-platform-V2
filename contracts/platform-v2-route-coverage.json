@@ -1,0 +1,26 @@
+{
+  "schemaVersion": "dinodia.v1",
+  "evidenceLevel": "route-inventory-and-auth-boundary-only",
+  "note": "This inventory is not full route acceptance. Behavior marked by integration tests must still pass against disposable PostgreSQL and the running OS.",
+  "routes": [
+    { "file": "src/app/api/v2/session/route.ts", "methods": ["GET", "POST", "DELETE"], "boundary": "delegates_to_canonical_customer_session_handlers" },
+    { "file": "src/app/api/v2/session/logout/route.ts", "methods": ["POST"], "boundary": "delegates_to_canonical_customer_session_handlers" },
+    { "file": "src/app/api/v2/support/notifications/route.ts", "methods": ["GET"], "boundary": "customer_scoped_stage1_projection" },
+    { "file": "src/app/api/v2/support/tickets/route.ts", "methods": ["POST"], "boundary": "customer_scoped_stage1_projection" },
+    { "file": "src/app/api/v2/support/tickets/[ticketId]/route.ts", "methods": ["POST"], "boundary": "customer_scoped_stage1_projection" },
+    { "file": "src/app/api/v2/support/tickets/[ticketId]/access-requests/route.ts", "methods": ["POST"], "boundary": "customer_scoped_stage1_projection" },
+    { "file": "src/app/api/v2/support/tickets/[ticketId]/access-requests/[requestId]/approve/route.ts", "methods": ["POST"], "boundary": "customer_step_up_stage1_projection" },
+    { "file": "src/app/api/v2/support/tickets/[ticketId]/access-requests/[requestId]/issue/route.ts", "methods": ["POST"], "boundary": "employee_scoped_stage1_projection" },
+    { "file": "src/app/api/v2/support/tickets/[ticketId]/access-requests/[requestId]/revoke/route.ts", "methods": ["POST"], "boundary": "employee_scoped_stage1_projection" },
+    { "file": "src/app/api/v2/offline-authorisations/route.ts", "methods": ["POST", "DELETE"], "boundary": "customer_scoped_offline_authority" },
+    { "file": "src/app/api/v2/trusted-devices/[trustedDeviceId]/route.ts", "methods": ["DELETE"], "boundary": "account_wide_trusted_device_revocation" },
+    { "file": "src/app/api/v2/alexa/discovery/route.ts", "methods": ["GET"], "boundary": "explicit_feature_disabled" },
+    { "file": "src/app/api/v2/alexa/directives/route.ts", "methods": ["POST"], "boundary": "explicit_feature_disabled" },
+    { "file": "src/app/api/v2/alexa/report-state/route.ts", "methods": ["POST"], "boundary": "explicit_feature_disabled" },
+    { "file": "src/app/api/v2/auth/session/route.ts", "methods": ["GET", "POST", "DELETE"], "boundary": "canonical_customer_session_handlers" },
+    { "file": "src/app/api/v2/hub-sessions/route.ts", "methods": ["POST"], "boundary": "canonical_selected_home_hub_session" },
+    { "file": "src/app/api/v2/security/step-up/challenge/route.ts", "methods": ["POST", "DELETE"], "boundary": "customer_operation_bound_step_up" },
+    { "file": "src/app/api/v2/security/step-up/consume/route.ts", "methods": ["POST"], "boundary": "customer_operation_bound_step_up" },
+    { "file": "src/app/api/v2/security/step-up/issue/route.ts", "methods": ["POST"], "boundary": "customer_operation_bound_step_up" }
+  ]
+}

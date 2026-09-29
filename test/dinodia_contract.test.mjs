@@ -12,6 +12,7 @@ const ts = require('typescript');
 const contract = JSON.parse(fs.readFileSync(path.join(root, 'contract.json'), 'utf8'));
 const ajv = new Ajv2020({ allErrors: true, strict: false });
 ajv.addFormat('date-time', /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/);
+ajv.addFormat('email', /^[^\s@]+@[^\s@]+\.[^\s@]+$/);
 ajv.addSchema(contract);
 const deviceSchema = ajv.compile({ $ref: `${contract.$id}#/$defs/device` });
 const valid = JSON.parse(fs.readFileSync(path.join(root, 'fixtures/multi-control-device.json'), 'utf8'));
@@ -21,10 +22,233 @@ const compiled = ts.transpileModule(source, { compilerOptions: { module: ts.Modu
 const module = { exports: {} };
 new Function('module','exports',compiled)(module,module.exports);
 const native = module.exports;
+test('customer login text limits use canonical Unicode code points', () => {
+  assert.equal(native.boundedContractText('😀', 1), '😀');
+  assert.equal(native.boundedContractText('😀😀', 1), '');
+  assert.equal(native.boundedContractText('é', 2), 'é');
+  assert.equal(native.boundedContractText('é', 1), '');
+  assert.equal(native.boundedContractText('  id  ', 2), 'id');
+  assert.equal(native.boundedContractText('id', -1), '');
+});
+test('customer login request has one strict canonical shape without fixture credentials', () => {
+  const request = {
+    email: 'customer@example.invalid',
+    password: 'ephemeral-test-input-only',
+    deviceInstallationId: 'installation:test-only',
+    publicKey: 'synthetic-test-public-key',
+    deviceName: 'Dinodia Smart Living test client',
+    model: 'test model',
+    osFamily: 'test',
+    osVersion: 'test',
+  };
+  const validator = ajv.compile({ $ref: `${contract.$id}#/$defs/customerSessionLoginRequest` });
+  assert.equal(validator(request), true, JSON.stringify(validator.errors));
+  assert.equal(native.validateCustomerSessionLoginRequest(request), true);
+  assert.equal(native.validateCustomerSessionLoginRequest({ ...request, extraAuthority: true }), false);
+  assert.equal(native.validateCustomerSessionLoginRequest({ ...request, password: '' }), false);
+  assert.equal(native.validateCustomerSessionLoginRequest({ ...request, deviceName: '   ' }), false);
+  assert.equal(validator({ ...request, deviceInstallationId: '   ' }), false);
+  assert.equal(native.validateCustomerSessionLoginRequest({ ...request, deviceInstallationId: '   ' }), false);
+  assert.equal(native.validateCustomerSessionLoginRequest({ ...request, email: 'not-an-email' }), false);
+  assert.equal(native.validateCustomerSessionLoginRequest({ ...request, deviceInstallationId: `😀${'a'.repeat(160)}` }), false);
+  assert.equal(native.validateCustomerSessionLoginRequest({ ...request, publicKey: 'x'.repeat(4097) }), false);
+  assert.equal(native.validateCustomerSessionLoginRequest({ ...request, model: 7 }), false);
+});
+test('customer logout receipt is exact and contains no reusable session material', () => {
+  const validator = ajv.compile({ $ref: `${contract.$id}#/$defs/customerSessionLogoutReceipt` });
+  assert.equal(validator({ ok: true }), true);
+  assert.equal(native.validateCustomerSessionLogoutReceipt({ ok: true }), true);
+  assert.equal(native.validateCustomerSessionLogoutReceipt({ ok: true, token: 'not-permitted' }), false);
+  assert.equal(native.validateCustomerSessionLogoutReceipt({ ok: false }), false);
+});
+test('active Native V2 security routes validate their canonical request and response DTOs', () => {
+  const schema = (name, value) => {
+    const validator = ajv.compile({ $ref: `${contract.$id}#/$defs/${name}` });
+    assert.equal(validator(value), true, `${name}: ${JSON.stringify(validator.errors)}`);
+  };
+  const challenge = { operationKind: 'support_access_approve', targetIds: ['ticket:1', 'request:1'], value: 'I approve this support access for my property' };
+  schema('stepUpChallengeRequest', challenge);
+  assert.equal(native.validateStepUpChallengeRequest(challenge), true);
+  assert.equal(native.validateStepUpChallengeRequest({ ...challenge, targetIds: ['ticket:1', 'ticket:1'] }), false);
+  assert.equal(native.validateStepUpChallengeRequest({ ...challenge, extraAuthority: true }), false);
+  const descriptor = { version: 1, serial: 'serial:1', identityGeneration: 2, actorId: 'account:1', customerSessionId: 'session:1', trustedDeviceId: 'trusted:1', homeId: 'home:1', membershipId: 'membership:1', hubInstallId: 'hub:1', operationKind: 'device_sensitive_command', targetIds: ['device:1'], controlId: 'control:1', descriptorRevision: 5, descriptorDigest: null, operationDigest: 'a'.repeat(64), nonce: 'n'.repeat(24), issuedAt: 1790000000000, hubSignature: 's'.repeat(64) };
+  const descriptorChallenge = { operationKind: 'device_sensitive_command', targetIds: ['device:1'], value: true, descriptorAttestation: descriptor };
+  schema('stepUpChallengeRequest', descriptorChallenge);
+  assert.equal(native.validateStepUpChallengeRequest(descriptorChallenge), true);
+  assert.equal(native.validateStepUpChallengeRequest({ ...descriptorChallenge, descriptorAttestation: { ...descriptor, targetIds: ['device:2'] } }), false);
+  assert.equal(native.validateStepUpCancellationRequest({ challengeId: 'challenge:1' }), true);
+  assert.equal(native.validateStepUpCancellationRequest({ challengeId: 'challenge:1', extra: 1 }), false);
+  const issueRequest = { challengeId: 'challenge:1', nonce: 'n'.repeat(24), deviceSignature: 's'.repeat(64) };
+  schema('stepUpIssueRequest', issueRequest);
+  assert.equal(native.validateStepUpIssueRequest(issueRequest), true);
+  const consumeRequest = { operationKind: 'device_sensitive_command', targetIds: ['device:1'], proof: 'proof-value', descriptorDigests: { 'device:1': 'b'.repeat(64) }, value: true };
+  schema('stepUpConsumeRequest', consumeRequest);
+  assert.equal(native.validateStepUpConsumeRequest(consumeRequest), true);
+  assert.equal(native.validateStepUpConsumeRequest({ ...consumeRequest, descriptorDigests: { 'device:1': 'not-a-digest' } }), false);
+  const offlineRequest = { trustedDeviceId: 'trusted:1', publicKey: 'PUBLIC KEY' };
+  schema('offlineAuthorisationRequest', offlineRequest);
+  assert.equal(native.validateOfflineAuthorisationRequest(offlineRequest), true);
+  const offlineReceipt = { ok: true, authorisation: { id: 'offline:1', homeId: 'home:1', membershipId: 'membership:1', trustedDeviceId: 'trusted:1', areaIds: ['area:1'], scopes: ['tenant:device-command'], policyRevision: 2 } };
+  schema('offlineAuthorisationReceipt', offlineReceipt);
+  assert.equal(native.validateOfflineAuthorisationReceipt(offlineReceipt), true);
+  assert.equal(native.validateOfflineAuthorisationReceipt({ ...offlineReceipt, authorisation: { ...offlineReceipt.authorisation, scopes: ['property:admin'] } }), false);
+  const notification = { ok: true, notifications: [{ id: 'notification:1', ticketId: 'ticket:1', eventType: 'STARTED', createdAt: '2026-09-29T10:00:00Z' }] };
+  schema('supportNotificationProjection', notification);
+  assert.equal(native.validateSupportNotificationProjection(notification), true);
+  assert.equal(native.validateSupportNotificationProjection({ ok: true, notifications: [{ ...notification.notifications[0], privateDescription: 'must not escape' }] }), false);
+  const closeRequest = { action: 'close', proof: 'proof-value' };
+  schema('supportTicketCloseRequest', closeRequest);
+  assert.equal(native.validateSupportTicketCloseRequest(closeRequest), true);
+  assert.equal(native.validateSupportTicketCloseRequest({ action: 'close', proof: 'proof', privateNote: 'extra' }), false);
+  const closeReceipt = { ok: true, ticketId: 'ticket:1', status: 'CLOSED', message: 'Support access revoked — waiting for hub confirmation' };
+  schema('supportTicketCloseReceipt', closeReceipt);
+  assert.equal(native.validateSupportTicketCloseReceipt(closeReceipt), true);
+});
+test('support create boundaries enforce the seven-category and exact scoped-request DTOs', () => {
+  const schema = (name, value) => {
+    const validator = ajv.compile({ $ref: `${contract.$id}#/$defs/${name}` });
+    assert.equal(validator(value), true, `${name}: ${JSON.stringify(validator.errors)}`);
+  };
+  const ticketRequest = { category: 'ACCESS_OR_PERMISSIONS', description: 'The door sensor is not reporting.' };
+  schema('supportTicketCreateRequest', ticketRequest);
+  assert.equal(native.validateSupportTicketCreateRequest(ticketRequest), true);
+  assert.equal(native.validateSupportTicketCreateRequest({ ...ticketRequest, category: 'HARNESS_PRIVATE' }), false);
+  assert.equal(native.validateSupportTicketCreateRequest({ ...ticketRequest, hiddenInternalNote: 'not customer supplied' }), false);
+  const ticketReceipt = { ok: true, ticket: { id: 'ticket:1', publicReference: 'DNO-123456', status: 'OPEN', createdAt: '2026-09-29T10:00:00Z' } };
+  schema('supportTicketCreateReceipt', ticketReceipt);
+  assert.equal(native.validateSupportTicketCreateReceipt(ticketReceipt), true);
+  const request = { requestedScope: 'TENANT_SCOPE', targetMembershipId: 'membership:1', areaIds: ['area:1'], targetIds: ['device:1'] };
+  schema('supportAccessRequestCreateRequest', request);
+  assert.equal(native.validateSupportAccessRequestCreateRequest(request), true);
+  assert.equal(native.validateSupportAccessRequestCreateRequest({ ...request, areaIds: ['area:1', 'area:1'] }), false);
+  assert.equal(native.validateSupportAccessRequestCreateRequest({ ...request, targetIds: ['device:1', 'device:1'] }), false);
+  const receipt = { ok: true, accessRequest: { id: 'request:1', status: 'REQUESTED', requestedScope: 'TENANT_SCOPE', touchesPropertyInfrastructure: false, createdAt: '2026-09-29T10:00:00Z' } };
+  schema('supportAccessRequestCreateReceipt', receipt);
+  assert.equal(native.validateSupportAccessRequestCreateReceipt(receipt), true);
+  assert.equal(native.validateSupportAccessRequestCreateReceipt({ ...receipt, accessRequest: { ...receipt.accessRequest, targetUserId: 'private' } }), false);
+});
+test('support decision contract requires an explicit choice and keeps denial receipts secret-free', () => {
+  const schema = (name, value) => {
+    const validator = ajv.compile({ $ref: `${contract.$id}#/$defs/${name}` });
+    assert.equal(validator(value), true, `${name}: ${JSON.stringify(validator.errors)}`);
+  };
+  const approval = { approve: true, confirmation: 'I approve this support access for my property', proof: 'step-up-proof' };
+  schema('supportAccessDecisionRequest', approval);
+  assert.equal(native.validateSupportAccessDecisionRequest(approval), true);
+  assert.equal(native.validateSupportAccessDecisionRequest({}), false);
+  assert.equal(native.validateSupportAccessDecisionRequest({ approve: false, proof: 'must-not-ride-a-denial' }), false);
+  assert.equal(native.validateSupportAccessDecisionRequest({ ...approval, unexpected: true }), false);
+  const denied = { ok: true, requestId: 'request:1', status: 'DENIED' };
+  schema('supportAccessDecisionReceipt', denied);
+  assert.equal(native.validateSupportAccessDecisionReceipt(denied), true);
+  assert.equal(native.validateSupportAccessDecisionReceipt({ ...denied, oneUseCode: 'must-not-exist' }), false);
+  const approved = { ok: true, requestId: 'request:1', status: 'APPROVED', oneUseCode: 'DNO-S-one-use-only', codeExpiresAt: '2026-09-29T10:10:00Z' };
+  schema('supportAccessDecisionReceipt', approved);
+  assert.equal(native.validateSupportAccessDecisionReceipt(approved), true);
+});
+test('trusted-device revocation request and receipt match the actual account-wide DELETE route', () => {
+  const requestSchema = ajv.compile({ $ref: `${contract.$id}#/$defs/trustedDeviceRemovalRequest` });
+  const receiptSchema = ajv.compile({ $ref: `${contract.$id}#/$defs/trustedDeviceRemovalReceipt` });
+  for (const request of [{}, { proof: 'one-use-proof' }]) {
+    assert.equal(requestSchema(request), true, JSON.stringify(requestSchema.errors));
+    assert.equal(native.validateTrustedDeviceRemovalRequest(request), true);
+  }
+  for (const request of [{ extraAuthority: true }, { proof: '' }, { proof: 'p'.repeat(8193) }]) {
+    assert.equal(requestSchema(request), false);
+    assert.equal(native.validateTrustedDeviceRemovalRequest(request), false);
+  }
+  const receipt = { ok: true, trustedDeviceId: 'trusted:2', accountWide: true };
+  assert.equal(receiptSchema(receipt), true);
+  assert.equal(native.validateTrustedDeviceRemovalReceipt(receipt), true);
+  assert.equal(receiptSchema({ ...receipt, accountWide: false }), false);
+  assert.equal(native.validateTrustedDeviceRemovalReceipt({ ...receipt, accountWide: false }), false);
+  assert.equal(native.validateTrustedDeviceRemovalReceipt({ ...receipt, privateKey: 'must-not-escape' }), false);
+});
 test('canonical device fixture passes schema and selected-home binding', () => {
   assert.equal(deviceSchema(valid.device), true);
   assert.equal(valid.device.homeId, valid.context.homeId);
   assert.ok(valid.device.controls.length >= 2);
+  const unreadableWritable = { ...valid.device, controls: valid.device.controls.map((control) => control.controlId === 'control:power' ? { ...control, readable: false } : control) };
+  assert.equal(deviceSchema(unreadableWritable), false, 'writable controls must also be readable');
+  const safeUnknown = { ...valid.device, controls: valid.device.controls.map((control) => control.controlId === 'control:power' ? { ...control, interactionKind: 'vendor_future', writable: false, automatable: false, idempotency: 'none', confirmationPolicy: 'none', stepUpPolicy: 'none' } : control) };
+  assert.equal(deviceSchema(safeUnknown), true);
+  assert.equal(native.validateNativeDevice(safeUnknown), true);
+  const unsafeUnknown = { ...safeUnknown, controls: safeUnknown.controls.map((control) => control.controlId === 'control:power' ? { ...control, writable: true } : control) };
+  assert.equal(deviceSchema(unsafeUnknown), false);
+  assert.equal(native.validateNativeDevice(unsafeUnknown), false);
+});
+test('customer labels share the 40-Unicode-code-point presentation-only boundary', () => {
+  const fixture = JSON.parse(fs.readFileSync(path.join(root, 'fixtures/customer-label-unicode-boundaries.json'), 'utf8'));
+  assert.equal(fixture.countingUnit, 'unicode_code_points');
+  for (const item of fixture.cases) {
+    const raw = typeof item.value === 'string' ? item.value : String(item.repeat || '').repeat(Number(item.repeatCount || 0));
+    const projected = raw.length === 0 ? null : Array.from(raw).slice(0, fixture.maximumPublicCodePoints).join('');
+    const candidate = { ...valid.device, customerLabel: raw };
+    assert.equal(Array.from(projected || '').length, item.projectedCodePoints, item.id);
+    assert.equal(deviceSchema(candidate), item.wireValid, `schema ${item.id}`);
+    assert.equal(native.validateNativeDevice(candidate), item.wireValid, `Platform validator ${item.id}`);
+  }
+});
+test('bounded dinodia.v1 strings use Unicode code points across descriptor and command fields', () => {
+  const fixture = JSON.parse(fs.readFileSync(path.join(root, 'fixtures/bounded-string-unicode-semantics.json'), 'utf8'));
+  const deviceSchemaValidator = deviceSchema;
+  const areaSchema = ajv.compile({ $ref: `${contract.$id}#/$defs/area` });
+  const baseArea = { id: 'area:living', homeId: valid.device.homeId, originalName: 'Living', overrideName: null, revision: 1, lifecycle: 'active' };
+  const baseCommand = JSON.parse(fs.readFileSync(path.join(root, 'fixtures/command-valid.json'), 'utf8'));
+  const repeat = (item, count) => item.repeat.repeat(count);
+  assert.equal(fixture.lengthUnit, 'unicode_code_points');
+  for (const item of [...fixture.boundaryCases, ...fixture.combiningSequenceCases]) {
+    const at = repeat(item, item.validRepeatCount);
+    const over = repeat(item, item.invalidRepeatCount);
+    if (item.field === 'opaqueId') {
+      const withId = (id) => ({ ...valid.device, id, controls: valid.device.controls.map((control) => ({ ...control, deviceId: id })) });
+      assert.equal(native.validateNativeDevice(withId(at)), true, `${item.id} at limit`);
+      assert.equal(native.validateNativeDevice(withId(over)), false, `${item.id} over limit`);
+    } else if (item.field === 'areaName') {
+      assert.equal(areaSchema({ ...baseArea, originalName: at }), true, `${item.id} schema at limit`);
+      assert.equal(native.validateNativeArea({ ...baseArea, originalName: at }), true, `${item.id} runtime at limit`);
+      assert.equal(areaSchema({ ...baseArea, originalName: over }), false, `${item.id} schema over limit`);
+      assert.equal(native.validateNativeArea({ ...baseArea, originalName: over }), false, `${item.id} runtime over limit`);
+    } else if (item.field === 'controlLabel') {
+      const candidate = { ...valid.device, controls: valid.device.controls.map((control, index) => index ? control : { ...control, label: at }) };
+      const invalid = { ...candidate, controls: candidate.controls.map((control, index) => index ? control : { ...control, label: over }) };
+      assert.equal(deviceSchemaValidator(candidate), true, `${item.id} schema at limit`);
+      assert.equal(native.validateNativeDevice(candidate), true, `${item.id} runtime at limit`);
+      assert.equal(deviceSchemaValidator(invalid), false, `${item.id} schema over limit`);
+      assert.equal(native.validateNativeDevice(invalid), false, `${item.id} runtime over limit`);
+    } else if (item.field === 'constraintUnit' || item.field === 'optionLabel') {
+      const controlsFor = (value) => [{ ...valid.device.controls[0], valueType: 'option', interactionKind: 'picker', constraints: { unit: item.field === 'constraintUnit' ? value : 'mode', options: [{ value: 'on', label: item.field === 'optionLabel' ? value : 'On' }] } }];
+      assert.equal(native.validateNativeDevice({ ...valid.device, controls: controlsFor(at) }), true, `${item.id} runtime at limit`);
+      assert.equal(native.validateNativeDevice({ ...valid.device, controls: controlsFor(over) }), false, `${item.id} runtime over limit`);
+    } else if (item.field === 'textCommand' || item.field === 'idempotencyKey') {
+      const control = { ...valid.device.controls[0], valueType: item.field === 'textCommand' ? 'text' : 'boolean', interactionKind: item.field === 'textCommand' ? 'text_input' : 'toggle' };
+      const candidate = { ...valid.device, controls: [control] };
+      const command = { ...baseCommand, homeId: candidate.homeId, deviceId: candidate.id, controlId: control.controlId, descriptorRevision: candidate.descriptorRevision, value: item.field === 'textCommand' ? at : true, idempotencyKey: item.field === 'idempotencyKey' ? at : baseCommand.idempotencyKey };
+      const invalid = { ...command, value: item.field === 'textCommand' ? over : true, idempotencyKey: item.field === 'idempotencyKey' ? over : baseCommand.idempotencyKey };
+      assert.equal(native.validateCommandAgainstDevice(command, candidate, control, baseCommand.homeMembershipId), true, `${item.id} runtime at limit`);
+      assert.equal(native.validateCommandAgainstDevice(invalid, candidate, control, baseCommand.homeMembershipId), false, `${item.id} runtime over limit`);
+      if (item.invalidMinimumRepeatCount) {
+        assert.equal(native.validateCommandAgainstDevice({ ...command, idempotencyKey: repeat(item, item.invalidMinimumRepeatCount) }, candidate, control, baseCommand.homeMembershipId), false, `${item.id} below minimum`);
+      }
+    }
+  }
+});
+test('Platform runtime consumes shared negative Area, state, and descriptor fixtures', () => {
+  const negativeArea = JSON.parse(fs.readFileSync(path.join(root, 'fixtures/invalid/area-negative-revision.json'), 'utf8'));
+  const areaValidator = ajv.compile({ $ref: `${contract.$id}#/$defs/area` });
+  assert.equal(areaValidator(negativeArea), false);
+  assert.equal(native.validateNativeArea(negativeArea), false);
+
+  const invalidState = JSON.parse(fs.readFileSync(path.join(root, 'fixtures/invalid/control-state-boolean-string.json'), 'utf8')).data;
+  const booleanControl = valid.device.controls.find((control) => control.valueType === 'boolean');
+  assert.equal(native.validateControlState(invalidState, valid.device, booleanControl), false);
+
+  const mutation = JSON.parse(fs.readFileSync(path.join(root, 'fixtures/invalid/writable-unreadable-control.json'), 'utf8'));
+  const sourceFixture = JSON.parse(fs.readFileSync(path.join(root, 'fixtures', mutation.sourceFixture.replace(/^fixtures\//, '')), 'utf8'));
+  const unreadable = structuredClone(sourceFixture.device);
+  Object.assign(unreadable.controls.find((control) => control.controlId === mutation.mutation.controlId), mutation.mutation);
+  assert.equal(native.validateNativeDevice(unreadable), false);
+  assert.equal(deviceSchema(unreadable), false);
 });
 test('account session fixture is multi-home, active, and rejects stale or mismatched memberships', () => {
   const value = JSON.parse(fs.readFileSync(path.join(root, 'fixtures/account-session-two-homes.json'), 'utf8'));
@@ -99,6 +323,19 @@ test('contract boundary fixes roles, management wire values and finite state qua
   assert.equal(replacement.homeId, 'home:opaque-a');
   assert.equal(replacement.nameBasedMergeAllowed, false);
 });
+test('hub heartbeat is online through the inclusive 420-second boundary and offline immediately after', () => {
+  const fixture = JSON.parse(fs.readFileSync(path.join(root, 'fixtures/hub-heartbeat-freshness.json'), 'utf8'));
+  const now = Date.parse(fixture.now);
+  assert.equal(fixture.heartbeatCadenceSeconds, 120);
+  assert.equal(fixture.onlineThroughSeconds, contract.wireRules.freshness.onlineThroughSeconds);
+  for (const scenario of fixture.cases) {
+    assert.equal(
+      native.effectiveHubOnlineState(scenario.lastHeartbeatAt, now),
+      scenario.expected,
+      `Hub freshness mismatch for ${scenario.id}`,
+    );
+  }
+});
 test('canonical signed LAN endpoint contract keeps private installer routing out of customer DTOs', () => {
   const schema = ajv.compile({ $ref: `${contract.$id}#/$defs/lanEndpointObservation` });
   const current = JSON.parse(fs.readFileSync(path.join(root, 'fixtures/lan-endpoint-current.json'), 'utf8'));
@@ -131,6 +368,8 @@ test('command validation enforces descriptor type, range, step and exact step-up
   for (const badValue of [100000, -1, 2.5, '50', NaN]) assert.equal(native.validateCommandAgainstDevice(command(brightness, badValue), valid.device, brightness, valid.context.homeMembershipId), false);
   assert.equal(native.validateCommandAgainstDevice(command(lock, true), valid.device, lock, valid.context.homeMembershipId), false);
   assert.equal(native.validateCommandAgainstDevice(command(lock, true, { stepUpOperationId: 'step-up:one-use' }), valid.device, lock, valid.context.homeMembershipId), true);
+  assert.equal(native.validateCommandAgainstDevice(command(brightness, 25), { ...valid.device, lifecycle: 'retired' }, brightness, valid.context.homeMembershipId), false);
+  assert.equal(native.validateCommandAgainstDevice(command(brightness, 25), { ...valid.device, lifecycle: 'view_only' }, brightness, valid.context.homeMembershipId), false);
   assert.equal(native.validateCommandAgainstDevice(command(brightness, 25), valid.device, { ...brightness, constraints: { ...brightness.constraints, maximum: 1000000 } }, valid.context.homeMembershipId), false, 'caller cannot substitute a looser descriptor with the same revision');
   assert.equal(native.validateNativeDevice({ ...valid.device, controls: valid.device.controls.map((item) => item.controlId === lock.controlId ? { ...item, stepUpPolicy: 'none' } : item) }), false, 'security controls must require step-up in the descriptor itself');
 });
@@ -151,6 +390,8 @@ test('area and error schemas use the settled wire names and uppercase codes', ()
   const errorSchema = ajv.compile({ $ref: `${contract.$id}#/$defs/error` });
   assert.equal(areaSchema({ id: 'area:a', homeId: 'home:a', originalName: 'Kitchen', overrideName: null, revision: 1, lifecycle: 'active' }), true);
   assert.equal(areaSchema({ id: 'area:a', homeId: 'home:a', canonicalName: 'Kitchen', overrideName: null, revision: 1, lifecycle: 'active' }), false);
+  assert.equal(areaSchema({ id: 'area:a', homeId: 'home:a', originalName: 'Kitchen', overrideName: null, revision: -1, lifecycle: 'active' }), false);
+  assert.equal(native.validateNativeArea({ id: 'area:a', homeId: 'home:a', originalName: 'Kitchen', overrideName: null, revision: -1, lifecycle: 'active' }), false);
   assert.equal(errorSchema({ error: { code: 'AUTH_REQUIRED', message: 'Sign in', requestId: 'request:a' } }), true);
   assert.equal(errorSchema({ error: { code: 'auth_required', message: 'Sign in', requestId: 'request:a' } }), false);
 });
@@ -162,6 +403,7 @@ test('control state becomes Unknown at validUntil and rejects stale descriptor/h
   assert.equal(native.effectiveControlQuality(state, Date.parse(state.validUntil)), 'unknown');
   assert.equal(native.validateControlState({ ...state, homeId: 'home:other' }, valid.device, control), false);
   assert.equal(native.validateControlState({ ...state, descriptorRevision: 2 }, valid.device, control), false);
+  assert.equal(native.validateControlState({ ...state, value: 'true' }, valid.device, control), false, 'a string value is not boolean state');
 });
 test('decision-bearing lifecycle examples satisfy canonical schemas and preserve non-membership states', () => {
   const compile = (name) => ajv.compile({ $ref: `${contract.$id}#/$defs/${name}` });

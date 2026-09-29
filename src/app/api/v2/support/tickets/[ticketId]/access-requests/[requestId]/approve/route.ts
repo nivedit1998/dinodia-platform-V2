@@ -4,6 +4,7 @@ import { nativeV1ErrorResponse } from '@/lib/contracts/nativeV1Error';
 import { requireCustomer, Stage1AuthError } from '@/lib/stage1Auth';
 import { consumeStepUp } from '@/lib/sensitiveOperationStepUp';
 import { randomSecret, sha256 } from '@/lib/stage1Crypto';
+import { validateSupportAccessDecisionReceipt, validateSupportAccessDecisionRequest } from '@/lib/contracts/dinodiaV1';
 
 export const dynamic = 'force-dynamic';
 
@@ -11,8 +12,9 @@ export async function POST(request: Request, context: { params: Promise<{ ticket
   try {
     const customer = await requireCustomer(request);
     const { ticketId, requestId } = await context.params;
-    const body = await request.json().catch(() => ({})) as Record<string, unknown>;
-    const approve = body.approve !== false;
+    const body = await request.json().catch(() => null) as Record<string, unknown> | null;
+    if (!body || !validateSupportAccessDecisionRequest(body)) throw new Stage1AuthError(400, 'support_decision_invalid', 'Choose approve or deny explicitly with only the fields allowed for that decision');
+    const approve = body.approve;
     const row = await prisma.supportAccessRequest.findUnique({ where: { id: requestId }, select: { id: true, ticketId: true, homeId: true, targetMembershipId: true, requestedScope: true, status: true } });
     const ticket = await prisma.supportTicket.findUnique({ where: { id: ticketId }, select: { id: true, homeId: true, selectedMembershipId: true, status: true } });
     if (!row || !ticket || row.ticketId !== ticketId || row.homeId !== customer.homeId || ticket.homeId !== customer.homeId || ticket.status !== 'OPEN' || row.status !== 'REQUESTED') throw new Stage1AuthError(403, 'support_approval_denied', 'This support request is not available');
@@ -40,6 +42,8 @@ export async function POST(request: Request, context: { params: Promise<{ ticket
     // Portal receives no code; it only starts the authenticated hub handoff.
     // Platform stores the hash and the hub later supplies the code over its
     // machine-authenticated local support surface.
-    return NextResponse.json({ ok: true, requestId: row.id, status: approve ? 'APPROVED' : 'DENIED', ...(oneUseCode ? { oneUseCode, codeExpiresAt } : {}) }, { headers: { 'Cache-Control': 'no-store', Pragma: 'no-cache' } });
+    const receipt = { ok: true, requestId: row.id, status: approve ? 'APPROVED' : 'DENIED', ...(oneUseCode ? { oneUseCode, codeExpiresAt: codeExpiresAt!.toISOString() } : {}) };
+    if (!validateSupportAccessDecisionReceipt(receipt)) throw new Stage1AuthError(500, 'native_v1_contract_invalid', 'The support decision response failed contract validation');
+    return NextResponse.json(receipt, { headers: { 'Cache-Control': 'no-store', Pragma: 'no-cache' } });
   } catch (error) { return nativeV1ErrorResponse(error); }
 }
