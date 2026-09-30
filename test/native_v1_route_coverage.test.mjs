@@ -8,14 +8,18 @@ import { stage1RouteInventory } from './stage1_route_inventory.mjs';
 const root = process.cwd();
 const coveragePath = 'contracts/platform-v2-route-coverage.json';
 const coverage = JSON.parse(fs.readFileSync(path.join(root, coveragePath), 'utf8'));
+const acRouteMatrix = coverage;
 const yaml = createRequire(import.meta.url)('js-yaml');
 const openApi = yaml.load(fs.readFileSync(path.join(root, 'contracts/dinodia-v1/openapi.yaml'), 'utf8'));
 const methodNames = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS', 'HEAD'];
+const authEntries = new Map(stage1RouteInventory.map(([method, route, auth]) => [`${method} ${route}`, auth]));
 
 function routePath(file) {
   const relative = file.replace(/^src\/app\/api/, '').replace(/\/route\.ts$/, '');
   return (`/api${relative}`).replace(/\[([^\]]+)\]/g, ':$1') || '/';
 }
+
+const entriesForCoverage = new Map(coverage.routes.flatMap((row) => row.methods.map((method) => [`${method} ${routePath(row.file)}`, row])));
 
 function exportedMethods(source) {
   const methods = new Set();
@@ -61,7 +65,6 @@ test('every executable Platform Native V2 route method has an explicit contract-
   const actualFiles = actualRouteFiles(path.join(root, 'src/app/api/v2')).sort();
   assert.deepEqual(coverage.routes.map((row) => row.file).sort(), actualFiles, 'new or removed Native V2 route files require a reviewed map update');
 
-  const authEntries = new Map(stage1RouteInventory.map(([method, route, auth]) => [`${method} ${route}`, auth]));
   for (const [methodAndRoute, row] of entries) {
     assert.ok(authEntries.has(methodAndRoute), `runtime auth inventory omits ${methodAndRoute}`);
     const authClass = authEntries.get(methodAndRoute);
@@ -75,6 +78,28 @@ test('every executable Platform Native V2 route method has an explicit contract-
       assert.match(harness, /stage1RouteInventory\.filter\(/, 'integration harness must execute the protected-route inventory');
     }
   }
+});
+
+test('every Native V2 route method has an explicit role-profile and AC cross-reference', () => {
+  assert.equal(acRouteMatrix.evidenceLevel, 'route-inventory-and-auth-boundary-only', 'the route index must not overstate acceptance evidence');
+  assert.ok(acRouteMatrix.principalProfiles && Object.keys(acRouteMatrix.principalProfiles).length > 0, 'principal profiles are required');
+  const indexed = new Set();
+  for (const row of acRouteMatrix.routes) {
+    assert.ok(Array.isArray(row.acceptanceCriteria) && row.acceptanceCriteria.length > 0, `AC cross-reference missing for ${row.file}`);
+    for (const criterion of row.acceptanceCriteria) assert.match(criterion, /^AC-02\.(?:[1-9]|[1-3][0-9]|4[0-5])$/, `invalid AC reference ${criterion} in ${row.file}`);
+    for (const method of row.methods) {
+      const profile = typeof row.principalProfile === 'string' ? row.principalProfile : row.principalProfile?.[method];
+      assert.ok(profile, `principal profile missing for ${method} ${routePath(row.file)}`);
+      assert.ok(acRouteMatrix.principalProfiles[profile], `unknown principal profile ${profile} for ${method} ${routePath(row.file)}`);
+      const routeKey = `${method} ${routePath(row.file)}`;
+      assert.ok(acRouteMatrix.principalProfiles[profile].stage1AuthClasses.includes(authEntries.get(routeKey)), `role profile/auth inventory mismatch for ${routeKey}`);
+      const key = `${method} ${routePath(row.file)}`;
+      assert.equal(indexed.has(key), false, `duplicate role/AC index row ${key}`);
+      indexed.add(key);
+      assert.ok(entriesForCoverage.has(key), `role/AC index is not tied to an inventoried route ${key}`);
+    }
+  }
+  assert.deepEqual([...indexed].sort(), [...entriesForCoverage.keys()].sort(), 'every route method must have exactly one role/AC index entry');
 });
 
 test('all active Native V2 non-Alexa routes preserve the canonical Native V1 error adapter', () => {

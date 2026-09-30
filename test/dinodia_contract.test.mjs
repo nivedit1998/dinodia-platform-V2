@@ -11,7 +11,19 @@ const Ajv2020 = require('ajv/dist/2020.js');
 const ts = require('typescript');
 const contract = JSON.parse(fs.readFileSync(path.join(root, 'contract.json'), 'utf8'));
 const ajv = new Ajv2020({ allErrors: true, strict: false });
-ajv.addFormat('date-time', /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/);
+const validUtcTimestamp = (value) => {
+  if (typeof value !== 'string') return false;
+  const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?Z$/.exec(value);
+  if (!match) return false;
+  const [, yearText, monthText, dayText, hourText, minuteText, secondText] = match;
+  const year = Number(yearText); const month = Number(monthText); const day = Number(dayText);
+  const hour = Number(hourText); const minute = Number(minuteText); const second = Number(secondText);
+  if (month < 1 || month > 12 || hour > 23 || minute > 59 || second > 59) return false;
+  const leapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const daysInMonth = [31, leapYear ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1];
+  return day >= 1 && day <= daysInMonth && Number.isFinite(Date.parse(value));
+};
+ajv.addFormat('date-time', validUtcTimestamp);
 ajv.addFormat('email', /^[^\s@]+@[^\s@]+\.[^\s@]+$/);
 ajv.addSchema(contract);
 const deviceSchema = ajv.compile({ $ref: `${contract.$id}#/$defs/device` });
@@ -22,6 +34,24 @@ const compiled = ts.transpileModule(source, { compilerOptions: { module: ts.Modu
 const module = { exports: {} };
 new Function('module','exports',compiled)(module,module.exports);
 const native = module.exports;
+test('canonical timestamps reject impossible Gregorian dates in schema and Platform runtime', () => {
+  const invalid = JSON.parse(fs.readFileSync(path.join(root, 'fixtures/invalid/impossible-calendar-date-envelope.json'), 'utf8'));
+  const validator = ajv.compile({ $ref: `${contract.$id}#/$defs/envelope` });
+  assert.equal(validator(invalid), false);
+  assert.equal(native.validateEnvelope(invalid), false);
+  assert.equal(native.validateEnvelope({ ...invalid, generatedAt: '2024-02-29T23:59:59Z' }), true);
+  assert.equal(native.validateEnvelope({ ...invalid, generatedAt: '2025-02-29T23:59:59Z' }), false);
+});
+test('Platform rejects a noncanonical stepUpPolicy before descriptor projection', () => {
+  const mutation = JSON.parse(fs.readFileSync(path.join(root, 'fixtures/invalid/device-invalid-step-up-policy.json'), 'utf8'));
+  const fixture = JSON.parse(fs.readFileSync(path.join(root, mutation.sourceFixture), 'utf8'));
+  const device = structuredClone(fixture.device);
+  const control = device.controls.find((item) => item.controlId === mutation.controlId);
+  assert.ok(control);
+  control[mutation.field] = mutation.invalidValue;
+  assert.equal(deviceSchema(device), false);
+  assert.equal(native.validateNativeDevice(device), false);
+});
 test('customer login text limits use canonical Unicode code points', () => {
   assert.equal(native.boundedContractText('😀', 1), '😀');
   assert.equal(native.boundedContractText('😀😀', 1), '');

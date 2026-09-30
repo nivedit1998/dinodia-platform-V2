@@ -179,6 +179,39 @@ test('native dispatcher uses one atomic bounded lease and isolates task failures
   assert.equal(outcomes.filter(Boolean).length, 1, 'concurrent dispatchers must have one lease winner');
 });
 
+test('native dispatcher lease denies until the exact expiry and keeps the two owners isolated', async () => {
+  const leases = new Map();
+  const { acquireOperationsLease } = loadTypeScriptModule('src/lib/nativeOperations.ts', {
+    './prisma': { prisma: { idempotencyRecord: {
+      updateMany: async ({ where, data }) => {
+        const key = `${where.namespace}:${where.keyHash}`;
+        const current = leases.get(key);
+        if (!current || current.expiresAt > where.expiresAt.lte) return { count: 0 };
+        leases.set(key, { expiresAt: data.expiresAt });
+        return { count: 1 };
+      },
+      create: async ({ data }) => {
+        const key = `${data.namespace}:${data.keyHash}`;
+        if (leases.has(key)) throw new Error('unique dispatcher lease');
+        leases.set(key, { expiresAt: data.expiresAt });
+      },
+    } } },
+    './hubOperatorCredentials': { reconcileCredentialLifecycle: async () => ({}) },
+    './stage1ClaimContract': { releaseExpiredClaim: async () => ({ released: false }) },
+    './supportNotifications': { createPropertySupportNotifications: async () => undefined },
+  });
+  const start = new Date('2026-09-30T12:00:00.000Z');
+  assert.equal(await acquireOperationsLease('native-operations', start), true);
+  assert.equal(await acquireOperationsLease('native-operations', new Date(start.getTime() + 179_999)), false,
+    'a lease remains occupied one millisecond before its deadline');
+  assert.equal(await acquireOperationsLease('native-operations', new Date(start.getTime() + 180_000)), true,
+    'the lease is replaceable at its exact inclusive expiry');
+  assert.equal(await acquireOperationsLease('native-maintenance', new Date(start.getTime() + 180_000)), true,
+    'the independent daily maintenance owner has its own lease key');
+  assert.equal(await acquireOperationsLease('native-operations', new Date(start.getTime() + 180_000)), false,
+    'the newly acquired operations lease is not confused with maintenance');
+});
+
 test('native expiry handlers use stable bounded oldest-first batches and conditional updates', async () => {
   const queries = [];
   const { NATIVE_OPERATION_BATCH_LIMIT, runNativeOperations } = loadTypeScriptModule('src/lib/nativeOperations.ts', {

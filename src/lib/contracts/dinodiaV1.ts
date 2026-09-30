@@ -35,7 +35,18 @@ export function boundedContractText(value: unknown, maximumCodePoints: number): 
   return codePointLength(text) <= maximumCodePoints ? text : '';
 }
 const id = (x: unknown): x is string => typeof x === 'string' && x.trim().length > 0 && codePointLength(x) <= 160;
-const utcTimestamp = (x: unknown): x is string => typeof x === 'string' && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/.test(x) && Number.isFinite(Date.parse(x));
+const utcTimestamp = (x: unknown): x is string => {
+  if (typeof x !== 'string') return false;
+  const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?Z$/.exec(x);
+  if (!match) return false;
+  const [, yearText, monthText, dayText, hourText, minuteText, secondText] = match;
+  const year = Number(yearText); const month = Number(monthText); const day = Number(dayText);
+  const hour = Number(hourText); const minute = Number(minuteText); const second = Number(secondText);
+  if (month < 1 || month > 12 || hour > 23 || minute > 59 || second > 59) return false;
+  const leapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const daysInMonth = [31, leapYear ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1];
+  return day >= 1 && day <= daysInMonth && Number.isFinite(Date.parse(x));
+};
 const roles = new Set(['OWNER','PROPERTY_MANAGER','TENANT']);
 const interactionKinds = new Set(['toggle','slider','thermostat','picker','text_input','momentary_action','read_only']);
 const semanticRoles = new Set(['power','brightness','active_heat_demand','active_heat_production','target_temperature','ambient_temperature','opening_percentage','connectivity','security_lock','lock_state','operating_mode','position','volume','color','state','unknown']);

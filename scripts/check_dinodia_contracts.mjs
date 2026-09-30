@@ -25,7 +25,19 @@ const contract = JSON.parse(
 if (contract.contractVersion !== "dinodia.v1")
   throw new Error("Contract version mismatch");
 const ajv = new Ajv2020({ allErrors: true, strict: false });
-ajv.addFormat("date-time", /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/);
+const validUtcTimestamp = (value) => {
+  if (typeof value !== "string") return false;
+  const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?Z$/.exec(value);
+  if (!match) return false;
+  const [, yearText, monthText, dayText, hourText, minuteText, secondText] = match;
+  const year = Number(yearText); const month = Number(monthText); const day = Number(dayText);
+  const hour = Number(hourText); const minute = Number(minuteText); const second = Number(secondText);
+  if (month < 1 || month > 12 || hour > 23 || minute > 59 || second > 59) return false;
+  const leapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const daysInMonth = [31, leapYear ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1];
+  return day >= 1 && day <= daysInMonth && Number.isFinite(Date.parse(value));
+};
+ajv.addFormat("date-time", validUtcTimestamp);
 ajv.addFormat("email", /^[^\s@]+@[^\s@]+\.[^\s@]+$/);
 ajv.addSchema(contract);
 const schemas = new Map();
@@ -222,6 +234,7 @@ const fixtureCases = [
   ["control-catalog-change.json", "controlCatalog", (v) => v.catalog, true],
   ["control-catalog-change.json", "controlCatalogEvent", (v) => ({ schemaVersion: "dinodia.v1", homeId: v.catalog.homeId, streamId: "stream:fixture", sequence: 1, generatedAt: "2026-09-27T10:00:00Z", revision: v.catalog.catalogRevision, data: v.catalog }), true],
   ["deleted-device-tombstone.json", "envelope", (v) => v, true],
+  ["invalid/impossible-calendar-date-envelope.json", "envelope", (v) => v, false],
   ["empty-area.json", "envelope", (v) => v, true],
   ["empty-area.json", "area", (v) => v.data, true],
   ["error-home-denied.json", "error", (v) => v, true],
@@ -256,10 +269,13 @@ const fixtureCases = [
 ];
 const semanticOnlyFixturePaths = new Set([
   "account-relationship-lifecycle.json",
+  "customer-recovery-lifecycle.json",
   "analytics-semantics.json",
   "claim-lifecycle.json",
   "invitation-lifecycle.json",
   "invalid/analytics-invalid-sample.json",
+  "invalid/device-missing-step-up-policy.json",
+  "invalid/device-invalid-step-up-policy.json",
   "invalid/writable-unreadable-control.json",
   "invalid/unknown-interaction-commandable.json",
   "duplicate-display-names.json",
@@ -277,6 +293,9 @@ const semanticOnlyFixturePaths = new Set([
   "notification-lifecycle.json",
   "out-of-order-events.json",
   "replacement-hub.json",
+  "stale-policy.json",
+  "trusted-device-revocation.json",
+  "offline-deregistration-pending.json",
   "room-qr-lifecycle.json",
   "prototype-scenarios.json",
   "stage2-decision-matrix.json",
@@ -293,6 +312,28 @@ for (const [filename, schemaName, select, expectedValid] of fixtureCases) {
   if (actualValid !== expectedValid)
     throw new Error(`Fixture ${filename} expected ${expectedValid ? "valid" : "invalid"} ${schemaName}; got ${actualValid}: ${JSON.stringify(validator?.errors)}`);
 }
+const impossibleDateEnvelope = JSON.parse(fs.readFileSync(path.join(fixtureRoot, "invalid/impossible-calendar-date-envelope.json"), "utf8"));
+if (definitionValidator("envelope")(impossibleDateEnvelope) || platformContractRuntime.validateEnvelope(impossibleDateEnvelope) || osContractRuntime.validateEnvelope(impossibleDateEnvelope))
+  throw new Error("Impossible calendar date must be rejected by schema, Platform and OS envelope validators");
+const missingStepUpScenario = JSON.parse(fs.readFileSync(path.join(fixtureRoot, "invalid/device-missing-step-up-policy.json"), "utf8"));
+const missingStepUpSource = JSON.parse(fs.readFileSync(path.join(fixtureRoot, missingStepUpScenario.sourceFixture.replace(/^fixtures\//, "")), "utf8"));
+const missingStepUpDevice = structuredClone(missingStepUpSource.device);
+const missingStepUpControl = missingStepUpDevice.controls.find((control) => control.controlId === missingStepUpScenario.controlId);
+if (!missingStepUpControl || missingStepUpScenario.removeField !== "stepUpPolicy") throw new Error("Missing-step-up fixture does not identify its source control and required field");
+delete missingStepUpControl.stepUpPolicy;
+if (definitionValidator("device")(missingStepUpDevice) || platformContractRuntime.validateNativeDevice(missingStepUpDevice) || osContractRuntime.validateDevice(missingStepUpDevice, { homeId: missingStepUpDevice.homeId, homeMembershipId: "membership:owner-a", role: "OWNER", areaIds: missingStepUpDevice.areaIds }))
+  throw new Error("Missing stepUpPolicy must be rejected by schema, Platform and OS before control projection");
+const invalidStepUpScenario = JSON.parse(fs.readFileSync(path.join(fixtureRoot, "invalid/device-invalid-step-up-policy.json"), "utf8"));
+if (typeof invalidStepUpScenario.sourceFixture !== "string" || !invalidStepUpScenario.sourceFixture.startsWith("fixtures/"))
+  throw new Error("Invalid-step-up fixture must reference an exact source fixture path");
+const invalidStepUpSource = JSON.parse(fs.readFileSync(path.join(fixtureRoot, invalidStepUpScenario.sourceFixture.slice("fixtures/".length)), "utf8"));
+const invalidStepUpDevice = structuredClone(invalidStepUpSource.device);
+const invalidStepUpControl = invalidStepUpDevice.controls.find((control) => control.controlId === invalidStepUpScenario.controlId);
+if (!invalidStepUpControl || invalidStepUpScenario.field !== "stepUpPolicy" || ["none", "required"].includes(invalidStepUpScenario.invalidValue))
+  throw new Error("Invalid-step-up fixture must identify a descriptor control and a forbidden enum value");
+invalidStepUpControl.stepUpPolicy = invalidStepUpScenario.invalidValue;
+if (definitionValidator("device")(invalidStepUpDevice) || platformContractRuntime.validateNativeDevice(invalidStepUpDevice) || osContractRuntime.validateDevice(invalidStepUpDevice, { homeId: invalidStepUpDevice.homeId, homeMembershipId: "membership:owner-a", role: "OWNER", areaIds: invalidStepUpDevice.areaIds }))
+  throw new Error("Invalid stepUpPolicy must be rejected by schema, Platform and OS before projection");
 const unreadableMutation = JSON.parse(fs.readFileSync(path.join(fixtureRoot, "invalid/writable-unreadable-control.json"), "utf8"));
 const unreadableSource = JSON.parse(fs.readFileSync(path.join(fixtureRoot, unreadableMutation.sourceFixture.replace(/^fixtures\//, "")), "utf8"));
 const unreadableDevice = structuredClone(unreadableSource.device);
@@ -413,6 +454,25 @@ if (replacementHub.hubInstallationId === replacementHub.previousHubInstallationI
   throw new Error("Hub replacement must use a new installation identity and prohibit name-based merge");
 const decisionMatrix = JSON.parse(fs.readFileSync(path.join(fixtureRoot, "stage2-decision-matrix.json"), "utf8"));
 const prototypeScenarios = JSON.parse(fs.readFileSync(path.join(fixtureRoot, "prototype-scenarios.json"), "utf8"));
+const recoveryLifecycle = JSON.parse(fs.readFileSync(path.join(fixtureRoot, "customer-recovery-lifecycle.json"), "utf8"));
+if (recoveryLifecycle.authority !== "account_recovery_contract_only" || recoveryLifecycle.persistenceStage !== 3 ||
+    recoveryLifecycle.cases.some((item) => item.accountExistsDisclosed !== false || item.sessionIssued !== false) ||
+    recoveryLifecycle.cases[0]?.responseClass !== recoveryLifecycle.cases[1]?.responseClass)
+  throw new Error("Customer recovery fixtures must conceal account existence, issue no session, and remain a Stage 3 persistence contract");
+const stalePolicy = JSON.parse(fs.readFileSync(path.join(fixtureRoot, "stale-policy.json"), "utf8"));
+if (stalePolicy.currentPolicyRevision <= stalePolicy.cachedPolicyRevision || stalePolicy.expected.canMutate !== false ||
+    stalePolicy.expected.canWidenOfflineScope !== false || stalePolicy.expected.clearStaleAuthorityBeforeReconnect !== true)
+  throw new Error("Stale policy must block mutation and scope widening until current authority is revalidated");
+const trustedRevocation = JSON.parse(fs.readFileSync(path.join(fixtureRoot, "trusted-device-revocation.json"), "utf8"));
+if (trustedRevocation.affectedMemberships.length < 2 || trustedRevocation.expected.allSessionsForInstallationRevoked !== true ||
+    trustedRevocation.expected.allOfflineLanAuthorisationsForInstallationRevoked !== true || trustedRevocation.expected.unrelatedTrustedDevicePreserved !== true ||
+    trustedRevocation.expected.offlineHubEnforcement !== "pending_until_acknowledged")
+  throw new Error("Trusted Device removal must revoke only that app installation across all homes and preserve unrelated devices");
+const pendingDeregistration = JSON.parse(fs.readFileSync(path.join(fixtureRoot, "offline-deregistration-pending.json"), "utf8"));
+if (pendingDeregistration.platformAuthority !== "revoked" || pendingDeregistration.hubAcknowledgement !== "pending" ||
+    pendingDeregistration.expected.protectedCustomerReads !== false || pendingDeregistration.expected.protectedCommands !== false ||
+    pendingDeregistration.expected.reportComplete !== false || pendingDeregistration.expected.retainedPhysicalPropertyPreserved !== true)
+  throw new Error("Offline deregistration must deny customer authority while honestly retaining physical property state pending hub acknowledgement");
 const requiredPrototypeFlows = ["support", "invitation", "room-qr", "property-actions", "area-edit", "quiet-hours", "trusted-device", "access-request", "descriptor-change", "claim", "recovery", "management-activity", "installation-request"];
 const knownPrototypeRoles = new Set(["Homeowner", "Property manager", "Tenant"]);
 if (prototypeScenarios.schemaVersion !== contract.contractVersion ||
@@ -1167,6 +1227,21 @@ for (const [screenKey, references] of Object.entries(fixtureIndex.screenFixtures
     JSON.parse(fs.readFileSync(target, "utf8"));
   }
 }
+for (const { line, cells } of registerRows) {
+  const screenKey = cells[0].replace(/^`|`$/g, "");
+  const references = [...cells[5].matchAll(/`(fixtures\/[A-Za-z0-9._/-]+\.json)`/g)].map((match) => match[1]);
+  const indexedReferences = fixtureIndex.screenFixtures[screenKey] ?? [];
+  if (JSON.stringify([...references].sort()) !== JSON.stringify([...indexedReferences].sort()))
+    throw new Error(`Matrix must enumerate every exact executable fixture path for ${screenKey}: ${JSON.stringify(references)} vs ${JSON.stringify(indexedReferences)}`);
+  for (const reference of references) {
+    const target = path.join(fixtureRoot, reference.replace(/^fixtures\//, ""));
+    if (!fs.existsSync(target) || !indexedReferences.includes(reference) || !indexedFixturePaths.has(reference.replace(/^fixtures\//, "")))
+      throw new Error(`Matrix fixture reference must resolve to an indexed executable fixture for ${screenKey}: ${reference} (${line})`);
+  }
+}
+const matrixWithoutExactFixturePaths = matrix.replace(/`fixtures\/[A-Za-z0-9._/-]+\.json`/g, "");
+for (const unresolved of ["recovery valid/expired fixtures", "stale-policy", "trusted-device-revocation", "offline-deregistration fixtures"])
+  if (matrixWithoutExactFixturePaths.includes(unresolved)) throw new Error(`Static-to-live matrix contains an unresolved fixture shorthand: ${unresolved}`);
 const expectedTaskFixtureIds = expectedNativeTasks.map(({ taskId }) => taskId).sort();
 if (JSON.stringify(Object.keys(fixtureIndex.taskFixtures ?? {}).sort()) !== JSON.stringify(expectedTaskFixtureIds))
   throw new Error("Fixture index must resolve every and only active native scheduler task");
