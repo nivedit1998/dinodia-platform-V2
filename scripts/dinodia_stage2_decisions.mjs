@@ -579,6 +579,19 @@ function executeSemanticFixture(path, value, adapters) {
       "property-scope support requires an explicit approved revision and cannot be inferred from a tenant-scoped request");
       return result("accepted", { protectedEffects: 0 });
     }
+    case "support-access-revoke.json": {
+      assert(platform.validateSupportAccessRevokeRequest(value.request) &&
+        platform.validateSupportAccessRevokeReceipt(value.receipt) &&
+        ["OWNER", "PROPERTY_MANAGER"].includes(value.decision?.actorRole) &&
+        value.decision.approvedBySameMembership === true &&
+        value.decision.operationKind === "support_access_revoke" &&
+        JSON.stringify(value.decision.targetTypes) === JSON.stringify(["ticket", "request"]) &&
+        value.decision.cloudAuthority === "revoked_immediately" && value.decision.hubAcknowledgement === "pending",
+      "support revocation must use its exact DTO, approving membership, operation-bound targets and pending hub acknowledgement");
+      return result("accepted", { protectedEffects: 0 });
+    }
+    case "invalid/support-access-revoke-extra-authority.json":
+      return deniedWithNoEffects(!platform.validateSupportAccessRevokeRequest(value), path);
     case "customer-hub-session-test-only.json": {
       const now = Date.parse("2026-09-27T10:00:00Z");
       const denied = schema("customerHubSession", value) &&

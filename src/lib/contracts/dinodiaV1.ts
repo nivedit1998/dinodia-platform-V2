@@ -242,6 +242,16 @@ export function validateSupportAccessDecisionReceipt(value: unknown): boolean {
   if (value.status === 'DENIED') return hasOnlyKeys(value, ['ok','requestId','status']);
   return value.status === 'APPROVED' && hasOnlyKeys(value, ['ok','requestId','status','oneUseCode','codeExpiresAt']) && typeof value.oneUseCode === 'string' && codePointLength(value.oneUseCode) > 0 && codePointLength(value.oneUseCode) <= 128 && utcTimestamp(value.codeExpiresAt);
 }
+export function validateSupportAccessRevokeRequest(value: unknown): boolean {
+  return object(value) && hasOnlyKeys(value, ['confirmation','proof']) &&
+    value.confirmation === 'I revoke this support access for my property' &&
+    (value.proof === undefined || typeof value.proof === 'string' && codePointLength(value.proof) > 0 && codePointLength(value.proof) <= 8192);
+}
+export function validateSupportAccessRevokeReceipt(value: unknown): boolean {
+  return object(value) && hasOnlyKeys(value, ['ok','requestId','status','message']) && value.ok === true &&
+    id(value.requestId) && value.status === 'REVOKED' &&
+    value.message === 'Property support access revoked — waiting for hub confirmation';
+}
 export function validateSupportTicketCloseRequest(value: unknown): boolean {
   return object(value) && hasOnlyKeys(value, ['action','proof']) && value.action === 'close' && (value.proof === undefined || typeof value.proof === 'string' && codePointLength(value.proof) > 0 && codePointLength(value.proof) <= 8192);
 }

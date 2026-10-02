@@ -68,9 +68,14 @@ export function localTopology(sourceRoot, { edgeWorkerConfigPath = path.resolve(
   };
 }
 
-export function summarizeHubRuntime(rows) {
+export function summarizeHubRuntime(rows, nowMs = Date.now()) {
   return rows.map((row) => {
     const packageVersion = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z.-]+)?$/.test(row.runtime_version ?? "");
+    const ageSeconds = (value) => {
+      if (value == null) return null;
+      const timestamp = new Date(value).getTime();
+      return Number.isFinite(timestamp) ? Math.max(0, Math.floor((nowMs - timestamp) / 1000)) : null;
+    };
     return {
       state: row.state,
       lanEndpointState: row.lan_endpoint_state,
@@ -82,7 +87,10 @@ export function summarizeHubRuntime(rows) {
       cloudUrlVerified: row.cloud_url_verified === true,
       count: row.count,
       maxLanRevision: row.max_lan_revision,
-      latestHeartbeatAgeSeconds: row.latest_heartbeat == null ? null : Math.max(0, Math.floor((Date.now() - new Date(row.latest_heartbeat).getTime()) / 1000)),
+      latestHeartbeatAgeSeconds: ageSeconds(row.latest_heartbeat),
+      latestRemoteChallengeAgeSeconds: ageSeconds(row.latest_remote_challenge),
+      latestRemoteVerificationAgeSeconds: ageSeconds(row.latest_remote_verification),
+      latestCloudUrlVerificationAgeSeconds: ageSeconds(row.latest_cloud_url_verification),
     };
   });
 }
@@ -125,7 +133,7 @@ export async function collectReadOnlyInventory(client, { sourceRoot, target, edg
 
     const [homeStates, hubStates, identityStates, credentialStates, anonymousGrants] = await Promise.all([
       tx.$queryRawUnsafe('SELECT lifecycle::text AS lifecycle, "installationStatus"::text AS installation_status, count(*)::int AS count FROM public."Home" GROUP BY lifecycle, "installationStatus" ORDER BY lifecycle, "installationStatus"'),
-      tx.$queryRawUnsafe('SELECT state::text AS state, "lanEndpointState" AS lan_endpoint_state, "runtimeVersion" AS runtime_version, bool_or("cloudUrlVerifiedAt" IS NOT NULL) AS cloud_url_verified, count(*)::int AS count, max("lanEndpointRevision")::int AS max_lan_revision, max("lastSeenAt") AS latest_heartbeat FROM public."HubInstallation" GROUP BY state, "lanEndpointState", "runtimeVersion" ORDER BY state, "lanEndpointState", "runtimeVersion"'),
+      tx.$queryRawUnsafe('SELECT state::text AS state, "lanEndpointState" AS lan_endpoint_state, "runtimeVersion" AS runtime_version, bool_or("cloudUrlVerifiedAt" IS NOT NULL) AS cloud_url_verified, count(*)::int AS count, max("lanEndpointRevision")::int AS max_lan_revision, max("lastSeenAt") AS latest_heartbeat, max("remoteChallengeAt") AS latest_remote_challenge, max("remoteVerificationAt") AS latest_remote_verification, max("cloudUrlVerifiedAt") AS latest_cloud_url_verification FROM public."HubInstallation" GROUP BY state, "lanEndpointState", "runtimeVersion" ORDER BY state, "lanEndpointState", "runtimeVersion"'),
       tx.$queryRawUnsafe('SELECT status::text AS status, "identityGeneration" AS generation, count(*)::int AS count FROM public."HubManufacturingIdentity" GROUP BY status, "identityGeneration" ORDER BY status, "identityGeneration"'),
       tx.$queryRawUnsafe('SELECT purpose, state::text AS state, count(*)::int AS count FROM public."HubCredentialVersion" GROUP BY purpose, state ORDER BY purpose, state'),
       tx.$queryRawUnsafe("SELECT grantee, privilege_type, count(*)::int AS count FROM information_schema.role_table_grants WHERE table_schema = 'public' AND grantee IN ('anon', 'authenticated', 'PUBLIC') GROUP BY grantee, privilege_type ORDER BY grantee, privilege_type"),

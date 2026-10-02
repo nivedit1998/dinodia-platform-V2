@@ -389,6 +389,19 @@ test('support decision contract requires an explicit choice and keeps denial rec
   schema('supportAccessDecisionReceipt', approved);
   assert.equal(native.validateSupportAccessDecisionReceipt(approved), true);
 });
+test('support revocation DTOs match the customer step-up route and reject caller-supplied authority', () => {
+  const requestSchema = ajv.compile({ $ref: `${contract.$id}#/$defs/supportAccessRevokeRequest` });
+  const receiptSchema = ajv.compile({ $ref: `${contract.$id}#/$defs/supportAccessRevokeReceipt` });
+  const request = { confirmation: 'I revoke this support access for my property', proof: 'fixture-only-step-up-proof' };
+  const receipt = { ok: true, requestId: 'request:1', status: 'REVOKED', message: 'Property support access revoked — waiting for hub confirmation' };
+  assert.equal(requestSchema(request), true);
+  assert.equal(native.validateSupportAccessRevokeRequest(request), true);
+  assert.equal(native.validateSupportAccessRevokeRequest({ confirmation: request.confirmation, homeId: 'home:attacker' }), false);
+  assert.equal(native.validateSupportAccessRevokeRequest({ confirmation: 'wrong confirmation' }), false);
+  assert.equal(receiptSchema(receipt), true);
+  assert.equal(native.validateSupportAccessRevokeReceipt(receipt), true);
+  assert.equal(native.validateSupportAccessRevokeReceipt({ ...receipt, proof: 'must-not-be-echoed' }), false);
+});
 test('trusted-device revocation request and receipt match the actual account-wide DELETE route', () => {
   const requestSchema = ajv.compile({ $ref: `${contract.$id}#/$defs/trustedDeviceRemovalRequest` });
   const receiptSchema = ajv.compile({ $ref: `${contract.$id}#/$defs/trustedDeviceRemovalReceipt` });

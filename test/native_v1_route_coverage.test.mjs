@@ -102,6 +102,19 @@ test('every Native V2 route method has an explicit role-profile and AC cross-ref
   assert.deepEqual([...indexed].sort(), [...entriesForCoverage.keys()].sort(), 'every route method must have exactly one role/AC index entry');
 });
 
+test('property-support revoke OpenAPI binds the approving customer and exact step-up DTO', () => {
+  const route = '/api/v2/support/tickets/{ticketId}/access-requests/{requestId}/revoke';
+  const operation = openApi.paths[route]?.post;
+  assert.ok(operation, 'support revocation route is documented');
+  assert.ok(operation.parameters.some((parameter) => parameter.$ref === '#/components/parameters/StepUpProof'));
+  assert.equal(operation.parameters.some((parameter) => parameter.$ref === '#/components/parameters/IdempotencyKey'), false);
+  assert.equal(operation.requestBody?.content?.['application/json']?.schema?.$ref, './contract.json#/$defs/supportAccessRevokeRequest');
+  assert.equal(operation.responses?.['200']?.content?.['application/json']?.schema?.$ref, './contract.json#/$defs/supportAccessRevokeReceipt');
+  const indexed = coverage.routes.find((row) => row.file === 'src/app/api/v2/support/tickets/[ticketId]/access-requests/[requestId]/revoke/route.ts');
+  assert.equal(indexed?.principalProfile, 'customer_membership');
+  assert.equal(indexed?.boundary, 'customer_step_up_stage1_projection');
+});
+
 test('all active Native V2 non-Alexa routes preserve the canonical Native V1 error adapter', () => {
   for (const row of coverage.routes.filter((item) => !['explicit_feature_disabled', 'delegates_to_canonical_customer_session_handlers'].includes(item.boundary))) {
     const source = fs.readFileSync(path.join(root, row.file), 'utf8');

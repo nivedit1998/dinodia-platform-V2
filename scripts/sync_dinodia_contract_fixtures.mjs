@@ -51,6 +51,8 @@ for (const fixture of [
   'selected-tenant-private-device.json',
   'support-ticket-private.json',
   'support-lifecycle.json',
+  'support-access-revoke.json',
+  'invalid/support-access-revoke-extra-authority.json',
   'invitation-lifecycle.json',
   'index.json',
   'installation-request-lifecycle.json',

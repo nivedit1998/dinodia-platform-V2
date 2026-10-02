@@ -61,7 +61,7 @@ export const stage1RouteInventory = [
   ['GET', '/api/v2/support/notifications', 'customer'],
   ['POST', '/api/v2/support/tickets/:ticketId/access-requests/:requestId/approve', 'customer'],
   ['POST', '/api/v2/support/tickets/:ticketId/access-requests/:requestId/issue', 'employee'],
-  ['POST', '/api/v2/support/tickets/:ticketId/access-requests/:requestId/revoke', 'employee'],
+  ['POST', '/api/v2/support/tickets/:ticketId/access-requests/:requestId/revoke', 'customer'],
   ['POST', '/api/v2/support/tickets/:ticketId/access-requests', 'employee'],
   ['POST', '/api/v2/support/tickets/:ticketId', 'customer'],
   ['POST', '/api/v2/support/tickets', 'customer'],

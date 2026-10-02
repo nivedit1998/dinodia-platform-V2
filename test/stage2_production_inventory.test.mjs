@@ -64,14 +64,22 @@ test("local scheduler evidence requires one daily Vercel maintenance schedule an
 });
 
 test("hub runtime evidence separates the package version from build IDs and redacts unknown values", () => {
+  const nowMs = Date.parse("2026-10-02T17:30:00.000Z");
   const rows = summarizeHubRuntime([
-    { state: "ACTIVE", lan_endpoint_state: "CURRENT", runtime_version: "0.1.0", cloud_url_verified: true, count: 1, max_lan_revision: 3, latest_heartbeat: new Date() },
+    { state: "ACTIVE", lan_endpoint_state: "CURRENT", runtime_version: "0.1.0", cloud_url_verified: true, count: 1, max_lan_revision: 3, latest_heartbeat: new Date(nowMs - 1_000), latest_remote_challenge: new Date(nowMs - 30_000), latest_remote_verification: new Date(nowMs - 60_000), latest_cloud_url_verification: new Date(nowMs - 120_000) },
     { state: "PROVISIONED", lan_endpoint_state: "CURRENT", runtime_version: "unrecognized-private-value", cloud_url_verified: true, count: 1, max_lan_revision: 5, latest_heartbeat: new Date() },
-  ]);
+  ], nowMs);
   assert.equal(rows[0].reportedPackageVersion, "0.1.0");
   assert.equal(rows[0].unrecognizedRuntimeVersionPresent, false);
+  assert.equal(rows[0].latestHeartbeatAgeSeconds, 1);
+  assert.equal(rows[0].latestRemoteChallengeAgeSeconds, 30);
+  assert.equal(rows[0].latestRemoteVerificationAgeSeconds, 60);
+  assert.equal(rows[0].latestCloudUrlVerificationAgeSeconds, 120);
   assert.equal(rows[1].reportedPackageVersion, null);
   assert.equal(rows[1].unrecognizedRuntimeVersionPresent, true);
   assert.equal(rows[1].runtimeVersionFingerprint.length, 16);
+  assert.equal(rows[1].latestRemoteChallengeAgeSeconds, null);
+  assert.equal(rows[1].latestRemoteVerificationAgeSeconds, null);
+  assert.equal(rows[1].latestCloudUrlVerificationAgeSeconds, null);
   assert.equal(JSON.stringify(rows).includes("unrecognized-private-value"), false);
 });

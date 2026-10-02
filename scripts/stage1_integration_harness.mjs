@@ -956,6 +956,54 @@ async function customerAuthorizationChecks() {
   const supportLogin = await loginEmployee(base, supportEmployee, supportPassword);
   const supportSession = supportLogin.session;
   const supportToken = supportLogin.token;
+  const identitySwapBefore = await tableRowSnapshot();
+  const routeId = '00000000-0000-4000-8000-000000000001';
+  const routePath = (template) => template
+    .replaceAll(':homeId', routeId)
+    .replaceAll(':hubInstallationId', routeId)
+    .replaceAll(':ticketId', routeId)
+    .replaceAll(':requestId', '00000000-0000-4000-8000-000000000002')
+    .replaceAll(':trustedDeviceId', routeId);
+  const identitySwapProbes = [
+    ...stage1RouteInventory.filter(([, , requiredAuthority]) => requiredAuthority === 'customer')
+      .map(([method, template]) => ({
+        label: `employee credentials cannot call customer route ${method} ${template}`,
+        method,
+        route: routePath(template),
+        headers: { 'x-dinodia-employee-session': supportToken },
+        expectedCode: 'AUTH_REQUIRED',
+      })),
+    ...stage1RouteInventory.filter(([, , requiredAuthority]) => requiredAuthority === 'employee')
+      .map(([method, template]) => ({
+        label: `customer credentials cannot call employee route ${method} ${template}`,
+        method,
+        route: routePath(template),
+        headers: { 'x-dinodia-app-token': tenantToken.body.token },
+        expectedCode: template.startsWith('/api/v2/') ? 'AUTH_REQUIRED' : 'employee_session_invalid',
+      })),
+  ];
+  for (const { label, route, method, headers, expectedCode } of identitySwapProbes) {
+    const response = await fetchJson(`${base}${route}`, {
+      method,
+      headers: { ...headers, ...(method === 'GET' ? {} : { 'content-type': 'application/json' }) },
+      ...(method === 'GET' ? {} : { body: '{}' }),
+    });
+    if (response.response.status !== 401) fail(`${label}: cross-principal request was not denied with HTTP 401 (${response.response.status})`);
+    if (route.startsWith('/api/v2/')) {
+      if (response.body?.error?.code !== expectedCode || !response.body?.error?.requestId || Object.hasOwn(response.body || {}, 'errorCode')) fail(`${label}: Native V2 denial did not return canonical 401 ${expectedCode} (${response.response.status}/${response.body?.error?.code || 'no_code'})`);
+    } else if (response.body?.errorCode !== expectedCode || typeof response.body?.error !== 'string' || response.body?.error?.code) {
+      fail(`${label}: Stage 1 employee boundary did not retain its bounded employee-authentication denial (${response.response.status}/${response.body?.errorCode || 'no_code'})`);
+    }
+    const serialized = JSON.stringify(response.body || {});
+    const protectedValues = [supportToken, tenantToken.body.token, account.id, propertyAccount.id, supportEmployee.id,
+      homeOne.id, homeTwo.id, tenantMembership.id, ownerMembership.id, propertyMembership.id, managerMembership.id];
+    if (protectedValues.some((value) => typeof value === 'string' && value.length > 0 && serialized.includes(value)))
+      fail(`${label}: denied cross-principal response echoed a credential or known account/home/membership identity`);
+    if (/"(?:accountId|employeeId|homeMembershipId|membershipId|homeId|token|refreshToken|session|memberships|work|workflow|identity|device)"\s*:/.test(serialized)) fail(`${label}: denied cross-principal response included protected identity or authority fields`);
+  }
+  const identitySwapAfter = await tableRowSnapshot();
+  if (JSON.stringify(identitySwapBefore) !== JSON.stringify(identitySwapAfter)) fail('Cross-principal customer/employee probes changed durable rows');
+  console.log(`[stage2:integration] PASS: employee credentials denied from ${stage1RouteInventory.filter(([, , authority]) => authority === 'customer').length} customer-only route methods and customer credentials denied from ${stage1RouteInventory.filter(([, , authority]) => authority === 'employee').length} employee-only route methods; canonical/bounded errors, no protected response fields or durable row changes`);
   const ticketCountBeforeInvalidCategory = await prisma.supportTicket.count({ where: { customerAccountId: account.id } });
   const invalidCategoryTicket = await fetchJson(`${base}/api/v2/support/tickets`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-app-token': tenantToken.body.token }, body: JSON.stringify({ category: 'HARNESS_PRIVATE', description: 'Must be rejected before persistence' }) });
   const ticketCountAfterInvalidCategory = await prisma.supportTicket.count({ where: { customerAccountId: account.id } });
@@ -1096,8 +1144,26 @@ async function customerAuthorizationChecks() {
   if (revokeChallenge.response.status !== 200) fail(`Property revoke step-up challenge failed (${revokeChallenge.response.status})`);
   const revokeSignature = crypto.sign(null, stepUpChallengeMessage({ challengeId: revokeChallenge.body.challengeId, nonce: revokeChallenge.body.nonce, operationDigest: revokeChallenge.body.operationDigest }), crypto.createPrivateKey(propertyPhone.privateKey)).toString('base64url');
   const revokeProof = await fetchJson(`${base}/api/v2/security/step-up/issue`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-app-token': propertyToken.body.token }, body: JSON.stringify({ challengeId: revokeChallenge.body.challengeId, nonce: revokeChallenge.body.nonce, deviceSignature: revokeSignature }) });
+  if (revokeProof.response.status !== 200 || !revokeProof.body.proof) fail(`Property revoke step-up proof issuance failed (${revokeProof.response.status})`);
+  const beforeRejectedPropertyRevoke = await prisma.supportAccessRequest.findUniqueOrThrow({ where: { id: propertyRequestId }, select: { status: true, revision: true, updatedAt: true, desiredRevokedAt: true } });
+  const beforeRejectedRevokeSessions = await prisma.supportSession.findMany({ where: { accessRequestId: propertyRequestId }, select: { status: true, desiredRevokedAt: true, hubAcknowledgedAt: true } });
+  const beforeRejectedRevokeAudit = await prisma.auditEvent.count({ where: { targetType: 'SupportAccessRequest', targetId: propertyRequestId, action: 'support_access_revoked' } });
+  const beforeRejectedRevokeNotifications = await prisma.supportAccessNotification.count({ where: { accessRequestId: propertyRequestId } });
+  const rejectedExtraAuthorityRevoke = await fetchJson(`${base}/api/v2/support/tickets/${propertyTicketId}/access-requests/${propertyRequestId}/revoke`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-app-token': propertyToken.body.token }, body: JSON.stringify({ confirmation: 'I revoke this support access for my property', proof: revokeProof.body.proof, homeId: propertyTicketId }) });
+  const afterRejectedPropertyRevoke = await prisma.supportAccessRequest.findUniqueOrThrow({ where: { id: propertyRequestId }, select: { status: true, revision: true, updatedAt: true, desiredRevokedAt: true } });
+  const afterRejectedRevokeSessions = await prisma.supportSession.findMany({ where: { accessRequestId: propertyRequestId }, select: { status: true, desiredRevokedAt: true, hubAcknowledgedAt: true } });
+  const afterRejectedRevokeAudit = await prisma.auditEvent.count({ where: { targetType: 'SupportAccessRequest', targetId: propertyRequestId, action: 'support_access_revoked' } });
+  const afterRejectedRevokeNotifications = await prisma.supportAccessNotification.count({ where: { accessRequestId: propertyRequestId } });
+  if (rejectedExtraAuthorityRevoke.response.status !== 400 || rejectedExtraAuthorityRevoke.body.error?.code !== 'VALIDATION_FAILED' ||
+      JSON.stringify(beforeRejectedPropertyRevoke) !== JSON.stringify(afterRejectedPropertyRevoke) ||
+      JSON.stringify(beforeRejectedRevokeSessions) !== JSON.stringify(afterRejectedRevokeSessions) || beforeRejectedRevokeAudit !== afterRejectedRevokeAudit) {
+    fail(`Actual support-revoke route accepted extra authority or caused durable effects (${rejectedExtraAuthorityRevoke.response.status}/${rejectedExtraAuthorityRevoke.body.error?.code || 'none'})`);
+  }
+  if (beforeRejectedRevokeNotifications !== afterRejectedRevokeNotifications || Object.keys(rejectedExtraAuthorityRevoke.body || {}).join(',') !== 'error' ||
+      JSON.stringify(rejectedExtraAuthorityRevoke.body).includes(revokeProof.body.proof)) fail('Rejected support-revoke route leaked protected response fields or changed notification/proof state');
+  console.log('[stage2:integration] PASS: actual property-support revoke route rejects extra authority with canonical VALIDATION_FAILED, zero response data, no durable effects, and leaves the exact one-use proof available for the valid revocation');
   const propertyRevoked = await fetchJson(`${base}/api/v2/support/tickets/${propertyTicketId}/access-requests/${propertyRequestId}/revoke`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-app-token': propertyToken.body.token }, body: JSON.stringify({ confirmation: 'I revoke this support access for my property', proof: revokeProof.body.proof }) });
-  if (propertyRevoked.response.status !== 200 || propertyRevoked.body.status !== 'REVOKED') fail(`Same-approver property revoke failed (${propertyRevoked.response.status}/${propertyRevoked.body.errorCode || ''})`);
+  if (propertyRevoked.response.status !== 200 || !nativeV1Contract.validateSupportAccessRevokeReceipt(propertyRevoked.body)) fail(`Same-approver property revoke failed (${propertyRevoked.response.status}/${propertyRevoked.body.error?.code || ''})`);
   const propertyNotificationsAfter = await fetchJson(`${base}/api/v2/support/notifications`, { headers: { 'x-dinodia-app-token': propertyToken.body.token } });
   const propertyEvents = (propertyNotificationsAfter.body.notifications || []).filter((item) => item.ticketId === propertyTicketId).map((item) => item.eventType).sort();
   if (propertyNotificationsAfter.response.status !== 200 || propertyEvents.join(',') !== 'REVOKED,STARTED') fail(`Property notification lifecycle was incomplete or leaked (${propertyEvents.join(',')})`);
