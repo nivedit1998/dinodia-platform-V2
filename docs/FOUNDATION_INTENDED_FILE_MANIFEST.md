@@ -17,6 +17,7 @@ This manifest is reviewed before staging. It is not permission to commit or push
 - Foundation tests under `test/`.
 - Foundation guard/verification scripts under `scripts/`.
 - `vercel.json`.
+- `public/.well-known/apple-app-site-association` — V2-only universal-link association for the canonical Vercel origin; App Store registration and signed-device verification remain external.
 - `README.md`.
 - `docs/V2_ENVIRONMENT_INVENTORY.md`.
 - `docs/V2_FOUNDATION_STATUS.md`.

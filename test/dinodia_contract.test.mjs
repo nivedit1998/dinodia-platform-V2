@@ -4,8 +4,10 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { createRequire } from 'node:module';
 import crypto from 'node:crypto';
+import { assertStage2DecisionFixtures, executeIndexedFixtureScenario } from '../scripts/dinodia_stage2_decisions.mjs';
 
 const root = path.join(process.cwd(), 'contracts/dinodia-v1');
+const osRoot = process.env.DINODIA_OS_ROOT || path.resolve(process.cwd(), '../Dinodia OS');
 const require = createRequire(import.meta.url);
 const Ajv2020 = require('ajv/dist/2020.js');
 const ts = require('typescript');
@@ -34,6 +36,141 @@ const compiled = ts.transpileModule(source, { compilerOptions: { module: ts.Modu
 const module = { exports: {} };
 new Function('module','exports',compiled)(module,module.exports);
 const native = module.exports;
+test('decision fixture runner rejects structurally valid privacy, delivery, offline and claim contradictions', () => {
+  const read = (name) => JSON.parse(fs.readFileSync(path.join(root, 'fixtures', name), 'utf8'));
+  const baseline = {
+    support: read('support-private-notification.json'),
+    receipt: read('notification-delivery-is-not-authority.json'),
+    offline: read('offline-scope-widening.json'),
+    decisionMatrix: read('stage2-decision-matrix.json'),
+    claim: read('claim-lifecycle.json'),
+  };
+  assert.equal(assertStage2DecisionFixtures(baseline), true);
+
+  const privateLeak = structuredClone(baseline);
+  privateLeak.support.expectedPrivateRecipients = ['membership:owner-a', 'membership:tenant-a'];
+  assert.throws(() => assertStage2DecisionFixtures(privateLeak), /Private tenant-device support/);
+
+  const receiptAuthority = structuredClone(baseline);
+  receiptAuthority.receipt.expectedMembershipCreated = true;
+  receiptAuthority.receipt.invitation = {
+    ...receiptAuthority.receipt.invitation,
+    state: 'accepted', membershipId: 'membership:invitee',
+  };
+  assert.throws(() => assertStage2DecisionFixtures(receiptAuthority), /delivery receipt cannot create/);
+
+  const widenedOffline = structuredClone(baseline);
+  widenedOffline.offline.expectedAllowed = true;
+  assert.throws(() => assertStage2DecisionFixtures(widenedOffline), /Offline selection widened/);
+
+  const falseClaimExtension = structuredClone(baseline);
+  falseClaimExtension.claim.events.find((event) => event.eventId === 'event:noop-save').expectedExpiresAt = '2026-09-28T11:35:00Z';
+  assert.throws(() => assertStage2DecisionFixtures(falseClaimExtension), /Claim lifecycle transition mismatch/);
+
+  const decisionDrift = structuredClone(baseline);
+  decisionDrift.decisionMatrix.offline.scopeCanWiden = true;
+  assert.throws(() => assertStage2DecisionFixtures(decisionDrift), /Contradictory executable decision fixture/);
+});
+test('V2 iOS distribution decision is concrete, configured locally, and externally unclaimed', () => {
+  const decisions = JSON.parse(fs.readFileSync(path.join(root, 'decisions.json'), 'utf8')).distribution;
+  const identity = JSON.parse(fs.readFileSync(path.join(root, 'fixtures/ios-v2-distribution-identity.json'), 'utf8'));
+  const ios = process.env.DINODIA_IOS_ROOT || path.resolve(process.cwd(), '../dinodia-ios-app-V2');
+  const project = fs.readFileSync(path.join(ios, 'Dinodia.xcodeproj/project.pbxproj'), 'utf8');
+  const entitlements = fs.readFileSync(path.join(ios, 'Dinodia/Dinodia.entitlements'), 'utf8');
+  const info = fs.readFileSync(path.join(ios, 'Dinodia/Info.plist'), 'utf8');
+  const aasa = JSON.parse(fs.readFileSync(path.join(process.cwd(), 'public/.well-known/apple-app-site-association'), 'utf8'));
+  const nextConfig = fs.readFileSync(path.join(process.cwd(), 'next.config.ts'), 'utf8');
+  assert.equal(identity.bundleIdentifier, 'com.dinodia.DinodiaV2');
+  assert.equal(identity.displayName, 'Dinodia Smart Living');
+  assert.equal(identity.apnsTopic, identity.bundleIdentifier);
+  assert.equal(identity.keychainAccessGroup, '$(AppIdentifierPrefix)com.dinodia.DinodiaV2');
+  assert.equal(identity.teamIdentifier, 'P759CSZK34');
+  assert.equal(identity.appSiteAssociationApplicationIdentifier, 'P759CSZK34.com.dinodia.DinodiaV2');
+  assert.deepEqual(identity.associatedDomains, ['applinks:dinodia-platform-v2.vercel.app']);
+  assert.equal(identity.deepLinkScheme, 'dinodia-v2');
+  assert.equal(identity.universalLinkPathPrefix, '/app/');
+  assert.equal(decisions.bundleIdentifier, identity.bundleIdentifier);
+  assert.equal(decisions.keychainAccessGroup, identity.keychainAccessGroup);
+  assert.equal(identity.appStoreRecordStatus, 'external_record_and_signing_required');
+  for (const field of ['oldAppImportAllowed', 'oldAppSessionReuseAllowed', 'oldAppPushTokenReuseAllowed', 'oldAppCachedHomeImportAllowed', 'oldAppDeepLinkAuthenticationAllowed']) {
+    assert.equal(identity.forbiddenLegacyState[field], false, field);
+  }
+  assert.match(project, /PRODUCT_BUNDLE_IDENTIFIER = com\.dinodia\.DinodiaV2;/);
+  assert.match(project, /INFOPLIST_KEY_CFBundleDisplayName = "Dinodia Smart Living";/);
+  assert.equal((project.match(/CODE_SIGN_ENTITLEMENTS = Dinodia\/Dinodia\.entitlements;/g) ?? []).length, 2);
+  assert.match(entitlements, /<string>\$\(DINODIA_APS_ENVIRONMENT\)<\/string>/);
+  assert.match(entitlements, /\$\(AppIdentifierPrefix\)com\.dinodia\.DinodiaV2/);
+  assert.match(entitlements, /applinks:dinodia-platform-v2\.vercel\.app/);
+  assert.match(info, /<string>dinodia-v2<\/string>/);
+  assert.doesNotMatch(entitlements, /com\.apple\.security\.application-groups|ubiquity-kvstore/);
+  assert.deepEqual(aasa.applinks.details[0].appIDs, ['P759CSZK34.com.dinodia.DinodiaV2']);
+  assert.deepEqual(aasa.applinks.details[0].components, [{ '/': '/app/*' }]);
+  assert.match(nextConfig, /source: '\/\.well-known\/apple-app-site-association'/);
+  assert.match(nextConfig, /key: 'Content-Type', value: 'application\/json'/);
+  assert.doesNotMatch(entitlements, /com\.apple\.application-identifier/);
+});
+test('indexed matrix scenario runner executes the owning semantic decision and fails closed on drift', () => {
+  const read = (name) => JSON.parse(fs.readFileSync(path.join(root, 'fixtures', name), 'utf8'));
+  const support = read('support-private-notification.json');
+  const adapters = {
+    os: require(path.join(osRoot, 'src/contracts/dinodiaV1.js')),
+    platform: native,
+    analytics: require(path.join(osRoot, 'src/contracts/analyticsV1.js')),
+    schema: (name, value) => ajv.compile({ $ref: `${contract.$id}#/$defs/${name}` })(value),
+    readFixture: (reference) => read(reference.replace(/^fixtures\//, '')),
+  };
+  const result = executeIndexedFixtureScenario({
+    screenKey: 'owner.support', fixturePath: 'fixtures/support-private-notification.json', fixture: support,
+    schemaChecks: [], adapters,
+  });
+  assert.equal(result.actualOutcome, 'matched');
+  assert.equal(result.semantic, 'accepted');
+  const contradiction = structuredClone(support);
+  contradiction.expectedPrivateRecipients = ['membership:owner-a', 'membership:tenant-a'];
+  assert.throws(() => executeIndexedFixtureScenario({
+    screenKey: 'owner.support', fixturePath: 'fixtures/support-private-notification.json', fixture: contradiction,
+    schemaChecks: [], adapters,
+  }), /private support recipient projection differs/);
+  assert.throws(() => executeIndexedFixtureScenario({
+    screenKey: 'system.unregistered', fixturePath: 'fixtures/not-indexed.json', fixture: {},
+    schemaChecks: [], adapters,
+  }), /no owning semantic validator, adapter, reducer or decision executor/);
+});
+test('duplicate-name area scenario binds exact Home and membership-scoped grants', () => {
+  const read = (name) => JSON.parse(fs.readFileSync(path.join(root, 'fixtures', name), 'utf8'));
+  const adapters = {
+    os: require(path.join(osRoot, 'src/contracts/dinodiaV1.js')),
+    platform: native,
+    analytics: require(path.join(osRoot, 'src/contracts/analyticsV1.js')),
+    schema: (name, value) => ajv.compile({ $ref: `${contract.$id}#/$defs/${name}` })(value),
+    readFixture: (reference) => read(reference.replace(/^fixtures\//, '')),
+  };
+  const fixture = read('duplicate-display-names.json');
+  const run = (value) => executeIndexedFixtureScenario({
+    screenKey: 'owner.floorplan', fixturePath: 'fixtures/duplicate-display-names.json', fixture: value,
+    schemaChecks: [], adapters,
+  });
+  assert.equal(run(fixture).semantic, 'accepted');
+
+  const wrongHome = structuredClone(fixture);
+  wrongHome.homeId = 'home:another-property';
+  assert.throws(() => run(wrongHome), /same-name area scenario must bind/);
+
+  const tenantScopeWidened = structuredClone(adapters.readFixture('fixtures/stage2-decision-matrix.json'));
+  tenantScopeWidened.property.partialGrantCombinedAreaIds = ['area:bedroom-a', 'area:bedroom-b'];
+  adapters.readFixture = (reference) => reference.endsWith('stage2-decision-matrix.json')
+    ? tenantScopeWidened
+    : read(reference.replace(/^fixtures\//, ''));
+  assert.throws(() => run(fixture), /same-name area scenario must bind/);
+
+  const wrongMembership = structuredClone(tenantScopeWidened);
+  wrongMembership.property.partialGrantCombinedAreaIds = ['area:bedroom-a'];
+  wrongMembership.property.areaScopeMemberships.partialTenantMembershipId = 'membership:other-tenant';
+  adapters.readFixture = (reference) => reference.endsWith('stage2-decision-matrix.json')
+    ? wrongMembership
+    : read(reference.replace(/^fixtures\//, ''));
+  assert.throws(() => run(fixture), /same-name area scenario must bind/);
+});
 test('canonical timestamps reject impossible Gregorian dates in schema and Platform runtime', () => {
   const invalid = JSON.parse(fs.readFileSync(path.join(root, 'fixtures/invalid/impossible-calendar-date-envelope.json'), 'utf8'));
   const validator = ajv.compile({ $ref: `${contract.$id}#/$defs/envelope` });
@@ -41,6 +178,28 @@ test('canonical timestamps reject impossible Gregorian dates in schema and Platf
   assert.equal(native.validateEnvelope(invalid), false);
   assert.equal(native.validateEnvelope({ ...invalid, generatedAt: '2024-02-29T23:59:59Z' }), true);
   assert.equal(native.validateEnvelope({ ...invalid, generatedAt: '2025-02-29T23:59:59Z' }), false);
+});
+test('command issuedAt rejects impossible Gregorian dates across schema, Platform and OS validators', () => {
+  const invalid = JSON.parse(fs.readFileSync(path.join(root, 'fixtures/invalid/impossible-calendar-date-command.json'), 'utf8'));
+  const device = JSON.parse(fs.readFileSync(path.join(root, 'fixtures/multi-control-device.json'), 'utf8')).device;
+  const control = device.controls.find((item) => item.controlId === invalid.command.controlId);
+  const commandSchema = ajv.compile({ $ref: `${contract.$id}#/$defs/command` });
+  assert.equal(commandSchema(invalid.command), false);
+  assert.equal(native.validateCommandAgainstDevice(invalid.command, device, control, invalid.command.homeMembershipId), false);
+  const os = require(path.join(osRoot, 'src/contracts/dinodiaV1.js'));
+  assert.equal(os.validateCommand(invalid.command, device, control, invalid.command.homeMembershipId), false);
+  for (const issuedAt of ['2026-02-28T23:59:59Z', '2024-02-29T12:00:00Z']) {
+    const candidate = { ...invalid.command, issuedAt };
+    assert.equal(commandSchema(candidate), true, issuedAt);
+    assert.equal(native.validateCommandAgainstDevice(candidate, device, control, candidate.homeMembershipId), true, issuedAt);
+    assert.equal(os.validateCommand(candidate, device, control, candidate.homeMembershipId), true, issuedAt);
+  }
+  for (const issuedAt of ['2025-02-29T12:00:00Z', '2026-04-31T10:00:00Z']) {
+    const candidate = { ...invalid.command, issuedAt };
+    assert.equal(commandSchema(candidate), false, issuedAt);
+    assert.equal(native.validateCommandAgainstDevice(candidate, device, control, candidate.homeMembershipId), false, issuedAt);
+    assert.equal(os.validateCommand(candidate, device, control, candidate.homeMembershipId), false, issuedAt);
+  }
 });
 test('Platform rejects a noncanonical stepUpPolicy before descriptor projection', () => {
   const mutation = JSON.parse(fs.readFileSync(path.join(root, 'fixtures/invalid/device-invalid-step-up-policy.json'), 'utf8'));

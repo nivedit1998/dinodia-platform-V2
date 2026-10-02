@@ -2,6 +2,7 @@
 import type { NextConfig } from 'next';
 
 const nextConfig: NextConfig = {
+  agentRules: false,
   reactStrictMode: true,
   reactCompiler: true,
   typedRoutes: true,
@@ -40,6 +41,13 @@ const nextConfig: NextConfig = {
     }
 
     return [
+      {
+        source: '/.well-known/apple-app-site-association',
+        headers: [
+          { key: 'Content-Type', value: 'application/json' },
+          { key: 'Cache-Control', value: 'public, max-age=300' },
+        ],
+      },
       {
         // Company Portal intentionally opens the paired hub on a separate
         // origin. Keep that popup in the opener's browsing-context group so

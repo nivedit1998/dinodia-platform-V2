@@ -5,6 +5,7 @@ import { createRequire } from "node:module";
 import crypto from "node:crypto";
 import Ajv2020 from "ajv/dist/2020.js";
 import yaml from "js-yaml";
+import { assertStage2DecisionFixtures, executeIndexedFixtureScenario } from "./dinodia_stage2_decisions.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const require = createRequire(import.meta.url);
@@ -157,6 +158,7 @@ for (const required of [
   "out-of-order-events.json",
   "invalid/wrong-home-envelope.json",
   "invalid/stale-descriptor-command.json",
+  "invalid/impossible-calendar-date-command.json",
   "invalid/unknown-required-version.json",
 ]) {
   if (!fs.existsSync(path.join(fixtureRoot, required)))
@@ -244,6 +246,7 @@ const fixtureCases = [
   ["invalid/lan-endpoint-public-address.json", "lanEndpointObservation", (v) => v, false],
   ["invalid/lan-endpoint-extra-authority-field.json", "lanEndpointObservation", (v) => v, false],
   ["invalid/stale-descriptor-command.json", "command", (v) => v.command, true],
+  ["invalid/impossible-calendar-date-command.json", "command", (v) => v.command, false],
   ["invalid/support-ticket-incomplete-home-scope.json", "supportTicket", (v) => v, false],
   ["invalid/tenant-device-wrong-owner.json", "device", (v) => v.device, true],
   ["invalid/unknown-required-version.json", "envelope", (v) => v, false],
@@ -291,6 +294,7 @@ const semanticOnlyFixturePaths = new Set([
   "bounded-string-unicode-semantics.json",
   "hub-heartbeat-freshness.json",
   "notification-lifecycle.json",
+  "ios-v2-distribution-identity.json",
   "out-of-order-events.json",
   "replacement-hub.json",
   "stale-policy.json",
@@ -842,6 +846,13 @@ const claim = JSON.parse(fs.readFileSync(path.join(fixtureRoot, "claim-first-win
 if (claim.state !== "reserved" || claim.firstWins !== true || Date.parse(claim.expiresAt) - Date.parse(claim.createdAt) !== 30 * 60 * 1000)
   throw new Error("Claim first-wins fixture disagrees with the frozen exact reservation window");
 const claimLifecycle = JSON.parse(fs.readFileSync(path.join(fixtureRoot, "claim-lifecycle.json"), "utf8"));
+if (!assertStage2DecisionFixtures({
+  support: privateSupportScenario,
+  receipt: deliveryReceiptScenario,
+  offline: offlineWidening,
+  decisionMatrix,
+  claim: claimLifecycle,
+})) throw new Error("Stage 2 decision fixtures were not behaviorally evaluated");
 const claimState = structuredClone(claimLifecycle.initial);
 const appliedClaimMutations = new Set();
 if (!claimState.emailVerified || claimLifecycle.competingClaim.winnerRemains !== claimState.claimantAccountId || claimLifecycle.competingClaim.expectedOutcome !== "non_identifying_unavailable")
@@ -1227,6 +1238,43 @@ for (const [screenKey, references] of Object.entries(fixtureIndex.screenFixtures
     JSON.parse(fs.readFileSync(target, "utf8"));
   }
 }
+const indexedScenarioResults = [];
+const semanticAdapters = {
+  os: osContractRuntime,
+  platform: platformContractRuntime,
+  schema: (name, value) => definitionValidator(name)(value),
+  analytics: osAnalyticsRuntime,
+  readFixture: (reference) => {
+    if (typeof reference !== "string" || !reference.startsWith("fixtures/")) throw new Error(`Invalid nested fixture reference: ${String(reference)}`);
+    const target = path.join(fixtureRoot, reference.slice("fixtures/".length));
+    if (!target.startsWith(`${fixtureRoot}${path.sep}`) || !fs.existsSync(target)) throw new Error(`Unresolved nested fixture reference: ${reference}`);
+    return JSON.parse(fs.readFileSync(target, "utf8"));
+  },
+};
+for (const [screenKey, references] of Object.entries(fixtureIndex.screenFixtures)) {
+  for (const reference of references) {
+    const relativePath = reference.slice("fixtures/".length);
+    const fixture = semanticAdapters.readFixture(reference);
+    const schemaChecks = fixtureCases
+      .filter(([filename]) => filename === relativePath)
+      .map(([, schemaName, select, expected]) => ({
+        schema: schemaName,
+        select,
+        expected,
+        validate: (value) => definitionValidator(schemaName)(value),
+      }));
+    indexedScenarioResults.push(executeIndexedFixtureScenario({
+      screenKey,
+      fixturePath: reference,
+      fixture,
+      schemaChecks,
+      adapters: semanticAdapters,
+    }));
+  }
+}
+if (indexedScenarioResults.length !== Object.values(fixtureIndex.screenFixtures).reduce((total, refs) => total + refs.length, 0) ||
+    indexedScenarioResults.some((result) => result.actualOutcome !== "matched" || result.semantic === "schema"))
+  throw new Error("Every matrix screen/action fixture must execute through its owning semantic validator, adapter or decision runner");
 for (const { line, cells } of registerRows) {
   const screenKey = cells[0].replace(/^`|`$/g, "");
   const references = [...cells[5].matchAll(/`(fixtures\/[A-Za-z0-9._/-]+\.json)`/g)].map((match) => match[1]);
@@ -1255,10 +1303,26 @@ for (const [taskId, references] of Object.entries(fixtureIndex.taskFixtures)) {
       throw new Error(`Unresolved task fixture reference for ${taskId}: ${reference}`);
   }
 }
+const hasCompleteOwnerDetails = (value) => {
+  const ownerDetails = value.split(";").map((part) => part.trim());
+  return /(?:Stages? \d+|all stages)/i.test(ownerDetails[0]) && ownerDetails.length >= 3 &&
+    ownerDetails.every((part) => part && !/^,\s*,?$/.test(part)) && cellsHasFixtureClause(ownerDetails.at(-1)) && value.length >= 16;
+};
+function cellsHasFixtureClause(value) {
+  return value.startsWith("Executable fixtures:");
+}
+for (const malformed of [
+  "Stage 3; , ,; Executable fixtures: `fixtures/example.json`",
+  "Stage 3 contract fixture:; Executable fixtures: `fixtures/example.json`",
+  "Stage 3; ; Executable fixtures: `fixtures/example.json`",
+]) {
+  if (hasCompleteOwnerDetails(malformed))
+    throw new Error("Static-to-live owner metadata validator accepted an empty or placeholder clause");
+}
 for (const { line, cells } of registerRows) {
   if (cells.length !== 6 || cells.some((cell) => !cell))
     throw new Error(`Static-to-live screen/action row must define all six contract columns: ${line}`);
-  if (!/(?:Stages? \d+|all stages)/i.test(cells[5]) || cells[5].length < 16)
+  if (!hasCompleteOwnerDetails(cells[5]))
     throw new Error(`Static-to-live screen/action row must name an owning stage and fixture reference: ${line}`);
 }
 for (const key of [
@@ -1310,6 +1374,19 @@ for (const [repo, relative] of [
 const iosPrototypeMatrix = path.resolve(root, "../dinodia-ios-app-V2/Dinodia/DebugFixtures/V2_STATIC_TO_LIVE_MATRIX.md");
 if (fs.readFileSync(iosPrototypeMatrix, "utf8") !== matrix)
   throw new Error("iOS DEBUG contract prototype matrix differs from the canonical Platform matrix");
+const iosPrototypeSource = path.resolve(root, "../dinodia-ios-app-V2/Dinodia/LiveContracts/Stage2ContractPrototypeView.swift");
+const iosPrototypeText = fs.readFileSync(iosPrototypeSource, "utf8");
+const iosFixtureSyncScript = fs.readFileSync(path.join(root, "scripts/sync_dinodia_contract_fixtures.mjs"), "utf8");
+const debugFixtureList = iosFixtureSyncScript.match(/for \(const fixture of \[([\s\S]*?)\]\) \{/);
+if (!debugFixtureList) throw new Error("iOS DEBUG fixture synchronization list is missing");
+const synchronizedDebugFixtures = new Set([...debugFixtureList[1].matchAll(/'([^']+\.json)'/g)].map((match) => match[1].replace(/\.json$/, "")));
+const iosPrototypeFixtureReferences = new Set([...iosPrototypeText.matchAll(/Stage2PrototypeFixtures\.object\("([A-Za-z0-9._-]+)"\)/g)].map((match) => match[1]));
+for (const name of iosPrototypeFixtureReferences) {
+  if (!fs.existsSync(path.join(fixtureRoot, `${name}.json`)))
+    throw new Error(`iOS prototype references a missing canonical fixture: ${name}.json`);
+  if (!synchronizedDebugFixtures.has(name))
+    throw new Error(`iOS prototype fixture is not copied into the DEBUG bundle: ${name}.json`);
+}
 console.log(
-  `dinodia.v1 schemas=${schemas.size} JSON fixtures=${fixtureFiles.length} runtime validators=${validatorNames.length}; Alexa schema and tenant-role negatives enforced`,
+  `dinodia.v1 schemas=${schemas.size} JSON fixtures=${fixtureFiles.length} runtime validators=${validatorNames.length}; indexed screen/action scenarios=${indexedScenarioResults.length}; semantic executions=${indexedScenarioResults.length}; modeled-denial assertions=${indexedScenarioResults.reduce((sum, result) => sum + result.zeroEffectDenials, 0)} (not a route side-effect proof); iOS DEBUG fixture references=${iosPrototypeFixtureReferences.size}; Alexa schema and tenant-role negatives enforced`,
 );

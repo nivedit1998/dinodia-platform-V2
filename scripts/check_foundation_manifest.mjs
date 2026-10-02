@@ -8,7 +8,7 @@ const entries = statusOutput.split('\0').filter(Boolean).map((entry) => ({
 }));
 
 const modifiedFiles = new Set([
-  '.gitignore', '.env.example', 'README.md', 'SECURITY_CHECKLIST.md', 'phase8-acceptance.md', 'docs/STAGE1_DEPENDENCY_ADVISORIES.md', 'docs/STAGE1_RELEASE_CANDIDATE_READINESS.md', 'docs/V2_ENVIRONMENT_INVENTORY.md',
+  '.gitignore', '.env.example', 'README.md', 'SECURITY_CHECKLIST.md', 'phase8-acceptance.md', 'docs/STAGE1_DEPENDENCY_ADVISORIES.md', 'docs/STAGE1_RELEASE_CANDIDATE_READINESS.md', 'docs/V2_ENVIRONMENT_INVENTORY.md', 'docs/FOUNDATION_INTENDED_FILE_MANIFEST.md',
   'docs/V2_FOUNDATION_STATUS.md', 'next.config.ts', 'package-lock.json', 'package.json', 'prisma.config.ts',
   'prisma/schema.prisma', 'scripts/assert_v2_target.mjs', 'scripts/check_no_unsafe_logs.mjs',
   'scripts/check_clean_clone.mjs', 'scripts/check_foundation.mjs', 'scripts/check_foundation_manifest.mjs', 'scripts/check_dinodia_contracts.mjs', 'scripts/foundation_db_checks.mjs', 'scripts/reset_rc_database.mjs',
@@ -25,6 +25,7 @@ const modifiedFiles = new Set([
   'src/app/api/installer/home-support/homes/[homeId]/os-access/revoke/route.ts',
   'contracts/dinodia-v1/contract.json', 'contracts/dinodia-v1/decisions.json', 'contracts/dinodia-v1/openapi.yaml', 'contracts/dinodia-v1/V2_STATIC_TO_LIVE_MATRIX.md', 'contracts/dinodia-v1/fixtures/index.json', 'contracts/dinodia-v1/fixtures/customer-hub-session-test-only.json',
   'contracts/dinodia-v1/fixtures/stage2-decision-matrix.json',
+  'contracts/dinodia-v1/fixtures/duplicate-display-names.json',
   'contracts/dinodia-v1/fixtures/analytics-semantics.json',
   'contracts/dinodia-v1/fixtures/unknown-interaction-kind.json',
   'contracts/platform-v2-route-coverage.json',
@@ -49,11 +50,12 @@ const modifiedFiles = new Set([
 
 const addedFiles = [
   /^contracts(?:\/|$)/,
+  /^public\/\.well-known(?:\/|$)/,
   /^\.env\.example$/,
   /^(SECURITY_CHECKLIST|phase8-acceptance)\.md$/,
   /^docs\/(FOUNDATION_INTENDED_FILE_MANIFEST|NATIVE_V2_SCHEMA_OWNERSHIP)\.md$/,
   /^prisma\/migrations\/\d+_[^/]+\//,
-  /^scripts\/(check_clean_clone|check_dinodia_contracts|check_foundation|check_foundation_manifest|check_stage1_security|enrol_manufactured_hub|foundation_db_checks|foundation_invariants|local_database|reset_rc_database|schema_fingerprint|stage1_db_checks|stage1_integration_harness|sync_dinodia_contract_fixtures)\.mjs$/,
+  /^scripts\/(check_aasa_runtime|check_clean_clone|check_dinodia_contracts|check_foundation|check_foundation_manifest|check_stage1_security|dinodia_stage2_decisions|enrol_manufactured_hub|foundation_db_checks|foundation_invariants|local_database|read_only_production_inventory|reset_rc_database|schema_fingerprint|stage1_db_checks|stage1_integration_harness|sync_dinodia_contract_fixtures)\.mjs$/,
   /^scripts\/stage1_loopback_guard\.mjs$/,
   /^src\/app\/api\/(health|readiness)(?:\/|$)/,
   /^src\/app\/api\/(company|cron|hub-agent|installer|internal|v2)(?:\/|$)/,
@@ -85,7 +87,7 @@ const classified = entries.map(({ status, file }) => {
     if (!modifiedFiles.has(file)) throw new Error(`unclassified modification: ${file}`);
     return { status, file, classification: 'KEEP_MODIFIED' };
   }
-  if (status === '??') {
+  if (status === '??' || status === 'A ' || status === 'AM') {
     if (replacedDocumentation.has(file)) return { status, file, classification: 'REPLACED_DOCUMENT' };
     if (!addedFiles.some((pattern) => pattern.test(file))) throw new Error(`unclassified addition: ${file}`);
     return { status, file, classification: 'INTENDED_ADD' };

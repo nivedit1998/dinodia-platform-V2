@@ -131,11 +131,17 @@ try {
   const crossRoot = path.join(tempRoot, '.cross-repository');
   const osFixture = path.join(crossRoot, 'Dinodia OS');
   const edgeFixture = path.join(crossRoot, 'dinodia-edge-worker-V2');
+  const iosFixture = path.join(crossRoot, 'dinodia-ios-app-V2');
   copyCrossRepositoryTree(path.resolve(sourceRoot, '../Dinodia OS'), osFixture, ['src', 'public']);
   copyCrossRepositoryFixture(path.resolve(sourceRoot, '../Dinodia OS'), osFixture, [
     'package.json', 'package-lock.json', '.env.example',
   ]);
   copyCrossRepositoryFixture(path.resolve(sourceRoot, '../dinodia-edge-worker-V2'), edgeFixture, ['wrangler.toml', 'src/index.ts']);
+  copyCrossRepositoryFixture(path.resolve(sourceRoot, '../dinodia-ios-app-V2'), iosFixture, [
+    'Dinodia.xcodeproj/project.pbxproj',
+    'Dinodia/Dinodia.entitlements',
+    'Dinodia/Info.plist',
+  ]);
   if (!fs.existsSync(path.join(tempRoot, '.env.example'))) throw new Error('.env.example is missing from the clean source snapshot');
   const example = fs.readFileSync(path.join(tempRoot, '.env.example'), 'utf8');
   if (/postgres(?:ql)?:\/\/[^\s:]+:[^\s@]+@/i.test(example.replaceAll('USER:PASSWORD', 'PLACEHOLDER'))) throw new Error('.env.example appears to contain a real database credential');
@@ -166,6 +172,7 @@ try {
     DATABASE_URL: databaseUrl,
     DIRECT_URL: databaseUrl,
     DINODIA_OS_ROOT: osFixture,
+    DINODIA_IOS_ROOT: iosFixture,
     DINODIA_EDGE_ROOT: edgeFixture,
   };
   run('npx', ['prisma', 'validate'], { cwd: tempRoot, env: localEnv });

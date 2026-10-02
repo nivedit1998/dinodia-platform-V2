@@ -9,6 +9,7 @@
     "lint": "eslint src scripts --max-warnings=0",
     "typecheck": "tsc --noEmit",
     "check:dinodia-contracts": "node scripts/check_dinodia_contracts.mjs",
+    "check:aasa:runtime": "node scripts/check_aasa_runtime.mjs",
     "contracts:sync": "node scripts/sync_dinodia_contract_fixtures.mjs",
     "test": "node --test test/*.test.mjs",
     "test:target-guard": "node --test test/target_guard.test.mjs test/runtime_target.test.mjs",
@@ -22,6 +23,7 @@
     "test:stage1:db": "node scripts/stage1_db_checks.mjs",
     "test:stage1:integration": "node scripts/stage1_integration_harness.mjs",
     "test:stage1": "node --test test/stage1_security.test.mjs test/operator_rate_limit_policy.test.mjs && npm run test:stage1:integration",
+    "evidence:production-read-only": "node scripts/read_only_production_inventory.mjs",
     "foundation:target": "node scripts/assert_v2_target.mjs --mode local",
     "db:validate-target": "node scripts/assert_v2_target.mjs --mode \"${V2_ENVIRONMENT:-local}\"",
     "db:local:up": "node scripts/local_database.mjs up",
@@ -38,7 +40,7 @@
   "dependencies": {
     "@aws-sdk/client-sesv2": "^3.1140.0",
     "@prisma/client": "^6.19.0",
-    "next": "^16.3.5",
+    "next": "16.3.8",
     "react": "19.2.1",
     "react-dom": "19.2.1"
   },
