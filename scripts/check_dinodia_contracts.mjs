@@ -5,7 +5,7 @@ import { createRequire } from "node:module";
 import crypto from "node:crypto";
 import Ajv2020 from "ajv/dist/2020.js";
 import yaml from "js-yaml";
-import { assertStage2DecisionFixtures, executeIndexedFixtureScenario } from "./dinodia_stage2_decisions.mjs";
+import { assertStage2DecisionFixtures, assertPrototypeActionMatrixBindings, executeIndexedFixtureScenario } from "./dinodia_stage2_decisions.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const require = createRequire(import.meta.url);
@@ -17,6 +17,11 @@ const platformContractModule = { exports: {} };
 const platformContractCompiled = typescript.transpileModule(platformContractSource, { compilerOptions: { module: typescript.ModuleKind.CommonJS, target: typescript.ScriptTarget.ES2022 } }).outputText;
 new Function("module", "exports", platformContractCompiled)(platformContractModule, platformContractModule.exports);
 const platformContractRuntime = platformContractModule.exports;
+const alexaContractSource = fs.readFileSync(path.resolve(root, "../dinodia-alexa-skill-V2/src/dinodiaV1.ts"), "utf8");
+const alexaContractModule = { exports: {} };
+const alexaContractCompiled = typescript.transpileModule(alexaContractSource, { compilerOptions: { module: typescript.ModuleKind.CommonJS, target: typescript.ScriptTarget.ES2022 } }).outputText;
+new Function("require", "module", "exports", alexaContractCompiled)(require, alexaContractModule, alexaContractModule.exports);
+const alexaContractRuntime = alexaContractModule.exports;
 const contract = JSON.parse(
   fs.readFileSync(
     path.join(root, "contracts/dinodia-v1/contract.json"),
@@ -134,6 +139,7 @@ for (const required of [
   "unknown-interaction-kind.json",
   "invalid/area-negative-revision.json",
   "invalid/control-state-boolean-string.json",
+  "invalid/control-state-option-outside-descriptor.json",
   "invalid/writable-unreadable-control.json",
   "invalid/unknown-interaction-commandable.json",
   "stale-and-unavailable-control-state.json",
@@ -267,6 +273,7 @@ const fixtureCases = [
   ["support-ticket-private.json", "supportTicket", (v) => v, true],
   ["invalid/area-negative-revision.json", "area", (v) => v, false],
   ["invalid/control-state-boolean-string.json", "controlState", (v) => v.data, true],
+  ["invalid/control-state-option-outside-descriptor.json", "controlState", (v) => v.state, true],
   ["ui-state-offline.json", "uiState", (v) => v, true],
   ["unknown-interaction-kind.json", "device", (v) => v.device, true],
 ];
@@ -281,6 +288,7 @@ const semanticOnlyFixturePaths = new Set([
   "invalid/device-invalid-step-up-policy.json",
   "invalid/writable-unreadable-control.json",
   "invalid/unknown-interaction-commandable.json",
+  "invalid/duplicate-device-control-id.json",
   "duplicate-display-names.json",
   "notification-delivery-is-not-authority.json",
   "offline-scope-widening.json",
@@ -302,6 +310,9 @@ const semanticOnlyFixturePaths = new Set([
   "offline-deregistration-pending.json",
   "room-qr-lifecycle.json",
   "prototype-scenarios.json",
+  "installation-request-lifecycle.json",
+  "area-edit-lifecycle.json",
+  "access-request-lifecycle.json",
   "stage2-decision-matrix.json",
 ]);
 const indexedFixturePaths = new Set([...fixtureCases.map(([filename]) => filename), ...semanticOnlyFixturePaths]);
@@ -346,6 +357,23 @@ if (!unreadableControl) throw new Error("Writable/unreadable negative fixture re
 Object.assign(unreadableControl, unreadableMutation.mutation);
 if (definitionValidator("device")(unreadableDevice) || platformContractRuntime.validateNativeDevice(unreadableDevice) || osContractRuntime.validateDevice(unreadableDevice, { homeId: unreadableDevice.homeId, homeMembershipId: "membership:owner-a", role: "OWNER", areaIds: unreadableDevice.areaIds }))
   throw new Error("Writable-but-unreadable control was accepted by a canonical schema/runtime consumer");
+const duplicateControlCase = JSON.parse(fs.readFileSync(path.join(fixtureRoot, "invalid/duplicate-device-control-id.json"), "utf8"));
+if (duplicateControlCase.expected !== "reject_descriptor_before_projection_or_dispatch" || duplicateControlCase.schemaExpected !== "structurally_valid_distinct_objects" || !duplicateControlCase.sourceFixture?.startsWith("fixtures/"))
+  throw new Error("Duplicate-control fixture must state its structural-schema and semantic-consumer outcomes");
+const duplicateControlSource = JSON.parse(fs.readFileSync(path.join(fixtureRoot, duplicateControlCase.sourceFixture.slice("fixtures/".length)), "utf8"));
+const duplicateControlDevice = structuredClone(duplicateControlSource.device);
+const duplicateControlTarget = duplicateControlDevice.controls.find((control) => control.controlId === duplicateControlCase.targetControlId);
+if (duplicateControlDevice.id !== duplicateControlCase.deviceId || !duplicateControlTarget || !duplicateControlDevice.controls.some((control) => control.controlId === duplicateControlCase.duplicateControlId))
+  throw new Error("Duplicate-control fixture references a missing source device/control");
+duplicateControlTarget.controlId = duplicateControlCase.duplicateControlId;
+if (!definitionValidator("device")(duplicateControlDevice) || platformContractRuntime.validateNativeDevice(duplicateControlDevice) || osContractRuntime.validateDevice(duplicateControlDevice, { homeId: duplicateControlDevice.homeId, homeMembershipId: duplicateControlSource.context.homeMembershipId, role: "OWNER", areaIds: duplicateControlDevice.areaIds }))
+  throw new Error("Schema must accept distinct descriptor objects while Platform and OS reject duplicate canonical control IDs");
+const duplicateAlexaProjection = JSON.parse(fs.readFileSync(path.join(fixtureRoot, "alexa-discovery-projection.json"), "utf8"));
+const duplicateAlexaDevice = structuredClone(duplicateAlexaProjection.data[0]);
+if (duplicateAlexaDevice.controls.length < 2) throw new Error("Alexa duplicate-control projection fixture must have at least two controls");
+duplicateAlexaDevice.controls[1].controlId = duplicateAlexaDevice.controls[0].controlId;
+if (alexaContractRuntime.decodeNativeAlexaDevices({ schemaVersion: "dinodia.v1", homeId: duplicateAlexaProjection.homeId, streamId: "stream:duplicate-control", sequence: 1, generatedAt: "2026-09-27T10:00:00Z", revision: 1, data: [duplicateAlexaDevice] }, { homeId: duplicateAlexaProjection.homeId, homeMembershipId: duplicateAlexaProjection.membership.homeMembershipId, role: "TENANT", authorisedAreaIds: duplicateAlexaProjection.selectedAreaIds }) !== null)
+  throw new Error("Alexa adapter must reject duplicate canonical control IDs before exposure projection");
 const unknownSafeFixture = JSON.parse(fs.readFileSync(path.join(fixtureRoot, "unknown-interaction-kind.json"), "utf8"));
 if (!definitionValidator("device")(unknownSafeFixture.device) || !platformContractRuntime.validateNativeDevice(unknownSafeFixture.device) || !osContractRuntime.validateDevice(unknownSafeFixture.device, { homeId: unknownSafeFixture.device.homeId, homeMembershipId: "membership:owner-a", role: "OWNER", areaIds: unknownSafeFixture.device.areaIds }))
   throw new Error("Safe unknown interaction must remain valid read-only metadata across schema, Platform and OS");
@@ -553,7 +581,8 @@ for (const scenario of invitationLifecycle.cases) {
   const beforeDeadline = at < invitationExpiry;
   const expected = !recipient ? "INVITATION_RECIPIENT_MISMATCH"
     : !verified ? "EMAIL_VERIFICATION_REQUIRED"
-      : !scenario.explicitAccept ? "INVITATION_PENDING"
+      : scenario.explicitDecline === true ? "INVITATION_DECLINED"
+        : !scenario.explicitAccept ? "INVITATION_PENDING"
         : !beforeDeadline ? "INVITATION_EXPIRED"
           : scenario.authorityRevalidated === true ? "MEMBERSHIP_ACTIVE" : "INVITATION_PENDING";
   const membership = expected === "MEMBERSHIP_ACTIVE" ? "membership:recipient-home" : null;
@@ -1238,10 +1267,12 @@ for (const [screenKey, references] of Object.entries(fixtureIndex.screenFixtures
     JSON.parse(fs.readFileSync(target, "utf8"));
   }
 }
+assertPrototypeActionMatrixBindings(prototypeScenarios, fixtureIndex);
 const indexedScenarioResults = [];
 const semanticAdapters = {
   os: osContractRuntime,
   platform: platformContractRuntime,
+  alexa: alexaContractRuntime,
   schema: (name, value) => definitionValidator(name)(value),
   analytics: osAnalyticsRuntime,
   readFixture: (reference) => {
@@ -1250,6 +1281,68 @@ const semanticAdapters = {
     if (!target.startsWith(`${fixtureRoot}${path.sep}`) || !fs.existsSync(target)) throw new Error(`Unresolved nested fixture reference: ${reference}`);
     return JSON.parse(fs.readFileSync(target, "utf8"));
   },
+};
+const alexaScenarioResults = new Map();
+const runAlexaFixture = (relativePath, fixture) => {
+  const projectionContext = (device, role = "TENANT", homeMembershipId = "membership:tenant-a") => ({
+    homeId: device.homeId,
+    homeMembershipId,
+    role,
+    authorisedAreaIds: [...(device.areaIds || [])],
+  });
+  const envelope = (devices, context, generatedAt = "2026-09-27T10:00:00Z") => ({
+    schemaVersion: "dinodia.v1", homeId: context.homeId, streamId: "contract-check", sequence: 1,
+    generatedAt, revision: 1, data: devices,
+  });
+  const rejectMutatedSourceControl = (mutation, mutate) => {
+    const controlId = mutation?.controlId ?? mutation?.mutation?.controlId;
+    if (typeof mutation?.sourceFixture !== "string" || typeof controlId !== "string")
+      throw new Error(`Alexa negative fixture lacks an exact source/control reference: ${relativePath}`);
+    const source = semanticAdapters.readFixture(mutation.sourceFixture);
+    const device = structuredClone(source.device);
+    const control = device.controls.find((candidate) => candidate.controlId === controlId);
+    if (!control) throw new Error(`Alexa negative fixture control does not exist in its source: ${relativePath}`);
+    mutate(control, mutation);
+    return alexaContractRuntime.decodeNativeAlexaDevices(envelope([device], projectionContext(device)), projectionContext(device)) === null;
+  };
+  switch (relativePath) {
+    case "alexa-discovery-projection.json":
+      return alexaContractRuntime.decodeNativeAlexaDiscovery(fixture);
+    case "invalid/impossible-calendar-date-envelope.json":
+      return alexaContractRuntime.decodeNativeAlexaDevices(fixture, { homeId: fixture.homeId, homeMembershipId: "membership:tenant-a", role: "TENANT", authorisedAreaIds: [] }) === null;
+    case "invalid/device-missing-step-up-policy.json":
+      return rejectMutatedSourceControl(fixture, (control, item) => { delete control[item.removeField]; });
+    case "invalid/device-invalid-step-up-policy.json":
+      return rejectMutatedSourceControl(fixture, (control, item) => { control[item.field] = item.invalidValue; });
+    case "invalid/writable-unreadable-control.json":
+      return rejectMutatedSourceControl(fixture, (control, item) => Object.assign(control, item.mutation));
+    case "invalid/unknown-interaction-commandable.json":
+      return rejectMutatedSourceControl(fixture, (control, item) => Object.assign(control, item.mutation));
+    case "invalid/duplicate-device-control-id.json": {
+      const source = semanticAdapters.readFixture(fixture.sourceFixture);
+      const device = structuredClone(source.device);
+      const target = device.controls.find((control) => control.controlId === fixture.targetControlId);
+      if (!target || device.id !== fixture.deviceId || !device.controls.some((control) => control.controlId === fixture.duplicateControlId))
+        throw new Error("Alexa duplicate-control fixture does not resolve its exact source descriptor");
+      target.controlId = fixture.duplicateControlId;
+      const context = projectionContext(device, "OWNER", source.context.homeMembershipId);
+      return alexaContractRuntime.decodeNativeAlexaDevices(envelope([device], context), context) === null;
+    }
+    case "unknown-interaction-kind.json": {
+      const device = { ...fixture.device, lifecycle: "installed" };
+      const context = projectionContext(device, "OWNER", "membership:owner-a");
+      const result = alexaContractRuntime.decodeNativeAlexaDevices(envelope([device], context), context);
+      return Array.isArray(result) && result.length === 0;
+    }
+    case "invalid/tenant-device-wrong-owner.json": {
+      const device = fixture.device;
+      const context = projectionContext(device, "TENANT", fixture.context?.homeMembershipId || "membership:tenant-a");
+      const result = alexaContractRuntime.decodeNativeAlexaDevices(envelope([device], context), context);
+      return Array.isArray(result) && result.length === 0;
+    }
+    default:
+      return undefined;
+  }
 };
 for (const [screenKey, references] of Object.entries(fixtureIndex.screenFixtures)) {
   for (const reference of references) {
@@ -1263,14 +1356,27 @@ for (const [screenKey, references] of Object.entries(fixtureIndex.screenFixtures
         expected,
         validate: (value) => definitionValidator(schemaName)(value),
       }));
-    indexedScenarioResults.push(executeIndexedFixtureScenario({
+    const indexedResult = executeIndexedFixtureScenario({
       screenKey,
       fixturePath: reference,
       fixture,
       schemaChecks,
       adapters: semanticAdapters,
-    }));
+    });
+    if (screenKey === "tenant.alexa.connection") {
+      const relativePath = reference.slice("fixtures/".length);
+      const alexaOutcome = runAlexaFixture(relativePath, fixture);
+      if (alexaOutcome !== undefined) {
+        if (alexaOutcome === false || alexaOutcome === null)
+          throw new Error(`Alexa's actual dinodiaV1 adapter disagrees with the indexed scenario: ${reference}`);
+        alexaScenarioResults.set(relativePath, alexaOutcome);
+      }
+    }
+    indexedScenarioResults.push(indexedResult);
   }
+}
+for (const required of ["alexa-discovery-projection.json", "invalid/device-missing-step-up-policy.json", "invalid/device-invalid-step-up-policy.json", "unknown-interaction-kind.json", "invalid/unknown-interaction-commandable.json"]) {
+  if (!alexaScenarioResults.has(required)) throw new Error(`Alexa owning-consumer execution is missing from tenant.alexa.connection: ${required}`);
 }
 if (indexedScenarioResults.length !== Object.values(fixtureIndex.screenFixtures).reduce((total, refs) => total + refs.length, 0) ||
     indexedScenarioResults.some((result) => result.actualOutcome !== "matched" || result.semantic === "schema"))
@@ -1388,5 +1494,5 @@ for (const name of iosPrototypeFixtureReferences) {
     throw new Error(`iOS prototype fixture is not copied into the DEBUG bundle: ${name}.json`);
 }
 console.log(
-  `dinodia.v1 schemas=${schemas.size} JSON fixtures=${fixtureFiles.length} runtime validators=${validatorNames.length}; indexed screen/action scenarios=${indexedScenarioResults.length}; semantic executions=${indexedScenarioResults.length}; modeled-denial assertions=${indexedScenarioResults.reduce((sum, result) => sum + result.zeroEffectDenials, 0)} (not a route side-effect proof); iOS DEBUG fixture references=${iosPrototypeFixtureReferences.size}; Alexa schema and tenant-role negatives enforced`,
+  `dinodia.v1 schemas=${schemas.size} JSON fixtures=${fixtureFiles.length} runtime validators=${validatorNames.length}; indexed screen/action scenarios=${indexedScenarioResults.length}; Platform/OS decision executions=${indexedScenarioResults.length}; Alexa actual adapter executions=${alexaScenarioResults.size}; modeled-denial assertions=${indexedScenarioResults.reduce((sum, result) => sum + result.zeroEffectDenials, 0)} (not a route side-effect proof); iOS DEBUG fixture references=${iosPrototypeFixtureReferences.size}`,
 );

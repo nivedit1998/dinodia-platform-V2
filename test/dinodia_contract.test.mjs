@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { createRequire } from 'node:module';
 import crypto from 'node:crypto';
-import { assertStage2DecisionFixtures, executeIndexedFixtureScenario } from '../scripts/dinodia_stage2_decisions.mjs';
+import { assertStage2DecisionFixtures, assertPrototypeActionMatrixBindings, executeIndexedFixtureScenario, resolveInstallationRequestDecision, resolvePrototypeActionDecision, simulateClaimLifecycle } from '../scripts/dinodia_stage2_decisions.mjs';
 
 const root = path.join(process.cwd(), 'contracts/dinodia-v1');
 const osRoot = process.env.DINODIA_OS_ROOT || path.resolve(process.cwd(), '../Dinodia OS');
@@ -36,6 +36,38 @@ const compiled = ts.transpileModule(source, { compilerOptions: { module: ts.Modu
 const module = { exports: {} };
 new Function('module','exports',compiled)(module,module.exports);
 const native = module.exports;
+test('installation request decision binds current role, selected home, revision and exact retry state', () => {
+  const fixture = JSON.parse(fs.readFileSync(path.join(root, 'fixtures/installation-request-lifecycle.json'), 'utf8'));
+  for (const item of fixture.cases) {
+    assert.equal(resolveInstallationRequestDecision(item), item.expectedDecision, item.id);
+    assert.equal(item.expectedEffects.homeCreated, false, item.id);
+    assert.equal(item.expectedEffects.installationCompleted, false, item.id);
+  }
+  const stale = structuredClone(fixture.cases.find((item) => item.id === 'owner-submit-current'));
+  stale.currentRevision += 1;
+  assert.equal(resolveInstallationRequestDecision(stale), 'REVISION_CONFLICT');
+  const invalidDate = structuredClone(fixture.cases.find((item) => item.id === 'expired-owner-retry'));
+  invalidDate.at = '2026-02-31T10:00:00Z';
+  assert.equal(resolveInstallationRequestDecision(invalidDate), 'INVALID_INPUT');
+  const invalidExpiry = structuredClone(fixture.cases.find((item) => item.id === 'expired-owner-retry'));
+  invalidExpiry.expiresAt = '2026-02-31T10:00:00Z';
+  assert.equal(resolveInstallationRequestDecision(invalidExpiry), 'INVALID_TRANSITION');
+});
+test('claim and invitation decision adapters reject impossible UTC calendar timestamps', () => {
+  const claimPath = path.join(root, 'fixtures/claim-lifecycle.json');
+  const invalidExpiry = JSON.parse(fs.readFileSync(claimPath, 'utf8'));
+  invalidExpiry.initial.expiresAt = '2026-02-31T10:00:00Z';
+  assert.throws(() => simulateClaimLifecycle(invalidExpiry), /valid UTC expiry/);
+
+  const invalidEventTime = JSON.parse(fs.readFileSync(claimPath, 'utf8'));
+  invalidEventTime.events[0].at = '2026-02-31T10:00:00Z';
+  assert.throws(() => simulateClaimLifecycle(invalidEventTime), /Invalid claim event clock/);
+
+  const invitation = JSON.parse(fs.readFileSync(path.join(root, 'fixtures/invitation-lifecycle.json'), 'utf8'));
+  const candidate = invitation.cases[0];
+  candidate.at = '2026-02-31T10:00:00Z';
+  assert.equal(resolvePrototypeActionDecision('invitation', 'accept', invitation, [candidate.id]), null);
+});
 test('decision fixture runner rejects structurally valid privacy, delivery, offline and claim contradictions', () => {
   const read = (name) => JSON.parse(fs.readFileSync(path.join(root, 'fixtures', name), 'utf8'));
   const baseline = {
@@ -135,6 +167,28 @@ test('indexed matrix scenario runner executes the owning semantic decision and f
     screenKey: 'system.unregistered', fixturePath: 'fixtures/not-indexed.json', fixture: {},
     schemaChecks: [], adapters,
   }), /no owning semantic validator, adapter, reducer or decision executor/);
+});
+test('every rendered action decision fixture is indexed by a rendered screen', () => {
+  const read = (name) => JSON.parse(fs.readFileSync(path.join(root, 'fixtures', name), 'utf8'));
+  const index = read('index.json');
+  const prototype = read('prototype-scenarios.json');
+  assert.equal(assertPrototypeActionMatrixBindings(prototype, index), true);
+  const driftedIndex = structuredClone(index);
+  driftedIndex.screenFixtures['auth.customer.recovery'] = driftedIndex.screenFixtures['auth.customer.recovery']
+    .filter((reference) => reference !== 'fixtures/customer-recovery-lifecycle.json');
+  driftedIndex.screenFixtures['auth.owner.recovery'] = driftedIndex.screenFixtures['auth.owner.recovery']
+    .filter((reference) => reference !== 'fixtures/customer-recovery-lifecycle.json');
+  assert.throws(() => assertPrototypeActionMatrixBindings(prototype, driftedIndex), /decision fixture is not indexed/);
+});
+test('quiet-hours projection declares the precise individual deferral result consistently', () => {
+  const prototype = JSON.parse(fs.readFileSync(path.join(root, 'fixtures/prototype-scenarios.json'), 'utf8'));
+  const flow = prototype.flows['quiet-hours'];
+  const action = flow.actions.find((item) => item.id === 'optional');
+  const fixture = JSON.parse(fs.readFileSync(path.join(root, 'fixtures/notification-lifecycle.json'), 'utf8'));
+  const decision = resolvePrototypeActionDecision('quiet-hours', action.id, fixture, action.decisionCases);
+  assert.equal(decision, 'DEFERRED_INDIVIDUALLY_UNTIL_QUIET_HOURS_END');
+  assert.equal(action.expectedDecision, decision);
+  assert.notEqual(decision, 'DEFERRED_UNTIL_QUIET_HOURS_END');
 });
 test('duplicate-name area scenario binds exact Home and membership-scoped grants', () => {
   const read = (name) => JSON.parse(fs.readFileSync(path.join(root, 'fixtures', name), 'utf8'));
@@ -431,6 +485,17 @@ test('Platform runtime consumes shared negative Area, state, and descriptor fixt
   const invalidState = JSON.parse(fs.readFileSync(path.join(root, 'fixtures/invalid/control-state-boolean-string.json'), 'utf8')).data;
   const booleanControl = valid.device.controls.find((control) => control.valueType === 'boolean');
   assert.equal(native.validateControlState(invalidState, valid.device, booleanControl), false);
+
+  const optionState = JSON.parse(fs.readFileSync(path.join(root, 'fixtures/invalid/control-state-option-outside-descriptor.json'), 'utf8'));
+  const optionDevice = optionState.device;
+  const optionControl = optionDevice.controls.find((control) => control.controlId === optionState.state.controlId);
+  const stateSchema = ajv.compile({ $ref: `${contract.$id}#/$defs/controlState` });
+  assert.equal(deviceSchema(optionDevice), true, JSON.stringify(deviceSchema.errors));
+  assert.equal(stateSchema(optionState.validState), true, JSON.stringify(stateSchema.errors));
+  assert.equal(stateSchema(optionState.state), true, JSON.stringify(stateSchema.errors));
+  assert.equal(native.validateControlState(optionState.validState, optionDevice, optionControl), true);
+  assert.equal(native.validateControlState(optionState.state, optionDevice, optionControl), false,
+    'option-valued state must be one of the current descriptor options');
 
   const mutation = JSON.parse(fs.readFileSync(path.join(root, 'fixtures/invalid/writable-unreadable-control.json'), 'utf8'));
   const sourceFixture = JSON.parse(fs.readFileSync(path.join(root, 'fixtures', mutation.sourceFixture.replace(/^fixtures\//, '')), 'utf8'));

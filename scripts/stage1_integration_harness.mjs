@@ -550,8 +550,16 @@ async function tableRowSnapshot() {
   const snapshot = {};
   for (const { tablename } of tables) {
     const safeTable = String(tablename).replaceAll('"', '""');
-    const rows = await prisma.$queryRawUnsafe(`SELECT COUNT(*)::text AS count FROM public."${safeTable}"`);
-    snapshot[tablename] = String(rows[0]?.count ?? '0');
+    // Keep the comparison value-free: row contents (which may include
+    // credentials or private customer data) never leave PostgreSQL. The
+    // digest detects update-in-place mutations that a row-count-only check
+    // would miss.
+    const rows = await prisma.$queryRawUnsafe(`
+      SELECT COUNT(*)::text AS count,
+             md5(COALESCE(string_agg(md5(row_to_json(t)::text), '' ORDER BY md5(row_to_json(t)::text)), '')) AS digest
+      FROM public."${safeTable}" AS t
+    `);
+    snapshot[tablename] = `${String(rows[0]?.count ?? '0')}:${String(rows[0]?.digest ?? '')}`;
   }
   return snapshot;
 }
@@ -576,6 +584,31 @@ async function protectedRouteDenialChecks(base) {
     results.push({ method, route, status: response.status });
     const expected = auth === 'public-idempotent-logout' ? 204 : auth === 'signed-manufacturing-bootstrap' ? 400 : 401;
     if (response.status !== expected) fail(`Route auth contract mismatch: ${method} ${route} expected ${expected}, got ${response.status} (${auth})`);
+    const responseText = await response.text();
+    if (response.status === 204 && responseText.length !== 0)
+      fail(`Idempotent logout denial unexpectedly returned response bytes: ${method} ${route}`);
+    if (responseText.length > 0) {
+      let payload;
+      try { payload = JSON.parse(responseText); }
+      catch { fail(`Denied protected route returned a non-JSON body: ${method} ${route}`); }
+      const protectedFields = new Set([
+        'data', 'home', 'homeId', 'homeMembershipId', 'membership', 'membershipId',
+        'areaIds', 'device', 'deviceId', 'ticket', 'ticketId', 'trustedDevice',
+        'trustedDeviceId', 'grant', 'credential', 'session', 'sessionId', 'token',
+        'work', 'workflow', 'identity', 'serialNumber',
+      ]);
+      const findProtectedField = (value) => {
+        if (!value || typeof value !== 'object') return null;
+        for (const [key, child] of Object.entries(value)) {
+          if (protectedFields.has(key)) return key;
+          const nested = findProtectedField(child);
+          if (nested) return nested;
+        }
+        return null;
+      };
+      const leakedField = findProtectedField(payload);
+      if (leakedField) fail(`Denied protected route returned protected field ${leakedField}: ${method} ${route}`);
+    }
   }
   const invalidManufacturing = keyPair();
   const invalidEncryption = x25519KeyPair();
@@ -598,7 +631,7 @@ async function protectedRouteDenialChecks(base) {
     const changed = Object.keys(after).filter((table) => before[table] !== after[table]).map((table) => `${table}:${before[table]}->${after[table]}`);
     fail(`Unauthenticated/invalid-signature route matrix changed durable row counts: ${changed.join(', ')}`);
   }
-  console.log(`[stage1:integration] PASS: ${results.length} inventoried protected Platform route/methods enforced unauthenticated 401 (idempotent logout 204, signed enrollment malformed-input 400) with no durable row-count changes; invalid root signature returned 401`);
+  console.log(`[stage1:integration] PASS: ${results.length} inventoried protected Platform route/methods enforced unauthenticated 401 (idempotent logout 204, signed enrollment malformed-input 400) with no durable row-count/content changes and no protected response fields; invalid root signature returned 401`);
 }
 async function customerAuthorizationChecks() {
   const base = `http://127.0.0.1:${appPort}`;
@@ -1249,8 +1282,9 @@ async function customerAuthorizationChecks() {
   if (mixedSelectorCommand.success || fakePhysicalCommandCount !== 1) fail(`WebSocket mixed an authorized entity with an ungranted area target or caused a device effect (${mixedSelectorCommand.success}/${fakePhysicalCommandCount})`);
   await hub.store.upsertDevice({
     id: 'harness-sensitive-control', name: 'Harness sensitive control', protocol: 'stage1_fake', areaId: areaOne.osAreaId,
+    labelIds: ['tenant_device'], metadata: { label: 'tenant_device', tenantOwnerMembershipId: tenantMembership.id },
     state: { state: 'OFF' }, setup: { status: 'ready' },
-    entities: { 'harness-sensitive-control:state': { name: 'Sensitive switch', stateKey: 'state', domain: 'switch', category: 'control', writable: true, primary: true, capability: { readable: true, writable: true, sensitive: true, primary: true, category: 'control', controlId: 'sensitive-power', bindings: [{ serviceId: 'switch.turn_on' }] } } },
+    entities: { 'harness-sensitive-control:state': { name: 'Sensitive switch', stateKey: 'state', domain: 'switch', category: 'control', writable: true, primary: true, capability: { readable: true, writable: true, sensitive: true, primary: true, semanticRole: 'power', category: 'control', controlId: 'sensitive-power', bindings: [{ serviceId: 'switch.turn_on' }] } } },
   });
   const sensitiveEntity = hub.model.entities().find((entity) => entity.device.id === 'harness-sensitive-control');
   if (!sensitiveEntity) fail('The safe fake sensitive control did not expose its current descriptor');
@@ -1672,20 +1706,120 @@ async function osChecks() {
   const freshNativeSession = await fetchJson(`${platformBase}/api/v2/hub-sessions`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-session': customerFixture.customerSessionSecret }, body: JSON.stringify({ homeId: customerFixture.homeOneId }) });
   if (freshNativeSession.response.status !== 200 || !freshNativeSession.body.token) fail(`Real customer login could not refresh a selected-home token for Native V1 HTTP (${freshNativeSession.response.status}/${freshNativeSession.body.error?.code || 'unknown'})`);
   const nativeDeviceRead = await fetchJson(`${base}/api/dinodia/v1/devices`, { headers: { authorization: `Bearer ${freshNativeSession.body.token}` } });
-  const nativeTenantDevice = nativeDeviceRead.body.data?.find((device) => device.id === 'harness-tenant-device');
+  let nativeTenantDevice = nativeDeviceRead.body.data?.find((device) => device.id === 'harness-tenant-device');
   if (nativeDeviceRead.response.status !== 200 || !nativeTenantDevice || nativeTenantDevice.managementClass !== 'tenant_device' || nativeTenantDevice.ownerMembershipId !== customerFixture.tenantMembershipId || JSON.stringify(nativeTenantDevice.areaIds) !== JSON.stringify([customerFixture.areaOneId]) || nativeTenantDevice.areaIds.includes(customerFixture.areaOneOsId)) fail(`Native V1 OS read did not serialize only the canonical Platform Area UUID for a private device (${nativeDeviceRead.response.status}/${nativeDeviceRead.body?.error?.code || nativeDeviceRead.body?.errorCode || 'no-code'}/${JSON.stringify(nativeTenantDevice?.areaIds || null)})`);
-  const nativeControl = nativeTenantDevice.controls.find((control) => control.writable && control.valueType === 'boolean');
+  let nativeControl = nativeTenantDevice.controls.find((control) => control.writable && control.valueType === 'boolean');
   if (!nativeControl) fail('The safe fixture device did not expose a writable boolean Native V1 control');
+  const originalSensitiveTestDevice = hub.store.getDevice(nativeTenantDevice.id);
+  const sensitiveTestEntity = Object.values(originalSensitiveTestDevice?.entities || {}).find((entity) => String(entity.id || entity.sourceId || entity.stateKey || entity.name) === nativeControl.controlId);
+  if (!originalSensitiveTestDevice || !sensitiveTestEntity?.capability) fail('Could not mark the authorized tenant control as sensitive for the Native V1 route regression');
+  const sensitiveTestDevice = structuredClone(originalSensitiveTestDevice);
+  const sensitiveTestEntityCopy = Object.values(sensitiveTestDevice.entities || {}).find((entity) => String(entity.id || entity.sourceId || entity.stateKey || entity.name) === nativeControl.controlId);
+  sensitiveTestEntityCopy.capability = { ...sensitiveTestEntityCopy.capability, sensitive: true };
+  await hub.store.upsertDevice(sensitiveTestDevice);
+  const sensitiveNativeRead = await fetchJson(`${base}/api/dinodia/v1/devices`, { headers: { authorization: `Bearer ${freshNativeSession.body.token}` } });
+  const nativeSensitiveDevice = sensitiveNativeRead.body.data?.find((device) => device.id === nativeTenantDevice.id);
+  const nativeSensitiveControl = nativeSensitiveDevice?.controls.find((control) => control.controlId === nativeControl.controlId);
+  if (!nativeSensitiveControl || nativeSensitiveControl.stepUpPolicy !== 'required' || nativeSensitiveControl.confirmationPolicy !== 'step_up' || nativeSensitiveControl.automatable) fail('OS Native V1 failed to project the current tenant control as sensitive and non-automatable');
+  const nativeSensitiveCommand = { commandId: `command-${crypto.randomUUID()}`, homeId: customerFixture.homeOneId, homeMembershipId: customerFixture.tenantMembershipId, deviceId: nativeSensitiveDevice.id, controlId: nativeSensitiveControl.controlId, descriptorRevision: nativeSensitiveDevice.descriptorRevision, value: true, issuedAt: new Date().toISOString(), idempotencyKey: `native-sensitive-${crypto.randomUUID()}`, stepUpOperationId: crypto.randomUUID() };
+  const sensitiveEffectsBefore = fakePhysicalCommandCount;
+  const deniedNativeSensitiveCommand = await fetchJson(`${base}/api/dinodia/v1/commands`, { method: 'POST', headers: { authorization: `Bearer ${freshNativeSession.body.token}`, 'content-type': 'application/json', 'idempotency-key': nativeSensitiveCommand.idempotencyKey, 'x-dinodia-step-up-proof': 'harness-invalid-step-up-proof' }, body: JSON.stringify(nativeSensitiveCommand) });
+  if (deniedNativeSensitiveCommand.response.status !== 403 || deniedNativeSensitiveCommand.body.error?.code !== 'STEP_UP_REQUIRED' || fakePhysicalCommandCount !== sensitiveEffectsBefore) fail(`Sensitive Native V1 command did not require a valid exact-operation proof before dispatch (${deniedNativeSensitiveCommand.response.status}/${deniedNativeSensitiveCommand.body?.error?.code || 'no-code'}/${fakePhysicalCommandCount - sensitiveEffectsBefore})`);
+  console.log('[stage2:integration] PASS: Native V1 sensitive capability requires an exact-operation step-up proof and denies an invalid proof before any fake-device effect');
+  await hub.store.upsertDevice(originalSensitiveTestDevice);
+  const restoredNativeRead = await fetchJson(`${base}/api/dinodia/v1/devices`, { headers: { authorization: `Bearer ${freshNativeSession.body.token}` } });
+  nativeTenantDevice = restoredNativeRead.body.data?.find((device) => device.id === 'harness-tenant-device');
+  nativeControl = nativeTenantDevice?.controls.find((control) => control.writable && control.valueType === 'boolean');
+  if (restoredNativeRead.response.status !== 200 || !nativeTenantDevice || !nativeControl) fail('The tenant descriptor did not recover after the sensitive step-up regression fixture was restored');
   const nativeCommand = { commandId: `command-${crypto.randomUUID()}`, homeId: customerFixture.homeOneId, homeMembershipId: customerFixture.tenantMembershipId, deviceId: nativeTenantDevice.id, controlId: nativeControl.controlId, descriptorRevision: nativeTenantDevice.descriptorRevision, value: true, issuedAt: new Date().toISOString(), idempotencyKey: `native-area-${crypto.randomUUID()}` };
   const physicalBeforeNative = fakePhysicalCommandCount;
   const acceptedNativeCommand = await fetchJson(`${base}/api/dinodia/v1/commands`, { method: 'POST', headers: { authorization: `Bearer ${freshNativeSession.body.token}`, 'content-type': 'application/json', 'idempotency-key': nativeCommand.idempotencyKey }, body: JSON.stringify(nativeCommand) });
   if (acceptedNativeCommand.response.status !== 202 || fakePhysicalCommandCount !== physicalBeforeNative + 1) fail(`Native V1 command through a canonical-ID DTO did not dispatch exactly once (${acceptedNativeCommand.response.status}/${fakePhysicalCommandCount - physicalBeforeNative})`);
+  const exactNativeRetry = await fetchJson(`${base}/api/dinodia/v1/commands`, { method: 'POST', headers: { authorization: `Bearer ${freshNativeSession.body.token}`, 'content-type': 'application/json', 'idempotency-key': nativeCommand.idempotencyKey }, body: JSON.stringify(nativeCommand) });
+  if (exactNativeRetry.response.status !== 202 || exactNativeRetry.body.commandId !== nativeCommand.commandId || fakePhysicalCommandCount !== physicalBeforeNative + 1) fail(`An exact Native V1 retry did not return the original acknowledgement without redispatch (${exactNativeRetry.response.status}/${fakePhysicalCommandCount - physicalBeforeNative})`);
+  const conflictingNativeRetryCommand = { ...nativeCommand, value: false };
+  const conflictingNativeRetry = await fetchJson(`${base}/api/dinodia/v1/commands`, { method: 'POST', headers: { authorization: `Bearer ${freshNativeSession.body.token}`, 'content-type': 'application/json', 'idempotency-key': nativeCommand.idempotencyKey }, body: JSON.stringify(conflictingNativeRetryCommand) });
+  if (conflictingNativeRetry.response.status !== 409 || conflictingNativeRetry.body.error?.code !== 'REVISION_CONFLICT' || fakePhysicalCommandCount !== physicalBeforeNative + 1) fail(`A conflicting Native V1 idempotency-key reuse was not denied without redispatch (${conflictingNativeRetry.response.status}/${conflictingNativeRetry.body?.error?.code || 'no-code'}/${fakePhysicalCommandCount - physicalBeforeNative})`);
+  console.log('[stage2:integration] PASS: exact Native V1 retry returned the original acknowledgement without redispatch; changed-payload key reuse was denied with REVISION_CONFLICT and zero extra fake-device effects');
+  const queuedRaceCommand = { ...nativeCommand, commandId: `command-${crypto.randomUUID()}`, idempotencyKey: `native-queued-revision-${crypto.randomUUID()}`, issuedAt: new Date().toISOString() };
+  const queuedRaceHash = sha256(`${customerFixture.tenantMembershipId}\n${queuedRaceCommand.idempotencyKey}`);
+  const queuedRaceSnapshot = hub.store.getDevice(queuedRaceCommand.deviceId);
+  const queuedRaceEntityId = Object.values(queuedRaceSnapshot?.entities || {}).find((entity) => String(entity.id || entity.sourceId || '') === nativeControl.controlId)?.id;
+  if (!queuedRaceSnapshot || !queuedRaceEntityId) fail('Could not resolve the real fake-device descriptor for the queued Native V1 race');
+  let signalQueuedDispatch;
+  let releaseQueuedDispatch;
+  let dispatchClaimIntercepted = false;
+  const queuedDispatchReached = new Promise((resolve) => { signalQueuedDispatch = resolve; });
+  const queuedDispatchGate = new Promise((resolve) => { releaseQueuedDispatch = resolve; });
+  const saveSecurityMethod = hub.store.saveSecurity;
+  const saveSecurityBound = saveSecurityMethod.bind(hub.store);
+  hub.store.saveSecurity = async (patch = {}) => {
+    if (!dispatchClaimIntercepted && patch.nativeCommandResults?.[queuedRaceHash]?.status === 'dispatching') {
+      dispatchClaimIntercepted = true;
+      signalQueuedDispatch();
+      await queuedDispatchGate;
+    }
+    return saveSecurityBound(patch);
+  };
+  const raceFakeEffectsBefore = fakePhysicalCommandCount;
+  const queuedRaceRequest = fetchJson(`${base}/api/dinodia/v1/commands`, { method: 'POST', headers: { authorization: `Bearer ${freshNativeSession.body.token}`, 'content-type': 'application/json', 'idempotency-key': queuedRaceCommand.idempotencyKey }, body: JSON.stringify(queuedRaceCommand) });
+  let queuedRaceResponse;
+  let queuedRaceError;
+  const dispatchPauseTimeout = setTimeout(() => { queuedRaceError = new Error('Native V1 command did not reach the controlled dispatch-claim boundary'); signalQueuedDispatch(); releaseQueuedDispatch(); }, 5000);
+  try {
+    await queuedDispatchReached;
+    clearTimeout(dispatchPauseTimeout);
+    if (queuedRaceError || !dispatchClaimIntercepted) throw queuedRaceError || new Error('Native V1 dispatch-claim barrier was not reached');
+    const readOnlyDevice = structuredClone(queuedRaceSnapshot);
+    const readOnlyEntity = Object.values(readOnlyDevice.entities || {}).find((entity) => String(entity.id || entity.sourceId || '') === nativeControl.controlId);
+    if (!readOnlyEntity) throw new Error('Queued Native V1 race lost its current fake-device control descriptor');
+    readOnlyEntity.writable = false;
+    readOnlyEntity.capability = { ...readOnlyEntity.capability, readable: true, writable: false, automatable: false };
+    await hub.store.upsertDevice(readOnlyDevice);
+    releaseQueuedDispatch();
+    queuedRaceResponse = await queuedRaceRequest;
+  } finally {
+    clearTimeout(dispatchPauseTimeout);
+    releaseQueuedDispatch();
+    hub.store.saveSecurity = saveSecurityMethod;
+    await queuedRaceRequest.catch(() => {});
+    await hub.store.upsertDevice(queuedRaceSnapshot);
+  }
+  if (queuedRaceError) throw queuedRaceError;
+  if (queuedRaceResponse?.response.status !== 409 || queuedRaceResponse.body.error?.code !== 'CATALOG_REVISION_MISMATCH' || fakePhysicalCommandCount !== raceFakeEffectsBefore) fail(`A control made read-only after command acceptance was dispatched or not rejected at the final boundary (${queuedRaceResponse?.response.status}/${queuedRaceResponse?.body?.error?.code || 'no-code'}/${fakePhysicalCommandCount - raceFakeEffectsBefore})`);
+  console.log('[stage2:integration] PASS: a Native V1 control made read-only while its request waited at the dispatch-claim boundary returned CATALOG_REVISION_MISMATCH with zero fake-device effects');
   const wrongHomeCommand = { ...nativeCommand, commandId: `command-${crypto.randomUUID()}`, homeId: customerFixture.homeTwoId, idempotencyKey: `native-wrong-home-${crypto.randomUUID()}` };
   const deniedNativeCommand = await fetchJson(`${base}/api/dinodia/v1/commands`, { method: 'POST', headers: { authorization: `Bearer ${freshNativeSession.body.token}`, 'content-type': 'application/json', 'idempotency-key': wrongHomeCommand.idempotencyKey }, body: JSON.stringify(wrongHomeCommand) });
   if (deniedNativeCommand.response.status !== 403 || deniedNativeCommand.body.error?.code !== 'HOME_MISMATCH' || fakePhysicalCommandCount !== physicalBeforeNative + 1) fail('Wrong-home Native V1 command was not denied before fake-device dispatch');
   const ownerNativeRead = await fetchJson(`${base}/api/dinodia/v1/devices`, { headers: { authorization: `Bearer ${customerFixture.propertyToken}` } });
   if (ownerNativeRead.response.status !== 403 || ownerNativeRead.body.error?.code !== 'SCOPE_DENIED' || JSON.stringify(ownerNativeRead.body).includes('Harness tenant light') || fakePhysicalCommandCount !== physicalBeforeNative + 1) fail('Property-role Native V1 OS read was not denied without private device bytes');
-  console.log('[stage2:integration] PASS: real customer login -> canonical membership Area UUID -> selected-home token -> machine-synchronized private hub alias -> Native V1 OS read and safe command; wrong-home and owner denials caused zero extra effects');
+  const managerNativeRead = await fetchJson(`${base}/api/dinodia/v1/devices`, { headers: { authorization: `Bearer ${customerFixture.managerToken}` } });
+  if (managerNativeRead.response.status !== 403 || managerNativeRead.body.error?.code !== 'SCOPE_DENIED' || /harness-tenant-device|Harness tenant light|tenantOwnerMembershipId/.test(JSON.stringify(managerNativeRead.body)) || fakePhysicalCommandCount !== physicalBeforeNative + 1) fail('Manager cloud visibility became direct OS device-read authority or exposed tenant-private bytes');
+  const managerNativeCommand = { ...nativeCommand, commandId: `command-${crypto.randomUUID()}`, homeMembershipId: customerFixture.managerMembershipId, idempotencyKey: `native-manager-denied-${crypto.randomUUID()}` };
+  const deniedManagerCommand = await fetchJson(`${base}/api/dinodia/v1/commands`, { method: 'POST', headers: { authorization: `Bearer ${customerFixture.managerToken}`, 'content-type': 'application/json', 'idempotency-key': managerNativeCommand.idempotencyKey }, body: JSON.stringify(managerNativeCommand) });
+  if (deniedManagerCommand.response.status !== 403 || deniedManagerCommand.body.error?.code !== 'SCOPE_DENIED' || /harness-tenant-device|Harness tenant light|tenantOwnerMembershipId/.test(JSON.stringify(deniedManagerCommand.body)) || fakePhysicalCommandCount !== physicalBeforeNative + 1) fail('Manager cloud visibility became direct OS command authority or caused a fake-device effect');
+  const otherTenantEmail = `stage1-other-tenant-${crypto.randomUUID()}@invalid.test`;
+  const otherTenantUsername = `stage1-other-${crypto.randomUUID().slice(0, 8)}`;
+  const otherTenantAccount = await prisma.customerAccount.create({ data: { displayName: 'Stage 1 other tenant', username: otherTenantUsername, usernameNormalized: otherTenantUsername, email: otherTenantEmail, emailNormalized: otherTenantEmail, emailVerifiedAt: new Date(), passwordHash: 'harness-only-password-hash' } });
+  const otherTenantMembership = await prisma.homeMembership.create({ data: { customerAccountId: otherTenantAccount.id, homeId: customerFixture.homeOneId, role: 'TENANT' } });
+  const otherTenantPhone = keyPair();
+  const otherTenantThumbprint = crypto.createHash('sha256').update(crypto.createPublicKey(otherTenantPhone.publicKey).export({ type: 'spki', format: 'der' })).digest('hex');
+  const otherTenantTrusted = await prisma.trustedDevice.create({ data: { customerAccountId: otherTenantAccount.id, deviceInstallationId: `harness-other-tenant-phone-${crypto.randomUUID()}`, publicKey: otherTenantPhone.publicKey, publicKeyThumbprint: otherTenantThumbprint, deviceName: 'Harness other tenant phone' } });
+  const otherTenantRawSession = `harness-other-tenant-session-${crypto.randomUUID()}`;
+  const otherTenantSession = await prisma.customerSession.create({ data: { customerAccountId: otherTenantAccount.id, trustedDeviceId: otherTenantTrusted.id, refreshTokenHash: sha256(otherTenantRawSession), securityVersion: otherTenantAccount.securityVersion, trustedDeviceSessionVersion: otherTenantTrusted.sessionVersion, expiresAt: new Date(Date.now() + 60 * 60 * 1000) } });
+  const otherTenantHubSession = await fetchJson(`${platformBase}/api/v2/hub-sessions`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-session': otherTenantRawSession }, body: JSON.stringify({ homeId: customerFixture.homeOneId }) });
+  if (otherTenantHubSession.response.status !== 200 || !otherTenantHubSession.body.token) fail(`A second tenant could not receive its own selected-home fixture token (${otherTenantHubSession.response.status})`);
+  customerFixture.otherTenantAccountId = otherTenantAccount.id;
+  customerFixture.otherTenantMembershipId = otherTenantMembership.id;
+  customerFixture.otherTenantTrustedId = otherTenantTrusted.id;
+  customerFixture.otherTenantSessionId = otherTenantSession.id;
+  const otherTenantRead = await fetchJson(`${base}/api/dinodia/v1/devices`, { headers: { authorization: `Bearer ${otherTenantHubSession.body.token}` } });
+  const otherTenantReadJson = JSON.stringify(otherTenantRead.body);
+  if (otherTenantRead.response.status !== 200 || !nativeV1Contract.validateEnvelope(otherTenantRead.body, customerFixture.homeOneId) || otherTenantRead.body.data.some((device) => device.id === nativeTenantDevice.id) || /harness-tenant-device|Harness tenant light|tenantOwnerMembershipId/.test(otherTenantReadJson) || fakePhysicalCommandCount !== physicalBeforeNative + 1) fail(`Another tenant received private device bytes or altered device state (${otherTenantRead.response.status})`);
+  const otherTenantCommand = { ...nativeCommand, commandId: `command-${crypto.randomUUID()}`, homeMembershipId: otherTenantMembership.id, idempotencyKey: `native-other-tenant-${crypto.randomUUID()}` };
+  const deniedOtherTenantCommand = await fetchJson(`${base}/api/dinodia/v1/commands`, { method: 'POST', headers: { authorization: `Bearer ${otherTenantHubSession.body.token}`, 'content-type': 'application/json', 'idempotency-key': otherTenantCommand.idempotencyKey }, body: JSON.stringify(otherTenantCommand) });
+  if (deniedOtherTenantCommand.response.status !== 404 || deniedOtherTenantCommand.body.error?.code !== 'RESOURCE_NOT_FOUND' || /harness-tenant-device|Harness tenant light|tenantOwnerMembershipId/.test(JSON.stringify(deniedOtherTenantCommand.body)) || fakePhysicalCommandCount !== physicalBeforeNative + 1) fail('Another tenant command was not hidden and denied before any fake-device effect');
+  console.log('[stage2:integration] PASS: selected-home tenant can read and command its own device; wrong-home, owner, manager, and different-tenant private-device read/command denials expose no private device identity and cause zero extra fake-device effects');
   for (const [role, token] of [['owner', customerFixture.propertyToken], ['property-manager', customerFixture.managerToken]]) {
     for (const suffix of ['capabilities', 'support-bundle']) {
       const privateRead = await fetchJson(`${base}/_dinodia/admin/api/devices/${encodeURIComponent('harness-tenant-device')}/${suffix}`, { headers: { authorization: `Bearer ${token}` } });
@@ -2041,7 +2175,10 @@ async function cleanup() {
     await prisma.trustedDevice.deleteMany({ where: { id: customerFixture.propertyTrustedDeviceId } }).catch(() => {});
     await prisma.customerSession.deleteMany({ where: { id: customerFixture.managerSessionId } }).catch(() => {});
     await prisma.trustedDevice.deleteMany({ where: { id: customerFixture.managerTrustedDeviceId } }).catch(() => {});
+    if (customerFixture.otherTenantSessionId) await prisma.customerSession.deleteMany({ where: { id: customerFixture.otherTenantSessionId } }).catch(() => {});
+    if (customerFixture.otherTenantTrustedId) await prisma.trustedDevice.deleteMany({ where: { id: customerFixture.otherTenantTrustedId } }).catch(() => {});
     await prisma.homeMembership.deleteMany({ where: { id: customerFixture.managerMembershipId } }).catch(() => {});
+    if (customerFixture.otherTenantMembershipId) await prisma.homeMembership.deleteMany({ where: { id: customerFixture.otherTenantMembershipId } }).catch(() => {});
     await prisma.tenantAreaGrant.deleteMany({ where: { membershipId: { in: [customerFixture.tenantMembershipId, customerFixture.ownerMembershipId] } } }).catch(() => {});
     await prisma.homeMembership.deleteMany({ where: { id: { in: [customerFixture.tenantMembershipId, customerFixture.ownerMembershipId] } } }).catch(() => {});
     await prisma.area.deleteMany({ where: { id: { in: [customerFixture.areaOneId, customerFixture.areaTwoId] } } }).catch(() => {});
@@ -2051,6 +2188,7 @@ async function cleanup() {
     await prisma.customerAccount.deleteMany({ where: { id: customerFixture.accountId } }).catch(() => {});
     await prisma.customerAccount.deleteMany({ where: { id: customerFixture.propertyAccountId } }).catch(() => {});
     await prisma.customerAccount.deleteMany({ where: { id: customerFixture.managerAccountId } }).catch(() => {});
+    if (customerFixture.otherTenantAccountId) await prisma.customerAccount.deleteMany({ where: { id: customerFixture.otherTenantAccountId } }).catch(() => {});
   }
   if (prisma) await prisma.$disconnect().catch(() => {});
   if (sesServer) await new Promise((resolve) => sesServer.close(resolve));

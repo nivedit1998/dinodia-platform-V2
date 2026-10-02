@@ -65,11 +65,15 @@ export function assertDecisionMatrix(matrix) {
 export function simulateClaimLifecycle(fixture) {
   const state = clone(fixture.initial);
   const applied = new Map();
-  if (!state.emailVerified || fixture.competingClaim.winnerRemains !== state.claimantAccountId ||
+  if (!isCalendarValidUtcTimestamp(state.expiresAt) || !state.emailVerified || fixture.competingClaim.winnerRemains !== state.claimantAccountId ||
       fixture.competingClaim.expectedOutcome !== "non_identifying_unavailable") {
-    throw new Error("Claim reservation must be first-wins and non-identifying");
+    throw new Error("Claim reservation must have a valid UTC expiry, be first-wins and non-identifying");
   }
   for (const event of fixture.events) {
+    if (!isCalendarValidUtcTimestamp(event.at) ||
+        (event.expectedExpiresAt !== undefined && !isCalendarValidUtcTimestamp(event.expectedExpiresAt))) {
+      throw new Error(`Invalid claim event clock: ${event.eventId}`);
+    }
     const at = Date.parse(event.at);
     const expires = Date.parse(state.expiresAt);
     if (!Number.isFinite(at) || !Number.isFinite(expires)) throw new Error(`Invalid claim event clock: ${event.eventId}`);
@@ -93,6 +97,243 @@ export function simulateClaimLifecycle(fixture) {
     }
   }
   return state;
+}
+
+export function resolveInstallationRequestDecision(item) {
+  if (!item || typeof item !== "object" || !isCalendarValidUtcTimestamp(item.at)) return "INVALID_INPUT";
+  if (item.membershipCurrent !== true) return "AUTHORITY_REVOKED";
+  if (item.selectedHomeId !== item.requestHomeId) return "HOME_MISMATCH";
+  if (!["OWNER", "PROPERTY_MANAGER"].includes(item.actorRole)) return "ROLE_DENIED";
+  if (!Number.isInteger(item.currentRevision) || !Number.isInteger(item.expectedRevision) || item.currentRevision !== item.expectedRevision) return "REVISION_CONFLICT";
+  if (item.action === "retry" && item.requestState === "expired" && isCalendarValidUtcTimestamp(item.expiresAt) &&
+      Number.isFinite(Date.parse(item.expiresAt)) && Date.parse(item.expiresAt) <= Date.parse(item.at)) return "RETRY_ALLOWED";
+  if (item.action === "submit" && item.requestState === "not_submitted" && item.expiresAt === null) return "REQUEST_PENDING";
+  return "INVALID_TRANSITION";
+}
+
+export function resolvePrototypeActionDecision(flowId, actionId, fixture, caseIds) {
+  if (!fixture || !Array.isArray(caseIds) || caseIds.length === 0) return null;
+  const findCase = (collection, id) => Array.isArray(collection) ? collection.find((item) => item.id === id) : null;
+  const decisions = [];
+  for (const caseId of caseIds) {
+    let decision = null;
+    switch (flowId) {
+      case "support": {
+        if (!caseIds.includes(actionId)) return null;
+        if (actionId === "private-request") {
+          const item = fixture.privateTenantOnly;
+          const recipients = item?.recipientCandidates?.filter((id) => id === item.ticketMembershipId);
+          decision = recipients?.length === 1 && recipients[0] === "membership:tenant-property" && item.ownerNotice === false ? "PRIVATE_TICKET_TENANT_ONLY" : null;
+        } else if (actionId === "infrastructure-approval") {
+          const item = fixture.propertyInfrastructure;
+          decision = item && JSON.stringify(item.recipientCandidates.filter((id) => id !== "membership:tenant-property")) === JSON.stringify(item.expectedGenericLifecycleRecipients) &&
+            item.noticeContainsTenantPrivateDeviceId === false && item.noticeContainsTenantPrivateTicketText === false ? "GENERIC_INFRA_NOTICE" : null;
+        } else if (actionId === "wrong-approver") {
+          const item = fixture.safetyAction;
+          decision = item?.differentApproverDenied === true && item?.sameApproverRequired === true ? "DIFFERENT_APPROVER_DENIED" : null;
+        } else if (actionId === "close-expire") {
+          const item = fixture.closure;
+          decision = item?.ticketState === "CLOSED" && item?.cloudAuthorityRevokedImmediately === true &&
+            item?.hubAcknowledgement === "pending" && item?.pendingHubAcknowledgementPermitsRenewal === false ? "CLOSED_PENDING_HUB_ACK" : null;
+        }
+        if (!decision) return null;
+        break;
+      }
+      case "invitation": {
+        const item = findCase(fixture.cases, caseId);
+        if (!isCalendarValidUtcTimestamp(fixture.initial?.expiresAt) ||
+            (actionId !== "resend" && !isCalendarValidUtcTimestamp(item?.at))) return null;
+        if (actionId === "resend") {
+          const resend = fixture.resend;
+          if (!resend || resend.newGeneration !== resend.oldGeneration + 1 || resend.oldRecipientProjectionVisible !== false || resend.oldMembershipCreated !== false) return null;
+          decision = "NEW_GENERATION_ISSUED";
+        } else if (item) {
+          const actual = item.authenticatedAccountId !== fixture.initial?.recipientAccountId ? "INVITATION_RECIPIENT_MISMATCH" :
+            item.emailVerified !== true ? "EMAIL_VERIFICATION_REQUIRED" :
+            item.explicitDecline === true ? "INVITATION_DECLINED" :
+            item.explicitAccept !== true ? "INVITATION_PENDING" :
+            Date.parse(item.at) >= Date.parse(fixture.initial.expiresAt) ? "INVITATION_EXPIRED" :
+            item.authorityRevalidated === true ? "MEMBERSHIP_ACTIVE" : "INVITATION_PENDING";
+          const membershipCreated = actual === "MEMBERSHIP_ACTIVE";
+          if (actual !== item.expected || membershipCreated !== (item.membershipId === "membership:recipient-home")) return null;
+          decision = actual;
+        }
+        break;
+      }
+      case "room-qr": {
+        const item = findCase(fixture.cases, caseId);
+        if (!item) return null;
+        decision = item.areaLifecycle === "retired" ? "AREA_NOT_AVAILABLE" : item.activeOwnerExists === false ? "NO_DURABLE_REQUEST" :
+          item.previousState === "REJECTED" && item.elapsedSeconds === 0 ? "NEW_REQUEST_ALLOWED" :
+          Number.isFinite(item.elapsedSeconds) && item.elapsedSeconds >= fixture.request.lifetimeSeconds ? "REQUEST_EXPIRED" :
+          item.emailVerified !== true ? "WAITING_FOR_EMAIL_VERIFICATION" : item.approved === true ? "MEMBERSHIP_ACTIVE" : "PENDING_OWNER_DECISION";
+        if (decision !== item.expected || item.membershipCreated === true !== (decision === "MEMBERSHIP_ACTIVE")) return null;
+        break;
+      }
+      case "property-actions": {
+        if (actionId === "offline-deregister") {
+          if (fixture.platformAuthority !== "revoked" || fixture.hubAcknowledgement !== "pending" || fixture.expected?.reportComplete !== false || fixture.expected?.protectedCommands !== false) return null;
+          decision = "REVOCATION_PENDING_HUB_ACK";
+        } else {
+          const item = findCase(fixture.cases, caseId);
+          if (!item) return null;
+          decision = item.successorIsActiveTenant ? "ACTIVE_TENANT_SUCCESSOR_DENIED" :
+            item.actorMembershipId !== fixture.activeClaim?.outgoingOwnerMembershipId && item.verifiedStaff !== true ? "SCOPE_DENIED" :
+            item.action === "cancel" ? "CANCELLED" : item.action === "replace" ? "REPLACED" :
+            item.action?.startsWith("consume:") && item.after ? "CLAIM_ALREADY_CONSUMED" :
+            item.action?.startsWith("consume:") ? "TRANSFERRED" : "INVALID_TRANSITION";
+          if (decision !== item.expected || (item.mutation !== (decision === "CANCELLED" || decision === "REPLACED" || decision === "TRANSFERRED"))) return null;
+        }
+        break;
+      }
+      case "area-edit": {
+        const item = findCase(fixture.cases, caseId);
+        if (!item) return null;
+        decision = item.selectedHomeId !== fixture.homeId ? "HOME_MISMATCH" : item.areaCurrent !== true ? "AREA_NOT_AVAILABLE" :
+          !["OWNER", "PROPERTY_MANAGER"].includes(item.actorRole) ? "ROLE_DENIED" :
+          item.expectedRevision !== fixture.currentRevision ? "REVISION_CONFLICT" : "AREA_EDITED";
+        if (decision !== item.expected || item.saved !== (decision === "AREA_EDITED")) return null;
+        break;
+      }
+      case "quiet-hours": {
+        if (actionId === "receipt") {
+          decision = fixture.receiptCreatesAuthority === false ? "DELIVERY_ONLY_NO_AUTHORITY" : null;
+          if (!decision) return null;
+          break;
+        }
+        const item = findCase(fixture.cases, caseId);
+        if (!item) return null;
+        const quietEnd = fixture.quietHours?.endLocalTime ?? "07:00";
+        decision = item.mandatory ? "DELIVERED_IMMEDIATELY" : item.enabled !== true ? "NOT_SENT" :
+          item.quietHoursEnabled === true && item.localTime < quietEnd ? "DEFERRED_INDIVIDUALLY_UNTIL_QUIET_HOURS_END" : "DELIVERED_ONCE";
+        const expected = ({
+          "delivered-immediately": "DELIVERED_IMMEDIATELY",
+          "not-sent": "NOT_SENT",
+          "deferred-individually-until-quiet-hours-end": "DEFERRED_INDIVIDUALLY_UNTIL_QUIET_HOURS_END",
+          "delivered-once": "DELIVERED_ONCE",
+        })[item.expected];
+        if (decision !== expected) return null;
+        break;
+      }
+      case "trusted-device": {
+        const item = findCase(fixture.cases, caseId);
+        if (!item || item.sessionsRevoked !== true || item.offlineAuthorityRevoked !== true || item.unrelatedDevicePreserved !== true) return null;
+        decision = item.online ? "REVOKED_ACCOUNT_WIDE" : "REVOCATION_PENDING_HUB_ACK";
+        if (decision !== item.expected) return null;
+        break;
+      }
+      case "access-request": {
+        const item = findCase(fixture.cases, caseId);
+        if (!item) return null;
+        decision = item.selectedHomeId !== fixture.homeId ? "HOME_MISMATCH" :
+          item.requestState === "expired" ? "REQUEST_EXPIRED" :
+          !["OWNER", "PROPERTY_MANAGER"].includes(item.actorRole) ? "ROLE_DENIED" :
+          item.currentRevision !== item.expectedRevision ? "REVISION_CONFLICT" :
+          !item.recipientVerified ? "RECIPIENT_NOT_VERIFIED" :
+          item.action === "reject" ? "REJECTED" : item.action === "approve" ? "MEMBERSHIP_ACTIVE" : "INVALID_TRANSITION";
+        if (decision !== item.expected || item.membershipCreated !== (decision === "MEMBERSHIP_ACTIVE") || item.protectedDataReturned !== false) return null;
+        break;
+      }
+      case "descriptor-change": {
+        const item = fixture.prototypeControls?.find((entry) => entry.id === caseId);
+        if (!item) return null;
+        decision = item.deleted ? "CONTROL_REMOVED" : item.writable === false ? "WRITE_DENIED_READ_ONLY" : item.replacementId ? "REPLACEMENT_HAS_NEW_IDENTITY" : null;
+        if (!decision || decision !== item.expected) return null;
+        break;
+      }
+      case "claim": {
+        if (actionId === "competing") {
+          decision = fixture.competingClaim?.expectedOutcome === "non_identifying_unavailable" && fixture.competingClaim.winnerRemains === fixture.initial?.claimantAccountId
+            ? "COMPETING_CLAIM_DENIED" : null;
+        } else {
+          const item = fixture.events?.find((event) => event.eventId === caseId);
+          if (!item) return null;
+          const state = simulateClaimLifecycle({ ...fixture, events: fixture.events.slice(0, fixture.events.indexOf(item) + 1) });
+          if (state.state !== (item.expectedState ?? state.state) ||
+              item.expectedExpiresAt && Date.parse(state.expiresAt) !== Date.parse(item.expectedExpiresAt) ||
+              item.expectedRevision !== undefined && state.revision !== item.expectedRevision) return null;
+          decision = item.eventId === "event:exact-expiry" ? "CLAIM_EXPIRED_AND_RELEASED" :
+            item.eventId === "event:noop-save" ? "NO_EXTENSION" : item.eventId === "event:required-save-replay" ? "IDEMPOTENT_RETRY_NO_SECOND_EXTENSION" :
+            item.kind === "required_save" && item.success && item.changed ? "REQUIRED_SAVE_EXTENDED_EXACTLY_30_MINUTES" : "RESERVATION_REMAINS_UNCHANGED";
+        }
+        if (!decision) return null;
+        break;
+      }
+      case "recovery": {
+        const item = findCase(fixture.cases, caseId);
+        if (!item || item.accountExistsDisclosed !== false || item.sessionIssued !== false) return null;
+        decision = item.requestAccepted && item.responseClass === "generic_accepted" ? "GENERIC_ACCEPTED_NO_SESSION" :
+          !item.requestAccepted && item.responseClass === "generic_denial" ? "GENERIC_DENIAL_NO_SESSION" : null;
+        break;
+      }
+      case "management-activity": {
+        if (actionId === "receipt") {
+          decision = fixture.receiptCreatesAuthority === false ? "DELIVERY_ONLY_NO_AUTHORITY" : null;
+        } else {
+          const maxSequence = Math.max(...fixture.events.map((event) => event.sequence));
+          const newest = fixture.events.filter((event) => event.sequence === maxSequence);
+          decision = actionId === "newer" && newest[0]?.value === "new" ? "NEWEST_REVISION_APPLIED" :
+            actionId === "duplicate" && fixture.expectedAppliedSequences?.length === 1 && fixture.expectedAppliedSequences[0] === maxSequence ? "DUPLICATE_OR_OLDER_IGNORED" : null;
+        }
+        if (!decision) return null;
+        break;
+      }
+      case "installation-request": {
+        const item = findCase(fixture.cases, caseId);
+        if (!item || !["OWNER", "PROPERTY_MANAGER"].includes(item.actorRole)) return null;
+        decision = resolveInstallationRequestDecision(item);
+        if (decision !== item.expectedDecision) return null;
+        break;
+      }
+      default: return null;
+    }
+    decisions.push(decision);
+  }
+  if (decisions.length !== caseIds.length) return null;
+  if (flowId === "claim" && actionId === "required-save" &&
+      JSON.stringify([...new Set(decisions)].sort()) === JSON.stringify(["IDEMPOTENT_RETRY_NO_SECOND_EXTENSION", "REQUIRED_SAVE_EXTENDED_EXACTLY_30_MINUTES"].sort())) {
+    return "REQUIRED_SAVE_EXTENDED_AND_RETRY_IDEMPOTENT";
+  }
+  return decisions.every((decision) => decision === decisions[0]) ? decisions[0] : null;
+}
+
+export function assertPrototypeActionMatrixBindings(prototypeScenarios, fixtureIndex) {
+  if (!prototypeScenarios || !fixtureIndex || fixtureIndex.schemaVersion !== "dinodia.v1" || !fixtureIndex.screenFixtures) {
+    throw new Error("Prototype scenarios require the canonical screen fixture index");
+  }
+  for (const [flowId, flow] of Object.entries(prototypeScenarios.flows ?? {})) {
+    const screens = flow.matrixScreens;
+    if (!Array.isArray(screens) || screens.length === 0 || new Set(screens).size !== screens.length) {
+      throw new Error(`Prototype flow ${flowId} has no unique matrix screen bindings`);
+    }
+    for (const screen of screens) {
+      const references = fixtureIndex.screenFixtures[screen];
+      if (!Array.isArray(references) || !references.includes("fixtures/prototype-scenarios.json")) {
+        throw new Error(`Prototype flow ${flowId} is not indexed on rendered screen ${screen}`);
+      }
+    }
+    const references = new Set(screens.flatMap((screen) => fixtureIndex.screenFixtures[screen] ?? []));
+    for (const action of flow.actions ?? []) {
+      const reference = `fixtures/${action.decisionFixture}.json`;
+      if (!references.has(reference)) {
+        throw new Error(`Prototype action ${flowId}/${action.id} decision fixture is not indexed for its rendered screens: ${reference}`);
+      }
+    }
+  }
+  return true;
+}
+
+function isCalendarValidUtcTimestamp(value) {
+  if (typeof value !== "string") return false;
+  const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?Z$/.exec(value);
+  if (!match) return false;
+  const [, yearText, monthText, dayText, hourText, minuteText, secondText] = match;
+  const year = Number(yearText); const month = Number(monthText); const day = Number(dayText);
+  const hour = Number(hourText); const minute = Number(minuteText); const second = Number(secondText);
+  if (year < 1 || month < 1 || month > 12 || hour > 23 || minute > 59 || second > 59) return false;
+  const leapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const daysInMonth = [31, leapYear ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1];
+  return day >= 1 && day <= daysInMonth && Number.isFinite(Date.parse(value));
 }
 
 export function assertStage2DecisionFixtures({ support, receipt, offline, decisionMatrix, claim }) {
@@ -125,7 +366,7 @@ function deniedWithNoEffects(denied, label) {
 }
 
 function executeSemanticFixture(path, value, adapters) {
-  const { os, platform, schema, analytics } = adapters;
+  const { os, platform, alexa, schema, analytics } = adapters;
   const result = (outcome, details = {}) => ({ outcome, ...details });
   switch (path) {
     case "account-relationship-lifecycle.json": {
@@ -165,6 +406,11 @@ function executeSemanticFixture(path, value, adapters) {
     case "invalid/unknown-required-version.json": {
       const denied = value.expected === "UPDATE_REQUIRED" && !schema("envelope", value) &&
         !platform.validateEnvelope(value) && !os.validateEnvelope(value);
+      return deniedWithNoEffects(denied, path);
+    }
+    case "invalid/impossible-calendar-date-envelope.json": {
+      const denied = !schema("envelope", value) && !platform.validateEnvelope(value) &&
+        !os.validateEnvelope(value);
       return deniedWithNoEffects(denied, path);
     }
     case "error-home-denied.json": {
@@ -361,11 +607,16 @@ function executeSemanticFixture(path, value, adapters) {
       assert(value.competingClaim.expectedOutcome === "non_identifying_unavailable", "competing claim must fail without identifying the winner");
       return result("accepted", { cases: value.events.length });
     case "invitation-lifecycle.json": {
+      if (!isCalendarValidUtcTimestamp(value.initial?.expiresAt) ||
+          !value.cases.every((item) => isCalendarValidUtcTimestamp(item.at))) {
+        throw new Error("Invitation lifecycle contains an invalid UTC calendar timestamp");
+      }
       const expires = Date.parse(value.initial.expiresAt);
       const actualFor = (item) => {
         const sameRecipient = item.authenticatedAccountId === value.initial.recipientAccountId;
         if (!sameRecipient) return "INVITATION_RECIPIENT_MISMATCH";
         if (!item.emailVerified) return "EMAIL_VERIFICATION_REQUIRED";
+        if (item.explicitDecline === true) return "INVITATION_DECLINED";
         if (!item.explicitAccept) return "INVITATION_PENDING";
         if (Date.parse(item.at) >= expires) return "INVITATION_EXPIRED";
         return item.authorityRevalidated ? "MEMBERSHIP_ACTIVE" : "INVITATION_PENDING";
@@ -461,6 +712,16 @@ function executeSemanticFixture(path, value, adapters) {
         !os.validateControlState(value.data, device, control);
       return deniedWithNoEffects(denied, path);
     }
+    case "invalid/control-state-option-outside-descriptor.json": {
+      const device = value.device;
+      const control = device.controls.find((entry) => entry.controlId === value.state.controlId);
+      assert(control?.valueType === "option" && platform.validateNativeDevice(device) && os.validateDevice(device),
+        "option-state scenario must use a valid current descriptor; both state DTOs are independently schema-checked by the contract gate");
+      assert(platform.validateControlState(value.validState, device, control) && os.validateControlState(value.validState, device, control),
+        "a current option value must be accepted by Platform and OS");
+      const denied = !platform.validateControlState(value.state, device, control) && !os.validateControlState(value.state, device, control);
+      return deniedWithNoEffects(denied, path);
+    }
     case "invalid/writable-unreadable-control.json": {
       const source = adapters.readFixture(value.sourceFixture);
       const device = clone(source.device);
@@ -478,6 +739,25 @@ function executeSemanticFixture(path, value, adapters) {
       Object.assign(control, value.mutation);
       const denied = !platform.validateNativeDevice(device) && !os.validateDevice(device, { homeId: device.homeId, homeMembershipId: "membership:owner-a", role: "OWNER", areaIds: device.areaIds });
       return deniedWithNoEffects(denied, path);
+    }
+    case "invalid/duplicate-device-control-id.json": {
+      const source = adapters.readFixture(value.sourceFixture);
+      const device = clone(source.device);
+      const target = device.controls.find((entry) => entry.controlId === value.targetControlId);
+      assert(target && device.id === value.deviceId && device.controls.some((entry) => entry.controlId === value.duplicateControlId),
+        "duplicate-control fixture must resolve its exact source device and both control identities");
+      target.controlId = value.duplicateControlId;
+      const context = { homeId: device.homeId, homeMembershipId: source.context.homeMembershipId, role: "OWNER", areaIds: device.areaIds };
+      const schemaAcceptsDistinctRows = schema("device", device);
+      const platformDenies = !platform.validateNativeDevice(device, context);
+      const osDenies = !os.validateDevice(device, context);
+      const alexaDenies = alexa.decodeNativeAlexaDevices({
+        schemaVersion: "dinodia.v1", homeId: device.homeId, streamId: "stream:duplicate-control",
+        sequence: 1, generatedAt: "2026-09-27T10:00:00Z", revision: 1, data: [device],
+      }, { homeId: device.homeId, homeMembershipId: context.homeMembershipId, role: "OWNER", authorisedAreaIds: device.areaIds }) === null;
+      assert(value.schemaExpected === "structurally_valid_distinct_objects" && schemaAcceptsDistinctRows && platformDenies && osDenies && alexaDenies,
+        "JSON Schema may accept distinct objects, but Platform, OS and Alexa must reject repeated public control IDs before projection or dispatch");
+      return deniedWithNoEffects(true, path);
     }
     case "duplicate-display-names.json": {
       const matrix = adapters.readFixture("fixtures/stage2-decision-matrix.json");
@@ -631,11 +911,73 @@ function executeSemanticFixture(path, value, adapters) {
       const flows = Object.entries(value.flows);
       for (const [flowId, flow] of flows) {
         assert(flow.initialOutcome.trim() && flow.actions.length > 0, `prototype flow ${flowId} has no state or action`);
-        for (const action of flow.actions) assert(action.id && action.label && action.outcome &&
-          (!action.allowedRoles || action.allowedRoles.every((role) => ["Homeowner", "Property manager", "Tenant"].includes(role))),
-        `prototype action ${flowId}/${action.id} is not executable/renderable`);
+        for (const action of flow.actions) {
+          assert(action.id && action.label && action.outcome &&
+            (!action.allowedRoles || action.allowedRoles.every((role) => ["Homeowner", "Property manager", "Tenant"].includes(role))),
+          `prototype action ${flowId}/${action.id} is not executable/renderable`);
+          assert(typeof action.decisionFixture === "string" && Array.isArray(action.decisionCases) && action.decisionCases.length > 0,
+            `prototype action ${flowId}/${action.id} has no executable decision binding`);
+          assert(typeof action.expectedDecision === "string" && action.expectedDecision.trim(),
+            `prototype action ${flowId}/${action.id} has no expected decision code`);
+          const source = adapters.readFixture(`fixtures/${action.decisionFixture}.json`);
+          const decision = source && resolvePrototypeActionDecision(flowId, action.id, source, action.decisionCases);
+          assert(decision && decision === action.expectedDecision,
+            `prototype action ${flowId}/${action.id} did not resolve through its owning fixture decision`);
+        }
       }
+      const installation = adapters.readFixture("fixtures/installation-request-lifecycle.json");
+      const decisions = new Map();
+      for (const item of installation.cases) {
+        const effects = item.expectedEffects;
+        const actual = resolveInstallationRequestDecision(item);
+        assert(actual === item.expectedDecision, `installation request ${item.id}: expected ${item.expectedDecision}, derived ${actual}`);
+        assert(effects && effects.homeCreated === false && effects.installationCompleted === false &&
+          effects.requestCreated === ["REQUEST_PENDING", "RETRY_ALLOWED"].includes(actual),
+        `installation request ${item.id} has contradictory side effects`);
+        decisions.set(item.id, actual);
+      }
+      const installFlow = value.flows["installation-request"];
+      assert(installFlow.actions.every((action) => action.decisionFixture === "installation-request-lifecycle" &&
+        Array.isArray(action.decisionCases) && action.decisionCases.length > 0 &&
+        action.decisionCases.every((caseId) => decisions.has(caseId))),
+      "every rendered installation action must resolve to executable lifecycle inputs");
+      assert(installFlow.actions.find((action) => action.id === "submit").decisionCases.every((caseId) =>
+        ["REQUEST_PENDING"].includes(decisions.get(caseId))), "installation submission must remain pending, never imply completion");
+      assert(installFlow.actions.find((action) => action.id === "expire").decisionCases.every((caseId) =>
+        decisions.get(caseId) === "RETRY_ALLOWED"), "expired installation retry requires current owner/manager authority");
       return result("accepted", { flows: flows.length, actions: flows.reduce((sum, [, flow]) => sum + flow.actions.length, 0) });
+    }
+    case "installation-request-lifecycle.json": {
+      assert(value.schemaVersion === "dinodia.v1" && value.decisionId === "installation_request" && value.cases.length >= 7,
+        "installation request fixture must contain the complete Stage 2 decision matrix");
+      for (const item of value.cases) {
+        const actual = resolveInstallationRequestDecision(item);
+        assert(actual === item.expectedDecision && item.expectedEffects?.homeCreated === false &&
+          item.expectedEffects?.installationCompleted === false &&
+          item.expectedEffects?.requestCreated === ["REQUEST_PENDING", "RETRY_ALLOWED"].includes(actual),
+        `installation request decision/effect mismatch: ${item.id}`);
+      }
+      return result("accepted", { cases: value.cases.length, productionEffects: 0 });
+    }
+    case "area-edit-lifecycle.json": {
+      for (const item of value.cases) {
+        const actual = item.selectedHomeId !== value.homeId ? "HOME_MISMATCH" : item.areaCurrent !== true ? "AREA_NOT_AVAILABLE" :
+          !["OWNER", "PROPERTY_MANAGER"].includes(item.actorRole) ? "ROLE_DENIED" :
+          item.expectedRevision !== value.currentRevision ? "REVISION_CONFLICT" : "AREA_EDITED";
+        assert(actual === item.expected && item.saved === (actual === "AREA_EDITED"), `area edit ${item.id}: decision/effect mismatch`);
+      }
+      return result("accepted", { cases: value.cases.length });
+    }
+    case "access-request-lifecycle.json": {
+      for (const item of value.cases) {
+        const actual = item.selectedHomeId !== value.homeId ? "HOME_MISMATCH" : item.requestState === "expired" ? "REQUEST_EXPIRED" :
+          !["OWNER", "PROPERTY_MANAGER"].includes(item.actorRole) ? "ROLE_DENIED" :
+          item.currentRevision !== item.expectedRevision ? "REVISION_CONFLICT" : !item.recipientVerified ? "RECIPIENT_NOT_VERIFIED" :
+          item.action === "reject" ? "REJECTED" : item.action === "approve" ? "MEMBERSHIP_ACTIVE" : "INVALID_TRANSITION";
+        assert(actual === item.expected && item.membershipCreated === (actual === "MEMBERSHIP_ACTIVE") && item.protectedDataReturned === false,
+          `access request ${item.id}: decision/effect mismatch`);
+      }
+      return result("accepted", { cases: value.cases.length });
     }
     case "stage2-decision-matrix.json": {
       assertStage2DecisionFixtures({
