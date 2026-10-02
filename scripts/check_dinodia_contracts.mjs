@@ -1498,6 +1498,9 @@ for (const name of iosPrototypeFixtureReferences) {
   if (!synchronizedDebugFixtures.has(name))
     throw new Error(`iOS prototype fixture is not copied into the DEBUG bundle: ${name}.json`);
 }
+const uniqueIndexedFixturePaths = new Set(
+  Object.values(fixtureIndex.screenFixtures).flat(),
+);
 console.log(
-  `dinodia.v1 schemas=${schemas.size} JSON fixtures=${fixtureFiles.length} runtime validators=${validatorNames.length}; indexed screen/action scenarios=${indexedScenarioResults.length}; Platform/OS decision executions=${indexedScenarioResults.length}; Alexa actual adapter executions=${alexaScenarioResults.size}; modeled-denial assertions=${indexedScenarioResults.reduce((sum, result) => sum + result.zeroEffectDenials, 0)} (not a route side-effect proof); iOS DEBUG fixture references=${iosPrototypeFixtureReferences.size}`,
+  `dinodia.v1 schemas=${schemas.size} JSON fixtures=${fixtureFiles.length} runtime validators=${validatorNames.length}; indexed screen/action references=${indexedScenarioResults.length}; unique indexed fixture paths=${uniqueIndexedFixturePaths.size}; semantic decision-runner executions=${indexedScenarioResults.length} (not one distinct consumer behavior per reference); Alexa actual adapter executions=${alexaScenarioResults.size}; modeled-denial assertions=${indexedScenarioResults.reduce((sum, result) => sum + result.zeroEffectDenials, 0)} (not a route side-effect proof); iOS DEBUG fixture references=${iosPrototypeFixtureReferences.size}`,
 );
