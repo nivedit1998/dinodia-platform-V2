@@ -23,9 +23,29 @@ export async function POST(request: Request) {
     if (operationKind === 'device_sensitive_command' || operationKind === 'heating_sensitive_command') {
       assertCustomerCanCommand(customer);
       if (targetIds.length !== 1) throw new Stage1AuthError(400, 'step_up_target_invalid', 'A device step-up must target one current control');
-      const devices = await prisma.nativeDevice.findMany({ where: { id: { in: targetIds }, homeId: customer.homeId, lifecycle: { in: ['INSTALLED', 'VIEW_ONLY'] } }, select: { id: true } });
-      if (devices.length !== new Set(targetIds).size) throw new Stage1AuthError(403, 'step_up_target_invalid', 'The device is not current in the selected home');
-      const assignments = await prisma.deviceAreaAssignment.findMany({ where: { deviceId: { in: targetIds }, homeId: customer.homeId, validUntil: null, areaId: { in: customer.areaIds } }, select: { deviceId: true } });
+      // Native OS requests address the device by its hub-local opaque
+      // osDeviceId. Platform storage has a separate UUID primary key. Resolve
+      // either exact identifier only inside the authenticated home + hub,
+      // reject ambiguous/non-1:1 mappings, and use database UUIDs only for
+      // membership-area authorization. Neither caller value grants authority.
+      const databaseUuidTargets = targetIds.filter((targetId) => /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(targetId));
+      const identifierConditions: Array<Record<string, unknown>> = [{ osDeviceId: { in: targetIds } }];
+      if (databaseUuidTargets.length) identifierConditions.push({ id: { in: databaseUuidTargets } });
+      const devices = await prisma.nativeDevice.findMany({
+        where: {
+          homeId: customer.homeId,
+          hubInstallationId: customer.hubInstallationId,
+          lifecycle: 'INSTALLED',
+          OR: identifierConditions,
+        },
+        select: { id: true, osDeviceId: true },
+      });
+      const resolvedIds = targetIds.map((targetId) => {
+        const matches = devices.filter((device) => device.id === targetId || device.osDeviceId === targetId);
+        return matches.length === 1 ? matches[0].id : null;
+      });
+      if (resolvedIds.some((id) => id === null) || new Set(resolvedIds).size !== targetIds.length) throw new Stage1AuthError(403, 'step_up_target_invalid', 'The device is not current in the selected home');
+      const assignments = await prisma.deviceAreaAssignment.findMany({ where: { deviceId: { in: resolvedIds as string[] }, homeId: customer.homeId, validUntil: null, areaId: { in: customer.areaIds } }, select: { deviceId: true } });
       if (new Set(assignments.map((assignment) => assignment.deviceId)).size !== devices.length) throw new Stage1AuthError(403, 'step_up_area_denied', 'The device is not in an area currently granted to this tenant');
       const attestation = body.descriptorAttestation && typeof body.descriptorAttestation === 'object' && !Array.isArray(body.descriptorAttestation)
         ? body.descriptorAttestation as Record<string, unknown> : null;
