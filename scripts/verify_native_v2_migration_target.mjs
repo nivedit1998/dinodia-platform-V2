@@ -5,6 +5,7 @@ import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import dotenv from 'dotenv';
 import { PrismaClient } from '@prisma/client';
+import { assertMigrationDoesNotReferenceVolatileRuntimeTables, compareExistingTablePreservation } from './native_migration_preservation.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const projectRef = 'fppzzesvukjbsfmxmfxe';
@@ -114,6 +115,7 @@ try {
   const direct = parseUrl(directUrl, 'DIRECT_URL');
   if (decodeURIComponent(db.pathname) !== decodeURIComponent(direct.pathname)) fail('DATABASE_URL and DIRECT_URL target different databases');
   const migrationSha = crypto.createHash('sha256').update(fs.readFileSync(migrationPath)).digest('hex');
+  assertMigrationDoesNotReferenceVolatileRuntimeTables(fs.readFileSync(migrationPath, 'utf8'));
   if (apply && (!authorizedApply || !expectedShaFlag || expectedShaFlag.slice('--expected-migration-sha256='.length) !== migrationSha)) fail('apply requires explicit authorization and the exact reviewed migration SHA-256');
   const projectFile = JSON.parse(fs.readFileSync(path.join(root, '.vercel/project.json'), 'utf8'));
   if (projectFile.projectId !== target.vercelProjectId || projectFile.orgId !== target.vercelOrgId) fail('linked Vercel project does not match the approved V2 target');
@@ -170,10 +172,10 @@ try {
   if (apply) {
     const afterFingerprint = runFingerprint(connectionEnv);
     const after = await inventory(client, before.columnsByTable);
-    const changedExistingCounts = Object.keys(before.rowCounts).filter((table) => after.rowCounts[table] !== before.rowCounts[table]);
-    if (changedExistingCounts.length) fail(`existing Production table row counts changed: ${changedExistingCounts.join(', ')}`);
-    const changedExistingRows = Object.keys(before.rowContentDigests).filter((table) => after.rowContentDigests[table] !== before.rowContentDigests[table]);
-    if (changedExistingRows.length) fail(`existing Production row content changed outside reviewed lifecycle-pointer columns: ${changedExistingRows.join(', ')}`);
+    let preservation;
+    try { preservation = compareExistingTablePreservation(before, after); }
+    catch (error) { fail(error instanceof Error ? error.message : 'existing Production rows changed'); }
+    const { volatileChanges } = preservation;
     const appliedNow = after.migrationRows.filter((row) => row.finished_at && !row.rolled_back_at && row.migration_name === migrationName);
     const checksumMatch = appliedNow.length === 1 && appliedNow[0].checksum === migrationSha;
     if (!checksumMatch) fail('Production migration ledger does not contain the exact reviewed migration checksum');
@@ -187,11 +189,12 @@ try {
       migrationSha256: migrationSha,
       priorSchemaFingerprint: beforeFingerprint,
       productionSchemaFingerprint: afterFingerprint,
-      existingTableRowCountsPreserved: changedExistingCounts.length === 0,
+      nonvolatileExistingTableRowCountsPreserved: true,
+      volatileRuntimeTableChanges: volatileChanges,
       existingBaseTableCount: Object.keys(before.rowCounts).length,
       postMigrationBaseTableCount: Object.keys(after.rowCounts).length,
       migrationLedgerMatchesReviewedChecksum: checksumMatch,
-      existingRowContentDigestPreserved: true,
+      nonvolatileExistingRowContentPreserved: true,
       postMigrationRowContentDigest: crypto.createHash('sha256').update(JSON.stringify(Object.entries(after.rowContentDigests).sort(([a], [b]) => a.localeCompare(b)))).digest('hex'),
       postMigrationPreflightCounts: after.dataPreflight,
       rollback: 'Keep the additive schema and roll back application deployment to the recorded prior V2 release; do not issue destructive reverse SQL',

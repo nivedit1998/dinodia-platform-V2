@@ -4,12 +4,34 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { createRequire } from 'node:module';
+import { assertMigrationDoesNotReferenceVolatileRuntimeTables, compareExistingTablePreservation } from '../scripts/native_migration_preservation.mjs';
 
 const root = process.cwd();
 const read = (file) => fs.readFileSync(path.join(root, file), 'utf8');
 const osRoot = process.env.DINODIA_OS_ROOT || path.resolve(root, '..', 'Dinodia OS');
 const readOs = (file) => fs.readFileSync(path.join(osRoot, file), 'utf8');
 const requireOsModule = (file) => createRequire(import.meta.url)(path.join(osRoot, file));
+
+test('Stage 3 preservation proof isolates only volatile ReplayNonce runtime churn', () => {
+  const before = {
+    rowCounts: { Home: '2', ReplayNonce: '4' },
+    rowContentDigests: { Home: 'home-digest', ReplayNonce: 'nonce-before' },
+  };
+  const after = {
+    rowCounts: { Home: '2', ReplayNonce: '5', NewStage3Table: '0' },
+    rowContentDigests: { Home: 'home-digest', ReplayNonce: 'nonce-after', NewStage3Table: '' },
+  };
+  assert.doesNotThrow(() => assertMigrationDoesNotReferenceVolatileRuntimeTables('CREATE TABLE "NewStage3Table" ("id" text);'));
+  assert.deepEqual(compareExistingTablePreservation(before, after), {
+    changedExistingCounts: [],
+    changedExistingRows: [],
+    volatileChanges: [{ table: 'ReplayNonce', rowCountChanged: true, rowContentChanged: true }],
+  });
+  assert.throws(() => assertMigrationDoesNotReferenceVolatileRuntimeTables('DELETE FROM "ReplayNonce";'), /references the volatile/);
+  assert.throws(() => compareExistingTablePreservation(before, { ...after, rowCounts: { ...after.rowCounts, Home: '3' } }), /nonvolatile.*row counts changed/);
+  assert.throws(() => compareExistingTablePreservation(before, { ...after, rowContentDigests: { ...after.rowContentDigests, Home: 'changed' } }), /nonvolatile.*row content changed/);
+  assert.throws(() => compareExistingTablePreservation(before, { rowCounts: { ReplayNonce: '4' }, rowContentDigests: { ReplayNonce: 'nonce-before' } }), /base-table inventory changed/);
+});
 
 function loadTypeScriptModule(relativePath, overrides = {}) {
   const require = createRequire(import.meta.url);
