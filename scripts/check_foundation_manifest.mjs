@@ -68,7 +68,7 @@ const addedFiles = [
   /^src\/app\/api\/(health|readiness)(?:\/|$)/,
   /^src\/app\/api\/(company|cron|hub-agent|installer|internal|v2)(?:\/|$)/,
   /^src\/app\/(company|installer)(?:\/|$)/,
-  /^src\/lib\/(foundation|foundationContracts|initialCxoInvitation|manufacturingEnrollment|runtimeDatabaseUrl|runtimeTarget|hubOperatorCredentials|idempotentOperatorMutation|operatorRateLimitPolicy|nativeOperations|passwords|rateLimit|serializableTransaction|sensitiveOperationStepUp|stepUpProofCodec|stage1Auth|stage1ClaimContract|stage1Crypto|stage1HubAuth|stage1Operator|supportNotifications|internalOperatorDaySession|lanEndpoint)\.(mjs|ts)$/,
+  /^src\/lib\/(buildIdentity|foundation|foundationContracts|initialCxoInvitation|manufacturingEnrollment|runtimeDatabaseUrl|runtimeTarget|hubOperatorCredentials|idempotentOperatorMutation|operatorRateLimitPolicy|nativeOperations|passwords|rateLimit|serializableTransaction|sensitiveOperationStepUp|stepUpProofCodec|stage1Auth|stage1ClaimContract|stage1Crypto|stage1HubAuth|stage1Operator|supportNotifications|internalOperatorDaySession|lanEndpoint)\.(mjs|ts)$/,
   /^src\/lib\/contracts(?:\/|$)/,
   /^test(?:\/|$)/,
   /^vercel\.json$/,

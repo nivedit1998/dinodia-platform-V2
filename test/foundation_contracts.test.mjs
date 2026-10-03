@@ -1,6 +1,25 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import { safeBuildId } from '../src/lib/buildIdentity.mjs';
+
+test('safe build identity prefers the real Vercel commit or deployment and never reports a stale pin', () => {
+  assert.equal(safeBuildId({
+    VERCEL_GIT_COMMIT_SHA: 'abcdef0123456789abcdef0123456789abcdef01',
+    VERCEL_DEPLOYMENT_ID: 'dpl_Production123',
+    FOUNDATION_SOURCE_FINGERPRINT: '453997b5cf659f6b',
+  }), 'abcdef012345');
+  assert.equal(safeBuildId({
+    VERCEL_DEPLOYMENT_ID: 'dpl_Production123',
+    FOUNDATION_SOURCE_FINGERPRINT: '453997b5cf659f6b',
+  }), 'dpl_Production123');
+  assert.equal(safeBuildId({
+    VERCEL: '1',
+    FOUNDATION_SOURCE_FINGERPRINT: '453997b5cf659f6b',
+  }), 'vercel-deployment-id-unavailable');
+  assert.equal(safeBuildId({ FOUNDATION_SOURCE_FINGERPRINT: 'abcdef0123456789' }), 'abcdef0123456789');
+  assert.equal(safeBuildId({ FOUNDATION_SOURCE_FINGERPRINT: 'not-a-fingerprint' }), 'local');
+});
 
 test('foundation and Stage 1 schema is exactly native and bounded', () => {
   const schema = fs.readFileSync('prisma/schema.prisma', 'utf8');

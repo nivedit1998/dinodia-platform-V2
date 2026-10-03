@@ -1,4 +1,5 @@
 import { runtimeTargetIsValid } from './runtimeTarget.mjs';
+export { safeBuildId } from './buildIdentity.mjs';
 
 export const FOUNDATION_MIGRATION = '00000000000000_native_v2_lean_foundation';
 export const FOUNDATION_MODEL_COUNT = 32;
@@ -10,11 +11,6 @@ export const STAGE1_MODEL_COUNT = 40;
 export const REQUIRED_MIGRATION = '20260927020000_nr4_operator_endpoint_binding';
 export const REQUIRED_MODEL_COUNT = 44;
 export const CANONICAL_PRODUCTION_ORIGIN = 'https://dinodia-platform-v2.vercel.app';
-export function safeBuildId(): string {
-  return process.env.FOUNDATION_SOURCE_FINGERPRINT?.slice(0, 16)
-    || process.env.VERCEL_GIT_COMMIT_SHA?.slice(0, 12)
-    || 'local';
-}
 export function isRuntimeTargetValid(): boolean { return runtimeTargetIsValid(process.env); }
 export function isCanonicalProductionOriginValid(): boolean {
   if (process.env.NODE_ENV !== 'production') return true;

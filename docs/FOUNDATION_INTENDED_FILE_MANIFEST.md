@@ -11,6 +11,7 @@ This manifest is reviewed before staging. It is not permission to commit or push
 - `src/app/api/health/route.ts`.
 - `src/app/api/readiness/route.ts`.
 - `src/lib/foundation.ts`.
+- `src/lib/buildIdentity.mjs` — safe runtime identity from validated Vercel commit/deployment system variables, without stale source-pin fallback.
 - `src/lib/foundationContracts.mjs`.
 - `src/lib/runtimeDatabaseUrl.ts`.
 - `src/lib/runtimeTarget.mjs`.
