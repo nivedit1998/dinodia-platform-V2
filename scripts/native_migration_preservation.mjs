@@ -1,4 +1,7 @@
 const volatileRuntimeTables = new Set(['ReplayNonce']);
+const volatileRuntimeColumns = new Map([
+  ['HubInstallation', new Set(['lastSeenAt', 'onlineStateEvaluatedAt', 'updatedAt'])],
+]);
 
 export function assertMigrationDoesNotReferenceVolatileRuntimeTables(sql) {
   if (/\bReplayNonce\b/i.test(sql)) {
@@ -21,6 +24,14 @@ export function compareExistingTablePreservation(before, after) {
     const contentChanged = after.rowContentDigests[table] !== before.rowContentDigests[table];
     if (volatileRuntimeTables.has(table)) {
       if (countChanged || contentChanged) volatileChanges.push({ table, rowCountChanged: countChanged, rowContentChanged: contentChanged });
+    } else if (volatileRuntimeColumns.has(table)) {
+      const columnsBefore = before.columnContentDigests?.[table] ?? {};
+      const columnsAfter = after.columnContentDigests?.[table] ?? {};
+      const changedColumns = Object.keys(columnsBefore).filter((column) => columnsBefore[column] !== columnsAfter[column]);
+      const disallowedColumns = changedColumns.filter((column) => !volatileRuntimeColumns.get(table).has(column));
+      if (countChanged) changedExistingCounts.push(table);
+      if (disallowedColumns.length) changedExistingRows.push(`${table}.${disallowedColumns.join(',')}`);
+      else if (contentChanged || changedColumns.length) volatileChanges.push({ table, rowCountChanged: false, rowContentChanged: contentChanged, changedColumns });
     } else {
       if (countChanged) changedExistingCounts.push(table);
       if (contentChanged) changedExistingRows.push(table);

@@ -12,7 +12,7 @@ const modifiedFiles = new Set([
   'docs/V2_FOUNDATION_STATUS.md', 'next.config.ts', 'package-lock.json', 'package.json', 'prisma.config.ts',
   'prisma/schema.prisma', 'scripts/assert_v2_target.mjs', 'scripts/check_no_unsafe_logs.mjs',
   'scripts/check_clean_clone.mjs', 'scripts/check_foundation.mjs', 'scripts/check_foundation_manifest.mjs', 'scripts/check_dinodia_contracts.mjs', 'scripts/foundation_db_checks.mjs', 'scripts/reset_rc_database.mjs',
-  'scripts/check_security_headers.mjs', 'scripts/check_stage1_security.mjs', 'scripts/stage1_integration_harness.mjs', 'scripts/foundation_invariants.mjs', 'scripts/sync_dinodia_contract_fixtures.mjs', 'scripts/verify_native_v2_migration_target.mjs', 'src/app/error.tsx', 'src/app/globals.css', 'src/app/layout.tsx',
+  'scripts/check_security_headers.mjs', 'scripts/check_stage1_security.mjs', 'scripts/stage1_integration_harness.mjs', 'scripts/foundation_invariants.mjs', 'scripts/sync_dinodia_contract_fixtures.mjs', 'scripts/native_migration_preservation.mjs', 'scripts/verify_native_v2_migration_target.mjs', 'src/app/error.tsx', 'src/app/globals.css', 'src/app/layout.tsx',
   'src/app/loading.tsx', 'src/app/not-found.tsx', 'src/app/page.tsx', 'src/lib/prisma.ts', 'supabase/config.toml',
   'tsconfig.json', 'src/app/api/readiness/route.ts', 'src/app/api/company/auth/bootstrap/complete/route.ts', 'src/app/api/company/auth/session/route.ts',
   'src/app/api/company/auth/bootstrap/route.ts', 'src/app/api/hub-agent/support/v2/redeem/route.ts', 'src/app/api/hub-agent/support/v2/revocation/route.ts', 'src/app/api/hub-agent/v2/pairing/cloud-url/route.ts',

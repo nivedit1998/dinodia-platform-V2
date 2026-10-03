@@ -16,10 +16,12 @@ test('Stage 3 preservation proof isolates only volatile ReplayNonce runtime chur
   const before = {
     rowCounts: { Home: '2', ReplayNonce: '4' },
     rowContentDigests: { Home: 'home-digest', ReplayNonce: 'nonce-before' },
+    columnContentDigests: { Home: { id: 'home-id', lifecycle: 'active' }, ReplayNonce: { id: 'nonce-id' } },
   };
   const after = {
     rowCounts: { Home: '2', ReplayNonce: '5', NewStage3Table: '0' },
     rowContentDigests: { Home: 'home-digest', ReplayNonce: 'nonce-after', NewStage3Table: '' },
+    columnContentDigests: { Home: { id: 'home-id', lifecycle: 'active' }, ReplayNonce: { id: 'nonce-id' }, NewStage3Table: { id: '' } },
   };
   assert.doesNotThrow(() => assertMigrationDoesNotReferenceVolatileRuntimeTables('CREATE TABLE "NewStage3Table" ("id" text);'));
   assert.deepEqual(compareExistingTablePreservation(before, after), {
@@ -31,6 +33,25 @@ test('Stage 3 preservation proof isolates only volatile ReplayNonce runtime chur
   assert.throws(() => compareExistingTablePreservation(before, { ...after, rowCounts: { ...after.rowCounts, Home: '3' } }), /nonvolatile.*row counts changed/);
   assert.throws(() => compareExistingTablePreservation(before, { ...after, rowContentDigests: { ...after.rowContentDigests, Home: 'changed' } }), /nonvolatile.*row content changed/);
   assert.throws(() => compareExistingTablePreservation(before, { rowCounts: { ReplayNonce: '4' }, rowContentDigests: { ReplayNonce: 'nonce-before' } }), /base-table inventory changed/);
+
+  const hubBefore = {
+    rowCounts: { HubInstallation: '1' },
+    rowContentDigests: { HubInstallation: 'hub-before' },
+    columnContentDigests: { HubInstallation: { id: 'id', lastSeenAt: 't1', onlineStateEvaluatedAt: 't1', updatedAt: 't1', baseUrl: 'endpoint1' } },
+  };
+  const hubAfter = {
+    rowCounts: { HubInstallation: '1' },
+    rowContentDigests: { HubInstallation: 'hub-after' },
+    columnContentDigests: { HubInstallation: { id: 'id', lastSeenAt: 't2', onlineStateEvaluatedAt: 't2', updatedAt: 't2', baseUrl: 'endpoint1' } },
+  };
+  assert.deepEqual(compareExistingTablePreservation(hubBefore, hubAfter).volatileChanges, [{
+    table: 'HubInstallation', rowCountChanged: false, rowContentChanged: true,
+    changedColumns: ['lastSeenAt', 'onlineStateEvaluatedAt', 'updatedAt'],
+  }]);
+  assert.throws(() => compareExistingTablePreservation(hubBefore, {
+    ...hubAfter,
+    columnContentDigests: { HubInstallation: { ...hubAfter.columnContentDigests.HubInstallation, baseUrl: 'endpoint2' } },
+  }), /HubInstallation\.baseUrl/);
 });
 
 function loadTypeScriptModule(relativePath, overrides = {}) {

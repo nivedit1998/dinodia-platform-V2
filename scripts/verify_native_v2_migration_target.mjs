@@ -52,6 +52,7 @@ async function inventory(client, baselineColumns = undefined) {
     const tables = await tx.$queryRawUnsafe("SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE' AND table_name <> '_prisma_migrations' ORDER BY table_name");
     const rowCounts = {};
     const rowContentDigests = {};
+    const columnContentDigests = {};
     const columnsByTable = {};
     for (const { table_name } of tables) {
       const identifier = `"${String(table_name).replaceAll('"', '""')}"`;
@@ -64,6 +65,14 @@ async function inventory(client, baselineColumns = undefined) {
       const rowJson = `jsonb_build_object(${pairs.join(',')})`;
       const content = await tx.$queryRawUnsafe(`SELECT md5(COALESCE(string_agg((${rowJson})::text, E'\\n' ORDER BY (${rowJson})::text), '')) AS digest FROM public.${identifier} AS row_record`);
       rowContentDigests[table_name] = content[0].digest;
+      const columnDigestExpressions = columns.map((column) => {
+        const jsonKey = String(column).replaceAll("'", "''");
+        const alias = String(column).replaceAll('"', '""');
+        const jsonValue = `to_jsonb(row_record)->'${jsonKey}'`;
+        return `md5(COALESCE(jsonb_agg(${jsonValue} ORDER BY (${jsonValue})::text)::text, '[]')) AS "${alias}"`;
+      });
+      const columnContent = await tx.$queryRawUnsafe(`SELECT ${columnDigestExpressions.join(',')} FROM public.${identifier} AS row_record`);
+      columnContentDigests[table_name] = columnContent[0];
     }
     const [labels, ownerCardinality, tenantOwners, activeAssignments, migrations, mismatchedDeviceHubs, mismatchedTenantGrants, mismatchedInvitationAreas, mismatchedRoomRequests, duplicateActiveRoomQrs, mismatchedClaimHubs, mismatchedClaimChallenges, mismatchedPendingSetups, mismatchedSupportMemberships, mismatchedSupportRequests, mismatchedSupportSessions, mismatchedSupportNotifications] = await Promise.all([
       tx.$queryRawUnsafe('SELECT count(*)::int AS count FROM public."NativeDevice" WHERE "customerLabel" IS NOT NULL AND char_length("customerLabel") > 40'),
@@ -102,7 +111,7 @@ async function inventory(client, baselineColumns = undefined) {
       supportSessionHomeMismatches: mismatchedSupportSessions[0].count,
       supportNotificationHomeMismatches: mismatchedSupportNotifications[0].count,
     };
-    return { rowCounts, rowContentDigests, columnsByTable, migrationRows: migrations, dataPreflight };
+    return { rowCounts, rowContentDigests, columnContentDigests, columnsByTable, migrationRows: migrations, dataPreflight };
   }, { maxWait: 10000, timeout: 120000 });
 }
 
