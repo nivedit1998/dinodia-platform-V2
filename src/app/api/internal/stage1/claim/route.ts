@@ -2,7 +2,7 @@ import crypto from 'node:crypto';
 import { NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
 import { requireEmployeeRecentAuth, Stage1AuthError, authErrorResponse } from '@/lib/stage1Auth';
-import { completeClaimSetup, recordQualifyingClaimMutation, redeemClaimContract, releaseExpiredClaim } from '@/lib/stage1ClaimContract';
+import { activatePendingInitialClaim, completeClaimSetup, correctRetainedAddressContract, readClaimAddressContract, recordQualifyingClaimMutation, redeemClaimContract, releaseExpiredClaim } from '@/lib/stage1ClaimContract';
 import { canonicalHubRequest, constantTimeEqual, sha256 } from '@/lib/stage1Crypto';
 
 export const dynamic = 'force-dynamic';
@@ -65,7 +65,11 @@ export async function POST(request: Request) {
       return NextResponse.json({ ok: true, ...(await redeemClaimContract({ reference: String(body.reference ?? ''), customerAccountId: account.id, emailVerified: Boolean(account.emailVerifiedAt) })) }, { headers: { 'Cache-Control': 'no-store' } });
     }
     if (action === 'mutate') return NextResponse.json({ ok: true, ...(await recordQualifyingClaimMutation(String(body.reservationId ?? ''), String(body.customerAccountId ?? ''), String(body.step ?? ''), body.mutation && typeof body.mutation === 'object' ? body.mutation as Record<string, unknown> : {})) }, { headers: { 'Cache-Control': 'no-store' } });
+    if (action === 'address') return NextResponse.json({ ok: true, ...(await readClaimAddressContract(String(body.reservationId ?? ''), String(body.customerAccountId ?? ''))) }, { headers: { 'Cache-Control': 'no-store' } });
+    if (action === 'correct_address') return NextResponse.json({ ok: true, ...(await correctRetainedAddressContract(String(body.homeId ?? ''), String(body.employeeId ?? ''), body.address && typeof body.address === 'object' ? body.address as Record<string, unknown> : {})) }, { headers: { 'Cache-Control': 'no-store' } });
+    if (action === 'get_help') return NextResponse.json({ ok: true, authorityChanged: false, next: 'SUPPORT' }, { headers: { 'Cache-Control': 'no-store' } });
     if (action === 'complete') return NextResponse.json(await completeClaimSetup(String(body.reservationId ?? ''), String(body.customerAccountId ?? '')), { headers: { 'Cache-Control': 'no-store' } });
+    if (action === 'activate') return NextResponse.json(await activatePendingInitialClaim(String(body.reservationId ?? ''), String(body.customerAccountId ?? '')), { headers: { 'Cache-Control': 'no-store' } });
     if (action === 'release') {
       const employee = await requireEmployeeRecentAuth(request, ['CXO', 'SENIOR_OPERATIONS_MANAGER', 'INSTALLER']);
       return NextResponse.json({ ok: true, ...(await releaseExpiredClaim(String(body.reservationId ?? ''), { employeeId: employee.id, reason: String(body.reason ?? '').trim().slice(0, 500) })) }, { headers: { 'Cache-Control': 'no-store' } });

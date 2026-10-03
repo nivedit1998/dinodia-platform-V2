@@ -1,7 +1,9 @@
 import fs from 'node:fs';
+import crypto from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
-import { execFileSync, spawnSync } from 'node:child_process';
+import { execFileSync, spawn, spawnSync } from 'node:child_process';
+import net from 'node:net';
 
 const sourceRoot = process.cwd();
 const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'dinodia-v2-clean-source-'));
@@ -13,6 +15,8 @@ const independentDatabaseUrl = `postgresql://postgres:${databasePassword}@127.0.
 const upgradeDatabaseUrl = `postgresql://postgres:${databasePassword}@127.0.0.1:${dockerPort}/dinodia_v2_foundation_upgrade`;
 const priorHeadDatabaseUrl = `postgresql://postgres:${databasePassword}@127.0.0.1:${dockerPort}/dinodia_v2_prior_stage3`;
 const priorHeadMigrationRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'dinodia-v2-prior-head-migrations-'));
+const rollbackRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'dinodia-v2-schema-compatible-rollback-'));
+const schemaCompatibleRollbackCommit = '0f6bcdcdb6cf465f906e08ed366b427e1772a741';
 let dockerStarted = false;
 
 function safeProcessEnvironment() {
@@ -123,6 +127,40 @@ function cleanup() {
   if (dockerStarted) spawnSync('docker', ['rm', '-f', dockerName], { stdio: 'ignore' });
   fs.rmSync(tempRoot, { recursive: true, force: true });
   fs.rmSync(priorHeadMigrationRoot, { recursive: true, force: true });
+  fs.rmSync(rollbackRoot, { recursive: true, force: true });
+}
+
+async function freePort() {
+  const server = net.createServer();
+  await new Promise((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve); });
+  const port = server.address().port;
+  await new Promise((resolve) => server.close(resolve));
+  return port;
+}
+
+async function probeApplication(source, env) {
+  const port = await freePort();
+  const child = spawn(process.execPath, ['node_modules/next/dist/bin/next', 'start', '-p', String(port)], { cwd: source, env, stdio: 'ignore' });
+  try {
+    let result;
+    for (let attempt = 0; attempt < 60; attempt += 1) {
+      if (child.exitCode !== null) throw new Error('application rollback candidate exited before readiness');
+      try {
+        const response = await fetch(`http://127.0.0.1:${port}/api/readiness`);
+        const body = await response.json();
+        if (response.status === 200 && body.ready === true) { result = body; break; }
+      } catch { /* Startup may not have bound its loopback port yet. */ }
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    }
+    if (!result) throw new Error('application did not become schema-ready on the disposable Stage 3 database');
+    const denied = await fetch(`http://127.0.0.1:${port}/api/v2/session`);
+    if (denied.status !== 401) throw new Error('schema-compatible application did not preserve the anonymous customer boundary');
+    return result;
+  } finally {
+    child.kill('SIGTERM');
+    await new Promise((resolve) => { if (child.exitCode !== null) resolve(); else { child.once('exit', resolve); setTimeout(resolve, 2000); } });
+    if (child.exitCode === null) child.kill('SIGKILL');
+  }
 }
 
 try {
@@ -268,6 +306,29 @@ WHERE "id" = '00000000-0000-4000-8000-000000001001';
   run('npm', ['run', 'typecheck'], { cwd: tempRoot, env: localEnv });
   run('npm', ['test'], { cwd: tempRoot, env: localEnv });
   run('npm', ['run', 'build'], { cwd: tempRoot, env: localEnv });
+  // A pre-Stage-3 binary expects the old migration head and cannot be a
+  // rollback after this additive schema is installed. Rehearse the actual
+  // current Production source (HEAD) and the forward candidate against the
+  // SAME migrated disposable database, with a retained row between them.
+  const rollbackArchive = execFileSync('git', ['archive', '--format=tar', schemaCompatibleRollbackCommit], { cwd: sourceRoot, maxBuffer: 64 * 1024 * 1024 });
+  runWithInput('tar', ['-xf', '-', '-C', rollbackRoot], rollbackArchive);
+  // Next/Turbopack will not compile a node_modules symlink outside this
+  // isolated source root. Install the immutable HEAD snapshot independently.
+  run('npm', ['ci'], { cwd: rollbackRoot, env: { ...safeProcessEnvironment(), CI: '1', NODE_ENV: 'test' } });
+  fs.mkdirSync(path.join(rollbackRoot, '.vercel'), { recursive: true });
+  fs.copyFileSync(path.join(tempRoot, '.vercel/project.json'), path.join(rollbackRoot, '.vercel/project.json'));
+  const migrationChecksum = crypto.createHash('sha256').update(fs.readFileSync(path.join(tempRoot, 'prisma/migrations/20261003000000_native_v2_stage3_domain_schema/migration.sql'))).digest('hex');
+  const applicationEnv = { ...localEnv, NODE_ENV: 'production', NEXT_PUBLIC_APP_URL: 'https://dinodia-platform-v2.vercel.app', FOUNDATION_MIGRATION_CHECKSUM: migrationChecksum };
+  run('npm', ['run', 'build'], { cwd: rollbackRoot, env: applicationEnv });
+  const markerId = crypto.randomUUID();
+  runWithInput('docker', ['exec', '-i', dockerName, 'psql', '-U', 'postgres', '-d', 'dinodia_v2_foundation', '-v', 'ON_ERROR_STOP=1'], `INSERT INTO "Home" ("id", "lifecycle", "installationStatus", "updatedAt") VALUES ('${markerId}', 'INSTALLING', 'DRAFT', CURRENT_TIMESTAMP);`);
+  const markerCount = () => capture('docker', ['exec', dockerName, 'psql', '-U', 'postgres', '-d', 'dinodia_v2_foundation', '-At', '-c', `SELECT count(*) FROM "Home" WHERE "id" = '${markerId}'`]).trim();
+  if (markerCount() !== '1') throw new Error('disposable rollback preservation marker could not be seeded');
+  await probeApplication(rollbackRoot, applicationEnv);
+  if (markerCount() !== '1') throw new Error('schema-compatible rollback application changed the disposable preservation marker');
+  await probeApplication(tempRoot, applicationEnv);
+  if (markerCount() !== '1') throw new Error('forward-recovered application changed the disposable preservation marker');
+  console.log(`[clean-clone:check] PASS: schema-compatible Production rollback source ${schemaCompatibleRollbackCommit.slice(0, 12)} (deployment dpl_9rUrz9a7BkcPgxcsg9UotLF6dCGv) and forward candidate both returned readiness 200 and anonymous denial 401 on the SAME Stage 3 schema; disposable row survived both`);
   run('npm', ['run', 'test:stage1'], { cwd: tempRoot, env: localEnv });
   run('node', ['scripts/schema_fingerprint.mjs'], { cwd: tempRoot, env: localEnv });
   console.log(`[clean-clone:check] OK: reconstructed ${files.length} intended files, installed, migrated, tested and built in ${tempRoot}`);
