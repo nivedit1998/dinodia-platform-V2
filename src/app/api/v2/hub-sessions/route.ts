@@ -46,6 +46,12 @@ export async function POST(request: Request) {
       const code = error instanceof NativeAccessDenied ? error.code.toLowerCase() : 'home_membership_forbidden';
       throw new Stage1AuthError(status, code, 'The selected home is not available to this account');
     }
+    // Native OS bearer sessions are a tenant live-control capability, not a
+    // read-only homeowner/manager shortcut. Those roles use the bounded
+    // Platform projection and never receive a direct hub endpoint or token.
+    if (membership.role !== 'TENANT') {
+      throw new Stage1AuthError(403, 'hub_session_tenant_required', 'Direct Dinodia OS sessions are available only to an active tenant membership');
+    }
     const now = Math.floor(Date.now() / 1000);
     const hubEndpoint = verifiedHubEndpoint({ cloudUrl: membership.cloudUrl, cloudUrlVerifiedAt: membership.cloudUrlVerifiedAt, remoteVerificationAt: membership.remoteVerificationAt, reservedHostname: membership.reservedHostname }, new Date(now * 1000));
     const privatePem = String(process.env.DINODIA_APP_SESSION_PRIVATE_KEY ?? '').replaceAll('\\n', '\n');

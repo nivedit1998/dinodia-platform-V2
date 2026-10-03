@@ -143,6 +143,20 @@ function keyPair() {
     publicKey: pair.publicKey.export({ type: 'spki', format: 'pem' }).toString(),
   };
 }
+function signedHarnessAppToken(claims, privateKeyPem) {
+  const encode = (value) => Buffer.from(JSON.stringify(value), 'utf8').toString('base64url');
+  const header = encode({ alg: 'EdDSA', typ: 'DNO-APP-1', v: 1 });
+  const payload = encode({
+    iss: 'dinodia-platform-v2', aud: `dinodia-hub:${claims.hubInstallationId}`,
+    sub: claims.accountId, sid: claims.sessionId, jti: crypto.randomBytes(24).toString('base64url'),
+    homeId: claims.homeId, membershipId: claims.membershipId, trustedDeviceId: claims.trustedDeviceId,
+    hubInstallationId: claims.hubInstallationId, householdRole: claims.role, areaIds: claims.areaIds || [],
+    policyRevision: claims.policyRevision || 0, scope: claims.scope,
+    iat: Math.floor(Date.now() / 1000), exp: Math.floor(Date.now() / 1000) + 300,
+  });
+  const input = `${header}.${payload}`;
+  return `dno-app-1.${input}.${crypto.sign(null, Buffer.from(input), crypto.createPrivateKey(privateKeyPem)).toString('base64url')}`;
+}
 const harnessManufacturingRoot = keyPair();
 function x25519KeyPair() {
   const pair = crypto.generateKeyPairSync('x25519');
@@ -775,12 +789,23 @@ async function customerAuthorizationChecks(deliveryEnv) {
   if (noSessionHubToken.response.status !== 401 || noSessionHubToken.body.error?.code !== 'AUTH_REQUIRED' || Object.hasOwn(noSessionHubToken.body, 'errorCode')) fail('Hub session issuance did not use the canonical authentication boundary');
   const tenantClaims = JSON.parse(Buffer.from(tenantToken.body.token.split('.')[2], 'base64url').toString('utf8'));
   if (JSON.stringify(tenantClaims.areaIds) !== JSON.stringify([areaOne.id]) || tenantClaims.areaIds.includes(areaOne.osAreaId) || Object.hasOwn(tenantClaims, 'areaBindings') || Object.hasOwn(tenantClaims, 'osAreaId')) fail('Customer bearer did not contain only canonical Area IDs and leaked no private hub alias');
-  const ownerToken = await issue(homeTwo.id);
-  assertHubSession(ownerToken, homeTwo.id, ownerMembership.id, 'Second-home owner session', 'https://dinodia-harness-two.dinodiasmartliving.com');
-  const propertyToken = await issueProperty();
-  assertHubSession(propertyToken, homeOne.id, propertyMembership.id, 'Homeowner session', 'https://dinodia-harness-one.dinodiasmartliving.com');
-  const managerToken = await issueManager();
-  assertHubSession(managerToken, homeOne.id, managerMembership.id, 'Property-manager session', 'https://dinodia-harness-one.dinodiasmartliving.com');
+  const ownerSessionDenied = await issue(homeTwo.id);
+  const propertySessionDenied = await issueProperty();
+  const managerSessionDenied = await issueManager();
+  for (const [label, denied] of [['second-home owner', ownerSessionDenied], ['homeowner', propertySessionDenied], ['property manager', managerSessionDenied]]) {
+    if (denied.response.status !== 403 || denied.body.error?.code !== 'SCOPE_DENIED' || Object.hasOwn(denied.body, 'token')) fail(`${label} received a direct Native OS token (${denied.response.status})`);
+  }
+  // These signed role tokens exist only inside the disposable integration
+  // harness so the OS is exercised against adversarial principals that the
+  // real Platform route correctly refuses to issue.
+  const ownerToken = { body: { token: signedHarnessAppToken({ accountId: account.id, sessionId: tenantClaims.sid, homeId: homeTwo.id, membershipId: ownerMembership.id, trustedDeviceId: trusted.id, hubInstallationId: hubTwo.id, role: 'OWNER', areaIds: [], policyRevision: 0, scope: ['property:read'] }, deliveryEnv.DINODIA_APP_SESSION_PRIVATE_KEY) } };
+  const propertyToken = { body: { token: signedHarnessAppToken({ accountId: propertyAccount.id, sessionId: propertySession.id, homeId: homeOne.id, membershipId: propertyMembership.id, trustedDeviceId: propertyTrusted.id, hubInstallationId: hubOne.id, role: 'OWNER', areaIds: [], policyRevision: 0, scope: ['property:read'] }, deliveryEnv.DINODIA_APP_SESSION_PRIVATE_KEY) } };
+  const managerToken = { body: { token: signedHarnessAppToken({ accountId: managerAccount.id, sessionId: managerSession.id, homeId: homeOne.id, membershipId: managerMembership.id, trustedDeviceId: managerTrusted.id, hubInstallationId: hubOne.id, role: 'PROPERTY_MANAGER', areaIds: [], policyRevision: 0, scope: ['property:read'] }, deliveryEnv.DINODIA_APP_SESSION_PRIVATE_KEY) } };
+  const [currentOwnerMembership, currentOwnerHub] = await Promise.all([
+    prisma.homeMembership.findUniqueOrThrow({ where: { id: ownerMembership.id }, select: { accessRevision: true } }),
+    prisma.hubInstallation.findUniqueOrThrow({ where: { id: hubTwo.id }, select: { accessPolicyRevision: true } }),
+  ]);
+  const ownerOfflineToken = signedHarnessAppToken({ accountId: account.id, sessionId: tenantClaims.sid, homeId: homeTwo.id, membershipId: ownerMembership.id, trustedDeviceId: trusted.id, hubInstallationId: hubTwo.id, role: 'OWNER', areaIds: [], policyRevision: Math.max(currentOwnerMembership.accessRevision, currentOwnerHub.accessPolicyRevision), scope: ['property:read'] }, deliveryEnv.DINODIA_APP_SESSION_PRIVATE_KEY);
   const wrongHomeHubSession = await issue(crypto.randomUUID());
   const extraFieldHubSession = await fetchJson(`${base}/api/v2/hub-sessions`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-session': rawSession }, body: JSON.stringify({ homeId: homeOne.id, membershipId: tenantMembership.id }) });
   if (wrongHomeHubSession.response.status !== 403 || wrongHomeHubSession.body.error?.code !== 'SCOPE_DENIED' || Object.hasOwn(wrongHomeHubSession.body || {}, 'token') || extraFieldHubSession.response.status !== 400 || extraFieldHubSession.body.error?.code !== 'VALIDATION_FAILED' || Object.hasOwn(extraFieldHubSession.body || {}, 'token')) fail(`Selected-home session contract mismatch (wrong-home=${wrongHomeHubSession.response.status}/${wrongHomeHubSession.body?.error?.code || 'none'}, extra-field=${extraFieldHubSession.response.status}/${extraFieldHubSession.body?.error?.code || 'none'})`);
@@ -796,8 +821,8 @@ async function customerAuthorizationChecks(deliveryEnv) {
   if (revocableToken.response.status !== 200 || !revocableToken.body.token) fail(`Second enrolled test phone did not receive its real customer token (${revocableToken.response.status})`);
   const revocableOffline = await fetchJson(`${base}/api/v2/offline-authorisations`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-app-token': revocableToken.body.token }, body: JSON.stringify({ trustedDeviceId: revocableTrustedDevice.id, publicKey: revocablePhone.publicKey }) });
   if (revocableOffline.response.status !== 200 || revocableOffline.body.authorisation?.trustedDeviceId !== revocableTrustedDevice.id) fail(`Second phone did not receive a durable Platform offline authorisation (${revocableOffline.response.status})`);
-  const ownerOffline = await fetchJson(`${base}/api/v2/offline-authorisations`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-app-token': ownerToken.body.token }, body: JSON.stringify({ trustedDeviceId: trusted.id, publicKey: phone.publicKey }) });
-  if (ownerOffline.response.status !== 403) fail(`Owner received offline household command authority (${ownerOffline.response.status})`);
+  const ownerOffline = await fetchJson(`${base}/api/v2/offline-authorisations`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-app-token': ownerOfflineToken }, body: JSON.stringify({ trustedDeviceId: trusted.id, publicKey: phone.publicKey }) });
+  if (ownerOffline.response.status !== 403) fail(`Owner direct-to-OS authority denial mismatch (HTTP ${ownerOffline.response.status}, ${String(ownerOffline.body?.error?.code || 'no canonical code')})`);
   const wrongPhone = await fetchJson(`${base}/api/v2/offline-authorisations`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-app-token': tenantToken.body.token }, body: JSON.stringify({ trustedDeviceId: crypto.randomUUID(), publicKey: phone.publicKey }) });
   if (wrongPhone.response.status !== 403) fail(`Wrong trusted device was accepted for offline authority (${wrongPhone.response.status})`);
 
