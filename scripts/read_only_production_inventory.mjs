@@ -7,6 +7,25 @@ import dotenv from "dotenv";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const projectRef = "fppzzesvukjbsfmxmfxe";
+const nativeOperationsProductionUrl = "https://dinodia-platform-v2.vercel.app/api/cron/native-operations";
+
+// Intentionally compare the complete frozen value. Never include the supplied
+// value in an error or inventory result: this URL is stored in Production Vault.
+export function isExactNativeOperationsUrl(value) {
+  if (typeof value !== "string" || value !== nativeOperationsProductionUrl) return false;
+  try {
+    const parsed = new URL(value);
+    return parsed.protocol === "https:"
+      && parsed.hostname === "dinodia-platform-v2.vercel.app"
+      && parsed.pathname === "/api/cron/native-operations"
+      && parsed.search === ""
+      && parsed.hash === ""
+      && parsed.username === ""
+      && parsed.password === "";
+  } catch {
+    return false;
+  }
+}
 
 export function databaseProjectRef(raw, target) {
   let url;
@@ -156,14 +175,23 @@ export async function collectReadOnlyInventory(client, { sourceRoot, target, edg
       const decryptedRefs = await optionalRead(tx, "safe_vault_decrypted_reference_inventory", () => tx.$queryRawUnsafe(
         "SELECT count(*) FILTER (WHERE name = 'DINODIA_NATIVE_OPERATIONS_URL')::int AS url_reference_present, count(*) FILTER (WHERE name = 'DINODIA_NATIVE_OPERATIONS_CRON_SECRET')::int AS secret_reference_present FROM vault.decrypted_secrets WHERE name IN ('DINODIA_NATIVE_OPERATIONS_URL', 'DINODIA_NATIVE_OPERATIONS_CRON_SECRET')",
       ));
-      vault.readable = result.readable && decryptedRefs.readable;
-      if (vault.readable) vault.value = { stored: result.value[0], decryptedViewReferences: decryptedRefs.value[0] };
+      const exactUrl = await optionalRead(tx, "safe_vault_exact_operations_url", () => tx.$queryRawUnsafe(
+        "SELECT count(*) FILTER (WHERE name = 'DINODIA_NATIVE_OPERATIONS_URL')::int AS url_reference_count, count(*) FILTER (WHERE name = 'DINODIA_NATIVE_OPERATIONS_URL' AND decrypted_secret = $1)::int AS exact_url_match_count FROM vault.decrypted_secrets WHERE name = 'DINODIA_NATIVE_OPERATIONS_URL'",
+        nativeOperationsProductionUrl,
+      ));
+      vault.readable = result.readable && decryptedRefs.readable && exactUrl.readable;
+      if (vault.readable) vault.value = {
+        stored: result.value[0],
+        decryptedViewReferences: decryptedRefs.value[0],
+        exactUrl: exactUrl.value[0],
+      };
     }
 
     const local = localTopology(sourceRoot, { edgeWorkerConfigPath });
     const productionOperation = cron.value?.[0] ?? null;
     const vaultRefs = vault.value?.stored;
     const decryptedRefs = vault.value?.decryptedViewReferences;
+    const exactUrl = vault.value?.exactUrl;
     const safeHubStates = summarizeHubRuntime(hubStates);
     const safeIdentities = identityStates.map((row) => ({ status: row.status, generation: row.generation, count: row.count }));
 
@@ -198,6 +226,9 @@ export async function collectReadOnlyInventory(client, { sourceRoot, target, edg
         vaultSecretReferencePresent: vaultRefs ? Number(vaultRefs.secret_reference_present) > 0 : null,
         decryptedUrlReferencePresent: decryptedRefs ? Number(decryptedRefs.url_reference_present) > 0 : null,
         decryptedSecretReferencePresent: decryptedRefs ? Number(decryptedRefs.secret_reference_present) > 0 : null,
+        nativeOperationsUrlExact: exactUrl
+          ? Number(exactUrl.url_reference_count) === 1 && Number(exactUrl.exact_url_match_count) === 1
+          : null,
       },
     };
   }, { maxWait: 10000, timeout: 30000 });
@@ -227,7 +258,7 @@ async function main() {
       || inventory.scheduler.expectedOperationsDispatchJobs !== 1 || !inventory.scheduler.dispatchReferencesMatch
       || !inventory.scheduler.vaultReferenceInventoryReadable || !inventory.scheduler.vaultUrlReferencePresent
       || !inventory.scheduler.vaultSecretReferencePresent || !inventory.scheduler.decryptedUrlReferencePresent
-      || !inventory.scheduler.decryptedSecretReferencePresent) process.exitCode = 2;
+      || !inventory.scheduler.decryptedSecretReferencePresent || inventory.scheduler.nativeOperationsUrlExact !== true) process.exitCode = 2;
   } finally {
     await client.$disconnect();
   }

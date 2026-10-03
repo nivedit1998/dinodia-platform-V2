@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import path from "node:path";
 import fs from "node:fs";
 import os from "node:os";
-import { databaseProjectRef, localTopology, summarizeHubRuntime, validateReadOnlyProductionTargets, collectReadOnlyInventory } from "../scripts/read_only_production_inventory.mjs";
+import { databaseProjectRef, isExactNativeOperationsUrl, localTopology, summarizeHubRuntime, validateReadOnlyProductionTargets, collectReadOnlyInventory } from "../scripts/read_only_production_inventory.mjs";
 
 const target = {
   supabaseProjectRef: "fppzzesvukjbsfmxmfxe",
@@ -23,6 +23,22 @@ test("read-only inventory accepts only TLS connections bound to the approved V2 
     [direct.replace("/postgres?", "/different?"), pooled],
     ["https://db.fppzzesvukjbsfmxmfxe.supabase.co/postgres", pooled],
   ]) assert.throws(() => validateReadOnlyProductionTargets({ databaseUrl: rejected[0], directUrl: rejected[1], target }));
+});
+
+test("native operations Vault URL must exactly match the frozen HTTPS endpoint with no query or fragment", () => {
+  const canonical = "https://dinodia-platform-v2.vercel.app/api/cron/native-operations";
+  assert.equal(isExactNativeOperationsUrl(canonical), true);
+  for (const rejected of [
+    undefined,
+    null,
+    "",
+    `${canonical}?x-vercel-protection-bypass=never-print-this-value`,
+    "https://alternate.example/api/cron/native-operations",
+    "https://dinodia-platform-v2.vercel.app/api/cron/other",
+    `${canonical}#fragment`,
+    "https://user:password@dinodia-platform-v2.vercel.app/api/cron/native-operations",
+    `${canonical}/`,
+  ]) assert.equal(isExactNativeOperationsUrl(rejected), false);
 });
 
 test("read-only inventory opens an explicitly read-only transaction and never selects secret values", async (t) => {
@@ -50,6 +66,41 @@ test("read-only inventory opens an explicitly read-only transaction and never se
   assert.equal(result.schema.publicBaseTableCount, 44);
   assert.ok(statements.every((sql) => !/SELECT\s+[^;]*decrypted_secret\b/i.test(sql)));
   assert.ok(statements.every((sql) => !/\b(?:INSERT|UPDATE|DELETE|ALTER|DROP|TRUNCATE|CREATE)\b/i.test(sql)));
+});
+
+test("Production inventory exposes only exact-URL booleans and rejects a Vault bypass value", async (t) => {
+  const sourceRoot = path.resolve(".");
+  const workerFixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), "dinodia-stage2-worker-config-"));
+  t.after(() => fs.rmSync(workerFixtureRoot, { recursive: true, force: true }));
+  const edgeWorkerConfigPath = path.join(workerFixtureRoot, "wrangler.toml");
+  fs.writeFileSync(edgeWorkerConfigPath, 'name = "fixture-worker"\n');
+
+  for (const exactMatchCount of [1, 0]) {
+    const statements = [];
+    const fakeTx = {
+      async $executeRawUnsafe(sql) { statements.push(sql); return 0; },
+      async $queryRawUnsafe(sql, ...parameters) {
+        statements.push(sql);
+        assert.ok(!/SELECT\s+[^;]*decrypted_secret\b/i.test(sql) || /count\(\*\) FILTER/i.test(sql));
+        if (sql.includes("_prisma_migrations")) return [];
+        if (sql.includes("to_regclass('cron.job')")) return [{ available: false }];
+        if (sql.includes("to_regclass('vault.secrets')")) return [{ secrets_available: true, decrypted_view_available: true }];
+        if (sql.includes("FROM vault.secrets")) return [{ url_reference_present: 1, secret_reference_present: 1 }];
+        if (sql.includes("FROM vault.decrypted_secrets") && sql.includes("decrypted_secret = $1")) {
+          assert.deepEqual(parameters, ["https://dinodia-platform-v2.vercel.app/api/cron/native-operations"]);
+          return [{ url_reference_count: 1, exact_url_match_count: exactMatchCount }];
+        }
+        if (sql.includes("FROM vault.decrypted_secrets")) return [{ url_reference_present: 1, secret_reference_present: 1 }];
+        if (sql.includes("information_schema.tables")) return [{ count: 44 }];
+        return [];
+      },
+    };
+    const fakeClient = { async $transaction(callback) { return callback(fakeTx); } };
+    const result = await collectReadOnlyInventory(fakeClient, { sourceRoot, target, edgeWorkerConfigPath });
+    assert.equal(result.scheduler.nativeOperationsUrlExact, exactMatchCount === 1);
+    assert.equal(JSON.stringify(result).includes("x-vercel-protection-bypass"), false);
+    assert.ok(statements.every((sql) => !/\b(?:INSERT|UPDATE|DELETE|ALTER|DROP|TRUNCATE|CREATE)\b/i.test(sql)));
+  }
 });
 
 test("local scheduler evidence requires one daily Vercel maintenance schedule and no Worker cron", (t) => {
