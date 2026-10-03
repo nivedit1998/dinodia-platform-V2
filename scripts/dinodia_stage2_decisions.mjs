@@ -1,4 +1,38 @@
+import fs from 'node:fs';
+
 const clone = (value) => structuredClone(value);
+const decisionRegister = JSON.parse(fs.readFileSync(new URL('../contracts/dinodia-v1/decisions.json', import.meta.url), 'utf8'));
+
+export function assertAccountRelationshipLifecycle(value) {
+  const identity = decisionRegister.identityLifecycle;
+  const retaining = identity.accountRetainingRelationshipKinds;
+  const nonRetaining = identity.accountNonRetainingRelationshipKinds;
+  assert(value?.schemaVersion === decisionRegister.version &&
+    Array.isArray(value.retainedRelationshipKinds) && Array.isArray(value.nonRetainingKinds) &&
+    JSON.stringify(value.retainedRelationshipKinds) === JSON.stringify(retaining) &&
+    JSON.stringify(value.nonRetainingKinds) === JSON.stringify(nonRetaining),
+  'account relationship fixture taxonomy differs from the canonical decision register');
+
+  const known = new Set([...retaining, ...nonRetaining]);
+  const caseIds = new Set();
+  assert(Array.isArray(value.cases) && value.cases.length > 0, 'account relationship fixture has no executable cases');
+  for (const item of value.cases) {
+    assert(typeof item.id === 'string' && item.id.length > 0 && !caseIds.has(item.id),
+      'account relationship fixture has an invalid or duplicate case ID');
+    caseIds.add(item.id);
+    assert(Array.isArray(item.remainingRelationships) &&
+      new Set(item.remainingRelationships).size === item.remainingRelationships.length &&
+      item.remainingRelationships.every((kind) => known.has(kind)),
+    `account relationship ${item.id} has an unknown or duplicate relationship kind`);
+    const retained = item.remainingRelationships.some((kind) => retaining.includes(kind));
+    const actual = retained ? 'ACCOUNT_RETAINED' : 'ACCOUNT_AND_ACCOUNT_SCOPED_STATE_DELETED';
+    assert(item.expected === actual, `account relationship ${item.id} expected ${item.expected}, got ${actual}`);
+  }
+  assert(value.tenantSelfRemoval?.preservesOtherHomeMemberships === true &&
+    value.tenantSelfRemoval?.removesOnlySelectedMembership === true,
+  'tenant account removal must remain membership-scoped');
+  return { cases: caseIds.size };
+}
 
 export function offlineScopeAllowed(grant, requested) {
   return Boolean(grant && requested &&
@@ -336,7 +370,7 @@ function isCalendarValidUtcTimestamp(value) {
   return day >= 1 && day <= daysInMonth && Number.isFinite(Date.parse(value));
 }
 
-export function assertStage2DecisionFixtures({ support, receipt, offline, decisionMatrix, claim }) {
+export function assertStage2DecisionFixtures({ support, receipt, offline, decisionMatrix, claim, accountRelationshipLifecycle }) {
   const privateRecipients = projectPrivateSupportRecipients(support);
   if (!privateRecipients || JSON.stringify(privateRecipients) !== JSON.stringify(support.expectedPrivateRecipients) ||
       privateRecipients.some((id) => id === "membership:owner-a") || support.expectedPrivateRecipients.includes("membership:owner-a")) {
@@ -351,6 +385,7 @@ export function assertStage2DecisionFixtures({ support, receipt, offline, decisi
   }
   assertDecisionMatrix(decisionMatrix);
   simulateClaimLifecycle(claim);
+  if (accountRelationshipLifecycle) assertAccountRelationshipLifecycle(accountRelationshipLifecycle);
   return true;
 }
 
@@ -365,22 +400,93 @@ function deniedWithNoEffects(denied, label) {
   return { outcome: "denied", protectedEffects };
 }
 
+export function projectAutomationPropertyImpact(fixture, request) {
+  const denied = { decision: "DENIED_NO_PROJECTION", projection: { automations: [] }, protectedEffects: 0 };
+  const keysEqual = (value, expected) => value && typeof value === "object" && !Array.isArray(value) &&
+    Object.keys(value).length === expected.length && expected.every((key) => Object.hasOwn(value, key));
+  const boundedText = (value, maximum) => typeof value === "string" && Array.from(value).length <= maximum;
+  const opaqueId = (value) => boundedText(value, 160) && value.trim().length > 0;
+  if (!keysEqual(fixture, ["schemaVersion", "homes", "cases"]) || fixture.schemaVersion !== "dinodia.v1" ||
+      !request || request.membershipCurrent !== true ||
+      !["OWNER", "PROPERTY_MANAGER"].includes(request.role) || typeof request.homeId !== "string" ||
+      typeof request.membershipId !== "string" || !opaqueId(request.homeId) || !opaqueId(request.membershipId)) return denied;
+
+  const homes = fixture.homes;
+  if (!Array.isArray(homes) || homes.some((home) => !keysEqual(home, ["homeId", "revision", "ownerMembershipIds", "managerMembershipIds", "automations"])) ||
+      homes.filter((home) => home?.homeId === request.homeId).length !== 1) return denied;
+  const home = homes.find((candidate) => candidate.homeId === request.homeId);
+  const authorisedMemberships = request.role === "OWNER" ? home.ownerMembershipIds : home.managerMembershipIds;
+  if (!Number.isInteger(home.revision) || home.revision < 0 || !Array.isArray(authorisedMemberships) ||
+      new Set(authorisedMemberships).size !== authorisedMemberships.length ||
+      authorisedMemberships.some((id) => !opaqueId(id)) || !authorisedMemberships.includes(request.membershipId)) return denied;
+  if (!Array.isArray(home.automations) || home.automations.length > 100) return denied;
+
+  const automationIds = home.automations.map((automation) => automation?.automationId);
+  if (automationIds.some((id) => !opaqueId(id)) || new Set(automationIds).size !== automationIds.length) return denied;
+  const projected = [];
+  for (const automation of home.automations) {
+    if (!keysEqual(automation, ["automationId", "homeId", "tenantName", "name", "schedule", "targets"]) ||
+        automation.homeId !== home.homeId || !opaqueId(automation.automationId) || !boundedText(automation.name, 60) || !automation.name.trim() ||
+        !boundedText(automation.tenantName, 80) || !automation.tenantName.trim() ||
+        !keysEqual(automation.schedule, ["timezone", "daysOfWeek", "localTime"]) ||
+        !Array.isArray(automation.schedule.daysOfWeek) || !automation.schedule.daysOfWeek.length ||
+        new Set(automation.schedule.daysOfWeek).size !== automation.schedule.daysOfWeek.length ||
+        automation.schedule.daysOfWeek.some((day) => !Number.isInteger(day) || day < 1 || day > 7) ||
+        typeof automation.schedule.localTime !== "string" || !/^(?:[01]\d|2[0-3]):[0-5]\d$/.test(automation.schedule.localTime) ||
+        !boundedText(automation.schedule.timezone, 64) || !automation.schedule.timezone.trim() ||
+        !Array.isArray(automation.targets)) return denied;
+    try { new Intl.DateTimeFormat("en", { timeZone: automation.schedule.timezone }); } catch { return denied; }
+    const targetIds = automation.targets.map((target) => target?.deviceId);
+    if (targetIds.some((id) => !opaqueId(id)) || new Set(targetIds).size !== targetIds.length ||
+        automation.targets.some((target) => {
+          const allowedKeys = target?.managementClass === "tenant_device"
+            ? ["deviceId", "managementClass", "displayName", "privateActionValue"]
+            : ["deviceId", "managementClass", "displayName"];
+          return !keysEqual(target, allowedKeys) || !["property_device", "tenant_device"].includes(target.managementClass) ||
+            !boundedText(target.displayName, 80) || !target.displayName.trim() ||
+            (Object.hasOwn(target, "privateActionValue") &&
+              (typeof target.privateActionValue !== "string" || Array.from(target.privateActionValue).length > 240));
+        })) return denied;
+    const permanentDevices = automation.targets
+      .filter((target) => target.managementClass === "property_device")
+      .map((target) => ({ deviceId: target.deviceId, displayName: target.displayName }))
+      .sort((left, right) => left.deviceId.localeCompare(right.deviceId));
+    if (permanentDevices.length === 0) continue;
+    projected.push({
+      automationId: automation.automationId,
+      tenantName: automation.tenantName,
+      name: automation.name,
+      schedule: {
+        timezone: automation.schedule.timezone,
+        daysOfWeek: [...automation.schedule.daysOfWeek],
+        localTime: automation.schedule.localTime,
+      },
+      affectedPermanentDevices: permanentDevices,
+      availableActions: ["disable", "delete"],
+      stepUpRequired: true,
+    });
+  }
+  projected.sort((left, right) => left.automationId.localeCompare(right.automationId));
+  return {
+    decision: "PROJECTED",
+    projection: {
+      schemaVersion: "dinodia.v1",
+      homeId: home.homeId,
+      membershipId: request.membershipId,
+      role: request.role,
+      revision: home.revision,
+      automations: projected,
+    },
+    protectedEffects: 0,
+  };
+}
+
 function executeSemanticFixture(path, value, adapters) {
   const { os, platform, alexa, schema, analytics } = adapters;
   const result = (outcome, details = {}) => ({ outcome, ...details });
   switch (path) {
     case "account-relationship-lifecycle.json": {
-      const retained = new Set(value.retainedRelationshipKinds);
-      const cases = value.cases.map((item) => {
-        const actual = item.remainingRelationships.some((kind) => retained.has(kind))
-          ? "ACCOUNT_RETAINED" : "ACCOUNT_AND_ACCOUNT_SCOPED_STATE_DELETED";
-        assert(item.expected === actual, `account relationship ${item.id} expected ${item.expected}, got ${actual}`);
-        return actual;
-      });
-      assert(value.tenantSelfRemoval.preservesOtherHomeMemberships === true &&
-        value.tenantSelfRemoval.removesOnlySelectedMembership === true,
-      "tenant removal must be membership-scoped");
-      return result("accepted", { cases: cases.length });
+      return result("accepted", assertAccountRelationshipLifecycle(value));
     }
     case "customer-recovery-lifecycle.json":
       assert(value.cases.length >= 2 && value.cases.every((item) => item.accountExistsDisclosed === false && item.sessionIssued === false) &&
@@ -491,6 +597,46 @@ function executeSemanticFixture(path, value, adapters) {
         }),
       "automation bundle must bind every action to the current writable, automatable non-security descriptor");
       return result("accepted", { actions: value.actions.length });
+    }
+    case "automation-property-impact.json": {
+      assert(Array.isArray(value.cases) && value.cases.length >= 6, "property automation fixture is missing role/privacy cases");
+      for (const item of value.cases) {
+        const actual = projectAutomationPropertyImpact(value, item.request);
+        assert(actual.decision === item.expectedDecision && JSON.stringify(actual.projection) === JSON.stringify(item.expectedProjection) &&
+          actual.protectedEffects === item.expectedProtectedEffects && actual.protectedEffects === 0,
+        `property automation projection case ${item.id} diverged or produced an effect`);
+        if (actual.decision === "PROJECTED")
+          assert(adapters.schema("automationPropertyImpactProjection", actual.projection),
+            `property automation projection case ${item.id} failed its canonical output schema`);
+        const serialized = JSON.stringify(actual.projection);
+        for (const automation of value.homes.flatMap((home) => home.automations)) {
+          const propertyTargetCount = automation.targets.filter((target) => target.managementClass === "property_device").length;
+          if (propertyTargetCount === 0 && item.request.homeId === automation.homeId)
+            assert(!serialized.includes(automation.automationId) && !serialized.includes(automation.name),
+              `private-only automation ${automation.automationId} leaked into the property projection`);
+          for (const target of automation.targets.filter((candidate) => candidate.managementClass === "tenant_device"))
+            assert(!serialized.includes(target.deviceId) && !serialized.includes(target.displayName) &&
+              !(target.privateActionValue && serialized.includes(target.privateActionValue)),
+            `tenant-private automation target ${target.deviceId} leaked into the property projection`);
+        }
+      }
+      return result("accepted", { cases: value.cases.length, protectedEffects: 0, privacyFiltered: true });
+    }
+    case "invalid/automation-property-target-extra-authority.json": {
+      const source = adapters.readFixture(value.sourceFixture);
+      const scenario = source.cases.find((item) => item.id === value.caseId);
+      const automation = source.homes.find((home) => home.homeId === scenario?.request.homeId)?.automations
+        ?.find((item) => item.automationId === value.automationId);
+      const target = automation?.targets.find((item) => item.deviceId === value.targetDeviceId);
+      assert(scenario && target && typeof value.addField === "string" && value.addField.length > 0,
+        "extra-authority denial fixture must resolve a real shared target");
+      target[value.addField] = structuredClone(value.addValue);
+      const actual = projectAutomationPropertyImpact(source, scenario.request);
+      assert(actual.decision === value.expectedDecision &&
+        JSON.stringify(actual.projection) === JSON.stringify(value.expectedProjection) &&
+        actual.protectedEffects === value.expectedProtectedEffects && actual.protectedEffects === 0,
+      "automation target authority extension must be denied before projection with no protected effects");
+      return deniedWithNoEffects(actual.decision === "DENIED_NO_PROJECTION", path);
     }
     case "alexa-discovery-projection.json": {
       const member = value.membership;
@@ -999,6 +1145,7 @@ function executeSemanticFixture(path, value, adapters) {
         offline: adapters.readFixture("fixtures/offline-scope-widening.json"),
         decisionMatrix: value,
         claim: adapters.readFixture("fixtures/claim-lifecycle.json"),
+        accountRelationshipLifecycle: adapters.readFixture("fixtures/account-relationship-lifecycle.json"),
       });
       return result("accepted", { domains: 16 });
     }

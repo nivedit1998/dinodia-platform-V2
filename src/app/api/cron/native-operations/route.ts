@@ -3,7 +3,7 @@ import { runNativeOperations, acquireOperationsLease } from '@/lib/nativeOperati
 
 export const dynamic = 'force-dynamic';
 
-export function isNativeOperationsAuthorized(request: Request): boolean {
+function isNativeOperationsAuthorized(request: Request): boolean {
   const secret = String(process.env.CRON_SECRET ?? '');
   const supplied = request.headers.get('authorization') ?? '';
   return Boolean(secret && supplied === `Bearer ${secret}`);

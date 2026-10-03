@@ -24,12 +24,17 @@ for (const [repo, relative] of repos) {
 const iosPrototype = path.resolve(platform, '../dinodia-ios-app-V2/Dinodia/DebugFixtures');
 fs.mkdirSync(iosPrototype, { recursive: true });
 fs.copyFileSync(path.join(source, 'V2_STATIC_TO_LIVE_MATRIX.md'), path.join(iosPrototype, 'V2_STATIC_TO_LIVE_MATRIX.md'));
+const iosPrototypeContracts = path.join(iosPrototype, 'DinodiaV1');
+fs.mkdirSync(iosPrototypeContracts, { recursive: true });
+fs.copyFileSync(path.join(source, 'decisions.json'), path.join(iosPrototypeContracts, 'decisions.json'));
 const iosPrototypeFixtures = path.join(iosPrototype, 'DinodiaV1/fixtures');
 fs.mkdirSync(iosPrototypeFixtures, { recursive: true });
 for (const fixture of [
   'account-session-two-homes.json',
   'account-relationship-lifecycle.json',
   'automation-full-bundle.json',
+  'automation-property-impact.json',
+  'invalid/automation-property-target-extra-authority.json',
   'analytics-semantics.json',
   'access-request-lifecycle.json',
   'area-edit-lifecycle.json',

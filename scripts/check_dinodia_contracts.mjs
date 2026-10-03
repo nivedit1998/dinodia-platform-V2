@@ -174,6 +174,7 @@ for (const required of [
 }
 const exampleChecks = [
   ["area", "empty-area.json", (fixture) => fixture.data],
+  ["automationPropertyImpactProjection", "automation-property-impact.json", (fixture) => fixture.cases.find((item) => item.expectedDecision === "PROJECTED")?.expectedProjection],
   ["analyticsObservation", "analytics-unknown-on-expiry.json", (fixture) => fixture],
   ["controlCatalog", "control-catalog-change.json", (fixture) => fixture.catalog],
   ["controlCatalogEvent", "control-catalog-change.json", (fixture) => ({ schemaVersion: "dinodia.v1", homeId: fixture.catalog.homeId, streamId: "stream:fixture", sequence: 1, generatedAt: "2026-09-27T10:00:00Z", revision: 1, data: fixture.catalog })],
@@ -237,6 +238,7 @@ const fixtureCases = [
   ["alexa-discovery-projection.json", "alexaDiscoveryProjection", (v) => v, true],
   ["analytics-unknown-on-expiry.json", "analyticsObservation", (v) => v, true],
   ["automation-full-bundle.json", "automation", (v) => v, true],
+  ["automation-property-impact.json", "automationPropertyImpactProjection", (v) => v.cases.find((item) => item.expectedDecision === "PROJECTED")?.expectedProjection, true],
   ["claim-first-wins.json", "claimReservation", (v) => v, true],
   ["command-result-uncertain.json", "commandResult", (v) => v, true],
   ["command-valid.json", "command", (v) => v, true],
@@ -294,6 +296,7 @@ const semanticOnlyFixturePaths = new Set([
   "invalid/writable-unreadable-control.json",
   "invalid/unknown-interaction-commandable.json",
   "invalid/duplicate-device-control-id.json",
+  "invalid/automation-property-target-extra-authority.json",
   "duplicate-display-names.json",
   "notification-delivery-is-not-authority.json",
   "offline-scope-widening.json",
@@ -668,7 +671,11 @@ if (JSON.stringify(notificationDedupe.keyFields) !== JSON.stringify(["eventId", 
 const accountRelationshipLifecycle = JSON.parse(fs.readFileSync(path.join(fixtureRoot, "account-relationship-lifecycle.json"), "utf8"));
 const retainedRelationshipKinds = new Set(accountRelationshipLifecycle.retainedRelationshipKinds);
 const nonRetainingKinds = new Set(accountRelationshipLifecycle.nonRetainingKinds);
-if (accountRelationshipLifecycle.schemaVersion !== contract.contractVersion || retainedRelationshipKinds.size !== 4 || nonRetainingKinds.size !== 6 ||
+const accountRelationshipDecisionRegister = JSON.parse(fs.readFileSync(path.join(root, "contracts/dinodia-v1/decisions.json"), "utf8"));
+if (accountRelationshipLifecycle.schemaVersion !== contract.contractVersion ||
+    JSON.stringify(accountRelationshipLifecycle.retainedRelationshipKinds) !== JSON.stringify(accountRelationshipDecisionRegister.identityLifecycle.accountRetainingRelationshipKinds) ||
+    JSON.stringify(accountRelationshipLifecycle.nonRetainingKinds) !== JSON.stringify(accountRelationshipDecisionRegister.identityLifecycle.accountNonRetainingRelationshipKinds) ||
+    retainedRelationshipKinds.size !== 4 || nonRetainingKinds.size !== 6 ||
     accountRelationshipLifecycle.tenantSelfRemoval.removesOnlySelectedMembership !== true ||
     accountRelationshipLifecycle.tenantSelfRemoval.preservesOtherHomeMemberships !== true ||
     accountRelationshipLifecycle.tenantSelfRemoval.preservesOtherTrustedInstallations !== true)
@@ -886,6 +893,7 @@ if (!assertStage2DecisionFixtures({
   offline: offlineWidening,
   decisionMatrix,
   claim: claimLifecycle,
+  accountRelationshipLifecycle,
 })) throw new Error("Stage 2 decision fixtures were not behaviorally evaluated");
 const claimState = structuredClone(claimLifecycle.initial);
 const appliedClaimMutations = new Set();
@@ -1091,6 +1099,8 @@ const requiredDecisions = [
   ["identityLifecycle.activeOwnerMaximumPerHome", 1],
   ["identityAndLifecycle.finalRelationshipDeletionCleansAccount", true],
   ["identityLifecycle.accountDeletionRemovesFinalRelationshipOnly", true],
+  ["identityLifecycle.accountRetainingRelationshipKinds", ["active_membership", "unexpired_invitation", "valid_pending_access_request", "durable_pending_property_setup"]],
+  ["identityLifecycle.accountNonRetainingRelationshipKinds", ["expired_invitation", "rejected_invitation", "cancelled_request", "expired_claim_reservation", "open_support_ticket", "closed_support_ticket"]],
   ["identityLifecycle.invitationCreatesMembership", false],
   ["identityLifecycle.deviceIdentityMergeRequiresProtocolEvidence", true],
   ["homeLifecycle.claimReservationSeconds", 1800],
@@ -1127,6 +1137,14 @@ const requiredDecisions = [
   ["analytics.expiredOrUnreliableTelemetryIsUnknown", true],
   ["analytics.targetTemperatureIsActivity", false],
   ["analytics.tenantDeviceIncluded", false],
+  ["automations.propertyImpactProjection.roles", ["OWNER", "PROPERTY_MANAGER"]],
+  ["automations.propertyImpactProjection.requiresCurrentSelectedMembership", true],
+  ["automations.propertyImpactProjection.includesTenantNameAndSchedule", true],
+  ["automations.propertyImpactProjection.includesOnlyAffectedPermanentDevices", true],
+  ["automations.propertyImpactProjection.omitsPrivateOnlyAutomations", true],
+  ["automations.propertyImpactProjection.omitsTenantDeviceIdsAndPrivateActionValues", true],
+  ["automations.propertyImpactProjection.disableDeleteRequireOperationBoundStepUp", true],
+  ["automations.propertyImpactProjection.projectionIsReadOnly", true],
   ["commandPolicy.valueMustMatchDescriptorTypeAndConstraints", true],
   ["commandPolicy.currentDescriptorAndWritabilityRequiredAtDispatch", true],
   ["commandPolicy.sensitiveProofOperationBoundAndSingleUse", true],

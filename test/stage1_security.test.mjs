@@ -77,13 +77,15 @@ test('native task registry rejects unknown tasks, duplicate tasks and dual-owner
 test('native operations route rejects wrong scheduler secrets before lease or task dispatch', async () => {
   let leases = 0;
   let dispatched = 0;
-  const { POST } = loadTypeScriptModule('src/app/api/cron/native-operations/route.ts', {
+  const routeModule = loadTypeScriptModule('src/app/api/cron/native-operations/route.ts', {
     'next/server': { NextResponse: { json: (body, init) => Response.json(body, init) } },
     '@/lib/nativeOperations': {
       acquireOperationsLease: async () => { leases += 1; return true; },
       runNativeOperations: async () => { dispatched += 1; return { tasks: [], failedTasks: [] }; },
     },
   });
+  const { POST } = routeModule;
+  assert.deepEqual(Object.keys(routeModule).sort(), ['POST', 'dynamic'].sort(), 'Next.js route modules may export only framework route handlers/config');
   const previousSecret = process.env.CRON_SECRET;
   process.env.CRON_SECRET = 'disposable-stage2-cron-secret';
   try {

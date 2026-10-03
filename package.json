@@ -9,6 +9,8 @@
     "lint": "eslint src scripts --max-warnings=0",
     "typecheck": "tsc --noEmit",
     "check:dinodia-contracts": "node scripts/check_dinodia_contracts.mjs",
+    "check:dinodia-contracts:swift": "bash ../dinodia-ios-app-V2/Scripts/check-dinodia-v1-runtime.sh",
+    "check:dinodia-contracts:all": "npm run check:dinodia-contracts && npm run check:dinodia-contracts:swift",
     "check:aasa:runtime": "node scripts/check_aasa_runtime.mjs",
     "contracts:sync": "node scripts/sync_dinodia_contract_fixtures.mjs",
     "test": "node --test test/*.test.mjs",

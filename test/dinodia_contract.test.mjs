@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { createRequire } from 'node:module';
 import crypto from 'node:crypto';
-import { assertStage2DecisionFixtures, assertPrototypeActionMatrixBindings, executeIndexedFixtureScenario, resolveInstallationRequestDecision, resolvePrototypeActionDecision, simulateClaimLifecycle } from '../scripts/dinodia_stage2_decisions.mjs';
+import { assertAccountRelationshipLifecycle, assertStage2DecisionFixtures, assertPrototypeActionMatrixBindings, executeIndexedFixtureScenario, projectAutomationPropertyImpact, resolveInstallationRequestDecision, resolvePrototypeActionDecision, simulateClaimLifecycle } from '../scripts/dinodia_stage2_decisions.mjs';
 
 const root = path.join(process.cwd(), 'contracts/dinodia-v1');
 const osRoot = process.env.DINODIA_OS_ROOT || path.resolve(process.cwd(), '../Dinodia OS');
@@ -53,6 +53,36 @@ test('installation request decision binds current role, selected home, revision 
   invalidExpiry.expiresAt = '2026-02-31T10:00:00Z';
   assert.equal(resolveInstallationRequestDecision(invalidExpiry), 'INVALID_TRANSITION');
 });
+test('property automation projection is selected-membership scoped and removes tenant-private fields', () => {
+  const fixture = JSON.parse(fs.readFileSync(path.join(root, 'fixtures/automation-property-impact.json'), 'utf8'));
+  for (const item of fixture.cases) {
+    const actual = projectAutomationPropertyImpact(fixture, item.request);
+    assert.equal(actual.decision, item.expectedDecision, item.id);
+    assert.deepEqual(actual.projection, item.expectedProjection, item.id);
+    assert.equal(actual.protectedEffects, item.expectedProtectedEffects, item.id);
+    assert.equal(actual.protectedEffects, 0, item.id);
+  }
+  const rendered = JSON.stringify(projectAutomationPropertyImpact(fixture, fixture.cases[1].request).projection);
+  for (const secret of [
+    'device:private-sensor-NEVER-RENDER', 'Private sensor NEVER RENDER', 'private-value-NEVER-RENDER',
+    'automation:private-only-NEVER-RENDER', 'Private-only rule NEVER RENDER',
+  ]) assert.equal(rendered.includes(secret), false, `private automation content leaked: ${secret}`);
+  const malformed = structuredClone(fixture);
+  malformed.homes[0].revision = -1;
+  assert.equal(projectAutomationPropertyImpact(malformed, fixture.cases[1].request).decision, 'DENIED_NO_PROJECTION');
+});
+test('property automation projection rejects unrecognized target authority metadata', () => {
+  const vector = JSON.parse(fs.readFileSync(path.join(root, 'fixtures/invalid/automation-property-target-extra-authority.json'), 'utf8'));
+  const fixture = JSON.parse(fs.readFileSync(path.join(root, vector.sourceFixture), 'utf8'));
+  const scenario = fixture.cases.find((item) => item.id === vector.caseId);
+  const automation = fixture.homes.find((home) => home.homeId === scenario.request.homeId).automations.find((item) => item.automationId === vector.automationId);
+  const target = automation.targets.find((item) => item.deviceId === vector.targetDeviceId);
+  target[vector.addField] = vector.addValue;
+  const actual = projectAutomationPropertyImpact(fixture, scenario.request);
+  assert.equal(actual.decision, vector.expectedDecision);
+  assert.deepEqual(actual.projection, vector.expectedProjection);
+  assert.equal(actual.protectedEffects, 0);
+});
 test('claim and invitation decision adapters reject impossible UTC calendar timestamps', () => {
   const claimPath = path.join(root, 'fixtures/claim-lifecycle.json');
   const invalidExpiry = JSON.parse(fs.readFileSync(claimPath, 'utf8'));
@@ -76,6 +106,7 @@ test('decision fixture runner rejects structurally valid privacy, delivery, offl
     offline: read('offline-scope-widening.json'),
     decisionMatrix: read('stage2-decision-matrix.json'),
     claim: read('claim-lifecycle.json'),
+    accountRelationshipLifecycle: read('account-relationship-lifecycle.json'),
   };
   assert.equal(assertStage2DecisionFixtures(baseline), true);
 
@@ -102,6 +133,21 @@ test('decision fixture runner rejects structurally valid privacy, delivery, offl
   const decisionDrift = structuredClone(baseline);
   decisionDrift.decisionMatrix.offline.scopeCanWiden = true;
   assert.throws(() => assertStage2DecisionFixtures(decisionDrift), /Contradictory executable decision fixture/);
+
+  const reclassifiedSupport = structuredClone(baseline);
+  reclassifiedSupport.accountRelationshipLifecycle.retainedRelationshipKinds.push('open_support_ticket');
+  reclassifiedSupport.accountRelationshipLifecycle.nonRetainingKinds = reclassifiedSupport.accountRelationshipLifecycle.nonRetainingKinds
+    .filter((kind) => kind !== 'open_support_ticket');
+  assert.throws(() => assertStage2DecisionFixtures(reclassifiedSupport), /taxonomy differs from the canonical decision register/);
+});
+test('Swift/Platform account-retention fixture taxonomy is anchored to the canonical decision register', () => {
+  const account = JSON.parse(fs.readFileSync(path.join(root, 'fixtures/account-relationship-lifecycle.json'), 'utf8'));
+  assert.deepEqual(assertAccountRelationshipLifecycle(account), { cases: 8 });
+  const forged = structuredClone(account);
+  forged.retainedRelationshipKinds.push('open_support_ticket');
+  forged.nonRetainingKinds = forged.nonRetainingKinds.filter((kind) => kind !== 'open_support_ticket');
+  forged.cases.find((item) => item.id === 'open-support-ticket-does-not-retain-account').expected = 'ACCOUNT_RETAINED';
+  assert.throws(() => assertAccountRelationshipLifecycle(forged), /taxonomy differs from the canonical decision register/);
 });
 test('V2 iOS distribution decision is concrete, configured locally, and externally unclaimed', () => {
   const decisions = JSON.parse(fs.readFileSync(path.join(root, 'decisions.json'), 'utf8')).distribution;
