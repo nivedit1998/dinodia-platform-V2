@@ -48,15 +48,27 @@ async function createValidActiveHome(tx) {
     },
   });
   const area = await tx.area.create({ data: { homeId: home.id, osAreaId: randomUUID(), originalName: 'Test area' } });
-  return { identity, home, hub, area };
+  const accountId = randomUUID();
+  const account = await tx.customerAccount.create({ data: {
+    id: accountId, displayName: 'Invariant owner', username: `owner-${accountId}`, usernameNormalized: `owner-${accountId}`,
+    email: `${accountId}@invalid.test`, emailNormalized: `${accountId}@invalid.test`, passwordHash: 'test-only-not-authenticatable', emailVerifiedAt: now,
+  } });
+  const owner = await tx.homeMembership.create({ data: { homeId: home.id, customerAccountId: account.id, role: 'OWNER', status: 'ACTIVE' } });
+  return { identity, home, hub, area, owner, account };
 }
 
 try {
   await mustReject('active Home without area and verified CloudURL', async () => {
     await prisma.$transaction(async (tx) => {
-      await tx.home.create({
+      const home = await tx.home.create({
         data: { addressLine1: 'Test', city: 'Test', postcode: 'TST 1AA', country: 'GB', timezone: 'Europe/London', addressStatus: 'VERIFIED', lifecycle: 'ACTIVE', installationStatus: 'COMPLETE' },
       });
+      const accountId = randomUUID();
+      const account = await tx.customerAccount.create({ data: {
+        id: accountId, displayName: 'Invariant owner', username: `owner-${accountId}`, usernameNormalized: `owner-${accountId}`,
+        email: `${accountId}@invalid.test`, emailNormalized: `${accountId}@invalid.test`, passwordHash: 'test-only-not-authenticatable', emailVerifiedAt: now,
+      } });
+      await tx.homeMembership.create({ data: { homeId: home.id, customerAccountId: account.id, role: 'OWNER', status: 'ACTIVE' } });
     });
   });
 
@@ -66,6 +78,7 @@ try {
   await prisma.hubInstallation.delete({ where: { id: valid.hub.id } });
   await prisma.home.delete({ where: { id: valid.home.id } });
   await prisma.hubManufacturingIdentity.delete({ where: { id: valid.identity.id } });
+  await prisma.customerAccount.delete({ where: { id: valid.account.id } });
   console.log('[test:foundation:invariants] valid active Home supports zero devices and cleanup');
 
   const isolationFixtures = await prisma.$transaction(async (tx) => {

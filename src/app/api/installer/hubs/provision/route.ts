@@ -80,8 +80,9 @@ export async function POST(request: Request) {
             const home = homeId ? await tx.home.findUnique({ where: { id: homeId }, select: { id: true } }) : await tx.home.create({ data: { lifecycle: 'INSTALLING', installationStatus: 'IN_PROGRESS' }, select: { id: true } });
             if (!home) throw new Stage1AuthError(409, 'workflow_home_missing', 'The installation home no longer exists');
             homeId = home.id;
-            const hub = await tx.hubInstallation.create({ data: { homeId, manufacturingIdentityId: attempt.manufacturingIdentityId, serialNumberSnapshot: identity.serialNumber, baseUrl: attempt.baseUrlPresentation, reservedHostname: reservedHostname(identity.serialNumber), reservedTunnelName: reservedTunnelName(identity.serialNumber), state: 'PAIRING' }, select: { id: true } });
+            const hub = await tx.hubInstallation.create({ data: { homeId, manufacturingIdentityId: attempt.manufacturingIdentityId, serialNumberSnapshot: identity.serialNumber, baseUrl: attempt.baseUrlPresentation, reservedHostname: reservedHostname(identity.serialNumber), reservedTunnelName: reservedTunnelName(identity.serialNumber), state: 'PAIRING', lifecycleStatus: 'ACTIVE' }, select: { id: true } });
             hubInstallationId = hub.id;
+            await tx.home.update({ where: { id: homeId }, data: { activeHubInstallationId: hub.id } });
             const homeToken = `dno_home_${randomSecret(32)}`;
             await tx.homeClaimReference.create({ data: { homeId, hubInstallationId, purpose: 'INITIAL_OWNER', generation: 1, state: 'AVAILABLE', companyQrReferenceHash: hashClaimReference(homeToken), resolverGeneration: 1, issuedAt: now } });
             await tx.hubInstallation.update({ where: { id: hubInstallationId }, data: { permanentResolverHash: hashClaimReference(homeToken), resolverIssuedAt: now } });

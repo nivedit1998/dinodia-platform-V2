@@ -18,7 +18,7 @@ export async function POST(request: Request, context: { params: Promise<{ ticket
     const targetIds = Array.isArray(body.targetIds) ? body.targetIds.map(String).slice(0, 100) : [];
     if (!['TENANT_SCOPE', 'PROPERTY_SCOPE'].includes(requestedScope)) throw new Stage1AuthError(400, 'support_scope_invalid', 'A support scope is required');
     const ticket = await prisma.supportTicket.findUnique({ where: { id: ticketId }, select: { id: true, homeId: true, assignedEmployeeId: true, status: true, selectedMembershipId: true } });
-    if (!ticket || ticket.status !== 'OPEN' || ticket.assignedEmployeeId !== employee.id) throw new Stage1AuthError(403, 'support_assignment_required', 'The employee is not assigned to this open ticket');
+    if (!ticket || !ticket.homeId || !ticket.selectedMembershipId || ticket.status !== 'OPEN' || ticket.assignedEmployeeId !== employee.id) throw new Stage1AuthError(403, 'support_assignment_required', 'The employee is not assigned to this open home-scoped ticket');
     if (requestedScope === 'TENANT_SCOPE' && !targetMembershipId) throw new Stage1AuthError(400, 'tenant_membership_required', 'Tenant support scope requires a target membership');
     if (requestedScope === 'PROPERTY_SCOPE') {
       const selectedMembership = await prisma.homeMembership.findUnique({ where: { id: ticket.selectedMembershipId }, select: { id: true, homeId: true, role: true } });
@@ -27,7 +27,10 @@ export async function POST(request: Request, context: { params: Promise<{ ticket
         if (!tenantApproval) throw new Stage1AuthError(403, 'support_broadening_requires_tenant_approval', 'A tenant ticket needs the tenant approval before property-wide support can be requested');
       }
     }
-    const hub = await prisma.hubInstallation.findUnique({ where: { homeId: ticket.homeId }, select: { id: true } });
+    const home = await prisma.home.findUnique({ where: { id: ticket.homeId }, select: { activeHubInstallationId: true } });
+    const hub = home?.activeHubInstallationId
+      ? await prisma.hubInstallation.findFirst({ where: { id: home.activeHubInstallationId, homeId: ticket.homeId, lifecycleStatus: 'ACTIVE' }, select: { id: true } })
+      : null;
     if (!hub) throw new Stage1AuthError(409, 'hub_not_available', 'The property has no active hub installation');
     const areas = areaIds.length ? await prisma.area.findMany({ where: { id: { in: areaIds }, homeId: ticket.homeId, status: 'ACTIVE' }, select: { id: true } }) : [];
     if (areas.length !== new Set(areaIds).size) throw new Stage1AuthError(403, 'support_area_scope_invalid', 'Every support area must belong to the selected home and remain active');

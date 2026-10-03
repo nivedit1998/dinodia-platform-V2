@@ -23,8 +23,19 @@ test('safe build identity prefers the real Vercel commit or deployment and never
 
 test('foundation and Stage 1 schema is exactly native and bounded', () => {
   const schema = fs.readFileSync('prisma/schema.prisma', 'utf8');
-  assert.equal([...schema.matchAll(/^model\s+/gm)].length, 44);
-  assert.doesNotMatch(schema, /HaConnection|HomeAssistant|SupportRequest|NativeAutomation|AlexaRefreshToken/);
+  const modelNames = [...schema.matchAll(/^model\s+(\w+)/gm)].map((match) => match[1]);
+  const stage3Models = [
+    'AreaSourceAlias', 'NativeDeviceSourceAlias', 'PermanentDeviceInstallationRequest', 'NativeCommissioningSession',
+    'NativeDeviceUsageBucket', 'NativeTemperatureSample', 'NativeAutomation', 'NativeAutomationTrigger',
+    'NativeAutomationAction', 'NativeAutomationExecution', 'AlexaNativeLink', 'AlexaNativeHomeScope',
+    'AlexaNativeEndpointProjection', 'AlexaNativeDirectiveReceipt', 'NativeBackgroundTaskState',
+    'NativeDomainOutbox', 'NativeNotificationDeliveryReceipt', 'NativeDeviceOutageIncident',
+    'NativeSupportTicketTimeline', 'ExceptionalOwnershipTransfer', 'NativeTenantDeviceRecovery',
+  ];
+  assert.equal(modelNames.length, 65);
+  assert.deepEqual(modelNames.filter((name) => stage3Models.includes(name)).sort(), [...stage3Models].sort());
+  assert.equal(modelNames.length - stage3Models.length, 44, 'Stage 1/foundation tables remain intact; Stage 3 is additive');
+  assert.doesNotMatch(schema, /HaConnection|HomeAssistant|SupportRequest|AlexaRefreshToken/);
   assert.match(schema, /model HomeMembership/);
   assert.match(schema, /model TenantAreaGrant/);
   assert.match(schema, /model NativeDevice/);

@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
 import { requireEmployee, Stage1AuthError, authErrorResponse } from '@/lib/stage1Auth';
+import { assertNativeInstallationCompletable } from '@/lib/nativeHubProvisioning';
 
 export const dynamic = 'force-dynamic';
 
@@ -16,6 +17,8 @@ export async function POST(request: Request, context: { params: Promise<{ homeId
       if (!work || work.assignedEmployeeId !== employee.id || work.homeId !== homeId || !work.hubInstallationId || !['IN_PROGRESS', 'REOPENED'].includes(work.state)) throw new Stage1AuthError(403, 'installation_work_denied', 'The installation work is not available to this employee');
       const hub = await tx.hubInstallation.findUnique({ where: { id: work.hubInstallationId }, select: { id: true, homeId: true, state: true, cloudUrlVerifiedAt: true, remoteVerificationAt: true } });
       if (!hub || hub.homeId !== homeId || !hub.cloudUrlVerifiedAt || !hub.remoteVerificationAt || !['PROVISIONED', 'ACTIVE'].includes(hub.state)) throw new Stage1AuthError(409, 'remote_verification_required', 'Installation cannot complete until the signed CloudURL verification succeeds');
+      try { await assertNativeInstallationCompletable(tx, homeId, hub.id); }
+      catch { throw new Stage1AuthError(409, 'installation_prerequisites_incomplete', 'Installation requires the current verified hub and at least one canonical active area'); }
       const now = new Date();
       await tx.home.update({ where: { id: homeId }, data: { lifecycle: 'ACTIVE', installationStatus: 'COMPLETE', installationCompletedAt: now } });
       await tx.hubInstallation.update({ where: { id: hub.id }, data: { state: 'ACTIVE' } });

@@ -652,19 +652,21 @@ async function customerAuthorizationChecks() {
   // exists. The fixture represents that already-completed prerequisite; the
   // CloudURL protocol itself is tested by the dedicated pairing tests.
   const verifiedAt = new Date(now.getTime() - 1000);
-  const hubOne = await prisma.hubInstallation.create({ data: { id: harnessHubInstallationId, homeId: homeOne.id, manufacturingIdentityId: identityOne.id, serialNumberSnapshot: identityOne.serialNumber, state: 'ACTIVE', baseUrl: 'http://192.168.1.76:8123', cloudUrl: 'https://dinodia-harness-one.dinodiasmartliving.com', reservedHostname: 'dinodia-harness-one.dinodiasmartliving.com', cloudUrlVerifiedAt: verifiedAt, remoteChallengeAt: verifiedAt, remoteVerificationAt: verifiedAt } });
-  const hubTwo = await prisma.hubInstallation.create({ data: { homeId: homeTwo.id, manufacturingIdentityId: identityTwo.id, serialNumberSnapshot: identityTwo.serialNumber, state: 'ACTIVE', cloudUrl: 'https://dinodia-harness-two.dinodiasmartliving.com', reservedHostname: 'dinodia-harness-two.dinodiasmartliving.com', cloudUrlVerifiedAt: verifiedAt, remoteChallengeAt: verifiedAt, remoteVerificationAt: verifiedAt } });
+  const hubOne = await prisma.hubInstallation.create({ data: { id: harnessHubInstallationId, homeId: homeOne.id, manufacturingIdentityId: identityOne.id, serialNumberSnapshot: identityOne.serialNumber, state: 'ACTIVE', lifecycleStatus: 'ACTIVE', baseUrl: 'http://192.168.1.76:8123', cloudUrl: 'https://dinodia-harness-one.dinodiasmartliving.com', reservedHostname: 'dinodia-harness-one.dinodiasmartliving.com', cloudUrlVerifiedAt: verifiedAt, remoteChallengeAt: verifiedAt, remoteVerificationAt: verifiedAt } });
+  const hubTwo = await prisma.hubInstallation.create({ data: { homeId: homeTwo.id, manufacturingIdentityId: identityTwo.id, serialNumberSnapshot: identityTwo.serialNumber, state: 'ACTIVE', lifecycleStatus: 'ACTIVE', cloudUrl: 'https://dinodia-harness-two.dinodiasmartliving.com', reservedHostname: 'dinodia-harness-two.dinodiasmartliving.com', cloudUrlVerifiedAt: verifiedAt, remoteChallengeAt: verifiedAt, remoteVerificationAt: verifiedAt } });
+  await prisma.home.update({ where: { id: homeOne.id }, data: { activeHubInstallationId: hubOne.id } });
+  await prisma.home.update({ where: { id: homeTwo.id }, data: { activeHubInstallationId: hubTwo.id } });
   const claimReferenceValue = `harness-permanent-label-${crypto.randomUUID()}`;
   const claimReferenceHashValue = claimReferenceHash(claimReferenceValue, env.CLAIM_REFERENCE_PEPPER);
   const claimIdentitySigning = keyPair();
   const claimIdentityEncryption = x25519KeyPair();
   const claimIdentity = await prisma.hubManufacturingIdentity.create({ data: { serialNumber: `harness-claim-${crypto.randomUUID()}`, signingPublicKey: claimIdentitySigning.publicKey, encryptionPublicKey: claimIdentityEncryption.publicKey, signingKeyFingerprint: publicKeyFingerprint(claimIdentitySigning.publicKey), encryptionKeyFingerprint: publicKeyFingerprint(claimIdentityEncryption.publicKey) } });
   const claimHome = await prisma.home.create({ data: { lifecycle: 'INSTALLING', installationStatus: 'DRAFT' } });
-  const claimHub = await prisma.hubInstallation.create({ data: { homeId: claimHome.id, manufacturingIdentityId: claimIdentity.id, serialNumberSnapshot: claimIdentity.serialNumber, state: 'PAIRING', permanentResolverHash: claimReferenceHashValue, permanentResolverGeneration: 1, permanentResolverStatus: 'ACTIVE' } });
+  const claimHub = await prisma.hubInstallation.create({ data: { homeId: claimHome.id, manufacturingIdentityId: claimIdentity.id, serialNumberSnapshot: claimIdentity.serialNumber, state: 'PAIRING', lifecycleStatus: 'ACTIVE', permanentResolverHash: claimReferenceHashValue, permanentResolverGeneration: 1, permanentResolverStatus: 'ACTIVE' } });
+  await prisma.home.update({ where: { id: claimHome.id }, data: { activeHubInstallationId: claimHub.id } });
   const claimReference = await prisma.homeClaimReference.create({ data: { homeId: claimHome.id, hubInstallationId: claimHub.id, purpose: 'INITIAL_OWNER', companyQrReferenceHash: claimReferenceHashValue, resolverGeneration: 1 } });
   const claimMachineSecret = `harness-claim-machine-${crypto.randomUUID()}`;
   await prisma.hubCredentialVersion.create({ data: { hubInstallationId: claimHub.id, version: 1, purpose: 'machine-credential', state: 'ACTIVE', tokenHash: sha256(claimMachineSecret), encryptedDeliveryEnvelope: { harness: true }, ciphertextKeyVersion: 1, deliveredAt: verifiedAt, acknowledgedAt: verifiedAt, activatedAt: verifiedAt } });
-  await prisma.home.updateMany({ where: { id: { in: [homeOne.id, homeTwo.id] } }, data: { lifecycle: 'ACTIVE', installationStatus: 'COMPLETE' } });
   const machineSecret = `harness-machine-${crypto.randomUUID()}`;
   await prisma.hubCredentialVersion.create({ data: { hubInstallationId: hubOne.id, version: 1, purpose: 'machine-credential', state: 'ACTIVE', tokenHash: sha256(machineSecret), encryptedDeliveryEnvelope: { harness: true }, ciphertextKeyVersion: 1, deliveredAt: verifiedAt, acknowledgedAt: verifiedAt, activatedAt: verifiedAt } });
   await prisma.hubCredentialVersion.create({ data: { hubInstallationId: hubOne.id, version: 1, purpose: 'operator-credential', state: 'ACTIVE', tokenHash: sha256(`harness-operator-v1-${crypto.randomUUID()}`), encryptedDeliveryEnvelope: { harness: true }, ciphertextKeyVersion: 1, issuedAt: new Date(Date.now() - 61 * 60 * 1000), deliveredAt: verifiedAt, acknowledgedAt: verifiedAt, activatedAt: new Date(Date.now() - 61 * 60 * 1000) } });
@@ -695,6 +697,7 @@ async function customerAuthorizationChecks() {
   const managerUsername = `stage1-manager-${crypto.randomUUID().slice(0, 8)}`;
   const managerAccount = await prisma.customerAccount.create({ data: { displayName: 'Stage 1 property manager', username: managerUsername, usernameNormalized: managerUsername, email: managerEmail, emailNormalized: managerEmail, emailVerifiedAt: now, passwordHash: 'harness-only-password-hash' } });
   const managerMembership = await prisma.homeMembership.create({ data: { customerAccountId: managerAccount.id, homeId: homeOne.id, role: 'PROPERTY_MANAGER' } });
+  await prisma.home.updateMany({ where: { id: { in: [homeOne.id, homeTwo.id] } }, data: { lifecycle: 'ACTIVE', installationStatus: 'COMPLETE' } });
   const phone = keyPair();
   const phoneThumbprint = crypto.createHash('sha256').update(crypto.createPublicKey(phone.publicKey).export({ type: 'spki', format: 'der' })).digest('hex');
   const trustedInstallationId = `harness-phone-${crypto.randomUUID()}`;

@@ -35,10 +35,11 @@ test('native task registry dispatches business operations and daily lease cleanu
   const cleanupCalls = [];
   const { nativeTaskRegistry, runNativeOperations, runNativeMaintenance } = loadTypeScriptModule('src/lib/nativeOperations.ts', {
     './prisma': { prisma: {
+      nativeBackgroundTaskState: { updateMany: async (input) => { cleanupCalls.push(input); return { count: 3 }; } },
+      $transaction: async (callback) => callback({ nativeBackgroundTaskState: { updateMany: async () => ({ count: 0 }) } }),
       supportSession: { findMany: async () => [] },
       supportAccessRequest: { findMany: async () => [], updateMany: async () => ({ count: 0 }) },
       homeClaimReservation: { findMany: async () => [] },
-      idempotencyRecord: { deleteMany: async (input) => { cleanupCalls.push(input); return { count: 3 }; } },
     } },
     './hubOperatorCredentials': { reconcileCredentialLifecycle: async () => ({ rotated: 0 }) },
     './stage1ClaimContract': { releaseExpiredClaim: async () => ({ released: false }) },
@@ -57,7 +58,7 @@ test('native task registry dispatches business operations and daily lease cleanu
   const maintenance = await runNativeMaintenance(now);
   assert.deepEqual(maintenance.tasks, ['expired_dispatch_lease_cleanup']);
   assert.equal(maintenance.expiredDispatcherLeases, 3);
-  assert.deepEqual(cleanupCalls, [{ where: { namespace: 'native-operations-lease', expiresAt: { lte: now } } }]);
+  assert.deepEqual(cleanupCalls, [{ where: { taskId: { not: 'expired_dispatch_lease_cleanup' }, leaseExpiresAt: { lte: now } }, data: { leaseOwner: null, leaseExpiresAt: null } }]);
 });
 
 test('native task registry rejects unknown tasks, duplicate tasks and dual-owner drift', () => {
@@ -80,7 +81,8 @@ test('native operations route rejects wrong scheduler secrets before lease or ta
   const routeModule = loadTypeScriptModule('src/app/api/cron/native-operations/route.ts', {
     'next/server': { NextResponse: { json: (body, init) => Response.json(body, init) } },
     '@/lib/nativeOperations': {
-      acquireOperationsLease: async () => { leases += 1; return true; },
+      acquireOperationsLease: async () => { leases += 1; return { owner: 'disposable-lease-owner', taskIds: ['operator_credential_lifecycle', 'support_expiry_and_revocation', 'claim_reservation_expiry'] }; },
+      completeOperationsLease: async () => true,
       runNativeOperations: async () => { dispatched += 1; return { tasks: [], failedTasks: [] }; },
     },
   });
@@ -111,7 +113,8 @@ test('daily maintenance route is the separate GET owner and rejects wrong schedu
   const { GET } = loadTypeScriptModule('src/app/api/cron/native-maintenance/route.ts', {
     'next/server': { NextResponse: { json: (body, init) => Response.json(body, init) } },
     '@/lib/nativeOperations': {
-      acquireOperationsLease: async (name) => { assert.equal(name, 'native-maintenance'); leases += 1; return true; },
+      acquireOperationsLease: async (name) => { assert.equal(name, 'native-maintenance'); leases += 1; return { owner: 'disposable-lease-owner', taskIds: ['expired_dispatch_lease_cleanup'] }; },
+      completeOperationsLease: async () => true,
       runNativeMaintenance: async () => { cleanup += 1; return { tasks: ['expired_dispatch_lease_cleanup'], expiredDispatcherLeases: 1 }; },
     },
   });
@@ -135,44 +138,51 @@ test('daily maintenance route is the separate GET owner and rejects wrong schedu
 });
 
 test('native dispatcher uses one atomic bounded lease and isolates task failures', async () => {
-  const lease = { expiresAt: new Date('2026-09-27T12:03:00Z') };
+  const dispatcherTasks = ['operator_credential_lifecycle', 'support_expiry_and_revocation', 'claim_reservation_expiry'];
+  const taskRows = new Map(dispatcherTasks.map((taskId) => [taskId, { leaseOwner: 'already-running', leaseExpiresAt: new Date('2026-09-27T12:02:00Z') }]));
   const leaseCalls = [];
   let supportTaskReached = false;
   let claimTaskReached = false;
-  const { acquireOperationsLease, runNativeOperations } = loadTypeScriptModule('src/lib/nativeOperations.ts', {
-    './prisma': { prisma: {
-      idempotencyRecord: {
-        updateMany: async ({ where, data }) => {
-          leaseCalls.push({ where, data });
-          if (lease.expiresAt <= where.expiresAt.lte) { lease.expiresAt = data.expiresAt; return { count: 1 }; }
-          return { count: 0 };
-        },
-        create: async ({ data }) => { if (lease.expiresAt > new Date('2026-09-27T12:00:00Z')) throw new Error('unique lease exists'); lease.expiresAt = data.expiresAt; },
-      },
-      supportSession: { findMany: async () => { supportTaskReached = true; throw new Error('isolated support database error'); } },
-      supportAccessRequest: { updateMany: async () => ({ count: 0 }) },
-      homeClaimReservation: { findMany: async () => { claimTaskReached = true; return []; } },
+  const prisma = {
+    nativeBackgroundTaskState: { updateMany: async (input) => {
+      leaseCalls.push(input);
+      const eligible = [...taskRows].filter(([taskId, row]) => input.where.taskId.in.includes(taskId)
+        && row.leaseExpiresAt <= input.where.OR[1].leaseExpiresAt.lte);
+      for (const [taskId] of eligible) taskRows.set(taskId, { leaseOwner: input.data.leaseOwner, leaseExpiresAt: input.data.leaseExpiresAt });
+      return { count: eligible.length };
     } },
+    $transaction: async (callback) => callback(prisma),
+    supportSession: { findMany: async () => { supportTaskReached = true; throw new Error('isolated support database error'); } },
+    supportAccessRequest: { findMany: async () => [], updateMany: async () => ({ count: 0 }) },
+    homeClaimReservation: { findMany: async () => { claimTaskReached = true; return []; } },
+  };
+  const { acquireOperationsLease, runNativeOperations } = loadTypeScriptModule('src/lib/nativeOperations.ts', {
+    './prisma': { prisma },
     './hubOperatorCredentials': { reconcileCredentialLifecycle: async () => { throw new Error('credential task failure'); } },
     './stage1ClaimContract': { releaseExpiredClaim: async () => ({ released: false }) },
     './supportNotifications': { createPropertySupportNotifications: async () => undefined },
   });
   const start = new Date('2026-09-27T12:00:00Z');
-  assert.equal(await acquireOperationsLease('native-operations', start), false, 'an existing live lease denies overlap');
-  assert.equal(leaseCalls[0].where.keyHash, 'native-operations', 'lease identity must not roll by minute bucket');
-  assert.equal(leaseCalls[0].data.expiresAt.getTime() - start.getTime(), 180_000);
+  assert.equal(await acquireOperationsLease('native-operations', start), null, 'an existing live lease denies overlap');
+  assert.deepEqual(leaseCalls[0].where.taskId.in, dispatcherTasks, 'lease ownership is stored on the three fixed operations task rows');
+  assert.equal(leaseCalls[0].data.leaseExpiresAt.getTime() - start.getTime(), 120_000);
 
   const result = await runNativeOperations(start);
   assert.ok(supportTaskReached);
   assert.ok(claimTaskReached, 'claim cleanup continues after independent task failures');
   assert.deepEqual(result.failedTasks.sort(), ['operator_credential_lifecycle', 'support_expiry_and_revocation']);
 
-  let occupied = false;
+  const concurrentRows = new Map(dispatcherTasks.map((taskId) => [taskId, { leaseOwner: null, leaseExpiresAt: null }]));
+  const concurrentPrisma = {
+    nativeBackgroundTaskState: { updateMany: async ({ where, data }) => {
+      const eligible = [...concurrentRows].filter(([taskId, row]) => where.taskId.in.includes(taskId) && (row.leaseExpiresAt === null || row.leaseExpiresAt <= where.OR[1].leaseExpiresAt.lte));
+      for (const [taskId] of eligible) concurrentRows.set(taskId, { leaseOwner: data.leaseOwner, leaseExpiresAt: data.leaseExpiresAt });
+      return { count: eligible.length };
+    } },
+    $transaction: async (callback) => callback(concurrentPrisma),
+  };
   const concurrentModule = loadTypeScriptModule('src/lib/nativeOperations.ts', {
-    './prisma': { prisma: { idempotencyRecord: {
-      updateMany: async () => ({ count: 0 }),
-      create: async () => { if (occupied) throw new Error('unique lease'); occupied = true; },
-    } } },
+    './prisma': { prisma: concurrentPrisma },
     './hubOperatorCredentials': { reconcileCredentialLifecycle: async () => ({}) },
     './stage1ClaimContract': { releaseExpiredClaim: async () => ({ released: false }) },
     './supportNotifications': { createPropertySupportNotifications: async () => undefined },
@@ -182,35 +192,36 @@ test('native dispatcher uses one atomic bounded lease and isolates task failures
 });
 
 test('native dispatcher lease denies until the exact expiry and keeps the two owners isolated', async () => {
-  const leases = new Map();
+  const taskIds = ['operator_credential_lifecycle', 'support_expiry_and_revocation', 'claim_reservation_expiry', 'expired_dispatch_lease_cleanup'];
+  const taskRows = new Map(taskIds.map((taskId) => [taskId, { leaseOwner: null, leaseExpiresAt: null }]));
+  const prisma = {
+    nativeBackgroundTaskState: { updateMany: async ({ where, data }) => {
+      const eligible = [...taskRows].filter(([taskId, row]) => where.taskId.in.includes(taskId)
+        && taskId !== 'expired_dispatch_lease_cleanup' || where.taskId.in.includes(taskId) && taskId === 'expired_dispatch_lease_cleanup')
+        .filter(([taskId, row]) => where.dispatcher === (taskId === 'expired_dispatch_lease_cleanup' ? 'MAINTENANCE' : 'OPERATIONS')
+          && (row.leaseExpiresAt === null || where.OR?.some((condition) => condition.leaseExpiresAt?.lte && row.leaseExpiresAt <= condition.leaseExpiresAt.lte)));
+      for (const [taskId] of eligible) taskRows.set(taskId, { leaseOwner: data.leaseOwner, leaseExpiresAt: data.leaseExpiresAt });
+      return { count: eligible.length };
+    } },
+    $transaction: async (callback) => callback(prisma),
+  };
   const { acquireOperationsLease } = loadTypeScriptModule('src/lib/nativeOperations.ts', {
-    './prisma': { prisma: { idempotencyRecord: {
-      updateMany: async ({ where, data }) => {
-        const key = `${where.namespace}:${where.keyHash}`;
-        const current = leases.get(key);
-        if (!current || current.expiresAt > where.expiresAt.lte) return { count: 0 };
-        leases.set(key, { expiresAt: data.expiresAt });
-        return { count: 1 };
-      },
-      create: async ({ data }) => {
-        const key = `${data.namespace}:${data.keyHash}`;
-        if (leases.has(key)) throw new Error('unique dispatcher lease');
-        leases.set(key, { expiresAt: data.expiresAt });
-      },
-    } } },
+    './prisma': { prisma },
     './hubOperatorCredentials': { reconcileCredentialLifecycle: async () => ({}) },
     './stage1ClaimContract': { releaseExpiredClaim: async () => ({ released: false }) },
     './supportNotifications': { createPropertySupportNotifications: async () => undefined },
   });
   const start = new Date('2026-09-30T12:00:00.000Z');
-  assert.equal(await acquireOperationsLease('native-operations', start), true);
-  assert.equal(await acquireOperationsLease('native-operations', new Date(start.getTime() + 179_999)), false,
+  const first = await acquireOperationsLease('native-operations', start);
+  assert.ok(first);
+  assert.equal(await acquireOperationsLease('native-operations', new Date(start.getTime() + 119_999)), null,
     'a lease remains occupied one millisecond before its deadline');
-  assert.equal(await acquireOperationsLease('native-operations', new Date(start.getTime() + 180_000)), true,
+  const second = await acquireOperationsLease('native-operations', new Date(start.getTime() + 120_000));
+  assert.ok(second,
     'the lease is replaceable at its exact inclusive expiry');
-  assert.equal(await acquireOperationsLease('native-maintenance', new Date(start.getTime() + 180_000)), true,
+  assert.ok(await acquireOperationsLease('native-maintenance', new Date(start.getTime() + 120_000)),
     'the independent daily maintenance owner has its own lease key');
-  assert.equal(await acquireOperationsLease('native-operations', new Date(start.getTime() + 180_000)), false,
+  assert.equal(await acquireOperationsLease('native-operations', new Date(start.getTime() + 120_000)), null,
     'the newly acquired operations lease is not confused with maintenance');
 });
 
@@ -334,8 +345,8 @@ test('Stage 1 database migration includes durable privacy and authority objects'
 
 test('readiness requires the completed Stage 1 migration rather than only the baseline', () => {
   assert.match(read('src/app/api/readiness/route.ts'), /REQUIRED_MIGRATION/);
-  assert.match(read('src/lib/foundation.ts'), /20260927020000_nr4_operator_endpoint_binding/);
-  assert.match(read('src/lib/foundation.ts'), /REQUIRED_MODEL_COUNT = 44/);
+  assert.match(read('src/lib/foundation.ts'), /20261003000000_native_v2_stage3_domain_schema/);
+  assert.match(read('src/lib/foundation.ts'), /REQUIRED_MODEL_COUNT = 65/);
 });
 
 test('normal hub routes require the acknowledged machine credential', () => {
