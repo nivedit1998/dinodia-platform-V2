@@ -138,7 +138,7 @@ async function freePort() {
   return port;
 }
 
-async function probeApplication(source, env) {
+async function probeApplication(source, env, fixture) {
   const port = await freePort();
   const child = spawn(process.execPath, ['node_modules/next/dist/bin/next', 'start', '-p', String(port)], { cwd: source, env, stdio: 'ignore' });
   try {
@@ -155,6 +155,21 @@ async function probeApplication(source, env) {
     if (!result) throw new Error('application did not become schema-ready on the disposable Stage 3 database');
     const denied = await fetch(`http://127.0.0.1:${port}/api/v2/session`);
     if (denied.status !== 401) throw new Error('schema-compatible application did not preserve the anonymous customer boundary');
+    const sessionCookie = `dinodia_customer_session=${encodeURIComponent(fixture.sessionToken)}`;
+    const allowed = await fetch(`http://127.0.0.1:${port}/api/v2/session`, { headers: { cookie: sessionCookie } });
+    const allowedBody = await allowed.json();
+    if (allowed.status !== 200 || allowedBody.accountId !== fixture.accountId || allowedBody.memberships?.length !== 1 || allowedBody.memberships[0]?.homeId !== fixture.allowedHomeId || allowedBody.memberships[0]?.role !== 'OWNER') {
+      throw new Error('schema-compatible application failed the authenticated allowed account-session read');
+    }
+    const wrongHome = await fetch(`http://127.0.0.1:${port}/api/v2/hub-sessions`, {
+      method: 'POST',
+      headers: { cookie: sessionCookie, 'content-type': 'application/json' },
+      body: JSON.stringify({ homeId: fixture.privateHomeId }),
+    });
+    const wrongHomeBody = await wrongHome.text();
+    if (wrongHome.status !== 403 || wrongHomeBody.includes(fixture.privateHomeMarker) || wrongHomeBody.includes(fixture.privateHomeId) || wrongHomeBody.includes(fixture.allowedHomeId)) {
+      throw new Error('schema-compatible application disclosed data or granted selected-home authority across a wrong-home boundary');
+    }
     return result;
   } finally {
     child.kill('SIGTERM');
@@ -324,11 +339,40 @@ WHERE "id" = '00000000-0000-4000-8000-000000001001';
   runWithInput('docker', ['exec', '-i', dockerName, 'psql', '-U', 'postgres', '-d', 'dinodia_v2_foundation', '-v', 'ON_ERROR_STOP=1'], `INSERT INTO "Home" ("id", "lifecycle", "installationStatus", "updatedAt") VALUES ('${markerId}', 'INSTALLING', 'DRAFT', CURRENT_TIMESTAMP);`);
   const markerCount = () => capture('docker', ['exec', dockerName, 'psql', '-U', 'postgres', '-d', 'dinodia_v2_foundation', '-At', '-c', `SELECT count(*) FROM "Home" WHERE "id" = '${markerId}'`]).trim();
   if (markerCount() !== '1') throw new Error('disposable rollback preservation marker could not be seeded');
-  await probeApplication(rollbackRoot, applicationEnv);
+  const rollbackFixture = {
+    accountId: crypto.randomUUID(),
+    allowedHomeId: crypto.randomUUID(),
+    privateHomeId: crypto.randomUUID(),
+    membershipId: crypto.randomUUID(),
+    trustedDeviceId: crypto.randomUUID(),
+    sessionId: crypto.randomUUID(),
+    sessionToken: `schema-compatible-rollback-${crypto.randomBytes(24).toString('hex')}`,
+    privateHomeMarker: `rollback-private-home-${crypto.randomBytes(16).toString('hex')}`,
+  };
+  const refreshTokenHash = crypto.createHash('sha256').update(rollbackFixture.sessionToken).digest('hex');
+  const rollbackFixtureSql = `
+INSERT INTO "CustomerAccount" ("id","displayName","username","usernameNormalized","email","emailNormalized","emailVerifiedAt","passwordHash","updatedAt") VALUES
+  ('${rollbackFixture.accountId}','Rollback owner','rollback-owner-${rollbackFixture.accountId.slice(0, 8)}','rollback-owner-${rollbackFixture.accountId.slice(0, 8)}','rollback-${rollbackFixture.accountId}@example.invalid','rollback-${rollbackFixture.accountId}@example.invalid',CURRENT_TIMESTAMP,'disposable-not-authenticatable',CURRENT_TIMESTAMP);
+INSERT INTO "Home" ("id","addressLine1","lifecycle","installationStatus","updatedAt") VALUES
+  ('${rollbackFixture.allowedHomeId}','Allowed rollback home','INSTALLING','DRAFT',CURRENT_TIMESTAMP),
+  ('${rollbackFixture.privateHomeId}','${rollbackFixture.privateHomeMarker}','INSTALLING','DRAFT',CURRENT_TIMESTAMP);
+INSERT INTO "HomeMembership" ("id","customerAccountId","homeId","role","status","updatedAt") VALUES
+  ('${rollbackFixture.membershipId}','${rollbackFixture.accountId}','${rollbackFixture.allowedHomeId}','OWNER','ACTIVE',CURRENT_TIMESTAMP);
+INSERT INTO "TrustedDevice" ("id","customerAccountId","deviceInstallationId","publicKey","publicKeyThumbprint","deviceName","updatedAt") VALUES
+  ('${rollbackFixture.trustedDeviceId}','${rollbackFixture.accountId}','rollback-device-${rollbackFixture.accountId.slice(0, 8)}','disposable-public-key','disposable-thumbprint','Rollback test device',CURRENT_TIMESTAMP);
+INSERT INTO "CustomerSession" ("id","customerAccountId","trustedDeviceId","refreshTokenHash","securityVersion","trustedDeviceSessionVersion","expiresAt","updatedAt") VALUES
+  ('${rollbackFixture.sessionId}','${rollbackFixture.accountId}','${rollbackFixture.trustedDeviceId}','${refreshTokenHash}',1,1,CURRENT_TIMESTAMP + INTERVAL '1 day',CURRENT_TIMESTAMP);
+`;
+  runWithInput('docker', ['exec', '-i', dockerName, 'psql', '-U', 'postgres', '-d', 'dinodia_v2_foundation', '-v', 'ON_ERROR_STOP=1'], rollbackFixtureSql);
+  const disposableRows = () => capture('docker', ['exec', dockerName, 'psql', '-U', 'postgres', '-d', 'dinodia_v2_foundation', '-At', '-c', `SELECT (SELECT count(*) FROM "Home" WHERE "id" IN ('${markerId}','${rollbackFixture.allowedHomeId}','${rollbackFixture.privateHomeId}')) || ':' || (SELECT count(*) FROM "CustomerAccount" WHERE "id"='${rollbackFixture.accountId}') || ':' || (SELECT count(*) FROM "CustomerSession" WHERE "id"='${rollbackFixture.sessionId}')`]).trim();
+  if (disposableRows() !== '3:1:1') throw new Error('disposable rollback fixture rows could not be verified before rehearsal');
+  await probeApplication(rollbackRoot, applicationEnv, rollbackFixture);
   if (markerCount() !== '1') throw new Error('schema-compatible rollback application changed the disposable preservation marker');
-  await probeApplication(tempRoot, applicationEnv);
+  if (disposableRows() !== '3:1:1') throw new Error('schema-compatible rollback application changed the authenticated disposable preservation fixture');
+  await probeApplication(tempRoot, applicationEnv, rollbackFixture);
   if (markerCount() !== '1') throw new Error('forward-recovered application changed the disposable preservation marker');
-  console.log(`[clean-clone:check] PASS: schema-compatible Production rollback source ${schemaCompatibleRollbackCommit.slice(0, 12)} (deployment dpl_9rUrz9a7BkcPgxcsg9UotLF6dCGv) and forward candidate both returned readiness 200 and anonymous denial 401 on the SAME Stage 3 schema; disposable row survived both`);
+  if (disposableRows() !== '3:1:1') throw new Error('forward-recovered application changed the authenticated disposable preservation fixture');
+  console.log(`[clean-clone:check] PASS: schema-compatible rollback source ${schemaCompatibleRollbackCommit.slice(0, 12)} (deployment dpl_9rUrz9a7BkcPgxcsg9UotLF6dCGv) and forward candidate both returned readiness 200, anonymous 401, authenticated account-session 200 and wrong-home 403 without private disclosure on the SAME Stage 3 schema; all seeded rows survived`);
   run('npm', ['run', 'test:stage1'], { cwd: tempRoot, env: localEnv });
   run('node', ['scripts/schema_fingerprint.mjs'], { cwd: tempRoot, env: localEnv });
   console.log(`[clean-clone:check] OK: reconstructed ${files.length} intended files, installed, migrated, tested and built in ${tempRoot}`);

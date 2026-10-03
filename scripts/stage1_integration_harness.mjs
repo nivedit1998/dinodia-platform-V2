@@ -861,20 +861,73 @@ async function customerAuthorizationChecks() {
   const winningAccountId = concurrentClaims[0].response.status === 200 ? winnerAccount.id : loserAccount.id;
   const losingAccountId = concurrentClaims[0].response.status === 200 ? loserAccount.id : winnerAccount.id;
   const reservationId = claimSuccesses[0].body.reservationId;
+  const claimHeaders = { 'content-type': 'application/json', 'x-stage1-contract-secret': env.STAGE1_CONTRACT_SECRET };
+  const claimAction = (body, extraHeaders = {}) => fetchJson(`${machineBase}/api/internal/stage1/claim`, { method: 'POST', headers: { ...claimHeaders, ...extraHeaders }, body: JSON.stringify(body) });
+  const snapshotClaimSetup = async (targetReservationId, targetAccountId, targetHomeId) => {
+    const [reservation, pendingSetup, home, customerAccount, policyAcceptances] = await Promise.all([
+      prisma.homeClaimReservation.findUniqueOrThrow({ where: { id: targetReservationId }, select: { state: true, expiresAt: true, setupRevision: true, lastQualifyingMutationAt: true, updatedAt: true } }),
+      prisma.pendingHomeSetup.findUniqueOrThrow({ where: { reservationId: targetReservationId }, select: { requiredStep: true, setupRevision: true, lastQualifyingMutationAt: true, retainedAddressRevision: true, retainedAddressDigest: true, retainedAddressConfirmedAt: true, retainedAddressConfirmedByAccountId: true, updatedAt: true } }),
+      prisma.home.findUniqueOrThrow({ where: { id: targetHomeId }, select: { addressLine1: true, addressLine2: true, city: true, region: true, postcode: true, country: true, timezone: true, addressStatus: true, managementRevision: true, updatedAt: true } }),
+      prisma.customerAccount.findUniqueOrThrow({ where: { id: targetAccountId }, select: { displayName: true, username: true, usernameNormalized: true, updatedAt: true } }),
+      prisma.policyAcceptance.findMany({ where: { customerAccountId: targetAccountId, policyKind: 'DINODIA_NATIVE' }, orderBy: { policyVersion: 'asc' }, select: { policyVersion: true, acceptedAt: true, createdAt: true } }),
+    ]);
+    return JSON.parse(JSON.stringify({ reservation, pendingSetup, home, customerAccount, policyAcceptances }));
+  };
   const claimHolderPhone = keyPair();
   const claimHolderThumbprint = crypto.createHash('sha256').update(crypto.createPublicKey(claimHolderPhone.publicKey).export({ type: 'spki', format: 'der' })).digest('hex');
   const claimHolderTrusted = await prisma.trustedDevice.create({ data: { customerAccountId: winningAccountId, deviceInstallationId: `claim-holder-${crypto.randomUUID()}`, publicKey: claimHolderPhone.publicKey, publicKeyThumbprint: claimHolderThumbprint, deviceName: 'Disposable claim holder phone' } });
   await prisma.customerSession.create({ data: { customerAccountId: winningAccountId, trustedDeviceId: claimHolderTrusted.id, refreshTokenHash: sha256(`claim-holder-session-${crypto.randomUUID()}`), securityVersion: 1, trustedDeviceSessionVersion: 1, expiresAt: new Date(Date.now() + 3600000) } });
   const repeatedClaim = await fetchJson(`${machineBase}/api/internal/stage1/claim`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-stage1-contract-secret': env.STAGE1_CONTRACT_SECRET }, body: JSON.stringify({ action: 'redeem', reference: claimReferenceValue, customerAccountId: winningAccountId }) });
   if (repeatedClaim.response.status !== 200 || repeatedClaim.body.reservationId !== reservationId || repeatedClaim.body.expiresAt !== claimSuccesses[0].body.expiresAt) fail('Claim polling/idempotent replay changed the reservation deadline');
-  const mutation = await fetchJson(`${machineBase}/api/internal/stage1/claim`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-stage1-contract-secret': env.STAGE1_CONTRACT_SECRET }, body: JSON.stringify({ action: 'mutate', reservationId, customerAccountId: winningAccountId, step: 'PROFILE', mutation: { displayName: 'Claim winner updated', username: `claim-updated-${crypto.randomUUID()}` } }) });
+  const initialProfile = { displayName: 'Claim winner updated', username: `claim-updated-${crypto.randomUUID()}` };
+  const mutation = await claimAction({ action: 'mutate', reservationId, customerAccountId: winningAccountId, step: 'PROFILE', mutation: initialProfile });
   if (mutation.response.status !== 200 || new Date(mutation.body.expiresAt).getTime() <= new Date(claimSuccesses[0].body.expiresAt).getTime()) fail('A persisted qualifying claim mutation did not extend the reservation');
+  await prisma.homeClaimReservation.update({ where: { id: reservationId }, data: { expiresAt: new Date(Date.now() + 30_000) } });
+  const beforeProfileReplay = await snapshotClaimSetup(reservationId, winningAccountId, claimHome.id);
+  const repeatedProfile = await claimAction({ action: 'mutate', reservationId, customerAccountId: winningAccountId, step: 'PROFILE', mutation: { displayName: ` ${initialProfile.displayName} `, username: ` ${initialProfile.username.toUpperCase()} ` } });
+  const afterProfileReplay = await snapshotClaimSetup(reservationId, winningAccountId, claimHome.id);
+  if (repeatedProfile.response.status !== 200 || repeatedProfile.body.expiresAt !== beforeProfileReplay.reservation.expiresAt || repeatedProfile.body.setupRevision !== beforeProfileReplay.reservation.setupRevision || JSON.stringify(afterProfileReplay) !== JSON.stringify(beforeProfileReplay)) fail('Normalized unchanged PROFILE replay extended or mutated claim/account state');
+  const changedProfile = { displayName: 'Claim winner changed', username: `claim-changed-${crypto.randomUUID()}` };
+  const profileChange = await claimAction({ action: 'mutate', reservationId, customerAccountId: winningAccountId, step: 'PROFILE', mutation: changedProfile });
+  const afterProfileChange = await snapshotClaimSetup(reservationId, winningAccountId, claimHome.id);
+  if (profileChange.response.status !== 200 || new Date(profileChange.body.expiresAt).getTime() <= new Date(beforeProfileReplay.reservation.expiresAt).getTime() || profileChange.body.setupRevision !== beforeProfileReplay.reservation.setupRevision + 1 || afterProfileChange.customerAccount.displayName !== changedProfile.displayName || afterProfileChange.customerAccount.usernameNormalized !== changedProfile.username.toLowerCase()) fail('A changed PROFILE save did not persist exactly one qualifying extension');
+  console.log('[stage3:integration] PASS: real claim route preserves expiry/revision on normalized PROFILE replay and extends once for changed values');
   // The production check constraint requires an ACTIVE reservation's expiry
   // to remain after its creation time. Move both timestamps together so the
   // fixture is already expired without bypassing that invariant.
-  const expiredCreatedAt = new Date(Date.now() - 2000);
-  const expiredAt = new Date(Date.now() - 1000);
-  await prisma.homeClaimReservation.update({ where: { id: reservationId }, data: { createdAt: expiredCreatedAt, expiresAt: expiredAt } });
+  let releaseClaimReference;
+  let signalClaimReferenceLocked;
+  const claimReferenceLocked = new Promise((resolve) => { signalClaimReferenceLocked = resolve; });
+  const claimReferenceHold = new Promise((resolve) => { releaseClaimReference = resolve; });
+  const claimExpiryLock = prisma.$transaction(async (tx) => {
+    await tx.$queryRaw`SELECT "id" FROM "HomeClaimReference" WHERE "id" = ${claimReference.id}::uuid FOR UPDATE`;
+    const expiredCreatedAt = new Date(Date.now() - 2000);
+    const expiryWhileLocked = new Date(Date.now() + 350);
+    await tx.homeClaimReservation.update({ where: { id: reservationId }, data: { createdAt: expiredCreatedAt, expiresAt: expiryWhileLocked } });
+    signalClaimReferenceLocked();
+    await claimReferenceHold;
+  });
+  await claimReferenceLocked;
+  const expiredMutationPromise = claimAction({ action: 'mutate', reservationId, customerAccountId: winningAccountId, step: 'PROFILE', mutation: { displayName: 'Expired reservation revival', username: `expired-revival-${crypto.randomUUID()}` } });
+  let requestWaitingForLock = false;
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    const waiting = await prisma.$queryRaw`SELECT count(*)::int AS count FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock' AND query LIKE '%HomeClaimReference%'`;
+    if (Number(waiting[0]?.count) > 0) { requestWaitingForLock = true; break; }
+    await sleep(50);
+  }
+  if (!requestWaitingForLock) {
+    releaseClaimReference();
+    await claimExpiryLock;
+    await expiredMutationPromise;
+    fail('Expired-while-queued claim mutation did not reach the real database lock boundary');
+  }
+  await sleep(400);
+  releaseClaimReference();
+  await claimExpiryLock;
+  const beforeExpiredMutation = await snapshotClaimSetup(reservationId, winningAccountId, claimHome.id);
+  const expiredMutation = await expiredMutationPromise;
+  const afterExpiredMutation = await snapshotClaimSetup(reservationId, winningAccountId, claimHome.id);
+  if (expiredMutation.response.status !== 409 || JSON.stringify(afterExpiredMutation) !== JSON.stringify(beforeExpiredMutation)) fail('A setup mutation revived or changed an expired reservation');
   const expiredClaim = await fetchJson(`${machineBase}/api/internal/stage1/claim`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-stage1-contract-secret': env.STAGE1_CONTRACT_SECRET }, body: JSON.stringify({ action: 'redeem', reference: claimReferenceValue, customerAccountId: losingAccountId }) });
   if (expiredClaim.response.status !== 409) fail(`Expired claim did not return the bounded restart error (${expiredClaim.response.status})`);
   const deletedWinner = await prisma.customerAccount.findUnique({ where: { id: winningAccountId }, select: { id: true } });
@@ -913,8 +966,6 @@ async function customerAuthorizationChecks() {
   const automaticallyRotated = await prisma.hubCredentialVersion.findFirst({ where: { hubInstallationId: hubOne.id, purpose: 'operator-credential', version: 2 }, select: { state: true, issuedAt: true } });
   if (automaticallyRotated?.state !== 'PENDING' || automaticallyRotated.issuedAt.getTime() > Date.now()) fail('The due operator rotation did not persist exactly one pending version before hub delivery');
   if (await prisma.customerAccount.findUnique({ where: { id: scheduledAccount.id }, select: { id: true } })) fail('Scheduled claim expiry did not delete an otherwise-unrelated verified account');
-  const claimHeaders = { 'content-type': 'application/json', 'x-stage1-contract-secret': env.STAGE1_CONTRACT_SECRET };
-  const claimAction = (body, extraHeaders = {}) => fetchJson(`${machineBase}/api/internal/stage1/claim`, { method: 'POST', headers: { ...claimHeaders, ...extraHeaders }, body: JSON.stringify(body) });
   const staffEmail = `claim-staff-${crypto.randomUUID()}@invalid.test`;
   const staffPassword = `claim-staff-password-${crypto.randomUUID()}`;
   const staff = await prisma.companyEmployeeAccount.create({ data: { displayName: 'Claim correction staff', email: staffEmail, emailNormalized: staffEmail, role: 'CXO', status: 'ACTIVE', passwordHash: hashPassword(staffPassword) } });
@@ -933,17 +984,49 @@ async function customerAuthorizationChecks() {
   const pendingClaim = await claimAction({ action: 'redeem', reference: claimReferenceValue, customerAccountId: pendingAccount.id });
   if (pendingClaim.response.status !== 200) fail(`Pending initial claim failed (${pendingClaim.response.status})`);
   const pendingId = pendingClaim.body.reservationId;
-  const addressInput = { addressLine1: '1 Registered Lane', city: 'London', postcode: 'N1 1AA', country: 'GB', timezone: 'Europe/London' };
+  const policyOne = await claimAction({ action: 'mutate', reservationId: pendingId, customerAccountId: pendingAccount.id, step: 'POLICY', mutation: { policyVersion: 'stage3-test-policy-1' } });
+  if (policyOne.response.status !== 200) fail('Initial policy acceptance failed');
+  const policyAcceptanceOne = await prisma.policyAcceptance.findUniqueOrThrow({ where: { customerAccountId_policyKind_policyVersion: { customerAccountId: pendingAccount.id, policyKind: 'DINODIA_NATIVE', policyVersion: 'stage3-test-policy-1' } }, select: { acceptedAt: true } });
+  await prisma.homeClaimReservation.update({ where: { id: pendingId }, data: { expiresAt: new Date(Date.now() + 30_000) } });
+  const beforePolicyReplay = await snapshotClaimSetup(pendingId, pendingAccount.id, claimHome.id);
+  const repeatedPolicy = await claimAction({ action: 'mutate', reservationId: pendingId, customerAccountId: pendingAccount.id, step: 'POLICY', mutation: { policyVersion: ' stage3-test-policy-1 ' } });
+  const afterPolicyReplay = await snapshotClaimSetup(pendingId, pendingAccount.id, claimHome.id);
+  const unchangedPolicyAcceptance = await prisma.policyAcceptance.findUniqueOrThrow({ where: { customerAccountId_policyKind_policyVersion: { customerAccountId: pendingAccount.id, policyKind: 'DINODIA_NATIVE', policyVersion: 'stage3-test-policy-1' } }, select: { acceptedAt: true } });
+  if (repeatedPolicy.response.status !== 200 || repeatedPolicy.body.expiresAt !== beforePolicyReplay.reservation.expiresAt || repeatedPolicy.body.setupRevision !== beforePolicyReplay.reservation.setupRevision || JSON.stringify(afterPolicyReplay) !== JSON.stringify(beforePolicyReplay) || unchangedPolicyAcceptance.acceptedAt.getTime() !== policyAcceptanceOne.acceptedAt.getTime()) fail('Unchanged POLICY replay extended or mutated reservation/acceptance state');
+  const beforePolicyChange = await prisma.homeClaimReservation.findUniqueOrThrow({ where: { id: pendingId }, select: { expiresAt: true, setupRevision: true } });
+  const policyTwo = await claimAction({ action: 'mutate', reservationId: pendingId, customerAccountId: pendingAccount.id, step: 'POLICY', mutation: { policyVersion: 'stage3-test-policy-2' } });
+  if (policyTwo.response.status !== 200 || new Date(policyTwo.body.expiresAt).getTime() <= beforePolicyChange.expiresAt.getTime() || policyTwo.body.setupRevision !== beforePolicyChange.setupRevision + 1 || await prisma.policyAcceptance.count({ where: { customerAccountId: pendingAccount.id, policyKind: 'DINODIA_NATIVE' } }) !== 2) fail('A newly accepted POLICY version did not extend the reservation exactly once');
+  console.log('[stage3:integration] PASS: real claim route preserves unchanged POLICY replay and extends for a newly accepted policy version');
+
+  let addressInput = { addressLine1: '1 Registered Lane', city: 'London', postcode: 'N1 1AA', country: 'GB', timezone: 'Europe/London' };
   const addressSave = await claimAction({ action: 'mutate', reservationId: pendingId, customerAccountId: pendingAccount.id, step: 'ADDRESS', mutation: addressInput });
   if (addressSave.response.status !== 200) fail(`Initial address save failed (${addressSave.response.status})`);
+  const initialAddressHome = await prisma.home.findUniqueOrThrow({ where: { id: claimHome.id }, select: { managementRevision: true } });
   const presentedAddress = await claimAction({ action: 'address', reservationId: pendingId, customerAccountId: pendingAccount.id });
   if (presentedAddress.response.status !== 200 || presentedAddress.body.addressLine1 !== addressInput.addressLine1) fail('Current registered address was not presented to its claimant');
   const staleConfirmation = await claimAction({ action: 'mutate', reservationId: pendingId, customerAccountId: pendingAccount.id, step: 'ADDRESS_CONFIRMATION', mutation: { addressRevision: presentedAddress.body.addressRevision - 1, addressDigest: presentedAddress.body.addressDigest } });
   if (staleConfirmation.response.status !== 409) fail(`Stale address revision was accepted (${staleConfirmation.response.status})`);
   const confirmed = await claimAction({ action: 'mutate', reservationId: pendingId, customerAccountId: pendingAccount.id, step: 'ADDRESS_CONFIRMATION', mutation: { addressRevision: presentedAddress.body.addressRevision, addressDigest: presentedAddress.body.addressDigest } });
   if (confirmed.response.status !== 200) fail(`Current address confirmation failed (${confirmed.response.status})`);
+  await prisma.homeClaimReservation.update({ where: { id: pendingId }, data: { expiresAt: new Date(Date.now() + 30_000) } });
+  const beforeAddressReplay = await snapshotClaimSetup(pendingId, pendingAccount.id, claimHome.id);
+  const repeatedAddress = await claimAction({ action: 'mutate', reservationId: pendingId, customerAccountId: pendingAccount.id, step: 'ADDRESS', mutation: { ...addressInput, addressLine1: ` ${addressInput.addressLine1} `, country: 'gb' } });
+  const afterAddressReplay = await snapshotClaimSetup(pendingId, pendingAccount.id, claimHome.id);
+  if (repeatedAddress.response.status !== 200 || repeatedAddress.body.expiresAt !== beforeAddressReplay.reservation.expiresAt || repeatedAddress.body.setupRevision !== beforeAddressReplay.reservation.setupRevision || JSON.stringify(afterAddressReplay) !== JSON.stringify(beforeAddressReplay)) fail('Normalized unchanged ADDRESS replay changed expiry, Home revision, or retained-address confirmation');
+  const beforeAddressChange = await prisma.homeClaimReservation.findUniqueOrThrow({ where: { id: pendingId }, select: { expiresAt: true, setupRevision: true } });
+  addressInput = { ...addressInput, addressLine1: '1B Registered Lane' };
+  const changedAddress = await claimAction({ action: 'mutate', reservationId: pendingId, customerAccountId: pendingAccount.id, step: 'ADDRESS', mutation: addressInput });
+  const afterAddressChange = await snapshotClaimSetup(pendingId, pendingAccount.id, claimHome.id);
+  if (changedAddress.response.status !== 200 || new Date(changedAddress.body.expiresAt).getTime() <= beforeAddressChange.expiresAt.getTime() || changedAddress.body.setupRevision !== beforeAddressChange.setupRevision + 1 || afterAddressChange.home.managementRevision !== initialAddressHome.managementRevision + 1 || afterAddressChange.pendingSetup.retainedAddressConfirmedAt || afterAddressChange.pendingSetup.retainedAddressDigest) fail('Changed ADDRESS did not extend once, increment Home revision, and invalidate its prior confirmation');
+  console.log('[stage3:integration] PASS: real claim route keeps normalized unchanged ADDRESS idempotent and changed ADDRESS invalidates prior confirmation while extending once');
+  const changedAddressPresentation = await claimAction({ action: 'address', reservationId: pendingId, customerAccountId: pendingAccount.id });
+  if (changedAddressPresentation.response.status !== 200 || changedAddressPresentation.body.addressLine1 !== addressInput.addressLine1) fail('Changed registered address was not presented for version-matched confirmation');
+  const changedAddressConfirmation = await claimAction({ action: 'mutate', reservationId: pendingId, customerAccountId: pendingAccount.id, step: 'ADDRESS_CONFIRMATION', mutation: { addressRevision: changedAddressPresentation.body.addressRevision, addressDigest: changedAddressPresentation.body.addressDigest } });
+  if (changedAddressConfirmation.response.status !== 200) fail('Changed registered address could not be confirmed at its current version');
   const repeatedConfirmation = await claimAction({ action: 'mutate', reservationId: pendingId, customerAccountId: pendingAccount.id, step: 'ADDRESS_CONFIRMATION', mutation: { addressRevision: presentedAddress.body.addressRevision, addressDigest: presentedAddress.body.addressDigest } });
-  if (repeatedConfirmation.response.status !== 200 || repeatedConfirmation.body.expiresAt !== confirmed.body.expiresAt || repeatedConfirmation.body.setupRevision !== confirmed.body.setupRevision) fail('Duplicate retained-address confirmation extended a claim');
+  if (repeatedConfirmation.response.status !== 409) fail('An obsolete retained-address confirmation remained valid after address change');
+  const duplicateChangedConfirmation = await claimAction({ action: 'mutate', reservationId: pendingId, customerAccountId: pendingAccount.id, step: 'ADDRESS_CONFIRMATION', mutation: { addressRevision: changedAddressPresentation.body.addressRevision, addressDigest: changedAddressPresentation.body.addressDigest } });
+  if (duplicateChangedConfirmation.response.status !== 200 || duplicateChangedConfirmation.body.expiresAt !== changedAddressConfirmation.body.expiresAt || duplicateChangedConfirmation.body.setupRevision !== changedAddressConfirmation.body.setupRevision) fail('Duplicate retained-address confirmation extended a claim');
   const forgedCorrection = await claimAction({ action: 'correct_address', homeId: claimHome.id, employeeId: pendingAccount.id, address: { ...addressInput, addressLine1: 'Forged Lane' } });
   if (forgedCorrection.response.status !== 403) fail(`Customer identity corrected a registered address (${forgedCorrection.response.status})`);
   const correction = await claimAction({ action: 'correct_address', homeId: claimHome.id, employeeId: staff.id, address: { ...addressInput, addressLine1: '2 Corrected Lane' } });

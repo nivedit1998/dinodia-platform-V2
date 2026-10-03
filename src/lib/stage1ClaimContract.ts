@@ -50,6 +50,44 @@ function completeAddress(address: ClaimAddress): boolean {
   return Boolean(address.addressLine1 && address.city && address.postcode && address.country && address.timezone);
 }
 
+function normalizeOptionalAddressPart(value: unknown, limit: number): string | null {
+  return String(value ?? '').trim().slice(0, limit) || null;
+}
+
+function normalizeClaimAddress(mutation: Record<string, unknown>) {
+  return {
+    addressLine1: String(mutation.addressLine1 ?? '').trim(),
+    addressLine2: normalizeOptionalAddressPart(mutation.addressLine2, 200),
+    city: String(mutation.city ?? '').trim(),
+    region: normalizeOptionalAddressPart(mutation.region, 120),
+    postcode: String(mutation.postcode ?? '').trim(),
+    country: String(mutation.country ?? '').trim().toUpperCase(),
+    timezone: String(mutation.timezone ?? '').trim(),
+  };
+}
+
+function normalizedPersistedAddress(address: { addressLine1: string | null; addressLine2: string | null; city: string | null; region: string | null; postcode: string | null; country: string | null; timezone: string | null }) {
+  return {
+    addressLine1: String(address.addressLine1 ?? '').trim(),
+    addressLine2: normalizeOptionalAddressPart(address.addressLine2, 200),
+    city: String(address.city ?? '').trim(),
+    region: normalizeOptionalAddressPart(address.region, 120),
+    postcode: String(address.postcode ?? '').trim(),
+    country: String(address.country ?? '').trim().toUpperCase(),
+    timezone: String(address.timezone ?? '').trim(),
+  };
+}
+
+function sameNormalizedAddress(left: ReturnType<typeof normalizeClaimAddress>, right: ReturnType<typeof normalizedPersistedAddress>): boolean {
+  return left.addressLine1 === right.addressLine1
+    && left.addressLine2 === right.addressLine2
+    && left.city === right.city
+    && left.region === right.region
+    && left.postcode === right.postcode
+    && left.country === right.country
+    && left.timezone === right.timezone;
+}
+
 export async function readClaimAddressContract(reservationId: string, customerAccountId: string) {
   const reservation = await prisma.homeClaimReservation.findUnique({ where: { id: reservationId }, select: { customerAccountId: true, state: true, expiresAt: true, claimReference: { select: { homeId: true } } } });
   if (!reservation || reservation.customerAccountId !== customerAccountId || (reservation.state !== 'ACTIVE' && reservation.state !== 'CONVERTED_TO_PENDING_INSTALLATION') || (reservation.state === 'ACTIVE' && reservation.expiresAt <= new Date())) throw new Stage1AuthError(409, 'claim_reservation_expired', 'The setup reservation has expired');
@@ -119,33 +157,48 @@ export async function redeemClaimContract(input: { reference: string; customerAc
 export async function recordQualifyingClaimMutation(reservationId: string, customerAccountId: string, step: string, mutation: Record<string, unknown> = {}) {
   const normalizedStep = String(step).toUpperCase();
   if (!['PROFILE', 'ADDRESS', 'ADDRESS_CONFIRMATION', 'POLICY'].includes(normalizedStep)) throw new Stage1AuthError(400, 'claim_step_invalid', 'The setup step is not a qualifying persisted setup mutation');
-  const now = new Date();
   return prisma.$transaction(async (tx) => {
     const claimLookup = await tx.homeClaimReservation.findUnique({ where: { id: reservationId }, select: { claimReferenceId: true } });
     if (!claimLookup) throw new Stage1AuthError(409, 'claim_reservation_expired', 'The setup reservation has expired');
     await tx.$queryRaw`SELECT "id" FROM "HomeClaimReference" WHERE "id" = ${claimLookup.claimReferenceId}::uuid FOR UPDATE`;
+    const initialReservation = await tx.homeClaimReservation.findUnique({ where: { id: reservationId }, select: { customerAccountId: true, state: true, claimReference: { select: { homeId: true } } } });
+    if (!initialReservation || initialReservation.customerAccountId !== customerAccountId) throw new Stage1AuthError(409, 'claim_reservation_expired', 'The setup reservation has expired');
+
+    // PROFILE and POLICY are account-wide. Serialize them across claims for
+    // different homes before comparing persisted values, so concurrent saves
+    // cannot both treat the same value as a newly accepted mutation.
+    if (normalizedStep === 'PROFILE' || normalizedStep === 'POLICY') {
+      await tx.$queryRaw`SELECT "id" FROM "CustomerAccount" WHERE "id" = ${customerAccountId}::uuid FOR UPDATE`;
+    } else {
+      await tx.$queryRaw`SELECT "id" FROM "Home" WHERE "id" = ${initialReservation.claimReference.homeId}::uuid FOR UPDATE`;
+    }
+
+    // Read time only after obtaining all serialization locks. A request that
+    // waited at a lock must not use a timestamp from before the reservation
+    // expired and thereby revive it.
+    const now = new Date();
     const reservation = await tx.homeClaimReservation.findUnique({ where: { id: reservationId }, select: { id: true, customerAccountId: true, state: true, expiresAt: true, claimReferenceId: true, setupRevision: true, claimReference: { select: { homeId: true } } } });
     const pendingReconfirmation = normalizedStep === 'ADDRESS_CONFIRMATION' && reservation?.state === 'CONVERTED_TO_PENDING_INSTALLATION';
     if (!reservation || reservation.customerAccountId !== customerAccountId || (!pendingReconfirmation && (reservation.state !== 'ACTIVE' || reservation.expiresAt <= now))) throw new Stage1AuthError(409, 'claim_reservation_expired', 'The setup reservation has expired');
+    const unchanged = () => ({ id: reservation.id, expiresAt: reservation.expiresAt, setupRevision: reservation.setupRevision });
     if (normalizedStep === 'PROFILE') {
       const displayName = String(mutation.displayName ?? '').trim();
       const username = String(mutation.username ?? '').trim();
       if (!displayName || !username || displayName.length > 160 || username.length > 80) throw new Stage1AuthError(400, 'claim_profile_invalid', 'A saved display name and username are required');
+      const current = await tx.customerAccount.findUnique({ where: { id: customerAccountId }, select: { displayName: true, username: true, usernameNormalized: true } });
+      if (!current) throw new Stage1AuthError(404, 'claim_account_missing', 'The customer account does not exist');
+      if (current.displayName.trim() === displayName && current.usernameNormalized === username.toLowerCase()) return unchanged();
       await tx.customerAccount.update({ where: { id: customerAccountId }, data: { displayName, username, usernameNormalized: username.toLowerCase() } });
     } else if (normalizedStep === 'ADDRESS') {
-      const addressLine1 = String(mutation.addressLine1 ?? '').trim();
-      const city = String(mutation.city ?? '').trim();
-      const postcode = String(mutation.postcode ?? '').trim();
-      const country = String(mutation.country ?? '').trim().toUpperCase();
-      const timezone = String(mutation.timezone ?? '').trim();
+      const nextAddress = normalizeClaimAddress(mutation);
+      const { addressLine1, city, postcode, country, timezone } = nextAddress;
       if (!addressLine1 || !city || !postcode || !/^[A-Z]{2}$/.test(country) || !timezone || addressLine1.length > 200 || city.length > 120 || postcode.length > 32 || timezone.length > 80) throw new Stage1AuthError(400, 'claim_address_invalid', 'A complete address is required');
-      await tx.$queryRaw`SELECT "id" FROM "Home" WHERE "id" = ${reservation.claimReference.homeId}::uuid FOR UPDATE`;
-      const current = await tx.home.findUniqueOrThrow({ where: { id: reservation.claimReference.homeId }, select: { addressStatus: true } });
+      const current = await tx.home.findUniqueOrThrow({ where: { id: reservation.claimReference.homeId }, select: { addressLine1: true, addressLine2: true, city: true, region: true, postcode: true, country: true, timezone: true, addressStatus: true } });
       if (current.addressStatus === 'VERIFIED' || current.addressStatus === 'STAFF_CORRECTED') throw new Stage1AuthError(403, 'claim_staff_required', 'Only authorised staff may correct a registered address');
-      await tx.home.update({ where: { id: reservation.claimReference.homeId }, data: { addressLine1, addressLine2: String(mutation.addressLine2 ?? '').trim().slice(0, 200) || null, city, region: String(mutation.region ?? '').trim().slice(0, 120) || null, postcode, country, timezone, addressStatus: 'PENDING_CLAIM', managementRevision: { increment: 1 } } });
+      if (sameNormalizedAddress(nextAddress, normalizedPersistedAddress(current))) return unchanged();
+      await tx.home.update({ where: { id: reservation.claimReference.homeId }, data: { ...nextAddress, addressStatus: 'PENDING_CLAIM', managementRevision: { increment: 1 } } });
       await tx.pendingHomeSetup.update({ where: { reservationId }, data: { retainedAddressRevision: null, retainedAddressDigest: null, retainedAddressConfirmedAt: null, retainedAddressConfirmedByAccountId: null } });
     } else if (normalizedStep === 'ADDRESS_CONFIRMATION') {
-      await tx.$queryRaw`SELECT "id" FROM "Home" WHERE "id" = ${reservation.claimReference.homeId}::uuid FOR UPDATE`;
       const current = await tx.home.findUniqueOrThrow({ where: { id: reservation.claimReference.homeId }, select: { addressLine1: true, addressLine2: true, city: true, region: true, postcode: true, country: true, timezone: true, managementRevision: true } });
       const revision = mutation.addressRevision;
       const digest = mutation.addressDigest;
@@ -156,7 +209,9 @@ export async function recordQualifyingClaimMutation(reservationId: string, custo
     } else {
       const policyVersion = String(mutation.policyVersion ?? '').trim();
       if (!policyVersion || policyVersion.length > 80) throw new Stage1AuthError(400, 'claim_policy_invalid', 'A policy version is required');
-      await tx.policyAcceptance.upsert({ where: { customerAccountId_policyKind_policyVersion: { customerAccountId, policyKind: 'DINODIA_NATIVE', policyVersion } }, create: { customerAccountId, policyKind: 'DINODIA_NATIVE', policyVersion }, update: {} });
+      const existing = await tx.policyAcceptance.findUnique({ where: { customerAccountId_policyKind_policyVersion: { customerAccountId, policyKind: 'DINODIA_NATIVE', policyVersion } }, select: { id: true } });
+      if (existing) return unchanged();
+      await tx.policyAcceptance.create({ data: { customerAccountId, policyKind: 'DINODIA_NATIVE', policyVersion } });
     }
     if (pendingReconfirmation) return { id: reservation.id, expiresAt: reservation.expiresAt, setupRevision: reservation.setupRevision };
     const updated = await tx.homeClaimReservation.update({ where: { id: reservation.id }, data: { expiresAt: new Date(now.getTime() + RESERVATION_MS), setupRevision: { increment: 1 }, lastQualifyingMutationAt: now }, select: { id: true, expiresAt: true, setupRevision: true } });
