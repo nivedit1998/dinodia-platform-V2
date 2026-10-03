@@ -4,6 +4,7 @@ import { prisma } from './prisma';
 import { Stage1AuthError } from './stage1Auth';
 
 const RESERVATION_MS = 30 * 60 * 1000;
+const POLICY_VERSION_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,79}$/;
 
 type ClaimTransaction = Prisma.TransactionClient;
 
@@ -38,6 +39,12 @@ function claimPepper(): Buffer {
   const value = String(process.env.CLAIM_REFERENCE_PEPPER ?? '');
   if (!value) throw new Stage1AuthError(503, 'claim_reference_unconfigured', 'Claim reference trust is not configured');
   return Buffer.from(value, 'utf8');
+}
+
+function currentNativePolicyVersion(): string {
+  const version = String(process.env.DINODIA_NATIVE_POLICY_VERSION ?? '').trim();
+  if (!POLICY_VERSION_PATTERN.test(version)) throw new Stage1AuthError(503, 'claim_policy_unavailable', 'The current customer policy is not configured');
+  return version;
 }
 
 type ClaimAddress = { addressLine1: string | null; addressLine2: string | null; city: string | null; region: string | null; postcode: string | null; country: string | null; timezone: string | null; managementRevision: number };
@@ -120,11 +127,13 @@ export function hashClaimReference(value: string): string {
 
 export async function redeemClaimContract(input: { reference: string; customerAccountId: string; emailVerified: boolean }) {
   if (!input.emailVerified) throw new Stage1AuthError(403, 'claim_email_unverified', 'Email verification is required before a claim can be reserved');
-  const now = new Date();
   const result = await prisma.$transaction(async (tx) => {
     // Serialize all claim attempts for the same physical reference. This is
     // the database-level first-wins rule; application-side checks alone race.
     await tx.$queryRaw`SELECT "id" FROM "HomeClaimReference" WHERE "companyQrReferenceHash" = ${hashClaimReference(input.reference)} FOR UPDATE`;
+    // Expiry is evaluated only after the serialization lock. A request queued
+    // before expiresAt cannot redeem the reservation using stale request time.
+    const now = new Date();
     const reference = await tx.homeClaimReference.findUnique({ where: { companyQrReferenceHash: hashClaimReference(input.reference) }, select: { id: true, homeId: true, hubInstallationId: true, state: true, generation: true } });
     if (!reference || !['AVAILABLE', 'RESERVED'].includes(reference.state)) throw new Stage1AuthError(409, 'claim_unavailable', 'This property claim is unavailable');
     const existing = await tx.homeClaimReservation.findFirst({ where: { claimReferenceId: reference.id, state: 'ACTIVE' }, select: { id: true, claimReferenceId: true, customerAccountId: true, expiresAt: true } });
@@ -157,6 +166,10 @@ export async function redeemClaimContract(input: { reference: string; customerAc
 export async function recordQualifyingClaimMutation(reservationId: string, customerAccountId: string, step: string, mutation: Record<string, unknown> = {}) {
   const normalizedStep = String(step).toUpperCase();
   if (!['PROFILE', 'ADDRESS', 'ADDRESS_CONFIRMATION', 'POLICY'].includes(normalizedStep)) throw new Stage1AuthError(400, 'claim_step_invalid', 'The setup step is not a qualifying persisted setup mutation');
+  const requestedPolicyVersion = normalizedStep === 'POLICY' && typeof mutation.policyVersion === 'string' ? mutation.policyVersion.trim() : null;
+  if (normalizedStep === 'POLICY' && (!requestedPolicyVersion || !POLICY_VERSION_PATTERN.test(requestedPolicyVersion))) throw new Stage1AuthError(400, 'claim_policy_invalid', 'A valid policy version is required');
+  const authoritativePolicyVersion = normalizedStep === 'POLICY' ? currentNativePolicyVersion() : null;
+  if (normalizedStep === 'POLICY' && requestedPolicyVersion !== authoritativePolicyVersion) throw new Stage1AuthError(409, 'claim_policy_stale', 'The accepted policy version is no longer current');
   return prisma.$transaction(async (tx) => {
     const claimLookup = await tx.homeClaimReservation.findUnique({ where: { id: reservationId }, select: { claimReferenceId: true } });
     if (!claimLookup) throw new Stage1AuthError(409, 'claim_reservation_expired', 'The setup reservation has expired');
@@ -207,11 +220,12 @@ export async function recordQualifyingClaimMutation(reservationId: string, custo
       if (pending.retainedAddressRevision === revision && pending.retainedAddressDigest === digest && pending.retainedAddressConfirmedByAccountId === customerAccountId) return { id: reservation.id, expiresAt: reservation.expiresAt, setupRevision: reservation.setupRevision };
       await tx.pendingHomeSetup.update({ where: { reservationId }, data: { retainedAddressRevision: current.managementRevision, retainedAddressDigest: digest, retainedAddressConfirmedAt: now, retainedAddressConfirmedByAccountId: customerAccountId } });
     } else {
-      const policyVersion = String(mutation.policyVersion ?? '').trim();
-      if (!policyVersion || policyVersion.length > 80) throw new Stage1AuthError(400, 'claim_policy_invalid', 'A policy version is required');
-      const existing = await tx.policyAcceptance.findUnique({ where: { customerAccountId_policyKind_policyVersion: { customerAccountId, policyKind: 'DINODIA_NATIVE', policyVersion } }, select: { id: true } });
+      // Persist the deployment's server-owned current version, never a
+      // caller-selected identifier. The request value is only an equality
+      // precondition checked above.
+      const existing = await tx.policyAcceptance.findUnique({ where: { customerAccountId_policyKind_policyVersion: { customerAccountId, policyKind: 'DINODIA_NATIVE', policyVersion: authoritativePolicyVersion! } }, select: { id: true } });
       if (existing) return unchanged();
-      await tx.policyAcceptance.create({ data: { customerAccountId, policyKind: 'DINODIA_NATIVE', policyVersion } });
+      await tx.policyAcceptance.create({ data: { customerAccountId, policyKind: 'DINODIA_NATIVE', policyVersion: authoritativePolicyVersion! } });
     }
     if (pendingReconfirmation) return { id: reservation.id, expiresAt: reservation.expiresAt, setupRevision: reservation.setupRevision };
     const updated = await tx.homeClaimReservation.update({ where: { id: reservation.id }, data: { expiresAt: new Date(now.getTime() + RESERVATION_MS), setupRevision: { increment: 1 }, lastQualifyingMutationAt: now }, select: { id: true, expiresAt: true, setupRevision: true } });
@@ -221,20 +235,26 @@ export async function recordQualifyingClaimMutation(reservationId: string, custo
 }
 
 export async function completeClaimSetup(reservationId: string, customerAccountId: string) {
-  const now = new Date();
   return prisma.$transaction(async (tx) => {
     const claimLookup = await tx.homeClaimReservation.findUnique({ where: { id: reservationId }, select: { claimReferenceId: true } });
     if (!claimLookup) throw new Stage1AuthError(409, 'claim_reservation_expired', 'The setup reservation has expired');
     await tx.$queryRaw`SELECT "id" FROM "HomeClaimReference" WHERE "id" = ${claimLookup.claimReferenceId}::uuid FOR UPDATE`;
     const reservation = await tx.homeClaimReservation.findUnique({ where: { id: reservationId }, select: { id: true, customerAccountId: true, claimReferenceId: true, state: true, expiresAt: true } });
-    if (!reservation || reservation.customerAccountId !== customerAccountId || reservation.state !== 'ACTIVE' || reservation.expiresAt <= now) throw new Stage1AuthError(409, 'claim_reservation_expired', 'The setup reservation has expired');
-    await tx.homeClaimReservation.update({ where: { id: reservation.id }, data: { state: 'CONVERTED_TO_PENDING_INSTALLATION', updatedAt: now } });
-    await tx.pendingHomeSetup.update({ where: { reservationId }, data: { state: 'PENDING_INSTALLATION', completedAt: now } });
+    if (!reservation || reservation.customerAccountId !== customerAccountId || reservation.state !== 'ACTIVE') throw new Stage1AuthError(409, 'claim_reservation_expired', 'The setup reservation has expired');
     const reference = await tx.homeClaimReference.findUniqueOrThrow({ where: { id: reservation.claimReferenceId }, select: { homeId: true, state: true } });
     if (reference.state !== 'RESERVED') throw new Stage1AuthError(409, 'claim_unavailable', 'This property claim is unavailable');
+    const account = await tx.customerAccount.findUnique({ where: { id: customerAccountId }, select: { status: true, emailVerifiedAt: true } });
+    if (!account || account.status !== 'ACTIVE' || !account.emailVerifiedAt) throw new Stage1AuthError(403, 'claim_account_unverified', 'An active verified customer account is required');
+    await tx.$queryRaw`SELECT "id" FROM "Home" WHERE "id" = ${reference.homeId}::uuid FOR UPDATE`;
+    // Check the deadline after all serialization locks, immediately before
+    // changing the pending authority state.
+    const now = new Date();
+    if (reservation.expiresAt <= now) throw new Stage1AuthError(409, 'claim_reservation_expired', 'The setup reservation has expired');
     const pending = await tx.pendingHomeSetup.findUniqueOrThrow({ where: { reservationId }, select: { retainedAddressRevision: true, retainedAddressDigest: true, retainedAddressConfirmedByAccountId: true } });
     const home = await tx.home.findUniqueOrThrow({ where: { id: reference.homeId }, select: { addressLine1: true, addressLine2: true, city: true, region: true, postcode: true, country: true, timezone: true, managementRevision: true } });
     if (!completeAddress(home) || pending.retainedAddressRevision !== home.managementRevision || pending.retainedAddressDigest !== addressDigest(home) || pending.retainedAddressConfirmedByAccountId !== customerAccountId) throw new Stage1AuthError(409, 'claim_address_confirmation_required', 'Confirm the current registered address before continuing');
+    await tx.homeClaimReservation.update({ where: { id: reservation.id }, data: { state: 'CONVERTED_TO_PENDING_INSTALLATION', updatedAt: now } });
+    await tx.pendingHomeSetup.update({ where: { reservationId }, data: { state: 'PENDING_INSTALLATION', completedAt: now } });
     await tx.homeClaimReference.update({ where: { id: reservation.claimReferenceId }, data: { state: 'PENDING_INSTALLATION', claimedAccountId: customerAccountId, consumedAt: null } });
     await tx.home.update({ where: { id: reference.homeId }, data: { lifecycle: 'PENDING_INSTALLATION' } });
     return { ok: true, state: 'PENDING_INSTALLATION' as const };

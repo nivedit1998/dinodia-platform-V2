@@ -255,6 +255,7 @@ function baseEnv() {
     FOUNDATION_MIGRATION_CHECKSUM: migrationChecksum, FOUNDATION_SOURCE_FINGERPRINT: 'stage1-integration-harness',
     JWT_SECRET: crypto.randomBytes(32).toString('base64url'), PLATFORM_DATA_ENCRYPTION_KEY: crypto.randomBytes(32).toString('base64'),
     CLAIM_REFERENCE_PEPPER: crypto.randomBytes(32).toString('base64url'), AUDIT_LOG_HASH_SALT: crypto.randomBytes(32).toString('base64url'),
+    DINODIA_NATIVE_POLICY_VERSION: `harness-current-policy-${crypto.randomUUID()}`,
     CRON_SECRET: crypto.randomBytes(32).toString('base64url'), STAGE1_CONTRACT_SECRET: crypto.randomBytes(32).toString('base64url'),
     COMPANY_PORTAL_SESSION_PRIVATE_KEY: company.privateKey, COMPANY_PORTAL_SESSION_PUBLIC_KEYS: company.publicKey,
     DINODIA_APP_SESSION_PRIVATE_KEY: app.privateKey, DINODIA_APP_PUBLIC_KEYS: app.publicKey,
@@ -633,7 +634,7 @@ async function protectedRouteDenialChecks(base) {
   }
   console.log(`[stage1:integration] PASS: ${results.length} inventoried protected Platform route/methods enforced unauthenticated 401 (idempotent logout 204, signed enrollment malformed-input 400) with no durable row-count/content changes and no protected response fields; invalid root signature returned 401`);
 }
-async function customerAuthorizationChecks() {
+async function customerAuthorizationChecks(deliveryEnv) {
   const base = `http://127.0.0.1:${appPort}`;
   const platformBase = base;
   const now = new Date();
@@ -864,15 +865,49 @@ async function customerAuthorizationChecks() {
   const claimHeaders = { 'content-type': 'application/json', 'x-stage1-contract-secret': env.STAGE1_CONTRACT_SECRET };
   const claimAction = (body, extraHeaders = {}) => fetchJson(`${machineBase}/api/internal/stage1/claim`, { method: 'POST', headers: { ...claimHeaders, ...extraHeaders }, body: JSON.stringify(body) });
   const snapshotClaimSetup = async (targetReservationId, targetAccountId, targetHomeId) => {
-    const [reservation, pendingSetup, home, customerAccount, policyAcceptances] = await Promise.all([
-      prisma.homeClaimReservation.findUniqueOrThrow({ where: { id: targetReservationId }, select: { state: true, expiresAt: true, setupRevision: true, lastQualifyingMutationAt: true, updatedAt: true } }),
+    const [reservation, pendingSetup, home, customerAccount, policyAcceptances, sessions, trustedDevices] = await Promise.all([
+      prisma.homeClaimReservation.findUniqueOrThrow({ where: { id: targetReservationId }, select: { state: true, expiresAt: true, setupRevision: true, lastQualifyingMutationAt: true, updatedAt: true, claimReference: { select: { state: true, claimedAccountId: true, consumedAt: true } } } }),
       prisma.pendingHomeSetup.findUniqueOrThrow({ where: { reservationId: targetReservationId }, select: { requiredStep: true, setupRevision: true, lastQualifyingMutationAt: true, retainedAddressRevision: true, retainedAddressDigest: true, retainedAddressConfirmedAt: true, retainedAddressConfirmedByAccountId: true, updatedAt: true } }),
       prisma.home.findUniqueOrThrow({ where: { id: targetHomeId }, select: { addressLine1: true, addressLine2: true, city: true, region: true, postcode: true, country: true, timezone: true, addressStatus: true, managementRevision: true, updatedAt: true } }),
       prisma.customerAccount.findUniqueOrThrow({ where: { id: targetAccountId }, select: { displayName: true, username: true, usernameNormalized: true, updatedAt: true } }),
       prisma.policyAcceptance.findMany({ where: { customerAccountId: targetAccountId, policyKind: 'DINODIA_NATIVE' }, orderBy: { policyVersion: 'asc' }, select: { policyVersion: true, acceptedAt: true, createdAt: true } }),
+      prisma.customerSession.findMany({ where: { customerAccountId: targetAccountId }, orderBy: { id: 'asc' }, select: { id: true, securityVersion: true, trustedDeviceSessionVersion: true, expiresAt: true, revokedAt: true, revokeReason: true } }),
+      prisma.trustedDevice.findMany({ where: { customerAccountId: targetAccountId }, orderBy: { id: 'asc' }, select: { id: true, sessionVersion: true, revokedAt: true } }),
     ]);
-    return JSON.parse(JSON.stringify({ reservation, pendingSetup, home, customerAccount, policyAcceptances }));
+    return JSON.parse(JSON.stringify({ reservation, pendingSetup, home, customerAccount, policyAcceptances, sessions, trustedDevices }));
   };
+  async function queueClaimRoutePastExpiry(targetReservationId, action, label) {
+    let releaseLock;
+    let signalLocked;
+    const claimReferenceLocked = new Promise((resolve) => { signalLocked = resolve; });
+    const claimReferenceHold = new Promise((resolve) => { releaseLock = resolve; });
+    const expiresAt = new Date(Date.now() + 1200);
+    const lockTransaction = prisma.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT "id" FROM "HomeClaimReference" WHERE "id" = ${claimReference.id}::uuid FOR UPDATE`;
+      await tx.homeClaimReservation.update({ where: { id: targetReservationId }, data: { createdAt: new Date(Date.now() - 2000), expiresAt } });
+      signalLocked();
+      await claimReferenceHold;
+    });
+    await claimReferenceLocked;
+    const routePromise = action();
+    let requestWaitingForLock = false;
+    for (let attempt = 0; attempt < 80; attempt += 1) {
+      const waiting = await prisma.$queryRaw`SELECT count(*)::int AS count FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock' AND query LIKE '%HomeClaimReference%'`;
+      if (Number(waiting[0]?.count) > 0) { requestWaitingForLock = true; break; }
+      await sleep(25);
+    }
+    if (!requestWaitingForLock) {
+      releaseLock();
+      await lockTransaction;
+      await routePromise;
+      fail(`${label} did not reach the real claim-reference lock`);
+    }
+    const remaining = expiresAt.getTime() - Date.now();
+    if (remaining > 0) await sleep(remaining + 30);
+    releaseLock();
+    await lockTransaction;
+    return routePromise;
+  }
   const claimHolderPhone = keyPair();
   const claimHolderThumbprint = crypto.createHash('sha256').update(crypto.createPublicKey(claimHolderPhone.publicKey).export({ type: 'spki', format: 'der' })).digest('hex');
   const claimHolderTrusted = await prisma.trustedDevice.create({ data: { customerAccountId: winningAccountId, deviceInstallationId: `claim-holder-${crypto.randomUUID()}`, publicKey: claimHolderPhone.publicKey, publicKeyThumbprint: claimHolderThumbprint, deviceName: 'Disposable claim holder phone' } });
@@ -984,26 +1019,103 @@ async function customerAuthorizationChecks() {
   if (reasonlessRelease.response.status !== 400) fail('Manual release without reason was accepted');
   const manualRelease = await claimAction({ action: 'release', reservationId: manualClaim.body.reservationId, reason: 'Disposable verified correction' }, staffCookie);
   if (manualRelease.response.status !== 200 || await prisma.customerAccount.findUnique({ where: { id: manualAccount.id }, select: { id: true } })) fail('Authorised manual release failed to clean only its holder');
+
+  const redeemRaceAccount = await prisma.customerAccount.create({ data: { displayName: 'Redeem lock boundary', username: `redeem-lock-${crypto.randomUUID()}`, usernameNormalized: `redeem-lock-${crypto.randomUUID()}`, email: `redeem-lock-${crypto.randomUUID()}@invalid.test`, emailNormalized: `redeem-lock-${crypto.randomUUID()}@invalid.test`, emailVerifiedAt: now, passwordHash: 'harness-only-password-hash' } });
+  const redeemRaceClaim = await claimAction({ action: 'redeem', reference: claimReferenceValue, customerAccountId: redeemRaceAccount.id });
+  if (redeemRaceClaim.response.status !== 200) fail('Could not create disposable reservation for queued redemption boundary');
+  const queuedRedemption = await queueClaimRoutePastExpiry(redeemRaceClaim.body.reservationId, () => claimAction({ action: 'redeem', reference: claimReferenceValue, customerAccountId: redeemRaceAccount.id }), 'Claim redemption');
+  const [redeemRaceReservation, redeemRaceReference, redeemRaceHome, redeemRaceDraft, redeemRaceSurvivor] = await Promise.all([
+    prisma.homeClaimReservation.findUnique({ where: { id: redeemRaceClaim.body.reservationId }, select: { state: true } }),
+    prisma.homeClaimReference.findUnique({ where: { id: claimReference.id }, select: { state: true, consumedAt: true } }),
+    prisma.home.findUnique({ where: { id: claimHome.id }, select: { lifecycle: true } }),
+    prisma.pendingHomeSetup.findUnique({ where: { reservationId: redeemRaceClaim.body.reservationId }, select: { id: true } }),
+    prisma.customerAccount.findUnique({ where: { id: redeemRaceAccount.id }, select: { id: true } }),
+  ]);
+  if (queuedRedemption.response.status !== 409 || queuedRedemption.body.errorCode !== 'claim_reservation_expired' || (redeemRaceReservation && redeemRaceReservation.state !== 'EXPIRED') || redeemRaceReference?.state !== 'AVAILABLE' || redeemRaceReference.consumedAt || redeemRaceHome?.lifecycle !== 'CLAIMABLE' || redeemRaceDraft || redeemRaceSurvivor) fail(`Redemption queued across expiry returned stale authority or failed holder-bound cleanup (HTTP ${queuedRedemption.response.status}/${queuedRedemption.body.errorCode}, reservation ${redeemRaceReservation?.state || 'deleted'}, claim ${redeemRaceReference?.state || 'missing'}, home ${redeemRaceHome?.lifecycle || 'missing'}, draft ${Boolean(redeemRaceDraft)}, account ${Boolean(redeemRaceSurvivor)})`);
+  console.log('[stage3:integration] PASS: actual claim redemption rechecks expiry after the claim-reference lock and commits holder cleanup without consuming the claim');
+
+  const completeRaceAccount = await prisma.customerAccount.create({ data: { displayName: 'Completion lock boundary', username: `complete-lock-${crypto.randomUUID()}`, usernameNormalized: `complete-lock-${crypto.randomUUID()}`, email: `complete-lock-${crypto.randomUUID()}@invalid.test`, emailNormalized: `complete-lock-${crypto.randomUUID()}@invalid.test`, emailVerifiedAt: now, passwordHash: 'harness-only-password-hash' } });
+  const completeRacePhone = keyPair();
+  const completeRaceThumbprint = crypto.createHash('sha256').update(crypto.createPublicKey(completeRacePhone.publicKey).export({ type: 'spki', format: 'der' })).digest('hex');
+  const completeRaceTrustedDevice = await prisma.trustedDevice.create({ data: { customerAccountId: completeRaceAccount.id, deviceInstallationId: `complete-lock-phone-${crypto.randomUUID()}`, publicKey: completeRacePhone.publicKey, publicKeyThumbprint: completeRaceThumbprint, deviceName: 'Disposable completion-boundary phone' } });
+  await prisma.customerSession.create({ data: { customerAccountId: completeRaceAccount.id, trustedDeviceId: completeRaceTrustedDevice.id, refreshTokenHash: sha256(`complete-lock-session-${crypto.randomUUID()}`), securityVersion: completeRaceAccount.securityVersion, trustedDeviceSessionVersion: completeRaceTrustedDevice.sessionVersion, expiresAt: new Date(Date.now() + 60 * 60 * 1000) } });
+  const completeRaceClaim = await claimAction({ action: 'redeem', reference: claimReferenceValue, customerAccountId: completeRaceAccount.id });
+  if (completeRaceClaim.response.status !== 200) fail('Could not create disposable reservation for queued completion boundary');
+  const completeRaceAddress = { addressLine1: '2 Expiry Boundary Lane', city: 'London', postcode: 'N2 2AA', country: 'GB', timezone: 'Europe/London' };
+  const completeRaceAddressSave = await claimAction({ action: 'mutate', reservationId: completeRaceClaim.body.reservationId, customerAccountId: completeRaceAccount.id, step: 'ADDRESS', mutation: completeRaceAddress });
+  const completeRaceAddressView = await claimAction({ action: 'address', reservationId: completeRaceClaim.body.reservationId, customerAccountId: completeRaceAccount.id });
+  const completeRaceConfirmation = await claimAction({ action: 'mutate', reservationId: completeRaceClaim.body.reservationId, customerAccountId: completeRaceAccount.id, step: 'ADDRESS_CONFIRMATION', mutation: { addressRevision: completeRaceAddressView.body.addressRevision, addressDigest: completeRaceAddressView.body.addressDigest } });
+  if (completeRaceAddressSave.response.status !== 200 || completeRaceAddressView.response.status !== 200 || completeRaceConfirmation.response.status !== 200) fail('Could not prepare the disposable pending claim for completion boundary test');
+  const completionAuthority = async () => {
+    const [reservation, pendingSetup, reference, home, accountExists, ownerCount] = await Promise.all([
+      prisma.homeClaimReservation.findUniqueOrThrow({ where: { id: completeRaceClaim.body.reservationId }, select: { state: true, setupRevision: true, lastQualifyingMutationAt: true } }),
+      prisma.pendingHomeSetup.findUniqueOrThrow({ where: { reservationId: completeRaceClaim.body.reservationId }, select: { state: true, requiredStep: true, setupRevision: true, retainedAddressRevision: true, retainedAddressDigest: true, retainedAddressConfirmedAt: true, retainedAddressConfirmedByAccountId: true } }),
+      prisma.homeClaimReference.findUniqueOrThrow({ where: { id: claimReference.id }, select: { state: true, claimedAccountId: true, consumedAt: true } }),
+      prisma.home.findUniqueOrThrow({ where: { id: claimHome.id }, select: { lifecycle: true, managementRevision: true, addressStatus: true } }),
+      prisma.customerAccount.findUnique({ where: { id: completeRaceAccount.id }, select: { id: true } }),
+      prisma.homeMembership.count({ where: { homeId: claimHome.id, status: 'ACTIVE', role: 'OWNER' } }),
+    ]);
+    const [sessions, trustedDevices] = await Promise.all([
+      prisma.customerSession.findMany({ where: { customerAccountId: completeRaceAccount.id }, orderBy: { id: 'asc' }, select: { id: true, securityVersion: true, trustedDeviceSessionVersion: true, expiresAt: true, revokedAt: true, revokeReason: true } }),
+      prisma.trustedDevice.findMany({ where: { customerAccountId: completeRaceAccount.id }, orderBy: { id: 'asc' }, select: { id: true, sessionVersion: true, revokedAt: true } }),
+    ]);
+    return JSON.stringify({ reservation, pendingSetup, reference, home, accountExists: Boolean(accountExists), ownerCount, sessions, trustedDevices });
+  };
+  const beforeQueuedCompletion = await completionAuthority();
+  const queuedCompletion = await queueClaimRoutePastExpiry(completeRaceClaim.body.reservationId, () => claimAction({ action: 'complete', reservationId: completeRaceClaim.body.reservationId, customerAccountId: completeRaceAccount.id }), 'Claim completion');
+  const afterQueuedCompletion = await completionAuthority();
+  if (queuedCompletion.response.status !== 409 || queuedCompletion.body.errorCode !== 'claim_reservation_expired' || afterQueuedCompletion !== beforeQueuedCompletion) fail('Claim completion queued across expiry accepted stale authority or changed claim/account/Home state');
+  const cleanupAfterDeniedCompletion = await claimAction({ action: 'redeem', reference: claimReferenceValue, customerAccountId: completeRaceAccount.id });
+  if (cleanupAfterDeniedCompletion.response.status !== 409 || await prisma.customerAccount.findUnique({ where: { id: completeRaceAccount.id }, select: { id: true } }) || await prisma.pendingHomeSetup.findUnique({ where: { reservationId: completeRaceClaim.body.reservationId }, select: { id: true } }) || (await prisma.homeClaimReference.findUniqueOrThrow({ where: { id: claimReference.id }, select: { state: true, consumedAt: true } })).state !== 'AVAILABLE') fail('Expired completion reservation did not clean up on the next authorized expiry check');
+  console.log('[stage3:integration] PASS: actual claim completion rechecks expiry after reference/Home locks with zero stale owner, claim, draft or account effects');
+
   const pendingAccount = await prisma.customerAccount.create({ data: { displayName: 'Pending owner', username: `pending-owner-${crypto.randomUUID()}`, usernameNormalized: `pending-owner-${crypto.randomUUID()}`, email: `pending-owner-${crypto.randomUUID()}@invalid.test`, emailNormalized: `pending-owner-${crypto.randomUUID()}@invalid.test`, emailVerifiedAt: now, passwordHash: 'harness-only-password-hash' } });
+  const pendingPhone = keyPair();
+  const pendingThumbprint = crypto.createHash('sha256').update(crypto.createPublicKey(pendingPhone.publicKey).export({ type: 'spki', format: 'der' })).digest('hex');
+  const pendingTrustedDevice = await prisma.trustedDevice.create({ data: { customerAccountId: pendingAccount.id, deviceInstallationId: `pending-policy-phone-${crypto.randomUUID()}`, publicKey: pendingPhone.publicKey, publicKeyThumbprint: pendingThumbprint, deviceName: 'Disposable policy-boundary phone' } });
+  await prisma.customerSession.create({ data: { customerAccountId: pendingAccount.id, trustedDeviceId: pendingTrustedDevice.id, refreshTokenHash: sha256(`pending-policy-session-${crypto.randomUUID()}`), securityVersion: pendingAccount.securityVersion, trustedDeviceSessionVersion: pendingTrustedDevice.sessionVersion, expiresAt: new Date(Date.now() + 60 * 60 * 1000) } });
   const pendingClaim = await claimAction({ action: 'redeem', reference: claimReferenceValue, customerAccountId: pendingAccount.id });
   if (pendingClaim.response.status !== 200) fail(`Pending initial claim failed (${pendingClaim.response.status})`);
   const pendingId = pendingClaim.body.reservationId;
-  const policyOne = await claimAction({ action: 'mutate', reservationId: pendingId, customerAccountId: pendingAccount.id, step: 'POLICY', mutation: { policyVersion: 'stage3-test-policy-1' } });
+  const initialCurrentPolicyVersion = env.DINODIA_NATIVE_POLICY_VERSION;
+  const beforeUnapprovedPolicy = await snapshotClaimSetup(pendingId, pendingAccount.id, claimHome.id);
+  const unapprovedPolicy = await claimAction({ action: 'mutate', reservationId: pendingId, customerAccountId: pendingAccount.id, step: 'POLICY', mutation: { policyVersion: 'harness-invented-policy-v9' } });
+  if (unapprovedPolicy.response.status !== 409 || JSON.stringify(await snapshotClaimSetup(pendingId, pendingAccount.id, claimHome.id)) !== JSON.stringify(beforeUnapprovedPolicy)) fail('Caller-invented POLICY version was accepted or changed claim/account/Home state');
+  const malformedPolicy = await claimAction({ action: 'mutate', reservationId: pendingId, customerAccountId: pendingAccount.id, step: 'POLICY', mutation: { policyVersion: {} } });
+  if (malformedPolicy.response.status !== 400 || JSON.stringify(await snapshotClaimSetup(pendingId, pendingAccount.id, claimHome.id)) !== JSON.stringify(beforeUnapprovedPolicy)) fail('Malformed POLICY version changed claim/account/Home state');
+  const policyOne = await claimAction({ action: 'mutate', reservationId: pendingId, customerAccountId: pendingAccount.id, step: 'POLICY', mutation: { policyVersion: initialCurrentPolicyVersion } });
   if (policyOne.response.status !== 200) fail('Initial policy acceptance failed');
-  const policyAcceptanceOne = await prisma.policyAcceptance.findUniqueOrThrow({ where: { customerAccountId_policyKind_policyVersion: { customerAccountId: pendingAccount.id, policyKind: 'DINODIA_NATIVE', policyVersion: 'stage3-test-policy-1' } }, select: { acceptedAt: true } });
+  const policyAcceptanceOne = await prisma.policyAcceptance.findUniqueOrThrow({ where: { customerAccountId_policyKind_policyVersion: { customerAccountId: pendingAccount.id, policyKind: 'DINODIA_NATIVE', policyVersion: initialCurrentPolicyVersion } }, select: { acceptedAt: true } });
   await prisma.homeClaimReservation.update({ where: { id: pendingId }, data: { expiresAt: new Date(Date.now() + 30_000) } });
   const beforePolicyReplay = await snapshotClaimSetup(pendingId, pendingAccount.id, claimHome.id);
   const invalidPolicy = await claimAction({ action: 'mutate', reservationId: pendingId, customerAccountId: pendingAccount.id, step: 'POLICY', mutation: { policyVersion: ' ' } });
   const afterInvalidPolicy = await snapshotClaimSetup(pendingId, pendingAccount.id, claimHome.id);
   if (invalidPolicy.response.status !== 400 || JSON.stringify(afterInvalidPolicy) !== JSON.stringify(beforePolicyReplay)) fail('Invalid POLICY validation changed claim/account/home state or deadline');
-  const repeatedPolicy = await claimAction({ action: 'mutate', reservationId: pendingId, customerAccountId: pendingAccount.id, step: 'POLICY', mutation: { policyVersion: ' stage3-test-policy-1 ' } });
+  const repeatedPolicy = await claimAction({ action: 'mutate', reservationId: pendingId, customerAccountId: pendingAccount.id, step: 'POLICY', mutation: { policyVersion: ` ${initialCurrentPolicyVersion} ` } });
   const afterPolicyReplay = await snapshotClaimSetup(pendingId, pendingAccount.id, claimHome.id);
-  const unchangedPolicyAcceptance = await prisma.policyAcceptance.findUniqueOrThrow({ where: { customerAccountId_policyKind_policyVersion: { customerAccountId: pendingAccount.id, policyKind: 'DINODIA_NATIVE', policyVersion: 'stage3-test-policy-1' } }, select: { acceptedAt: true } });
+  const unchangedPolicyAcceptance = await prisma.policyAcceptance.findUniqueOrThrow({ where: { customerAccountId_policyKind_policyVersion: { customerAccountId: pendingAccount.id, policyKind: 'DINODIA_NATIVE', policyVersion: initialCurrentPolicyVersion } }, select: { acceptedAt: true } });
   if (repeatedPolicy.response.status !== 200 || repeatedPolicy.body.expiresAt !== beforePolicyReplay.reservation.expiresAt || repeatedPolicy.body.setupRevision !== beforePolicyReplay.reservation.setupRevision || JSON.stringify(afterPolicyReplay) !== JSON.stringify(beforePolicyReplay) || unchangedPolicyAcceptance.acceptedAt.getTime() !== policyAcceptanceOne.acceptedAt.getTime()) fail('Unchanged POLICY replay extended or mutated reservation/acceptance state');
+  const staleWhileV1 = await claimAction({ action: 'mutate', reservationId: pendingId, customerAccountId: pendingAccount.id, step: 'POLICY', mutation: { policyVersion: 'harness-current-policy-v2' } });
+  if (staleWhileV1.response.status !== 409 || JSON.stringify(await snapshotClaimSetup(pendingId, pendingAccount.id, claimHome.id)) !== JSON.stringify(beforePolicyReplay)) fail('A non-current POLICY version was accepted while the server policy remained unchanged');
+  const changedCurrentPolicyVersion = `harness-current-policy-${crypto.randomUUID()}`;
+  deliveryEnv.DINODIA_NATIVE_POLICY_VERSION = changedCurrentPolicyVersion;
+  await stopPlatform();
+  await startPlatform(deliveryEnv);
+  const staleAfterAuthorizedChange = await claimAction({ action: 'mutate', reservationId: pendingId, customerAccountId: pendingAccount.id, step: 'POLICY', mutation: { policyVersion: initialCurrentPolicyVersion } });
+  if (staleAfterAuthorizedChange.response.status !== 409 || JSON.stringify(await snapshotClaimSetup(pendingId, pendingAccount.id, claimHome.id)) !== JSON.stringify(beforePolicyReplay)) fail('A formerly current but now stale POLICY version changed durable state');
   const beforePolicyChange = await prisma.homeClaimReservation.findUniqueOrThrow({ where: { id: pendingId }, select: { expiresAt: true, setupRevision: true } });
-  const policyTwo = await claimAction({ action: 'mutate', reservationId: pendingId, customerAccountId: pendingAccount.id, step: 'POLICY', mutation: { policyVersion: 'stage3-test-policy-2' } });
-  if (policyTwo.response.status !== 200 || new Date(policyTwo.body.expiresAt).getTime() <= beforePolicyChange.expiresAt.getTime() || policyTwo.body.setupRevision !== beforePolicyChange.setupRevision + 1 || await prisma.policyAcceptance.count({ where: { customerAccountId: pendingAccount.id, policyKind: 'DINODIA_NATIVE' } }) !== 2) fail('A newly accepted POLICY version did not extend the reservation exactly once');
-  console.log('[stage3:integration] PASS: real claim route preserves unchanged POLICY replay and extends for a newly accepted policy version');
+  const policyTwo = await claimAction({ action: 'mutate', reservationId: pendingId, customerAccountId: pendingAccount.id, step: 'POLICY', mutation: { policyVersion: changedCurrentPolicyVersion } });
+  if (policyTwo.response.status !== 200 || new Date(policyTwo.body.expiresAt).getTime() <= beforePolicyChange.expiresAt.getTime() || policyTwo.body.setupRevision !== beforePolicyChange.setupRevision + 1 || await prisma.policyAcceptance.count({ where: { customerAccountId: pendingAccount.id, policyKind: 'DINODIA_NATIVE' } }) !== 2) fail('A server-authorized current POLICY version change did not extend the reservation exactly once');
+  const beforeCurrentPolicyReplay = await snapshotClaimSetup(pendingId, pendingAccount.id, claimHome.id);
+  const currentPolicyReplay = await claimAction({ action: 'mutate', reservationId: pendingId, customerAccountId: pendingAccount.id, step: 'POLICY', mutation: { policyVersion: changedCurrentPolicyVersion } });
+  if (currentPolicyReplay.response.status !== 200 || JSON.stringify(await snapshotClaimSetup(pendingId, pendingAccount.id, claimHome.id)) !== JSON.stringify(beforeCurrentPolicyReplay)) fail('Duplicate acceptance of the actual current POLICY version changed durable state');
+  await prisma.homeClaimReservation.update({ where: { id: pendingId }, data: { expiresAt: new Date(Date.now() - 1) } });
+  const beforeExpiredPolicy = await snapshotClaimSetup(pendingId, pendingAccount.id, claimHome.id);
+  const expiredPolicy = await claimAction({ action: 'mutate', reservationId: pendingId, customerAccountId: pendingAccount.id, step: 'POLICY', mutation: { policyVersion: changedCurrentPolicyVersion } });
+  if (expiredPolicy.response.status !== 409 || expiredPolicy.body.errorCode !== 'claim_reservation_expired' || JSON.stringify(await snapshotClaimSetup(pendingId, pendingAccount.id, claimHome.id)) !== JSON.stringify(beforeExpiredPolicy)) fail('Expired POLICY submission changed acceptance, deadline, revisions, address confirmation, session, trusted-device or claim authority');
+  console.log('[stage3:integration] PASS: expired POLICY submission is denied without changing acceptance, expiry/revisions, Home/address confirmation, sessions, trusted devices or claim authority');
+  await prisma.homeClaimReservation.update({ where: { id: pendingId }, data: { expiresAt: new Date(Date.now() + 30_000) } });
+  console.log('[stage3:integration] PASS: the actual claim route accepts only the server-current policy, rejects arbitrary/stale versions without effects, and extends once after a server-authorized version change');
 
   let addressInput = { addressLine1: '1 Registered Lane', city: 'London', postcode: 'N1 1AA', country: 'GB', timezone: 'Europe/London' };
   const addressSave = await claimAction({ action: 'mutate', reservationId: pendingId, customerAccountId: pendingAccount.id, step: 'ADDRESS', mutation: addressInput });
@@ -2578,7 +2690,7 @@ try {
   const deliveryEnv = { ...env, V2_ENVIRONMENT: 'test', COMPANY_PORTAL_INITIAL_CXO_EMAIL: 'niveditgupta@dinodiasmartliving.com', AWS_REGION: 'eu-north-1', SES_FROM_EMAIL: 'no-reply@dinodiasmartliving.com', AWS_ACCESS_KEY_ID: 'stage1-test-access-key', AWS_SECRET_ACCESS_KEY: 'stage1-test-secret', SES_TEST_ENDPOINT: sesEndpoint };
   await startPlatform(deliveryEnv);
   await bootstrapDeliveryChecks(deliveryEnv);
-  await customerAuthorizationChecks();
+  await customerAuthorizationChecks(deliveryEnv);
   await osChecks();
   await operatorMutationChecks();
   const childTargets = verifyChildOutboundTargets();
