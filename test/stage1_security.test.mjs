@@ -54,6 +54,34 @@ test('Stage 3 preservation proof isolates only volatile ReplayNonce runtime chur
   }), /HubInstallation\.baseUrl/);
 });
 
+test('migration preservation permits live scheduler lease/cursor churn but protects task identity, owner and row count', () => {
+  const before = {
+    rowCounts: { NativeBackgroundTaskState: '2' },
+    rowContentDigests: { NativeBackgroundTaskState: 'before' },
+    columnContentDigests: { NativeBackgroundTaskState: {
+      taskId: 'ids', dispatcher: 'owners', leaseOwner: 'old-lease', cursor: 'old-cursor', updatedAt: 't1',
+    } },
+  };
+  const after = {
+    rowCounts: { NativeBackgroundTaskState: '2' },
+    rowContentDigests: { NativeBackgroundTaskState: 'after' },
+    columnContentDigests: { NativeBackgroundTaskState: {
+      taskId: 'ids', dispatcher: 'owners', leaseOwner: 'new-lease', cursor: 'new-cursor', updatedAt: 't2',
+    } },
+  };
+  assert.deepEqual(compareExistingTablePreservation(before, after).volatileChanges, [{
+    table: 'NativeBackgroundTaskState', rowCountChanged: false, rowContentChanged: true,
+    changedColumns: ['leaseOwner', 'cursor', 'updatedAt'],
+  }]);
+  assert.throws(() => compareExistingTablePreservation(before, {
+    ...after,
+    columnContentDigests: { NativeBackgroundTaskState: { ...after.columnContentDigests.NativeBackgroundTaskState, dispatcher: 'different-owner' } },
+  }), /NativeBackgroundTaskState\.dispatcher/);
+  assert.throws(() => compareExistingTablePreservation(before, {
+    ...after, rowCounts: { NativeBackgroundTaskState: '3' },
+  }), /nonvolatile.*row counts changed/);
+});
+
 function loadTypeScriptModule(relativePath, overrides = {}) {
   const require = createRequire(import.meta.url);
   const ts = require('typescript');

@@ -1,6 +1,13 @@
 const volatileRuntimeTables = new Set(['ReplayNonce']);
 const volatileRuntimeColumns = new Map([
   ['HubInstallation', new Set(['lastSeenAt', 'onlineStateEvaluatedAt', 'updatedAt'])],
+  // The fixed scheduler legitimately advances leases/cursors while a
+  // production migration is being applied. Preserve row cardinality and the
+  // immutable taskId/dispatcher ownership; only its runtime state may move.
+  ['NativeBackgroundTaskState', new Set([
+    'nextDueAt', 'cursor', 'leaseOwner', 'leaseExpiresAt', 'lastStartedAt',
+    'lastCompletedAt', 'lastOutcome', 'consecutiveFailures', 'updatedAt',
+  ])],
 ]);
 
 export function assertMigrationDoesNotReferenceVolatileRuntimeTables(sql) {
