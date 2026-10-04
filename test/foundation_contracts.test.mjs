@@ -1,7 +1,22 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import ts from 'typescript';
 import { safeBuildId } from '../src/lib/buildIdentity.mjs';
+
+function loadFoundationRuntime() {
+  const compiled = ts.transpileModule(fs.readFileSync('src/lib/foundation.ts', 'utf8'), {
+    compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
+  }).outputText;
+  const loaded = { exports: {} };
+  const localRequire = (specifier) => {
+    if (specifier === './runtimeTarget.mjs') return { runtimeTargetIsValid: () => true };
+    if (specifier === './buildIdentity.mjs') return { safeBuildId: () => 'test-build' };
+    throw new Error(`Unexpected foundation dependency: ${specifier}`);
+  };
+  new Function('require', 'module', 'exports', compiled)(localRequire, loaded, loaded.exports);
+  return loaded.exports;
+}
 
 test('safe build identity prefers the real Vercel commit or deployment and never reports a stale pin', () => {
   assert.equal(safeBuildId({
@@ -19,6 +34,19 @@ test('safe build identity prefers the real Vercel commit or deployment and never
   }), 'vercel-deployment-id-unavailable');
   assert.equal(safeBuildId({ FOUNDATION_SOURCE_FINGERPRINT: 'abcdef0123456789' }), 'abcdef0123456789');
   assert.equal(safeBuildId({ FOUNDATION_SOURCE_FINGERPRINT: 'not-a-fingerprint' }), 'local');
+});
+
+test('readiness accepts only the exact Stage 3 head plus the reviewed additive Stage 4 migration', () => {
+  const { REQUIRED_MIGRATION, REQUIRED_MODEL_COUNT, COMPATIBLE_ADDITIVE_MIGRATIONS, isSchemaReady } = loadFoundationRuntime();
+  const stage3Checksum = 'b'.repeat(64);
+  const stage3 = [{ migration_name: REQUIRED_MIGRATION, checksum: stage3Checksum }];
+  const stage4 = [{ migration_name: Object.keys(COMPATIBLE_ADDITIVE_MIGRATIONS)[0], checksum: Object.values(COMPATIBLE_ADDITIVE_MIGRATIONS)[0] }, ...stage3];
+  assert.equal(isSchemaReady(stage3, REQUIRED_MODEL_COUNT, stage3Checksum), true);
+  assert.equal(isSchemaReady(stage4, REQUIRED_MODEL_COUNT, stage3Checksum), true, 'the app rollback remains ready after the additive migration');
+  assert.equal(isSchemaReady([{ migration_name: 'unreviewed_migration', checksum: 'c'.repeat(64) }, ...stage4], REQUIRED_MODEL_COUNT, stage3Checksum), false);
+  assert.equal(isSchemaReady([{ ...stage4[0], checksum: '0'.repeat(64) }, ...stage3], REQUIRED_MODEL_COUNT, stage3Checksum), false);
+  assert.equal(isSchemaReady(stage4, REQUIRED_MODEL_COUNT + 1, stage3Checksum), false);
+  assert.equal(isSchemaReady(stage4, REQUIRED_MODEL_COUNT, '0'.repeat(64)), false);
 });
 
 test('foundation and Stage 1 schema is exactly native and bounded', () => {

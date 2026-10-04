@@ -386,9 +386,11 @@ test('Stage 1 database migration includes durable privacy and authority objects'
   for (const marker of ['SupportAccessRequest_scope_guard', 'HubCredentialVersion_hub_purpose_state_idx', 'REVOKE ALL PRIVILEGES']) assert.match(migration, new RegExp(marker.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
 });
 
-test('readiness requires the completed Stage 1 migration rather than only the baseline', () => {
-  assert.match(read('src/app/api/readiness/route.ts'), /REQUIRED_MIGRATION/);
+test('readiness requires the exact Stage 3 schema plus only reviewed additive Stage 4 migrations', () => {
+  assert.match(read('src/app/api/readiness/route.ts'), /isSchemaReady\(migration, Number\(modelCount\[0\]\?\.count \?\? 0\), expectedMigrationChecksum\)/);
   assert.match(read('src/lib/foundation.ts'), /20261003000000_native_v2_stage3_domain_schema/);
+  assert.match(read('src/lib/foundation.ts'), /20261004050000_stage4_customer_lan_tls_identity/);
+  assert.match(read('src/lib/foundation.ts'), /8b6f9a3ed68fb00805dbc54ba750fc339da3f375bb6c4a899e286c7b3844a5d1/);
   assert.match(read('src/lib/foundation.ts'), /REQUIRED_MODEL_COUNT = 65/);
 });
 
