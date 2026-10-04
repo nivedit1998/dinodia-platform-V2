@@ -59,6 +59,6 @@ export async function POST(request: Request) {
       const payload = { version: 1, id: row.id, customerAccountId: offlineAccountByMembership.get(row.membershipId) ?? '', trustedDeviceId: row.trustedDeviceId, membershipId: row.membershipId, homeId: row.homeId, hubInstallId: row.hubInstallationId, publicKey: row.publicKey, areaIds: row.areaIds, scope: row.scopes, householdRole: 'TENANT', policyRevision: row.policyRevision, issuedAt: row.issuedAt.getTime(), revokedAt: row.revokedAt?.getTime() ?? null, revokeReason: row.revokeReason ?? null };
       return { payload, signature: signEnvelope(payload) };
     });
-    return NextResponse.json({ ok: true, homeId: hub.installation.homeId, latestVersion: latest._max.version ?? 0, operatorCredentialDelivery: delivery, operatorCredentialStates, offlineAuthorisations, areaBindings, policyRevision: hub.installation.accessPolicyRevision }, { headers: { 'Cache-Control': 'no-store', Pragma: 'no-cache' } });
+    return NextResponse.json({ ok: true, hubInstallId: hub.installation.id, homeId: hub.installation.homeId, latestVersion: latest._max.version ?? 0, operatorCredentialDelivery: delivery, operatorCredentialStates, offlineAuthorisations, areaBindings, policyRevision: hub.installation.accessPolicyRevision }, { headers: { 'Cache-Control': 'no-store', Pragma: 'no-cache' } });
   } catch (error) { return authErrorResponse(error); }
 }

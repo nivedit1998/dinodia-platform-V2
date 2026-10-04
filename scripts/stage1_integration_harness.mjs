@@ -1243,6 +1243,7 @@ async function customerAuthorizationChecks(deliveryEnv) {
   await prisma.customerAccount.deleteMany({ where: { id: { in: [winnerAccount.id, loserAccount.id] } } });
   const tokenState = await machineRequest({ base: machineBase, path: '/api/hub-agent/token-state', machineSecret, body: { serial: identityOne.serialNumber, identityGeneration: identityOne.identityGeneration, operatorCredentialVersion: 1 } });
   if (tokenState.response.status !== 200 || tokenState.body.operatorCredentialDelivery?.version !== 2) fail(`Operator credential delivery did not expose the next version (${tokenState.response.status})`);
+  if (tokenState.body.hubInstallId !== hubOne.id) fail('Authenticated token-state did not return this machine identity\'s canonical hub installation ID');
   const operatorV2 = await prisma.hubCredentialVersion.findFirst({ where: { hubInstallationId: hubOne.id, purpose: 'operator-credential', version: 2 }, select: { id: true, tokenHash: true, state: true } });
   if (operatorV2?.state !== 'DELIVERED') fail(`Operator credential was not durably marked DELIVERED (${operatorV2?.state})`);
   const deliveryAudits = await prisma.auditEvent.findMany({ where: { targetType: 'HubCredentialVersion', targetId: operatorV2.id, action: 'operator_credential_delivered' }, select: { id: true, metadata: true } });
