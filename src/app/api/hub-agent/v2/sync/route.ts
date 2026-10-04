@@ -6,8 +6,10 @@ import { authenticateHub } from '@/lib/stage1HubAuth';
 import { buildHubCloudConfiguration, finalizeHubCloudConfiguration } from '@/lib/hubCloudConfiguration';
 import { applyHubSyncEvent } from '@/lib/hubSyncIngestion';
 import { HUB_SYNC_MAX_BODY_BYTES, hubSyncBodyHash, validateHubSyncEnvelope } from '@/lib/hubSyncEnvelope';
+import { resolveNativeInstallationSyncMode } from '@/lib/nativeInstallationSyncMode';
 
 export const dynamic = 'force-dynamic';
+const INSTALLATION_BOOTSTRAP_EVENT_TYPES = new Set(['sync.compacted', 'update.status', 'area.upsert']);
 
 async function readBoundedBody(request: Request): Promise<string> {
   const length = Number(request.headers.get('content-length') || 0);
@@ -62,15 +64,32 @@ export async function POST(request: Request) {
       try {
         const result = await prisma.$transaction(async (tx) => {
           const current = await tx.hubInstallation.findUnique({ where: { id: hub.installation.id }, select: {
-            id: true, homeId: true, manufacturingIdentityId: true, serialNumberSnapshot: true, lifecycleStatus: true,
+            id: true, homeId: true, manufacturingIdentityId: true, serialNumberSnapshot: true, state: true, lifecycleStatus: true,
+            cloudUrlVerifiedAt: true, remoteVerificationAt: true,
             syncStreamId: true, syncAcceptedSequence: true, acknowledgedCloudRevision: true, accessPolicyRevision: true,
             cloudConfigurationRevision: true, cloudConfigurationChecksum: true,
           } });
-          const home = current ? await tx.home.findUnique({ where: { id: current.homeId }, select: { id: true, activeHubInstallationId: true, managementRevision: true } }) : null;
+          const home = current ? await tx.home.findUnique({ where: { id: current.homeId }, select: { id: true, lifecycle: true, installationStatus: true, activeHubInstallationId: true, managementRevision: true } }) : null;
           const activeIdentity = await tx.hubManufacturingIdentity.findFirst({ where: { id: hub.identity.id, serialNumber: hub.identity.serialNumber, identityGeneration: hub.identity.identityGeneration, status: 'ACTIVE' }, select: { id: true } });
+          const [openAssignedInstallationWorkCount, activeMembershipCount] = current && home ? await Promise.all([
+            tx.companyOperationalWorkItem.count({ where: {
+              homeId: current.homeId, hubInstallationId: current.id, kind: 'INITIAL_HUB_INSTALLATION',
+              state: { in: ['IN_PROGRESS', 'REOPENED'] }, assignedEmployee: { status: 'ACTIVE' },
+            } }),
+            tx.homeMembership.count({ where: { homeId: current.homeId, status: 'ACTIVE' } }),
+          ]) : [0, 0];
+          const syncMode = current && home ? resolveNativeInstallationSyncMode({
+            hubId: current.id, hubState: current.state, hubLifecycleStatus: current.lifecycleStatus,
+            cloudUrlVerifiedAt: current.cloudUrlVerifiedAt, remoteVerificationAt: current.remoteVerificationAt,
+            homeId: home.id, homeLifecycle: home.lifecycle, installationStatus: home.installationStatus,
+            activeHubInstallationId: home.activeHubInstallationId, openAssignedInstallationWorkCount, activeMembershipCount, now,
+          }) : 'UNAVAILABLE';
           if (!current || !home || !activeIdentity || current.manufacturingIdentityId !== hub.identity.id || current.serialNumberSnapshot !== hub.identity.serialNumber
-            || current.lifecycleStatus !== 'ACTIVE' || home.activeHubInstallationId !== current.id) {
+            || syncMode === 'UNAVAILABLE') {
             throw new Stage1AuthError(401, 'hub_sync_authority_changed', 'The enrolled hub no longer has current synchronization authority');
+          }
+          if (syncMode === 'INSTALLATION_BOOTSTRAP' && (envelope.events.length === 0 || envelope.events.some((event) => !INSTALLATION_BOOTSTRAP_EVENT_TYPES.has(event.type)))) {
+            throw new Stage1AuthError(409, envelope.events.length === 0 ? 'hub_sync_installation_area_required' : 'hub_sync_installation_area_only', 'An assigned in-progress installation may synchronize only safe updater status, compaction and OS-owned Area events');
           }
 
           const priorRange = await tx.hubSyncReceipt.findFirst({ where: { hubInstallationId: current.id, streamId: envelope.streamId, fromSequence: from, toSequence: to } });
@@ -153,7 +172,7 @@ export async function POST(request: Request) {
           };
 
           if (envelope.events.length) {
-            const advanced = await tx.hubInstallation.updateMany({ where: { id: current.id, homeId: current.homeId, syncStreamId: current.syncStreamId, syncAcceptedSequence: current.syncAcceptedSequence, lifecycleStatus: 'ACTIVE' }, data: {
+            const advanced = await tx.hubInstallation.updateMany({ where: { id: current.id, homeId: current.homeId, syncStreamId: current.syncStreamId, syncAcceptedSequence: current.syncAcceptedSequence, lifecycleStatus: syncMode === 'INSTALLATION_BOOTSTRAP' ? 'PENDING' : 'ACTIVE' }, data: {
               syncStreamId: envelope.streamId,
               syncAcceptedSequence: to,
               acknowledgedCloudRevision: Number(envelope.acknowledgedCloudRevision),

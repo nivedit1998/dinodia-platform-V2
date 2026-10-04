@@ -17,6 +17,29 @@ function loadTypeScript(relative) {
 }
 
 const { validateHubSyncEnvelope } = loadTypeScript('src/lib/hubSyncEnvelope.ts');
+const { resolveNativeInstallationSyncMode } = loadTypeScript('src/lib/nativeInstallationSyncMode.ts');
+
+test('installation sync mode permits only the current active hub or a verified, assigned, membership-free initial Area bootstrap', () => {
+  const now = new Date('2026-10-05T12:00:00.000Z');
+  const base = {
+    hubId: '11111111-1111-4111-8111-111111111111', hubState: 'PROVISIONED', hubLifecycleStatus: 'PENDING',
+    cloudUrlVerifiedAt: new Date(now.getTime() - 1000), remoteVerificationAt: new Date(now.getTime() - 1000),
+    homeId: '22222222-2222-4222-8222-222222222222', homeLifecycle: 'INSTALLING', installationStatus: 'IN_PROGRESS',
+    activeHubInstallationId: null, openAssignedInstallationWorkCount: 1, activeMembershipCount: 0, now,
+  };
+  assert.equal(resolveNativeInstallationSyncMode(base), 'INSTALLATION_BOOTSTRAP');
+  assert.equal(resolveNativeInstallationSyncMode({ ...base, activeMembershipCount: 1 }), 'UNAVAILABLE');
+  assert.equal(resolveNativeInstallationSyncMode({ ...base, openAssignedInstallationWorkCount: 0 }), 'UNAVAILABLE');
+  assert.equal(resolveNativeInstallationSyncMode({ ...base, cloudUrlVerifiedAt: null }), 'UNAVAILABLE');
+  assert.equal(resolveNativeInstallationSyncMode({ ...base, remoteVerificationAt: new Date(now.getTime() + 1) }), 'UNAVAILABLE');
+  assert.equal(resolveNativeInstallationSyncMode({ ...base, homeLifecycle: 'ACTIVE' }), 'UNAVAILABLE');
+  const active = { ...base, hubLifecycleStatus: 'ACTIVE', hubState: 'ACTIVE', installationStatus: 'COMPLETE', homeLifecycle: 'PENDING_INSTALLATION', activeHubInstallationId: base.hubId };
+  assert.equal(resolveNativeInstallationSyncMode(active), 'ACTIVE');
+  assert.equal(resolveNativeInstallationSyncMode({ ...active, homeLifecycle: 'ACTIVE' }), 'ACTIVE');
+  assert.equal(resolveNativeInstallationSyncMode({ ...active, installationStatus: 'IN_PROGRESS' }), 'UNAVAILABLE');
+  assert.equal(resolveNativeInstallationSyncMode({ ...active, homeLifecycle: 'RETIRED' }), 'UNAVAILABLE');
+  assert.equal(resolveNativeInstallationSyncMode({ ...active, hubState: 'REVOKED' }), 'UNAVAILABLE');
+});
 
 function envelope() {
   return {

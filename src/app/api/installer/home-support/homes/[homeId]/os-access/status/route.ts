@@ -10,20 +10,41 @@ export async function GET(request: Request, context: { params: Promise<{ homeId:
     const { homeId } = await context.params;
     const workflowId = String(new URL(request.url).searchParams.get('workflowId') ?? '').trim();
     if (!workflowId) throw new Stage1AuthError(400, 'workflow_required', 'An assigned workflow is required');
-    const work = await prisma.companyOperationalWorkItem.findUnique({ where: { id: workflowId }, select: { assignedEmployeeId: true, homeId: true, hubInstallationId: true, state: true } });
-    if (!work || work.assignedEmployeeId !== employee.id || work.homeId !== homeId || !work.hubInstallationId) throw new Stage1AuthError(403, 'workflow_not_authorized', 'The workflow is not available to this employee');
-    const [rows, hub, home, liveDeviceCount, openIncidentCount, replacementCandidates] = await Promise.all([
+    const work = await prisma.companyOperationalWorkItem.findUnique({ where: { id: workflowId }, select: { kind: true, assignedEmployeeId: true, homeId: true, hubInstallationId: true, state: true } });
+    if (!work || work.kind !== 'INITIAL_HUB_INSTALLATION' || work.assignedEmployeeId !== employee.id || work.homeId !== homeId || !work.hubInstallationId) throw new Stage1AuthError(403, 'workflow_not_authorized', 'The assigned initial installation workflow is not available to this employee');
+    const [rows, hub, home, liveDeviceCount, openIncidentCount, activeAreaCount, replacementCandidates, otherActiveHubCount, activeMembershipCount] = await Promise.all([
       prisma.hubCredentialVersion.findMany({ where: { hubInstallationId: work.hubInstallationId, purpose: 'operator-credential' }, orderBy: { version: 'desc' }, select: { version: true, purpose: true, state: true, issuedAt: true, deliveredAt: true, acknowledgedAt: true, activatedAt: true, graceUntil: true, revokedAt: true, deliveryAttempts: true } }),
-      prisma.hubInstallation.findFirst({ where: { id: work.hubInstallationId, homeId }, select: { id: true, lifecycleStatus: true, installationGeneration: true, lastSeenAt: true, lastSuccessfulSyncAt: true, syncAcceptedSequence: true, lastQueueDepth: true, lastSyncErrorCode: true, syncGapDetected: true, syncCriticalBacklog: true, syncTelemetryPaused: true, syncDroppedTelemetryCount: true, cloudConfigurationRevision: true, acknowledgedCloudRevision: true, updaterTrustState: true, updatePhase: true, updateAttemptId: true, updateReleaseId: true, activeReleaseVersion: true, updateResultCode: true, updateStatusAt: true, updateBusy: true } }),
-      prisma.home.findUnique({ where: { id: homeId }, select: { activeHubInstallationId: true } }),
+      prisma.hubInstallation.findFirst({ where: { id: work.hubInstallationId, homeId }, select: { id: true, state: true, lifecycleStatus: true, installationGeneration: true, cloudUrlVerifiedAt: true, remoteVerificationAt: true, lastSeenAt: true, lastSuccessfulSyncAt: true, syncAcceptedSequence: true, lastQueueDepth: true, lastSyncErrorCode: true, syncGapDetected: true, syncCriticalBacklog: true, syncTelemetryPaused: true, syncDroppedTelemetryCount: true, cloudConfigurationRevision: true, acknowledgedCloudRevision: true, updaterTrustState: true, updatePhase: true, updateAttemptId: true, updateReleaseId: true, activeReleaseVersion: true, updateResultCode: true, updateStatusAt: true, updateBusy: true } }),
+      prisma.home.findUnique({ where: { id: homeId }, select: { lifecycle: true, installationStatus: true, activeHubInstallationId: true } }),
       prisma.nativeDevice.count({ where: { homeId, hubInstallationId: work.hubInstallationId, lifecycle: { notIn: ['RETIRED', 'REMOVED'] } } }),
       prisma.nativeDeviceOutageIncident.count({ where: { homeId, state: 'OPEN' } }),
+      prisma.area.count({ where: { homeId, status: 'ACTIVE' } }),
       prisma.hubInstallation.findMany({ where: { homeId, id: { not: work.hubInstallationId }, lifecycleStatus: 'PENDING', state: { in: ['PROVISIONED', 'ACTIVE'] }, cloudUrlVerifiedAt: { not: null }, remoteVerificationAt: { not: null } }, orderBy: { createdAt: 'desc' }, take: 5, select: { id: true, installationGeneration: true, createdAt: true } }),
+      prisma.hubInstallation.count({ where: { homeId, id: { not: work.hubInstallationId }, lifecycleStatus: 'ACTIVE', state: { notIn: ['REVOKED', 'WAITING_FOR_CLEANUP'] } } }),
+      prisma.homeMembership.count({ where: { homeId, status: 'ACTIVE' } }),
     ]);
     const now = Date.now();
     const lastSeenAt = hub?.lastSeenAt ?? null;
+    const remoteVerified = Boolean(hub?.cloudUrlVerifiedAt && hub.remoteVerificationAt
+      && hub.cloudUrlVerifiedAt.getTime() <= now && hub.remoteVerificationAt.getTime() <= now);
+    const pendingCurrentHub = hub?.lifecycleStatus === 'PENDING' && hub.state === 'PROVISIONED'
+      && home?.lifecycle === 'INSTALLING' && home.installationStatus === 'IN_PROGRESS'
+      && home.activeHubInstallationId === null;
+    const installationCanComplete = ['IN_PROGRESS', 'REOPENED'].includes(work.state)
+      && activeMembershipCount === 0 && activeAreaCount > 0 && remoteVerified
+      && otherActiveHubCount === 0 && pendingCurrentHub;
+    const installationBlockReason = home?.installationStatus === 'COMPLETE' ? 'ALREADY_COMPLETE'
+      : activeMembershipCount > 0 ? 'MEMBERSHIP_ALREADY_PRESENT'
+        : activeAreaCount === 0 ? 'NO_ACTIVE_AREAS'
+        : !remoteVerified ? 'REMOTE_VERIFICATION_REQUIRED'
+          : otherActiveHubCount > 0 || !pendingCurrentHub ? 'HUB_NOT_CURRENT'
+            : !['IN_PROGRESS', 'REOPENED'].includes(work.state) ? 'WORK_NOT_OPEN' : null;
     return NextResponse.json({
       ok: true, homeId, hubInstallationId: work.hubInstallationId, workflowState: work.state,
+      installation: {
+        lifecycle: home?.lifecycle ?? 'UNAVAILABLE', status: home?.installationStatus ?? 'UNAVAILABLE',
+        activeAreaCount, canComplete: installationCanComplete, blockReason: installationBlockReason,
+      },
       heartbeat: { lastSeenAt, state: lastSeenAt && now - lastSeenAt.getTime() <= 420_000 ? 'ONLINE' : 'OFFLINE', onlineThroughSeconds: 420 },
       sync: { lastSuccessfulSyncAt: hub?.lastSuccessfulSyncAt ?? null, acceptedSequence: Number(hub?.syncAcceptedSequence ?? 0), queueDepth: hub?.lastQueueDepth ?? 0, errorCode: hub?.lastSyncErrorCode ?? null, gapDetected: hub?.syncGapDetected ?? false, criticalBacklog: hub?.syncCriticalBacklog ?? false, telemetryPaused: hub?.syncTelemetryPaused ?? false, droppedTelemetryCount: hub?.syncDroppedTelemetryCount ?? 0, cloudConfigurationRevision: hub?.cloudConfigurationRevision ?? 0, acknowledgedCloudRevision: hub?.acknowledgedCloudRevision ?? 0 },
       incidents: { openCount: openIncidentCount },

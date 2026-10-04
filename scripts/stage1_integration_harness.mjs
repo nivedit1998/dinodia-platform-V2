@@ -1948,6 +1948,119 @@ async function customerAuthorizationChecks(deliveryEnv) {
   customerFixture = { accountId: account.id, sessionId: session.id, trustedDeviceId: trusted.id, trustedPhonePrivateKey: phone.privateKey, customerSessionSecret: rawSession, offlineAuthorisationId: tenantOffline.body.authorisation.id, revocableTrustedDeviceId: revocableTrustedDevice.id, revocableRawSession, revocablePhonePrivateKey: revocablePhone.privateKey, revocableOfflineAuthorisationId: revocableOffline.body.authorisation.id, propertyAccountId: propertyAccount.id, propertySessionId: propertySession.id, propertyTrustedDeviceId: propertyTrusted.id, managerAccountId: managerAccount.id, managerMembershipId: managerMembership.id, managerSessionId: managerSession.id, managerTrustedDeviceId: managerTrusted.id, homeOneId: homeOne.id, homeTwoId: homeTwo.id, hubOneId: hubOne.id, hubTwoId: hubTwo.id, identityOneId: identityOne.id, identityTwoId: identityTwo.id, tenantDeviceId: tenantDevice.id, machineSecret, tenantMembershipId: tenantMembership.id, ownerMembershipId: ownerMembership.id, propertyMembershipId: propertyMembership.id, areaOneId: areaOne.id, areaOneOsId: areaOne.osAreaId, areaTwoId: areaTwo.id, areaTwoOsId: areaTwo.osAreaId, tenantToken: tenantToken.body.token, ownerToken: ownerToken.body.token, propertyToken: propertyToken.body.token, managerToken: managerToken.body.token, ticketId, stepUpTicketId, identityOneSigningPrivateKey: identityOneSigning.privateKey, identityOneSigningPublicKey: identityOneSigning.publicKey, identityOneEncryptionPrivateKey: identityOneEncryption.privateKey, identityOneEncryptionPublicKey: identityOneEncryption.publicKey, identityOneSerial: identityOne.serialNumber, identityOneGeneration: identityOne.identityGeneration, operatorEmployeeId: operatorEmployee.id, operatorSessionId: operatorSession.id, operatorWorkId: operatorWork.id, operatorToken };
 }
 
+async function installationBootstrapChecks() {
+  const base = `http://127.0.0.1:${appPort}`;
+  const now = new Date();
+  const home = await prisma.home.create({ data: {
+    lifecycle: 'INSTALLING', installationStatus: 'IN_PROGRESS', addressStatus: 'VERIFIED',
+    addressLine1: '1 Verified Harness Street', city: 'London', postcode: 'N1 1AA', country: 'GB', timezone: 'Europe/London',
+  } });
+  const signing = keyPair();
+  const encryption = x25519KeyPair();
+  const serial = `harness-install-bootstrap-${crypto.randomUUID()}`;
+  const identity = await prisma.hubManufacturingIdentity.create({ data: {
+    serialNumber: serial, signingPublicKey: signing.publicKey, encryptionPublicKey: encryption.publicKey,
+    signingKeyFingerprint: publicKeyFingerprint(signing.publicKey), encryptionKeyFingerprint: publicKeyFingerprint(encryption.publicKey),
+  } });
+  const verifiedAt = new Date(now.getTime() - 1000);
+  const hub = await prisma.hubInstallation.create({ data: {
+    homeId: home.id, manufacturingIdentityId: identity.id, serialNumberSnapshot: serial,
+    state: 'PROVISIONED', lifecycleStatus: 'PENDING', cloudUrl: `https://bootstrap-${crypto.randomUUID()}.dinodiasmartliving.com`,
+    reservedHostname: `bootstrap-${crypto.randomUUID()}.dinodiasmartliving.com`, cloudUrlVerifiedAt: verifiedAt,
+    remoteChallengeAt: verifiedAt, remoteVerificationAt: verifiedAt,
+  } });
+  const machineSecret = `harness-bootstrap-machine-${crypto.randomUUID()}`;
+  await prisma.hubCredentialVersion.create({ data: {
+    hubInstallationId: hub.id, version: 1, purpose: 'machine-credential', state: 'ACTIVE',
+    tokenHash: sha256(machineSecret), encryptedDeliveryEnvelope: { harness: true }, ciphertextKeyVersion: 1,
+    deliveredAt: verifiedAt, acknowledgedAt: verifiedAt, activatedAt: verifiedAt,
+  } });
+  const work = await prisma.companyOperationalWorkItem.create({ data: {
+    publicReference: `DIN-${sha256(`installation-bootstrap-${crypto.randomUUID()}`).slice(0, 16).toUpperCase()}`,
+    kind: 'INITIAL_HUB_INSTALLATION', state: 'IN_PROGRESS', homeId: home.id, hubInstallationId: hub.id,
+    certifiedSerialNumber: serial, assignedEmployeeId: customerFixture.operatorEmployeeId,
+    createdByEmployeeId: customerFixture.operatorEmployeeId, reason: 'Disposable first-Area bootstrap route test', startedAt: now,
+  } });
+  const streamId = `installation-bootstrap-${crypto.randomUUID()}`;
+  const runtime = { kind: 'dinodia_os', version: 'integration-test', capabilities: {} };
+  const event = (sequence, type, aggregateId, payload) => ({ id: crypto.randomUUID(), sequence, type, aggregateId, occurredAt: now.toISOString(), critical: true, payload });
+  const send = (events) => machineRequest({ base, path: '/api/hub-agent/v2/sync', machineSecret, body: {
+    serial, identityGeneration: identity.identityGeneration, schemaVersion: 1, hubInstallationId: hub.id, streamId,
+    fromSequence: events[0].sequence, toSequence: events.at(-1).sequence, events, queueDepth: events.length,
+    acknowledgedCloudRevision: 0, runtime, sentAt: new Date().toISOString(),
+  } });
+  const tokenState = await machineRequest({ base, path: '/api/hub-agent/token-state', machineSecret, body: { serial, identityGeneration: identity.identityGeneration, agentSeenVersion: 0, operatorCredentialVersion: 0 } });
+  if (tokenState.response.status !== 200 || tokenState.body.installationSyncMode !== 'INSTALLATION_BOOTSTRAP' || tokenState.body.hubInstallId !== hub.id || Number(tokenState.body.syncAcceptedSequence) !== 0) fail(`A verified assigned unclaimed installation did not receive the bounded bootstrap mode (${tokenState.response.status}/${tokenState.body.installationSyncMode || tokenState.body.errorCode || 'no-mode'})`);
+
+  const forbiddenBefore = event(1, 'device.tombstone', 'private-device', { osDeviceId: 'private-device', removedAt: now.toISOString() });
+  const denied = await send([forbiddenBefore]);
+  const [areasAfterDenial, cursorAfterDenial, receiptsAfterDenial] = await Promise.all([
+    prisma.area.count({ where: { homeId: home.id } }),
+    prisma.hubInstallation.findUniqueOrThrow({ where: { id: hub.id }, select: { syncAcceptedSequence: true } }),
+    prisma.hubSyncReceipt.count({ where: { hubInstallationId: hub.id } }),
+  ]);
+  if (denied.response.status !== 409 || denied.body.errorCode !== 'hub_sync_installation_area_only' || areasAfterDenial !== 0
+    || Number(cursorAfterDenial.syncAcceptedSequence) !== 0 || receiptsAfterDenial !== 0 || JSON.stringify(denied.body).includes('private-device')) {
+    fail(`Installation bootstrap accepted a device event or produced effects before a real Area (${denied.response.status}/${denied.body.errorCode || 'no-code'}; areas=${areasAfterDenial}; cursor=${cursorAfterDenial.syncAcceptedSequence}; receipts=${receiptsAfterDenial})`);
+  }
+  const completionKeyBeforeArea = `install-complete-before-area-${crypto.randomUUID()}`;
+  const completionBeforeArea = await fetchJson(`${base}/api/installer/home-support/homes/${encodeURIComponent(home.id)}/installation/complete`, {
+    method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-employee-session': customerFixture.operatorToken, 'idempotency-key': completionKeyBeforeArea },
+    body: JSON.stringify({ workflowId: work.id }),
+  });
+  const homeBeforeAreaCompletion = await prisma.home.findUniqueOrThrow({ where: { id: home.id }, select: { lifecycle: true, installationStatus: true, activeHubInstallationId: true } });
+  if (completionBeforeArea.response.status !== 409 || completionBeforeArea.body.errorCode !== 'installation_prerequisites_incomplete'
+    || homeBeforeAreaCompletion.lifecycle !== 'INSTALLING' || homeBeforeAreaCompletion.installationStatus !== 'IN_PROGRESS'
+    || homeBeforeAreaCompletion.activeHubInstallationId !== null
+    || await prisma.idempotencyRecord.count({ where: { namespace: 'installation-complete:v1', keyHash: sha256(`${customerFixture.operatorEmployeeId}:${completionKeyBeforeArea}`) } }) !== 0) {
+    fail('Installation completion without a real synchronized Area did not deny atomically with zero authority/idempotency effects');
+  }
+
+  const statusEvent = event(1, 'update.status', 'hub-updater', {
+    trustState: 'unprovisioned', phase: 'idle', activeReleaseVersion: null, attemptId: null, releaseId: null,
+    attemptPhase: null, resultCode: null, updatedAt: null, busy: false, revision: 1,
+  });
+  const areaEvent = event(2, 'area.upsert', 'os-kitchen', { osAreaId: 'os-kitchen', name: 'Kitchen', icon: 'room' });
+  const accepted = await send([statusEvent, areaEvent]);
+  const area = await prisma.area.findUnique({ where: { homeId_osAreaId: { homeId: home.id, osAreaId: 'os-kitchen' } }, select: { id: true, originalName: true, status: true } });
+  const acceptedCursor = await prisma.hubInstallation.findUniqueOrThrow({ where: { id: hub.id }, select: { syncAcceptedSequence: true, syncStreamId: true } });
+  if (accepted.response.status !== 200 || Number(accepted.body.acceptedThroughSequence) !== 2 || !area || area.originalName !== 'Kitchen'
+    || area.status !== 'ACTIVE' || acceptedCursor.syncStreamId !== streamId || Number(acceptedCursor.syncAcceptedSequence) !== 2) fail(`The authenticated bootstrap did not accept only the OS Area projection (${accepted.response.status}/${accepted.body.errorCode || 'no-code'})`);
+  if (await prisma.homeMembership.count({ where: { homeId: home.id, status: 'ACTIVE' } }) !== 0
+    || await prisma.nativeDevice.count({ where: { homeId: home.id } }) !== 0) fail('Initial Area bootstrap created customer membership or a device authority record');
+  const statusBeforeCompletion = await fetchJson(`${base}/api/installer/home-support/homes/${encodeURIComponent(home.id)}/os-access/status?workflowId=${encodeURIComponent(work.id)}`, { headers: { 'x-dinodia-employee-session': customerFixture.operatorToken } });
+  if (statusBeforeCompletion.response.status !== 200 || statusBeforeCompletion.body.installation?.canComplete !== true || statusBeforeCompletion.body.installation?.activeAreaCount !== 1) fail(`The assigned installer did not receive the exact ready-to-complete status (${statusBeforeCompletion.response.status}/${statusBeforeCompletion.body.installation?.blockReason || 'not-ready'})`);
+
+  const idempotencyKey = `install-complete-${crypto.randomUUID()}`;
+  const complete = () => fetchJson(`${base}/api/installer/home-support/homes/${encodeURIComponent(home.id)}/installation/complete`, {
+    method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-employee-session': customerFixture.operatorToken, 'idempotency-key': idempotencyKey },
+    body: JSON.stringify({ workflowId: work.id }),
+  });
+  const completions = await Promise.all([complete(), complete()]);
+  const completedHome = await prisma.home.findUniqueOrThrow({ where: { id: home.id }, select: { lifecycle: true, installationStatus: true, activeHubInstallationId: true } });
+  const completedHub = await prisma.hubInstallation.findUniqueOrThrow({ where: { id: hub.id }, select: { state: true, lifecycleStatus: true, syncAcceptedSequence: true } });
+  const completedWork = await prisma.companyOperationalWorkItem.findUniqueOrThrow({ where: { id: work.id }, select: { state: true } });
+  const completionEvents = await prisma.auditEvent.count({ where: { homeId: home.id, action: 'installation_completed' } });
+  if (completions.some((result) => result.response.status !== 200 || result.body.hubInstallationId !== hub.id)
+    || completions.filter((result) => result.body.idempotentReplay === false).length !== 1
+    || completions.filter((result) => result.body.idempotentReplay === true).length !== 1
+    || completedHome.lifecycle !== 'PENDING_INSTALLATION' || completedHome.installationStatus !== 'COMPLETE' || completedHome.activeHubInstallationId !== hub.id
+    || completedHub.state !== 'ACTIVE' || completedHub.lifecycleStatus !== 'ACTIVE' || Number(completedHub.syncAcceptedSequence) !== 2
+    || completedWork.state !== 'COMPLETED' || completionEvents !== 1
+      || await prisma.homeMembership.count({ where: { homeId: home.id, status: 'ACTIVE' } }) !== 0) {
+    fail(`Installation completion did not atomically activate the verified hub/Home once under duplicate idempotent requests (${completions.map((result) => `${result.response.status}/${result.body.errorCode || 'no-code'}/${result.body.idempotentReplay}`).join(',')}; home=${completedHome.lifecycle}/${completedHome.installationStatus}; hub=${completedHub.state}/${completedHub.lifecycleStatus}; work=${completedWork.state}; audit=${completionEvents})`);
+  }
+  const activeState = await machineRequest({ base, path: '/api/hub-agent/token-state', machineSecret, body: { serial, identityGeneration: identity.identityGeneration, agentSeenVersion: 0, operatorCredentialVersion: 0 } });
+  const afterActivationEvent = event(3, 'device.tombstone', 'private-device', { osDeviceId: 'private-device', removedAt: now.toISOString() });
+  const activeSync = await send([afterActivationEvent]);
+  const finalCursor = await prisma.hubInstallation.findUniqueOrThrow({ where: { id: hub.id }, select: { syncAcceptedSequence: true } });
+  if (activeState.response.status !== 200 || activeState.body.installationSyncMode !== 'ACTIVE'
+    || activeSync.response.status !== 200 || Number(activeSync.body.acceptedThroughSequence) !== 3 || Number(finalCursor.syncAcceptedSequence) !== 3) {
+    fail(`The completed installation did not transition to normal ordered sync (${activeState.response.status}/${activeState.body.installationSyncMode}, ${activeSync.response.status}/${activeSync.body.errorCode || 'no-code'})`);
+  }
+  console.log('[stage5:integration] PASS: actual machine-authenticated routes permit only a verified assigned initial installation to sync safe updater status and real Area projection, deny device events with zero rows/cursor/receipt effects, expose the guarded assigned completion action, commit Home/Hub/work atomically and idempotently, then restore normal ordered sync');
+}
+
 async function operatorMutationChecks() {
   const base = `http://127.0.0.1:${appPort}`;
   const homeId = customerFixture.homeOneId;
@@ -2862,6 +2975,7 @@ try {
   await startPlatform(deliveryEnv);
   await bootstrapDeliveryChecks(deliveryEnv);
   await customerAuthorizationChecks(deliveryEnv);
+  await installationBootstrapChecks();
   await osChecks();
   await operatorMutationChecks();
   const childTargets = verifyChildOutboundTargets();

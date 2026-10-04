@@ -3,6 +3,7 @@ import crypto from 'node:crypto';
 import { prisma } from '@/lib/prisma';
 import { authErrorResponse } from '@/lib/stage1Auth';
 import { authenticateHub } from '@/lib/stage1HubAuth';
+import { resolveNativeInstallationSyncMode } from '@/lib/nativeInstallationSyncMode';
 
 export const dynamic = 'force-dynamic';
 
@@ -52,6 +53,23 @@ export async function POST(request: Request) {
     const operatorCredentialStates = await prisma.hubCredentialVersion.findMany({ where: { hubInstallationId: hub.installation.id, purpose: 'operator-credential', state: { in: ['ACTIVE', 'GRACE'] } }, orderBy: { version: 'asc' }, select: { version: true, state: true, graceUntil: true, revokedAt: true } });
     const offlineRows = await prisma.offlineMembershipAuthorisation.findMany({ where: { hubInstallationId: hub.installation.id }, select: { id: true, trustedDeviceId: true, membershipId: true, homeId: true, hubInstallationId: true, publicKey: true, areaIds: true, scopes: true, policyRevision: true, issuedAt: true, revokedAt: true, revokeReason: true } });
     const homeAreas = await prisma.area.findMany({ where: { homeId: hub.installation.homeId, status: 'ACTIVE' }, orderBy: [{ id: 'asc' }], select: { id: true, osAreaId: true } });
+    const [syncInstallation, syncHome, openAssignedInstallationWorkCount, activeMembershipCount] = await Promise.all([
+      prisma.hubInstallation.findUnique({ where: { id: hub.installation.id }, select: { id: true, state: true, lifecycleStatus: true, cloudUrlVerifiedAt: true, remoteVerificationAt: true, syncStreamId: true, syncAcceptedSequence: true } }),
+      prisma.home.findUnique({ where: { id: hub.installation.homeId }, select: { id: true, lifecycle: true, installationStatus: true, activeHubInstallationId: true } }),
+      prisma.companyOperationalWorkItem.count({ where: {
+        homeId: hub.installation.homeId, hubInstallationId: hub.installation.id, kind: 'INITIAL_HUB_INSTALLATION',
+        state: { in: ['IN_PROGRESS', 'REOPENED'] }, assignedEmployee: { status: 'ACTIVE' },
+      } }),
+      prisma.homeMembership.count({ where: { homeId: hub.installation.homeId, status: 'ACTIVE' } }),
+    ]);
+    const installationSyncMode = syncInstallation && syncHome
+      ? resolveNativeInstallationSyncMode({
+        hubId: syncInstallation.id, hubState: syncInstallation.state, hubLifecycleStatus: syncInstallation.lifecycleStatus,
+        cloudUrlVerifiedAt: syncInstallation.cloudUrlVerifiedAt, remoteVerificationAt: syncInstallation.remoteVerificationAt,
+        homeId: syncHome.id, homeLifecycle: syncHome.lifecycle, installationStatus: syncHome.installationStatus,
+        activeHubInstallationId: syncHome.activeHubInstallationId, openAssignedInstallationWorkCount, activeMembershipCount, now,
+      })
+      : 'UNAVAILABLE';
     const areaBindings = homeAreas.map((area) => ({ areaId: area.id, hubAreaId: area.osAreaId }));
     const offlineMemberships = await prisma.homeMembership.findMany({ where: { id: { in: offlineRows.map((row) => row.membershipId) } }, select: { id: true, customerAccountId: true } });
     const offlineAccountByMembership = new Map(offlineMemberships.map((membership) => [membership.id, membership.customerAccountId]));
@@ -59,6 +77,6 @@ export async function POST(request: Request) {
       const payload = { version: 1, id: row.id, customerAccountId: offlineAccountByMembership.get(row.membershipId) ?? '', trustedDeviceId: row.trustedDeviceId, membershipId: row.membershipId, homeId: row.homeId, hubInstallId: row.hubInstallationId, publicKey: row.publicKey, areaIds: row.areaIds, scope: row.scopes, householdRole: 'TENANT', policyRevision: row.policyRevision, issuedAt: row.issuedAt.getTime(), revokedAt: row.revokedAt?.getTime() ?? null, revokeReason: row.revokeReason ?? null };
       return { payload, signature: signEnvelope(payload) };
     });
-    return NextResponse.json({ ok: true, hubInstallId: hub.installation.id, homeId: hub.installation.homeId, latestVersion: latest._max.version ?? 0, operatorCredentialDelivery: delivery, operatorCredentialStates, offlineAuthorisations, areaBindings, policyRevision: hub.installation.accessPolicyRevision }, { headers: { 'Cache-Control': 'no-store', Pragma: 'no-cache' } });
+    return NextResponse.json({ ok: true, hubInstallId: hub.installation.id, homeId: hub.installation.homeId, latestVersion: latest._max.version ?? 0, operatorCredentialDelivery: delivery, operatorCredentialStates, offlineAuthorisations, areaBindings, policyRevision: hub.installation.accessPolicyRevision, installationSyncMode, syncStreamId: syncInstallation?.syncStreamId ?? null, syncAcceptedSequence: Number(syncInstallation?.syncAcceptedSequence ?? 0) }, { headers: { 'Cache-Control': 'no-store', Pragma: 'no-cache' } });
   } catch (error) { return authErrorResponse(error); }
 }
