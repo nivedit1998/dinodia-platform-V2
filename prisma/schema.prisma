@@ -831,6 +831,20 @@ model HubInstallation {
   lanEndpointReportedAt            DateTime?
   lanEndpointState                 String                   @default("UNKNOWN") @db.VarChar(24)
   lanEndpointIdentityGeneration    Int?
+  publicHubId                      String?                  @unique @db.VarChar(20)
+  lanTlsRevision                   Int                      @default(0)
+  lanTlsReportedAt                 DateTime?
+  lanTlsState                      String                   @default("UNKNOWN") @db.VarChar(24)
+  lanTlsIdentityGeneration         Int?
+  lanTlsCertificateGeneration      Int?
+  lanTlsCurrentSpkiPin              String?                  @db.VarChar(64)
+  lanTlsCurrentNotBefore            DateTime?
+  lanTlsCurrentNotAfter             DateTime?
+  lanTlsNextCertificateGeneration  Int?
+  lanTlsNextSpkiPin                 String?                  @db.VarChar(64)
+  lanTlsNextNotBefore               DateTime?
+  lanTlsNextNotAfter                DateTime?
+  lanTlsAcknowledgedGeneration      Int                      @default(0)
   cloudUrl                         String?                  @db.VarChar(500)
   cloudUrlVerifiedAt               DateTime?
   cloudflareTunnelId               String?                  @db.VarChar(200)

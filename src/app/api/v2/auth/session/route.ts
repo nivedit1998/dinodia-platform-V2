@@ -47,6 +47,11 @@ export async function GET(request: Request) {
     const accountContext = {
       schemaVersion: 'dinodia.v1',
       accountId: account.id,
+      // These opaque identifiers let the app bind per-action step-up proofs
+      // after cookie-backed session restoration. Neither value authenticates
+      // a request; the HttpOnly session cookie remains the authority.
+      sessionId: session.id,
+      trustedDeviceId: trusted.id,
       memberships: memberships.map((membership) => ({
         accountId: account.id,
         homeId: membership.homeId,

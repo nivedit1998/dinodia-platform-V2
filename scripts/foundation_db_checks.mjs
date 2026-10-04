@@ -35,9 +35,10 @@ try {
     '20260927010000_nr3_hub_lan_endpoint_observation',
     '20260927020000_nr4_operator_endpoint_binding',
     '20261003000000_native_v2_stage3_domain_schema',
+    '20261004050000_stage4_customer_lan_tls_identity',
   ];
-  if (migration.length !== required.length || required.some((name) => !migrations.has(name)) || required.some((name) => !migrations.get(name).finished_at || migrations.get(name).rolled_back_at)) throw new Error('migration ledger is not exactly the completed native baseline, Stage 1 and Stage 3 migrations');
-  console.log(`[test:stage3-schema] OK: ${names.size} tables, no direct anon/authenticated grants, native baseline, Stage 1 and additive Stage 3 migrations completed`);
+  if (migration.length !== required.length || required.some((name) => !migrations.has(name)) || required.some((name) => !migrations.get(name).finished_at || migrations.get(name).rolled_back_at)) throw new Error('migration ledger is not exactly the completed native baseline, Stage 1, Stage 3 and Stage 4 migrations');
+  console.log(`[test:stage4-schema] OK: ${names.size} tables, no direct anon/authenticated grants, native baseline, Stage 1, Stage 3 and additive Stage 4 migrations completed`);
 } finally {
   await prisma.$disconnect();
 }

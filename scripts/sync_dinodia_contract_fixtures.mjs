@@ -31,6 +31,7 @@ const iosPrototypeFixtures = path.join(iosPrototype, 'DinodiaV1/fixtures');
 fs.mkdirSync(iosPrototypeFixtures, { recursive: true });
 for (const fixture of [
   'account-session-two-homes.json',
+  'customer-hub-session-test-only.json',
   'account-relationship-lifecycle.json',
   'automation-full-bundle.json',
   'automation-property-impact.json',
@@ -66,6 +67,8 @@ for (const fixture of [
   'transfer-lifecycle.json',
   'trusted-device-revocation.json',
   'notification-lifecycle.json',
+  'updater-maintenance-status-unprovisioned.json',
+  'invalid/updater-maintenance-status-exposes-authority.json',
 ]) {
   const target = path.join(iosPrototypeFixtures, fixture);
   fs.mkdirSync(path.dirname(target), { recursive: true });

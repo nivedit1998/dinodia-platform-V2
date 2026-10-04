@@ -36,6 +36,10 @@ const compiled = ts.transpileModule(source, { compilerOptions: { module: ts.Modu
 const module = { exports: {} };
 new Function('module','exports',compiled)(module,module.exports);
 const native = module.exports;
+const lanEndpointSource = fs.readFileSync(path.join(process.cwd(), 'src/lib/lanEndpoint.ts'), 'utf8');
+const lanEndpointCompiled = ts.transpileModule(lanEndpointSource, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText;
+const lanEndpointModule = { exports: {} };
+new Function('module', 'exports', 'require', lanEndpointCompiled)(lanEndpointModule, lanEndpointModule.exports, () => ({ Stage1AuthError: class Stage1AuthError extends Error {}, validateLanEndpointObservation: () => true, validateLanTlsIdentityObservation: () => true }));
 test('installation request decision binds current role, selected home, revision and exact retry state', () => {
   const fixture = JSON.parse(fs.readFileSync(path.join(root, 'fixtures/installation-request-lifecycle.json'), 'utf8'));
   for (const item of fixture.cases) {
@@ -568,6 +572,8 @@ test('account session fixture is multi-home, active, and rejects stale or mismat
   const schema = ajv.compile({ $ref: `${contract.$id}#/$defs/accountSessionContext` });
   assert.equal(schema(value), true, JSON.stringify(schema.errors));
   assert.equal(native.validateAccountSessionContext(value, Date.parse('2029-01-01T00:00:00Z')), true);
+  assert.equal(native.validateAccountSessionContext({ ...value, sessionId: undefined }, Date.parse('2029-01-01T00:00:00Z')), false, 'restoration must include the current opaque session context for operation-bound step-up');
+  assert.equal(native.validateAccountSessionContext({ ...value, trustedDeviceId: undefined }, Date.parse('2029-01-01T00:00:00Z')), false, 'restoration must include the current trusted installation context');
   assert.equal(native.validateAccountSessionContext({ ...value, memberships: value.memberships.map((membership) => ({ ...membership, accountId: 'account:other' })) }, Date.parse('2029-01-01T00:00:00Z')), false);
   assert.equal(native.validateAccountSessionContext(value, Date.parse(value.expiresAt)), false);
   const duplicateHome = { ...value, memberships: [value.memberships[0], { ...value.memberships[1], homeId: value.memberships[0].homeId, homeMembershipId: 'membership:other' }] };
@@ -599,6 +605,17 @@ test('session receipt and selected-home bearer have separate strict, bounded con
   }
   assert.equal(native.validateCustomerHubSession({ ...syntheticHubSession, hubEndpoint: { state: 'unavailable', origin: 'https://dinodia-fixture-hub.dinodiasmartliving.com' } }, expected, now), false, 'unavailable endpoint cannot carry an origin');
   assert.equal(native.validateCustomerHubSession({ ...syntheticHubSession, hubEndpoint: { state: 'verified_cloud', origin: 'https://dinodia-fixture-hub.dinodiasmartliving.com', extra: true } }, expected, now), false, 'endpoint authority fields are exact');
+  assert.equal(native.validateCustomerHubSession(syntheticHubSession, expected, now), true, 'fresh authenticated current/next LAN pins are an optional customer transport candidate');
+  const lan = syntheticHubSession.hubEndpoint.lan;
+  for (const invalidLan of [
+    { ...lan, origin: 'https://192.168.1.20:8123' },
+    { ...lan, publicHubId: 'a'.repeat(19) },
+    { ...lan, currentSpkiPin: 'sha256/not-a-pin' },
+    { ...lan, validUntil: '2026-09-27T10:08:00Z' },
+    { ...lan, nextCertificateGeneration: 1 },
+    { ...lan, nextSpkiPin: lan.currentSpkiPin },
+  ]) assert.equal(native.validateCustomerHubSession({ ...syntheticHubSession, hubEndpoint: { ...syntheticHubSession.hubEndpoint, lan: invalidLan } }, expected, now), false);
+  assert.equal(native.validateCustomerHubSession({ ...syntheticHubSession, hubEndpoint: { state: 'unavailable', lan: { ...lan, reportedAt: '2026-09-27T09:52:59Z', validUntil: '2026-09-27T09:59:59Z' } } }, expected, now), false, 'stale LAN pin report is not a customer endpoint');
 });
 test('offline home candidates are exact-account, tenant-only and fresh before an exact-home challenge', () => {
   const schema = ajv.compile({ $ref: `${contract.$id}#/$defs/offlineHomeSelection` });
@@ -656,10 +673,13 @@ test('canonical signed LAN endpoint contract keeps private installer routing out
   const publicAddress = JSON.parse(fs.readFileSync(path.join(root, 'fixtures/invalid/lan-endpoint-public-address.json'), 'utf8'));
   const extraAuthority = JSON.parse(fs.readFileSync(path.join(root, 'fixtures/invalid/lan-endpoint-extra-authority-field.json'), 'utf8'));
   assert.equal(schema(current), true, JSON.stringify(schema.errors));
+  const setupHttp = { ...current, baseUrl: 'http://192.168.0.110:80' };
+  assert.equal(schema(setupHttp), true, JSON.stringify(schema.errors));
   assert.equal(schema(unavailable), true, JSON.stringify(schema.errors));
   assert.equal(schema(publicAddress), false);
   assert.equal(schema(extraAuthority), false);
   assert.equal(native.validateLanEndpointObservation(current, 'din-home-001'), true);
+  assert.equal(native.validateLanEndpointObservation(setupHttp, 'din-home-001'), true);
   assert.equal(native.validateLanEndpointObservation(unavailable, 'din-home-001'), true);
   for (const invalid of [
     { ...current, discoveryHost: 'dinodia-another-hub.local' },
@@ -672,6 +692,51 @@ test('canonical signed LAN endpoint contract keeps private installer routing out
   assert.equal(contract.$defs.hubInstallation.properties.baseUrl, undefined, 'private installer IP is not exposed in the customer HubInstallation DTO');
   const openapi = fs.readFileSync(path.join(root, 'openapi.yaml'), 'utf8');
   assert.match(openapi, /HubLanEndpointObservation:\s*\n\s+\$ref: "\.\/contract\.json#\/\$defs\/lanEndpointObservation"/);
+});
+test('machine-authenticated LAN TLS identity report is immutable, versioned and pin-bounded', () => {
+  const report = {
+    version: 1, revision: 2, state: 'CURRENT', publicHubId: '0123456789abcdef0123', host: 'dinodia-0123456789abcdef0123.local', port: 8123,
+    certificateGeneration: 1, currentSpkiPin: 'sha256/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=', currentNotBefore: '2026-09-27T09:00:00Z', currentNotAfter: '2028-09-26T09:00:00Z',
+    nextCertificateGeneration: 2, nextSpkiPin: 'sha256/BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=', nextNotBefore: '2026-09-27T09:30:00Z', nextNotAfter: '2028-09-26T09:30:00Z', acknowledgedGeneration: 0,
+  };
+  const schema = ajv.compile({ $ref: `${contract.$id}#/$defs/lanTlsIdentityObservation` });
+  assert.equal(schema(report), true, JSON.stringify(schema.errors));
+  assert.equal(native.validateLanTlsIdentityObservation(report), true);
+  const invalidReports = [
+    { ...report, publicHubId: 'different-public-id' },
+    { ...report, host: 'dinodia-other.local' },
+    { ...report, port: 8124 },
+    { ...report, revision: 0 },
+    { ...report, currentSpkiPin: 'sha256/invalid' },
+    { ...report, nextCertificateGeneration: 1 },
+    { ...report, nextSpkiPin: report.currentSpkiPin },
+    { ...report, nextNotAfter: '2026-01-01T00:00:00Z' },
+    { ...report, privateKey: 'must-not-be-published' },
+  ];
+  for (const invalid of invalidReports) {
+    assert.equal(native.validateLanTlsIdentityObservation(invalid), false);
+  }
+  for (const invalid of [...invalidReports.slice(0, 6), invalidReports.at(-1)]) assert.equal(schema(invalid), false);
+  assert.equal(schema(invalidReports[6]), true, 'JSON Schema cannot compare the current and next SPKI values; the owning runtime validator rejects equality');
+  assert.equal(schema(invalidReports[7]), true, 'JSON Schema cannot order two timestamp fields; the owning runtime validator rejects reversed validity');
+  const openapi = fs.readFileSync(path.join(root, 'openapi.yaml'), 'utf8');
+  assert.match(openapi, /HubLanTlsIdentityObservation:\s*\n\s+\$ref: "\.\/contract\.json#\/\$defs\/lanTlsIdentityObservation"/);
+});
+test('customer LAN projection is bound to the current active manufacturing generation', () => {
+  const now = new Date('2026-10-04T10:00:00Z');
+  const identity = {
+    manufacturingIdentityGeneration: 7, manufacturingIdentityStatus: 'ACTIVE',
+    publicHubId: '0123456789abcdef0123', lanTlsReportedAt: new Date(now.getTime() - 1000), lanTlsState: 'CURRENT',
+    lanTlsIdentityGeneration: 7, lanTlsCertificateGeneration: 2,
+    lanTlsCurrentSpkiPin: 'sha256/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=',
+    lanTlsCurrentNotBefore: new Date('2026-10-01T00:00:00Z'), lanTlsCurrentNotAfter: new Date('2027-10-01T00:00:00Z'),
+    lanTlsNextCertificateGeneration: null, lanTlsNextSpkiPin: null, lanTlsNextNotBefore: null, lanTlsNextNotAfter: null,
+  };
+  const projected = lanEndpointModule.exports.verifiedCustomerLanEndpoint(identity, now);
+  assert.equal(projected?.origin, 'https://dinodia-0123456789abcdef0123.local:8123');
+  assert.equal(lanEndpointModule.exports.verifiedCustomerLanEndpoint({ ...identity, manufacturingIdentityGeneration: 8 }, now), undefined, 'old TLS report is not authority after manufacturing rotation');
+  assert.equal(lanEndpointModule.exports.verifiedCustomerLanEndpoint({ ...identity, manufacturingIdentityStatus: 'REVOKED' }, now), undefined);
+  assert.equal(lanEndpointModule.exports.verifiedCustomerLanEndpoint({ ...identity, lanTlsReportedAt: new Date(now.getTime() - 420_001) }, now), undefined);
 });
 test('command validation enforces descriptor type, range, step and exact step-up reference', () => {
   const brightness = valid.device.controls.find((control) => control.controlId === 'control:brightness');
@@ -736,6 +801,13 @@ test('decision-bearing lifecycle examples satisfy canonical schemas and preserve
   assert.equal(Date.parse(claim.expiresAt) - Date.parse(claim.createdAt), 30 * 60 * 1000);
   const badClaim = { ...claim, firstWins: false };
   assert.equal(compile('claimReservation')(badClaim), false);
+});
+test('updater maintenance status is bounded and never exposes signing or artifact authority', () => {
+  const validate = ajv.compile({ $ref: `${contract.$id}#/$defs/updaterMaintenanceStatus` });
+  const good = JSON.parse(fs.readFileSync(path.join(root, 'fixtures/updater-maintenance-status-unprovisioned.json'), 'utf8'));
+  const bad = JSON.parse(fs.readFileSync(path.join(root, 'fixtures/invalid/updater-maintenance-status-exposes-authority.json'), 'utf8'));
+  assert.equal(validate(good), true, JSON.stringify(validate.errors));
+  assert.equal(validate(bad), false);
 });
 test('analytics activity and aggregation semantics match the canonical shared fixture', () => {
   const fixture = JSON.parse(fs.readFileSync(path.join(root, 'fixtures/analytics-semantics.json'), 'utf8'));

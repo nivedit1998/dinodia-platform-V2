@@ -9,19 +9,22 @@ import { assertMigrationDoesNotReferenceVolatileRuntimeTables, compareExistingTa
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const projectRef = 'fppzzesvukjbsfmxmfxe';
-const migrationName = '20261003000000_native_v2_stage3_domain_schema';
-const migrationPath = path.join(root, 'prisma/migrations', migrationName, 'migration.sql');
 const target = JSON.parse(fs.readFileSync(path.join(root, 'scripts/v2-target.json'), 'utf8'));
 const envFile = dotenv.parse(fs.readFileSync(path.join(root, '.env.local')));
 const databaseUrl = process.env.DATABASE_URL || envFile.DATABASE_URL || '';
 const directUrl = process.env.DIRECT_URL || envFile.DIRECT_URL || '';
 const flags = new Set(process.argv.slice(2));
+const stage4LanTls = flags.has('--stage4-lan-tls');
+const migrationName = stage4LanTls
+  ? '20261004050000_stage4_customer_lan_tls_identity'
+  : '20261003000000_native_v2_stage3_domain_schema';
+const migrationPath = path.join(root, 'prisma/migrations', migrationName, 'migration.sql');
 const confirm = `--confirm-project=${projectRef}`;
 const expectedShaFlag = process.argv.slice(2).find((value) => value.startsWith('--expected-migration-sha256='));
 const apply = flags.has('--apply');
 const authorizedApply = flags.has('--confirm-additive-forward-migration');
 
-function fail(reason) { throw new Error(`[stage3:target] BLOCKED: ${reason}`); }
+function fail(reason) { throw new Error(`[stage${stage4LanTls ? '4' : '3'}:target] BLOCKED: ${reason}`); }
 function safeError(value) { return String(value).replace(/postgres(?:ql)?:\/\/[^\s"'`]+/gi, '<database-url-redacted>'); }
 function parseUrl(raw, label) {
   let url;
@@ -118,8 +121,10 @@ async function inventory(client, baselineColumns = undefined) {
 let client;
 try {
   const args = process.argv.slice(2);
-  if (!args.includes(confirm) || args.some((arg) => ![confirm, '--apply', '--confirm-additive-forward-migration'].includes(arg) && !arg.startsWith('--expected-migration-sha256='))) fail(`pass ${confirm}; apply additionally requires the explicit additive-forward-migration confirmation`);
+  if (flags.has('--stage3-domain-schema') && stage4LanTls) fail('select exactly one reviewed migration target');
+  if (!args.includes(confirm) || args.some((arg) => ![confirm, '--apply', '--confirm-additive-forward-migration', '--stage4-lan-tls'].includes(arg) && !arg.startsWith('--expected-migration-sha256='))) fail(`pass ${confirm}; apply additionally requires the explicit additive-forward-migration confirmation`);
   if (target.supabaseProjectRef !== projectRef) fail('checked-in V2 target manifest does not match the authorized project');
+  if (envFile.SUPABASE_PROJECT_REF !== projectRef || envFile.VERCEL_PROJECT_ID !== target.vercelProjectId) fail('project-local environment identity does not match the authorized V2 Production target');
   const db = parseUrl(databaseUrl, 'DATABASE_URL');
   const direct = parseUrl(directUrl, 'DIRECT_URL');
   if (decodeURIComponent(db.pathname) !== decodeURIComponent(direct.pathname)) fail('DATABASE_URL and DIRECT_URL target different databases');
@@ -146,7 +151,7 @@ try {
   if (mismatched.length) fail(`applied migration checksums disagree with reviewed source (${mismatched.length} mismatch(es))`);
   if (pending.some((name) => name !== migrationName)) fail(`unexpected pending migrations: ${pending.join(', ')}`);
   const unsafe = Object.values(before.dataPreflight).some((count) => Number(count) > 0);
-  if (unsafe) fail(`existing Production data violates the Stage 3 migration preflight (${Object.entries(before.dataPreflight).filter(([, count]) => Number(count) > 0).map(([name]) => name).join(', ')})`);
+  if (unsafe) fail(`existing Production data violates the native schema integrity preflight (${Object.entries(before.dataPreflight).filter(([, count]) => Number(count) > 0).map(([name]) => name).join(', ')})`);
   const rowCountDigest = crypto.createHash('sha256').update(JSON.stringify(Object.entries(before.rowCounts).sort(([a], [b]) => a.localeCompare(b)))).digest('hex');
   const rowContentPreservationDigest = crypto.createHash('sha256').update(JSON.stringify(Object.entries(before.rowContentDigests).sort(([a], [b]) => a.localeCompare(b)))).digest('hex');
   console.log(JSON.stringify({
@@ -157,7 +162,7 @@ try {
     migrationName,
     migrationSha256: migrationSha,
     pendingMigrationCount: pending.length,
-    pendingStage3MigrationOnly: pending.length === 0 || (pending.length === 1 && pending[0] === migrationName),
+    onlySelectedMigrationPending: pending.length === 0 || (pending.length === 1 && pending[0] === migrationName),
     priorSchemaFingerprint: beforeFingerprint,
     preMigrationBaseTableCount: Object.keys(before.rowCounts).length,
     preMigrationRowCountDigest: rowCountDigest,

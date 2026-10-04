@@ -10,11 +10,17 @@ export type HubOnlineState = 'online' | 'offline' | 'unknown';
 export type UIState = 'restoring_session' | 'loading' | 'ready' | 'empty' | 'stale' | 'offline' | 'denied' | 'expired' | 'uncertain' | 'maintenance' | 'error';
 
 export interface MembershipContext { accountId: OpaqueId; homeId: OpaqueId; homeMembershipId: OpaqueId; role: MembershipRole; status: 'active'|'suspended'|'removed'; areaIds: OpaqueId[]; revision: number }
-export interface AccountSessionContext { schemaVersion: typeof DINODIA_V1; accountId: OpaqueId; memberships: MembershipContext[]; expiresAt: string }
+export interface AccountSessionContext { schemaVersion: typeof DINODIA_V1; accountId: OpaqueId; sessionId: OpaqueId; trustedDeviceId: OpaqueId; memberships: MembershipContext[]; expiresAt: string }
 export interface CustomerSessionLoginRequest { email: string; password: string; deviceInstallationId: OpaqueId; publicKey: string; deviceName: string; model?: string; osFamily?: string; osVersion?: string }
 export interface CustomerSessionReceipt { ok: true; accountId: OpaqueId; sessionId: OpaqueId; trustedDeviceId: OpaqueId; expiresAt: string }
 export interface CustomerSessionLogoutReceipt { ok: true }
-export type CustomerHubEndpoint = { state: 'verified_cloud'; origin: string } | { state: 'unavailable' };
+export interface CustomerLanEndpoint {
+  state: 'verified_lan'; origin: string; publicHubId: string; certificateGeneration: number;
+  currentSpkiPin: string; currentNotBefore: string; currentNotAfter: string;
+  nextCertificateGeneration?: number; nextSpkiPin?: string; nextNotBefore?: string; nextNotAfter?: string;
+  reportedAt: string; validUntil: string;
+}
+export type CustomerHubEndpoint = ({ state: 'verified_cloud'; origin: string } | { state: 'unavailable' }) & { lan?: CustomerLanEndpoint };
 export interface CustomerHubSession { ok: true; token: string; expiresAt: string; homeId: OpaqueId; membershipId: OpaqueId; hubEndpoint: CustomerHubEndpoint }
 export interface OfflineHomeCandidate { schemaVersion: typeof DINODIA_V1; grantId: OpaqueId; accountId: OpaqueId; homeId: OpaqueId; homeMembershipId: OpaqueId; trustedDeviceId: OpaqueId; role: 'TENANT'; areaIds: OpaqueId[]; membershipRevision: number; issuedAt: string; expiresAt: string|null }
 export interface OfflineHomeSelection { schemaVersion: typeof DINODIA_V1; accountId: OpaqueId; generatedAt: string; state: 'offline'; candidates: OfflineHomeCandidate[] }
@@ -26,6 +32,12 @@ export interface NativeCommand { commandId: OpaqueId; homeId: OpaqueId; homeMemb
 export interface NativeError { error: { code: string; message: string; requestId: OpaqueId; retryable?: boolean } }
 export interface NativeArea { id: OpaqueId; homeId: OpaqueId; originalName: string; overrideName?: string|null; revision: number; lifecycle: 'active'|'retired' }
 export interface LanEndpointObservation { version: 1; revision: number; state: 'CURRENT'|'UNAVAILABLE'; baseUrl?: string; discoveryHost: string }
+export interface LanTlsIdentityObservation {
+  version: 1; revision: number; state: 'CURRENT'|'UNAVAILABLE'; publicHubId: string; host: string; port: 8123;
+  certificateGeneration: number; currentSpkiPin: string; currentNotBefore: string; currentNotAfter: string;
+  nextCertificateGeneration?: number; nextSpkiPin?: string; nextNotBefore?: string; nextNotAfter?: string;
+  acknowledgedGeneration: number;
+}
 const object = (x: unknown): x is Record<string, unknown> => !!x && typeof x === 'object' && !Array.isArray(x);
 const codePointLength = (value: string): number => Array.from(value).length;
 /** Trim user-supplied text and enforce JSON Schema's Unicode code-point bound. */
@@ -71,7 +83,7 @@ function sameJsonValue(a: unknown, b: unknown): boolean {
   return ak.length === bk.length && ak.every((key, index) => key === bk[index] && sameJsonValue(a[key], b[key]));
 }
 /** Canonical signed hub-heartbeat endpoint DTO; not a customer-visible Home endpoint. */
-export function validateLanEndpointObservation(value: unknown, serial: string, expectedPort = 8123): value is LanEndpointObservation {
+export function validateLanEndpointObservation(value: unknown, serial: string, expectedPort = 80): value is LanEndpointObservation {
   if (!object(value) || !hasOnlyKeys(value, ['version','revision','state','baseUrl','discoveryHost']) || value.version !== 1
     || !Number.isSafeInteger(value.revision) || Number(value.revision) < 1 || !id(serial)) return false;
   const host = `dinodia-${serial.toLowerCase()}.local`;
@@ -79,12 +91,35 @@ export function validateLanEndpointObservation(value: unknown, serial: string, e
   if (value.state === 'UNAVAILABLE') return !Object.hasOwn(value, 'baseUrl');
   if (value.state !== 'CURRENT' || typeof value.baseUrl !== 'string') return false;
   const match = value.baseUrl.match(/^http:\/\/(\d{1,3}(?:\.\d{1,3}){3}):(\d{1,5})$/);
-  if (!match || match[2] !== String(expectedPort)) return false;
+  const allowedPorts = expectedPort === 80 ? new Set(['80', '8123']) : new Set([String(expectedPort)]);
+  if (!match || !allowedPorts.has(match[2])) return false;
   const octets = match[1].split('.').map(Number);
   if (octets.length !== 4 || octets.some((part, index) => !Number.isInteger(part) || part < 0 || part > 255 || String(part) !== match[1].split('.')[index])) return false;
   const [a, b, , last] = octets;
   if (last === 0 || last === 255 || a === 172 && (b === 17 || b === 18)) return false;
   return a === 10 || a === 192 && b === 168 || a === 172 && b >= 16 && b <= 31;
+}
+/** Authenticated machine report for the customer-only HTTPS LAN identity. */
+export function validateLanTlsIdentityObservation(value: unknown): value is LanTlsIdentityObservation {
+  if (!object(value) || !hasOnlyKeys(value, ['version','revision','state','publicHubId','host','port','certificateGeneration','currentSpkiPin','currentNotBefore','currentNotAfter','nextCertificateGeneration','nextSpkiPin','nextNotBefore','nextNotAfter','acknowledgedGeneration'])
+    || value.version !== 1 || !Number.isSafeInteger(value.revision) || Number(value.revision) < 1
+    || !['CURRENT','UNAVAILABLE'].includes(String(value.state)) || typeof value.publicHubId !== 'string' || !/^[a-f0-9]{20}$/.test(value.publicHubId)
+    || value.host !== `dinodia-${value.publicHubId}.local` || value.port !== 8123
+    || !Number.isSafeInteger(value.certificateGeneration) || Number(value.certificateGeneration) < 1
+    || typeof value.currentSpkiPin !== 'string' || !/^sha256\/[A-Za-z0-9+/]{43}=$/.test(value.currentSpkiPin)
+    || !utcTimestamp(value.currentNotBefore) || !utcTimestamp(value.currentNotAfter)
+    || !Number.isSafeInteger(value.acknowledgedGeneration) || Number(value.acknowledgedGeneration) < 0) return false;
+  if (Date.parse(value.currentNotBefore) >= Date.parse(value.currentNotAfter)) return false;
+  const nextFields = ['nextCertificateGeneration','nextSpkiPin','nextNotBefore','nextNotAfter'];
+  const hasNext = nextFields.some((key) => Object.hasOwn(value, key));
+  if (hasNext && (nextFields.some((key) => !Object.hasOwn(value, key))
+    || !Number.isSafeInteger(value.nextCertificateGeneration) || Number(value.nextCertificateGeneration) <= Number(value.certificateGeneration)
+    || typeof value.nextSpkiPin !== 'string' || !/^sha256\/[A-Za-z0-9+/]{43}=$/.test(value.nextSpkiPin)
+    || value.nextSpkiPin === value.currentSpkiPin || !utcTimestamp(value.nextNotBefore) || !utcTimestamp(value.nextNotAfter)
+    || Date.parse(value.nextNotBefore) >= Date.parse(value.nextNotAfter))) return false;
+  if (Number(value.acknowledgedGeneration) > Number(value.certificateGeneration)
+    && (!hasNext || Number(value.acknowledgedGeneration) !== Number(value.nextCertificateGeneration))) return false;
+  return value.state === 'CURRENT' || value.state === 'UNAVAILABLE';
 }
 const deviceKeys = ['id','homeId','managementClass','ownerMembershipId','lifecycle','technicalLabel','customerLabel','areaIds','controls','descriptorRevision'];
 const controlKeys = ['schemaVersion','deviceId','surfaceId','controlId','label','group','sortOrder','valueType','interactionKind','semanticRole','readable','writable','automatable','observable','idempotency','confirmationPolicy','riskLevel','stepUpPolicy','constraints','expectedReportingIntervalSeconds','maxStateValiditySeconds','unsupportedReason','catalogRevision'];
@@ -113,7 +148,7 @@ export function validateMembership(value: unknown): value is MembershipContext {
   return object(value) && hasOnlyKeys(value, ['accountId','homeId','homeMembershipId','role','status','areaIds','revision']) && id(value.accountId) && id(value.homeId) && id(value.homeMembershipId) && roles.has(String(value.role)) && value.status === 'active' && Array.isArray(value.areaIds) && value.areaIds.every(id) && new Set(value.areaIds).size === value.areaIds.length && Number.isInteger(value.revision) && Number(value.revision) >= 0;
 }
 export function validateAccountSessionContext(value: unknown, now = Date.now()): value is AccountSessionContext {
-  if (!object(value) || !hasOnlyKeys(value, ['schemaVersion','accountId','memberships','expiresAt']) || value.schemaVersion !== DINODIA_V1 || !id(value.accountId) || !utcTimestamp(value.expiresAt) || Date.parse(value.expiresAt) <= now || !Array.isArray(value.memberships)) return false;
+  if (!object(value) || !hasOnlyKeys(value, ['schemaVersion','accountId','sessionId','trustedDeviceId','memberships','expiresAt']) || value.schemaVersion !== DINODIA_V1 || !id(value.accountId) || !id(value.sessionId) || !id(value.trustedDeviceId) || !utcTimestamp(value.expiresAt) || Date.parse(value.expiresAt) <= now || !Array.isArray(value.memberships)) return false;
   const homes = new Set<string>(); const membershipIds = new Set<string>();
   for (const membership of value.memberships) {
     if (!validateMembership(membership) || membership.accountId !== value.accountId || membership.status !== 'active' || homes.has(membership.homeId) || membershipIds.has(membership.homeMembershipId)) return false;
@@ -147,13 +182,29 @@ export function validateCustomerHubSession(value: unknown, expected: { homeId: s
   const endpoint = value.hubEndpoint;
   if (!object(endpoint)) return false;
   if (endpoint.state === 'unavailable') {
-    if (!hasOnlyKeys(endpoint, ['state'])) return false;
+    if (!hasOnlyKeys(endpoint, ['state','lan'])) return false;
   } else if (endpoint.state === 'verified_cloud') {
-    if (!hasOnlyKeys(endpoint, ['state','origin']) || typeof endpoint.origin !== 'string') return false;
+    if (!hasOnlyKeys(endpoint, ['state','origin','lan']) || typeof endpoint.origin !== 'string') return false;
     let parsed: URL;
     try { parsed = new URL(endpoint.origin); } catch { return false; }
     if (parsed.protocol !== 'https:' || parsed.username || parsed.password || parsed.port || parsed.pathname !== '/' && parsed.pathname !== '' || parsed.search || parsed.hash || parsed.origin !== endpoint.origin || !/^dinodia-[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.dinodiasmartliving\.com$/.test(parsed.hostname)) return false;
   } else return false;
+  if (endpoint.lan !== undefined) {
+    const lan = endpoint.lan;
+    if (!object(lan) || !hasOnlyKeys(lan, ['state','origin','publicHubId','certificateGeneration','currentSpkiPin','currentNotBefore','currentNotAfter','nextCertificateGeneration','nextSpkiPin','nextNotBefore','nextNotAfter','reportedAt','validUntil'])
+      || lan.state !== 'verified_lan' || typeof lan.publicHubId !== 'string' || !/^[a-f0-9]{20}$/.test(lan.publicHubId)
+      || lan.origin !== `https://dinodia-${lan.publicHubId}.local:8123` || !Number.isSafeInteger(lan.certificateGeneration) || Number(lan.certificateGeneration) < 1
+      || typeof lan.currentSpkiPin !== 'string' || !/^sha256\/[A-Za-z0-9+/]{43}=$/.test(lan.currentSpkiPin)
+      || !utcTimestamp(lan.currentNotBefore) || !utcTimestamp(lan.currentNotAfter) || !utcTimestamp(lan.reportedAt) || !utcTimestamp(lan.validUntil)) return false;
+    const notBefore = Date.parse(lan.currentNotBefore); const notAfter = Date.parse(lan.currentNotAfter);
+    const reportedAt = Date.parse(lan.reportedAt); const validUntil = Date.parse(lan.validUntil);
+    if (notBefore > now || notAfter <= now || notAfter <= notBefore || reportedAt > now || now - reportedAt > 420_000 || validUntil <= now || validUntil > reportedAt + 420_000) return false;
+    const hasNext = lan.nextCertificateGeneration !== undefined || lan.nextSpkiPin !== undefined || lan.nextNotBefore !== undefined || lan.nextNotAfter !== undefined;
+    if (hasNext && (!Number.isSafeInteger(lan.nextCertificateGeneration) || Number(lan.nextCertificateGeneration) <= Number(lan.certificateGeneration)
+      || typeof lan.nextSpkiPin !== 'string' || !/^sha256\/[A-Za-z0-9+/]{43}=$/.test(lan.nextSpkiPin)
+      || !utcTimestamp(lan.nextNotBefore) || !utcTimestamp(lan.nextNotAfter)
+      || Date.parse(lan.nextNotBefore) > Date.parse(lan.nextNotAfter) || lan.nextSpkiPin === lan.currentSpkiPin)) return false;
+  }
   const expiresAt = Date.parse(value.expiresAt);
   return expiresAt > now && expiresAt <= now + 5 * 60 * 1000 + 1000;
 }
@@ -198,9 +249,28 @@ export function validateOfflineAuthorisationRequest(value: unknown): boolean {
   return object(value) && hasOnlyKeys(value, ['trustedDeviceId','publicKey']) && id(value.trustedDeviceId) && typeof value.publicKey === 'string' && codePointLength(value.publicKey) > 0 && codePointLength(value.publicKey) <= 4096;
 }
 export function validateOfflineAuthorisationReceipt(value: unknown): boolean {
-  if (!object(value) || !hasOnlyKeys(value, ['ok','authorisation']) || value.ok !== true || !object(value.authorisation) || !hasOnlyKeys(value.authorisation, ['id','homeId','membershipId','trustedDeviceId','areaIds','scopes','policyRevision'])) return false;
+  if (!object(value) || !hasOnlyKeys(value, ['ok','authorisation']) || value.ok !== true || !object(value.authorisation) || !hasOnlyKeys(value.authorisation, ['id','homeId','membershipId','trustedDeviceId','areaIds','scopes','policyRevision','hubInstallationId','membershipRevision','issuedAt','lanEndpoint'])) return false;
   const row = value.authorisation;
-  return id(row.id) && id(row.homeId) && id(row.membershipId) && id(row.trustedDeviceId) && Array.isArray(row.areaIds) && row.areaIds.every(id) && new Set(row.areaIds).size === row.areaIds.length && sameJsonValue(row.scopes, ['tenant:device-command']) && Number.isInteger(row.policyRevision) && Number(row.policyRevision) >= 0;
+  const hasEnrollmentBinding = ['hubInstallationId','membershipRevision','issuedAt','lanEndpoint'].some((key) => Object.hasOwn(row, key));
+  if (hasEnrollmentBinding && (!id(row.hubInstallationId) || !Number.isInteger(row.membershipRevision) || Number(row.membershipRevision) < 0 || !utcTimestamp(row.issuedAt) || !validCustomerLanEndpoint(row.lanEndpoint))) return false;
+  return id(row.id) && id(row.homeId) && id(row.membershipId) && id(row.trustedDeviceId) && Array.isArray(row.areaIds) && row.areaIds.length > 0 && row.areaIds.every(id) && new Set(row.areaIds).size === row.areaIds.length && sameJsonValue(row.scopes, ['tenant:device-command']) && Number.isInteger(row.policyRevision) && Number(row.policyRevision) >= 0;
+}
+
+function validCustomerLanEndpoint(value: unknown): boolean {
+  if (!object(value) || !hasOnlyKeys(value, ['state','origin','publicHubId','certificateGeneration','currentSpkiPin','currentNotBefore','currentNotAfter','nextCertificateGeneration','nextSpkiPin','nextNotBefore','nextNotAfter','reportedAt','validUntil'])
+    || value.state !== 'verified_lan' || typeof value.publicHubId !== 'string' || !/^[a-f0-9]{20}$/.test(value.publicHubId)
+    || value.origin !== `https://dinodia-${value.publicHubId}.local:8123`
+    || !Number.isSafeInteger(value.certificateGeneration) || Number(value.certificateGeneration) < 1
+    || typeof value.currentSpkiPin !== 'string' || !/^sha256\/[A-Za-z0-9+/]{43}=$/.test(value.currentSpkiPin)
+    || !utcTimestamp(value.currentNotBefore) || !utcTimestamp(value.currentNotAfter) || Date.parse(value.currentNotBefore) >= Date.parse(value.currentNotAfter)
+    || !utcTimestamp(value.reportedAt) || !utcTimestamp(value.validUntil) || Date.parse(value.validUntil) <= Date.parse(value.reportedAt)) return false;
+  const next = ['nextCertificateGeneration','nextSpkiPin','nextNotBefore','nextNotAfter'];
+  const hasNext = next.some((key) => Object.hasOwn(value, key));
+  return !hasNext || next.every((key) => Object.hasOwn(value, key))
+    && Number.isSafeInteger(value.nextCertificateGeneration) && Number(value.nextCertificateGeneration) > Number(value.certificateGeneration)
+    && typeof value.nextSpkiPin === 'string' && /^sha256\/[A-Za-z0-9+/]{43}=$/.test(value.nextSpkiPin)
+    && utcTimestamp(value.nextNotBefore) && utcTimestamp(value.nextNotAfter)
+    && Date.parse(value.nextNotBefore) < Date.parse(value.nextNotAfter) && value.nextSpkiPin !== value.currentSpkiPin;
 }
 export function validateOfflineRevocationReceipt(value: unknown): boolean {
   return object(value) && hasOnlyKeys(value, ['ok','revoked']) && value.ok === true && Number.isInteger(value.revoked) && Number(value.revoked) >= 0;

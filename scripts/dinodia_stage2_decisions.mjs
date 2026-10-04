@@ -694,6 +694,19 @@ function executeSemanticFixture(path, value, adapters) {
       else assert(!Object.hasOwn(value, "baseUrl"), "unavailable LAN observation must not retain a stale endpoint");
       return result("accepted", { state: value.state });
     }
+    case "updater-maintenance-status-unprovisioned.json": {
+      assert(schema("updaterMaintenanceStatus", value) && value.status.trustState === "unprovisioned"
+        && value.status.phase === "idle" && value.status.busy === false
+        && value.status.activeReleaseVersion === null && value.status.lastAttempt === null,
+      "read-only updater status must identify disabled signing trust without implying an update or release authority");
+      return result("accepted", { trustState: value.status.trustState, updateRequestAllowed: false });
+    }
+    case "invalid/updater-maintenance-status-exposes-authority.json": {
+      const denied = !schema("updaterMaintenanceStatus", value)
+        && Object.hasOwn(value.status, "artifactUrl")
+        && value.status.trustState === "unprovisioned";
+      return deniedWithNoEffects(denied, path);
+    }
     case "override-area-name.json": {
       assert(schema("override", value) && value.targetType === "area" && value.field === "overrideName" &&
         value.homeId.length > 0 && value.targetId.length > 0 && Number.isInteger(value.revision) && value.revision > 0 &&

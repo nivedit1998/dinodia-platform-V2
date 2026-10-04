@@ -28,7 +28,16 @@ export async function resolveNativeHomeContext(
   const activeHub = membership.home.activeHubInstallationId
     ? await db.hubInstallation.findFirst({
       where: { id: membership.home.activeHubInstallationId, homeId: membership.homeId, lifecycleStatus: 'ACTIVE', state: { in: ['PROVISIONED', 'ACTIVE', 'MAINTENANCE', 'PAIRING'] } },
-      select: { id: true, state: true, accessPolicyRevision: true, installationGeneration: true, cloudUrl: true, cloudUrlVerifiedAt: true, remoteVerificationAt: true, reservedHostname: true },
+      select: {
+        id: true, state: true, accessPolicyRevision: true, installationGeneration: true,
+        manufacturingIdentity: { select: { identityGeneration: true, status: true } },
+        cloudUrl: true, cloudUrlVerifiedAt: true, remoteVerificationAt: true, reservedHostname: true,
+        publicHubId: true, lanTlsRevision: true, lanTlsReportedAt: true, lanTlsState: true,
+        lanTlsIdentityGeneration: true, lanTlsCertificateGeneration: true, lanTlsCurrentSpkiPin: true,
+        lanTlsCurrentNotBefore: true, lanTlsCurrentNotAfter: true, lanTlsNextCertificateGeneration: true,
+        lanTlsNextSpkiPin: true, lanTlsNextNotBefore: true, lanTlsNextNotAfter: true,
+        lanTlsAcknowledgedGeneration: true,
+      },
     })
     : null;
   if (!activeHub) throw new NativeAccessDenied('HUB_UNAVAILABLE');
@@ -43,10 +52,26 @@ export async function resolveNativeHomeContext(
     activeHubInstallationId: activeHub.id,
     hubAccessPolicyRevision: activeHub.accessPolicyRevision,
     installationGeneration: activeHub.installationGeneration,
+    manufacturingIdentityGeneration: activeHub.manufacturingIdentity.identityGeneration,
+    manufacturingIdentityStatus: activeHub.manufacturingIdentity.status,
     cloudUrl: activeHub.cloudUrl,
     cloudUrlVerifiedAt: activeHub.cloudUrlVerifiedAt,
     remoteVerificationAt: activeHub.remoteVerificationAt,
     reservedHostname: activeHub.reservedHostname,
+    publicHubId: activeHub.publicHubId,
+    lanTlsRevision: activeHub.lanTlsRevision,
+    lanTlsReportedAt: activeHub.lanTlsReportedAt,
+    lanTlsState: activeHub.lanTlsState,
+    lanTlsIdentityGeneration: activeHub.lanTlsIdentityGeneration,
+    lanTlsCertificateGeneration: activeHub.lanTlsCertificateGeneration,
+    lanTlsCurrentSpkiPin: activeHub.lanTlsCurrentSpkiPin,
+    lanTlsCurrentNotBefore: activeHub.lanTlsCurrentNotBefore,
+    lanTlsCurrentNotAfter: activeHub.lanTlsCurrentNotAfter,
+    lanTlsNextCertificateGeneration: activeHub.lanTlsNextCertificateGeneration,
+    lanTlsNextSpkiPin: activeHub.lanTlsNextSpkiPin,
+    lanTlsNextNotBefore: activeHub.lanTlsNextNotBefore,
+    lanTlsNextNotAfter: activeHub.lanTlsNextNotAfter,
+    lanTlsAcknowledgedGeneration: activeHub.lanTlsAcknowledgedGeneration,
     grantedAreaIds: Object.freeze(membership.role === 'TENANT' ? membership.tenantAreaGrants.map((grant) => grant.areaId) : []),
   });
 }

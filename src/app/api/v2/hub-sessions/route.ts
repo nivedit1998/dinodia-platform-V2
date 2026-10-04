@@ -6,6 +6,7 @@ import { validateCustomerHubSession } from '@/lib/contracts/dinodiaV1';
 import { nativeV1ErrorResponse } from '@/lib/contracts/nativeV1Error';
 import { Stage1AuthError, cookieToken } from '@/lib/stage1Auth';
 import { NativeAccessDenied, resolveNativeHomeContext } from '@/lib/nativeHomeContext';
+import { verifiedCustomerLanEndpoint } from '@/lib/lanEndpoint';
 
 export const dynamic = 'force-dynamic';
 
@@ -53,7 +54,10 @@ export async function POST(request: Request) {
       throw new Stage1AuthError(403, 'hub_session_tenant_required', 'Direct Dinodia OS sessions are available only to an active tenant membership');
     }
     const now = Math.floor(Date.now() / 1000);
-    const hubEndpoint = verifiedHubEndpoint({ cloudUrl: membership.cloudUrl, cloudUrlVerifiedAt: membership.cloudUrlVerifiedAt, remoteVerificationAt: membership.remoteVerificationAt, reservedHostname: membership.reservedHostname }, new Date(now * 1000));
+    const evaluatedAt = new Date(now * 1000);
+    const cloudEndpoint = verifiedHubEndpoint({ cloudUrl: membership.cloudUrl, cloudUrlVerifiedAt: membership.cloudUrlVerifiedAt, remoteVerificationAt: membership.remoteVerificationAt, reservedHostname: membership.reservedHostname }, evaluatedAt);
+    const lanEndpoint = verifiedCustomerLanEndpoint(membership, evaluatedAt);
+    const hubEndpoint = { ...cloudEndpoint, ...(lanEndpoint ? { lan: lanEndpoint } : {}) };
     const privatePem = String(process.env.DINODIA_APP_SESSION_PRIVATE_KEY ?? '').replaceAll('\\n', '\n');
     if (!privatePem) throw new Stage1AuthError(503, 'app_auth_unconfigured', 'App session authentication is not configured');
     const token = signStage1Token('customer', { id: account.id, sessionId: session.id, homeId: membership.homeId, membershipId: membership.membershipId, trustedDeviceId: trusted.id, hubInstallationId: membership.activeHubInstallationId, role: membership.role, areaIds: [...membership.grantedAreaIds], scopes: membership.role === 'TENANT' ? ['tenant:device-command'] : ['property:read'], policyRevision: Math.max(membership.accessRevision, membership.hubAccessPolicyRevision), issuedAt: now, expiresAt: now + 5 * 60 }, crypto.createPrivateKey(privatePem));

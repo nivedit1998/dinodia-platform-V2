@@ -30,6 +30,7 @@
     "stage3:migration:prepare": "node scripts/prepare_stage3_migration.mjs",
     "stage3:upgrade:check": "node scripts/verify_native_v2_upgrade_path.mjs",
     "stage3:migration:target": "node scripts/verify_native_v2_migration_target.mjs",
+    "stage4:migration:target": "node scripts/verify_native_v2_migration_target.mjs --stage4-lan-tls",
     "evidence:production-read-only": "node scripts/read_only_production_inventory.mjs",
     "foundation:target": "node scripts/assert_v2_target.mjs --mode local",
     "db:validate-target": "node scripts/assert_v2_target.mjs --mode \"${V2_ENVIRONMENT:-local}\"",
