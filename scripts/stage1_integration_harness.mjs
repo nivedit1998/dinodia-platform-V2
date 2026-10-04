@@ -1791,6 +1791,107 @@ async function customerAuthorizationChecks(deliveryEnv) {
   // and exercise the real machine-authenticated policy/token-state route.
   hub.pairing.lastHeartbeatAt = Date.now();
   await hub.pairing.syncNow();
+  const initialSyncCursor = await prisma.hubInstallation.findUniqueOrThrow({ where: { id: hubOne.id }, select: {
+    syncStreamId: true, syncAcceptedSequence: true, lastSuccessfulSyncAt: true, lastQueueDepth: true,
+  } });
+  if (!initialSyncCursor.syncStreamId || Number(initialSyncCursor.syncAcceptedSequence) < 0 || !initialSyncCursor.lastSuccessfulSyncAt || hub.pairing.lastError) {
+    fail(`The real signed sync endpoint did not establish a durable cursor/configuration acknowledgement (${JSON.stringify({ stream: Boolean(initialSyncCursor.syncStreamId), sequence: String(initialSyncCursor.syncAcceptedSequence), successful: Boolean(initialSyncCursor.lastSuccessfulSyncAt), errorCode: hub.store.getSyncOutbox?.().lastErrorCode || 'none' })})`);
+  }
+  // Drain the bounded boot snapshot and any earlier source changes before
+  // asserting the isolated one-event route vector below. A sync now begins
+  // with a durable initial inventory snapshot, so a successful first receipt
+  // does not imply the complete snapshot fit in one HTTP batch.
+  let initialSnapshotDrained = false;
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    while (hub.pairing.syncing) await sleep(10);
+    const outbox = hub.store.getSyncOutbox();
+    const remaining = outbox.events.filter((event) => event.sequence > outbox.acknowledgedSequence).length;
+    if (remaining === 0 && !outbox.inFlight) { initialSnapshotDrained = true; break; }
+    hub.pairing.nextRetryAt = 0;
+    await hub.pairing.syncNow();
+    if (hub.pairing.lastError) break;
+  }
+  if (!initialSnapshotDrained) {
+    const finalOutbox = hub.store.getSyncOutbox();
+    fail(`The bounded initial OS snapshot did not drain through the real sync route before the isolated event proof (${JSON.stringify({ queueDepth: finalOutbox.events.filter((event) => event.sequence > finalOutbox.acknowledgedSequence).length, acknowledgedSequence: finalOutbox.acknowledgedSequence, nextSequence: finalOutbox.nextSequence, inFlight: Boolean(finalOutbox.inFlight), lastErrorCode: finalOutbox.lastErrorCode, queuedTypes: [...new Set(finalOutbox.events.filter((event) => event.sequence > finalOutbox.acknowledgedSequence).map((event) => event.type))] })})`);
+  }
+  const syncAreaId = `stage5-loopback-${crypto.randomUUID()}`;
+  await hub.store.saveArea({ name: 'Stage 5 loopback reconciliation', icon: 'room' }, syncAreaId);
+  const syncBatch = await hub.store.prepareSyncBatch(hubOne.id, hub.pairing.runtime, Date.now());
+  if (!syncBatch || syncBatch.events.length !== 1 || syncBatch.events[0].type !== 'area.upsert') fail('The local durable outbox did not prepare the expected single area event');
+  const syncCursorBeforeDenial = await prisma.hubInstallation.findUniqueOrThrow({ where: { id: hubOne.id }, select: { syncAcceptedSequence: true } });
+  const signedSyncBody = (envelope) => ({ serial: identityOne.serialNumber, identityGeneration: identityOne.identityGeneration, ...envelope });
+  const deniedSync = await machineRequest({ base: platformBase, path: '/api/hub-agent/v2/sync', machineSecret: `${machineSecret}-wrong`, body: signedSyncBody(syncBatch) });
+  const deniedArea = await prisma.area.findUnique({ where: { homeId_osAreaId: { homeId: homeOne.id, osAreaId: syncAreaId } }, select: { id: true } });
+  const cursorAfterDenial = await prisma.hubInstallation.findUniqueOrThrow({ where: { id: hubOne.id }, select: { syncAcceptedSequence: true } });
+  if (deniedSync.response.status !== 401 || deniedArea || cursorAfterDenial.syncAcceptedSequence !== syncCursorBeforeDenial.syncAcceptedSequence) fail('An unauthenticated sync request disclosed or mutated the test inventory/cursor');
+  const acceptedSync = await machineRequest({ base: platformBase, path: '/api/hub-agent/v2/sync', machineSecret, body: signedSyncBody(syncBatch) });
+  if (acceptedSync.response.status !== 200 || Number(acceptedSync.body.acceptedThroughSequence) !== syncBatch.toSequence) fail(`The valid machine-authenticated sync batch failed (${acceptedSync.response.status}/${acceptedSync.body.errorCode || 'no-code'})`);
+  const acceptedArea = await prisma.area.findUnique({ where: { homeId_osAreaId: { homeId: homeOne.id, osAreaId: syncAreaId } }, select: { id: true, originalName: true, status: true, updatedAt: true } });
+  const receiptCountAfterAccept = await prisma.hubSyncReceipt.count({ where: { hubInstallationId: hubOne.id, streamId: syncBatch.streamId, fromSequence: syncBatch.fromSequence, toSequence: syncBatch.toSequence } });
+  if (!acceptedArea || acceptedArea.originalName !== 'Stage 5 loopback reconciliation' || acceptedArea.status !== 'ACTIVE' || receiptCountAfterAccept !== 1) fail('The accepted sync did not create exactly one canonical area projection and durable range receipt');
+  const exactRetry = await machineRequest({ base: platformBase, path: '/api/hub-agent/v2/sync', machineSecret, body: signedSyncBody(syncBatch) });
+  const receiptCountAfterRetry = await prisma.hubSyncReceipt.count({ where: { hubInstallationId: hubOne.id, streamId: syncBatch.streamId, fromSequence: syncBatch.fromSequence, toSequence: syncBatch.toSequence } });
+  const areaAfterRetry = await prisma.area.findUniqueOrThrow({ where: { homeId_osAreaId: { homeId: homeOne.id, osAreaId: syncAreaId } }, select: { id: true, originalName: true, updatedAt: true } });
+  if (exactRetry.response.status !== 200 || receiptCountAfterRetry !== 1 || areaAfterRetry.id !== acceptedArea.id || areaAfterRetry.updatedAt.getTime() !== acceptedArea.updatedAt.getTime()) fail('An exact sync retry was not idempotent at the receipt and projection boundaries');
+  const priorCloudRevision = Number(exactRetry.body.cloudRevision);
+  await prisma.area.update({ where: { id: acceptedArea.id }, data: { overrideName: 'Cloud-authoritative retry revision', revision: { increment: 1 } } });
+  const areaAtPolicyChange = await prisma.area.findUniqueOrThrow({ where: { id: acceptedArea.id }, select: { updatedAt: true } });
+  const retryAfterCloudPolicyChange = await machineRequest({ base: platformBase, path: '/api/hub-agent/v2/sync', machineSecret, body: signedSyncBody(syncBatch) });
+  const areaAfterPolicyRetry = await prisma.area.findUniqueOrThrow({ where: { homeId_osAreaId: { homeId: homeOne.id, osAreaId: syncAreaId } }, select: { id: true, originalName: true, updatedAt: true } });
+  const receiptCountAfterPolicyRetry = await prisma.hubSyncReceipt.count({ where: { hubInstallationId: hubOne.id, streamId: syncBatch.streamId, fromSequence: syncBatch.fromSequence, toSequence: syncBatch.toSequence } });
+  if (retryAfterCloudPolicyChange.response.status !== 200 || retryAfterCloudPolicyChange.body.duplicate !== true
+    || Number(retryAfterCloudPolicyChange.body.acceptedThroughSequence) !== syncBatch.toSequence
+    || Number(retryAfterCloudPolicyChange.body.cloudRevision) <= priorCloudRevision
+    || Number(retryAfterCloudPolicyChange.body.configuration?.revision) !== Number(retryAfterCloudPolicyChange.body.cloudRevision)
+    || retryAfterCloudPolicyChange.body.configuration?.areas?.find((area) => area.id === acceptedArea.id)?.overrideName !== 'Cloud-authoritative retry revision'
+    || receiptCountAfterPolicyRetry !== 1 || areaAfterPolicyRetry.id !== acceptedArea.id
+    || areaAfterPolicyRetry.originalName !== acceptedArea.originalName
+    || areaAfterPolicyRetry.updatedAt.getTime() !== areaAtPolicyChange.updatedAt.getTime()) {
+    fail(`An exact retry after a cloud policy revision change did not deliver current config without reapplying event effects (${JSON.stringify({ status: retryAfterCloudPolicyChange.response.status, duplicate: retryAfterCloudPolicyChange.body.duplicate, acceptedThroughSequence: retryAfterCloudPolicyChange.body.acceptedThroughSequence, expectedSequence: syncBatch.toSequence, priorCloudRevision, cloudRevision: retryAfterCloudPolicyChange.body.cloudRevision, configurationRevision: retryAfterCloudPolicyChange.body.configuration?.revision, receiptCountAfterPolicyRetry, sameArea: areaAfterPolicyRetry.id === acceptedArea.id, areaNamePreserved: areaAfterPolicyRetry.originalName === acceptedArea.originalName, areaTimestampPreserved: areaAfterPolicyRetry.updatedAt.getTime() === acceptedArea.updatedAt.getTime() })})`);
+  }
+  const conflictingBatch = { ...syncBatch, events: syncBatch.events.map((event) => ({ ...event, payload: { ...event.payload, name: 'Conflicting same-range area' } })) };
+  const conflict = await machineRequest({ base: platformBase, path: '/api/hub-agent/v2/sync', machineSecret, body: signedSyncBody(conflictingBatch) });
+  const areaAfterConflict = await prisma.area.findUniqueOrThrow({ where: { homeId_osAreaId: { homeId: homeOne.id, osAreaId: syncAreaId } }, select: { originalName: true } });
+  const receiptCountAfterConflict = await prisma.hubSyncReceipt.count({ where: { hubInstallationId: hubOne.id, streamId: syncBatch.streamId, fromSequence: syncBatch.fromSequence, toSequence: syncBatch.toSequence } });
+  if (conflict.response.status !== 409 || conflict.body.errorCode !== 'hub_sync_range_conflict' || areaAfterConflict.originalName !== 'Stage 5 loopback reconciliation' || receiptCountAfterConflict !== 1) fail('Conflicting same-range sync reuse was not denied with zero domain effects');
+  hub.pairing.nextRetryAt = 0;
+  await hub.pairing.syncNow(); // resume the identical persisted batch and durably acknowledge it locally
+  await hub.store.removeArea(syncAreaId);
+  const tombstoneSequence = hub.store.getSyncOutbox().nextSequence - 1;
+  for (let attempt = 0; attempt < 100 && hub.store.getSyncOutbox().acknowledgedSequence < tombstoneSequence; attempt += 1) {
+    if (!hub.pairing.syncing) {
+      hub.pairing.nextRetryAt = 0;
+      await hub.pairing.syncNow();
+    }
+    await sleep(20);
+  }
+  while (hub.pairing.syncing) await sleep(10);
+  const retiredSyncArea = await prisma.area.findUniqueOrThrow({ where: { homeId_osAreaId: { homeId: homeOne.id, osAreaId: syncAreaId } }, select: { status: true, retiredAt: true } });
+  if (hub.store.getSyncOutbox().acknowledgedSequence < tombstoneSequence || retiredSyncArea.status !== 'RETIRED' || !retiredSyncArea.retiredAt) {
+    fail(`The durable area tombstone did not retire the cloud projection (${JSON.stringify({ status: retiredSyncArea.status, acknowledged: hub.store.getSyncOutbox().acknowledgedSequence, tombstoneSequence, syncError: hub.store.getSyncOutbox().lastErrorCode })})`);
+  }
+  const cursorBeforePrivateProjection = await prisma.hubInstallation.findUniqueOrThrow({ where: { id: hubOne.id }, select: { syncStreamId: true, syncAcceptedSequence: true, acknowledgedCloudRevision: true } });
+  const privateProjectionEvent = {
+    id: crypto.randomUUID(), sequence: Number(cursorBeforePrivateProjection.syncAcceptedSequence) + 1,
+    type: 'device.upsert', aggregateId: 'harness-tenant-device', occurredAt: new Date().toISOString(), critical: false,
+    payload: { osDeviceId: 'harness-tenant-device', name: 'must-not-project-private-label', areaId: null, protocol: 'unknown', deviceType: 'light', technicalLabel: 'private_device', descriptorRevision: 1, descriptorDigest: tenantDescriptorDigest, available: true, observedAt: new Date().toISOString() },
+  };
+  const privateProjectionEnvelope = {
+    ...syncBatch, streamId: String(cursorBeforePrivateProjection.syncStreamId),
+    fromSequence: privateProjectionEvent.sequence, toSequence: privateProjectionEvent.sequence,
+    events: [privateProjectionEvent], queueDepth: 1,
+    acknowledgedCloudRevision: Number(cursorBeforePrivateProjection.acknowledgedCloudRevision),
+    runtime: hub.store.getSyncRuntime(hub.pairing.runtime), sentAt: new Date().toISOString(),
+  };
+  const privateProjectionDenied = await machineRequest({ base: platformBase, path: '/api/hub-agent/v2/sync', machineSecret, body: signedSyncBody(privateProjectionEnvelope) });
+  const tenantDeviceAfterProjectionAttempt = await prisma.nativeDevice.findUniqueOrThrow({ where: { id: tenantDevice.id }, select: { originalName: true, managementClass: true } });
+  const cursorAfterPrivateProjection = await prisma.hubInstallation.findUniqueOrThrow({ where: { id: hubOne.id }, select: { syncAcceptedSequence: true } });
+  if (privateProjectionDenied.response.status !== 409 || privateProjectionDenied.body.errorCode !== 'hub_sync_device_uncommissioned'
+    || tenantDeviceAfterProjectionAttempt.originalName !== 'Harness tenant light' || tenantDeviceAfterProjectionAttempt.managementClass !== 'TENANT_DEVICE'
+    || cursorAfterPrivateProjection.syncAcceptedSequence !== cursorBeforePrivateProjection.syncAcceptedSequence
+    || JSON.stringify(privateProjectionDenied.body).includes('must-not-project-private-label')) fail('A signed OS device projection exposed or mutated a tenant-private device');
+  console.log('[stage5:integration] PASS: actual loopback sync route proves signed denial/no mutation, one allowed projection, exact retry with fresh cloud policy, conflicting-body 409/no effect, local acknowledgement, tombstone and tenant-private projection denial');
   const preRevocationOsGrant = hub.store.getSecurity().offlineAuthorisations?.[revocableOffline.body.authorisation.id];
   if (!preRevocationOsGrant || preRevocationOsGrant.userId !== account.id || preRevocationOsGrant.revokedAt) {
     const platformGrant = await prisma.offlineMembershipAuthorisation.findUnique({ where: { id: revocableOffline.body.authorisation.id }, select: { id: true, homeId: true, hubInstallationId: true, revokedAt: true } });
@@ -2127,10 +2228,10 @@ async function osChecks() {
   let nativeControl = nativeTenantDevice.controls.find((control) => control.writable && control.valueType === 'boolean');
   if (!nativeControl) fail('The safe fixture device did not expose a writable boolean Native V1 control');
   const originalSensitiveTestDevice = hub.store.getDevice(nativeTenantDevice.id);
-  const sensitiveTestEntity = Object.values(originalSensitiveTestDevice?.entities || {}).find((entity) => String(entity.id || entity.sourceId || entity.stateKey || entity.name) === nativeControl.controlId);
-  if (!originalSensitiveTestDevice || !sensitiveTestEntity?.capability) fail('Could not mark the authorized tenant control as sensitive for the Native V1 route regression');
+  const sensitiveTestEntity = Object.values(originalSensitiveTestDevice?.entities || {}).find((entity) => [entity.capability?.controlId, entity.controlId, entity.id, entity.sourceId, entity.stateKey, entity.name].some((value) => value != null && String(value) === nativeControl.controlId));
+  if (!originalSensitiveTestDevice || !sensitiveTestEntity?.capability) fail(`Could not mark the authorized tenant control as sensitive for the Native V1 route regression (${JSON.stringify({ controlId: nativeControl.controlId, entities: Object.values(originalSensitiveTestDevice?.entities || {}).map((entity) => ({ id: entity.id || null, sourceId: entity.sourceId || null, stateKey: entity.stateKey || null, controlId: entity.controlId || entity.capability?.controlId || null, hasCapability: Boolean(entity.capability) })) })})`);
   const sensitiveTestDevice = structuredClone(originalSensitiveTestDevice);
-  const sensitiveTestEntityCopy = Object.values(sensitiveTestDevice.entities || {}).find((entity) => String(entity.id || entity.sourceId || entity.stateKey || entity.name) === nativeControl.controlId);
+  const sensitiveTestEntityCopy = Object.values(sensitiveTestDevice.entities || {}).find((entity) => [entity.capability?.controlId, entity.controlId, entity.id, entity.sourceId, entity.stateKey, entity.name].some((value) => value != null && String(value) === nativeControl.controlId));
   sensitiveTestEntityCopy.capability = { ...sensitiveTestEntityCopy.capability, sensitive: true };
   await hub.store.upsertDevice(sensitiveTestDevice);
   const sensitiveNativeRead = await fetchJson(`${base}/api/dinodia/v1/devices`, { headers: { authorization: `Bearer ${freshNativeSession.body.token}` } });
@@ -2215,7 +2316,7 @@ async function osChecks() {
   const queuedRaceCommand = { ...nativeCommand, commandId: `command-${crypto.randomUUID()}`, idempotencyKey: `native-queued-revision-${crypto.randomUUID()}`, issuedAt: new Date().toISOString() };
   const queuedRaceHash = sha256(`${customerFixture.tenantMembershipId}\n${queuedRaceCommand.idempotencyKey}`);
   const queuedRaceSnapshot = hub.store.getDevice(queuedRaceCommand.deviceId);
-  const queuedRaceEntityId = Object.values(queuedRaceSnapshot?.entities || {}).find((entity) => String(entity.id || entity.sourceId || '') === nativeControl.controlId)?.id;
+  const queuedRaceEntityId = Object.values(queuedRaceSnapshot?.entities || {}).find((entity) => [entity.capability?.controlId, entity.controlId, entity.id, entity.sourceId].some((value) => value != null && String(value) === nativeControl.controlId))?.id;
   if (!queuedRaceSnapshot || !queuedRaceEntityId) fail('Could not resolve the real fake-device descriptor for the queued Native V1 race');
   let signalQueuedDispatch;
   let releaseQueuedDispatch;
@@ -2242,7 +2343,7 @@ async function osChecks() {
     clearTimeout(dispatchPauseTimeout);
     if (queuedRaceError || !dispatchClaimIntercepted) throw queuedRaceError || new Error('Native V1 dispatch-claim barrier was not reached');
     const readOnlyDevice = structuredClone(queuedRaceSnapshot);
-    const readOnlyEntity = Object.values(readOnlyDevice.entities || {}).find((entity) => String(entity.id || entity.sourceId || '') === nativeControl.controlId);
+    const readOnlyEntity = Object.values(readOnlyDevice.entities || {}).find((entity) => [entity.capability?.controlId, entity.controlId, entity.id, entity.sourceId].some((value) => value != null && String(value) === nativeControl.controlId));
     if (!readOnlyEntity) throw new Error('Queued Native V1 race lost its current fake-device control descriptor');
     readOnlyEntity.writable = false;
     readOnlyEntity.capability = { ...readOnlyEntity.capability, readable: true, writable: false, automatable: false };

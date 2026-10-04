@@ -86,7 +86,8 @@ export async function runNativeMaintenance(now = new Date()) {
     where: { taskId: { not: 'expired_dispatch_lease_cleanup' }, leaseExpiresAt: { lte: now } },
     data: { leaseOwner: null, leaseExpiresAt: null },
   });
-  return { tasks: taskIds, expiredDispatcherLeases: leases.count };
+  const receipts = await prisma.hubSyncReceipt.deleteMany({ where: { expiresAt: { lte: now } } });
+  return { tasks: taskIds, expiredDispatcherLeases: leases.count, expiredSyncReceipts: receipts.count };
 }
 
 const taskIdsByDispatcher = {
@@ -116,12 +117,12 @@ export async function acquireOperationsLease(name: string, now = new Date()): Pr
 }
 
 export async function completeOperationsLease(name: string, lease: NativeDispatcherLease, outcome: {
-  failedTasks?: string[]; expiredSupport?: number; expiredRequests?: number; releasedClaims?: number; expiredDispatcherLeases?: number;
+  failedTasks?: string[]; expiredSupport?: number; expiredRequests?: number; releasedClaims?: number; expiredDispatcherLeases?: number; expiredSyncReceipts?: number;
 }, now = new Date()): Promise<boolean> {
   const dispatcher = taskIdsByDispatcher[name as keyof typeof taskIdsByDispatcher];
   if (!dispatcher || !lease || !Number.isFinite(now.getTime()) || lease.taskIds.length !== dispatcher.taskIds.length || dispatcher.taskIds.some((id) => !lease.taskIds.includes(id))) return false;
   const failedTasks = new Set((outcome.failedTasks ?? []).filter((id) => dispatcher.taskIds.includes(id)));
-  const summary = Object.fromEntries(['expiredSupport', 'expiredRequests', 'releasedClaims', 'expiredDispatcherLeases']
+  const summary = Object.fromEntries(['expiredSupport', 'expiredRequests', 'releasedClaims', 'expiredDispatcherLeases', 'expiredSyncReceipts']
     .filter((key) => Number.isSafeInteger(outcome[key as keyof typeof outcome]) && Number(outcome[key as keyof typeof outcome]) >= 0)
     .map((key) => [key, Number(outcome[key as keyof typeof outcome])]));
   const completed = await prisma.$transaction(async (tx) => {

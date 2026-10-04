@@ -45,7 +45,9 @@ export async function POST(request: Request) {
       }
       return { version: candidate.version, envelope: candidate.encryptedDeliveryEnvelope };
     });
-    await prisma.hubInstallation.update({ where: { id: hub.installation.id }, data: { lastSeenAt: now, onlineStateEvaluatedAt: now } });
+    // This bounded credential/bootstrap bridge is not the signed liveness
+    // authority. Only the dedicated heartbeat route advances lastSeenAt, and
+    // OS sends that heartbeat after current sync policy has been applied.
     const latest = await prisma.hubCredentialVersion.aggregate({ where: { hubInstallationId: hub.installation.id, purpose: 'operator-credential' }, _max: { version: true } });
     const operatorCredentialStates = await prisma.hubCredentialVersion.findMany({ where: { hubInstallationId: hub.installation.id, purpose: 'operator-credential', state: { in: ['ACTIVE', 'GRACE'] } }, orderBy: { version: 'asc' }, select: { version: true, state: true, graceUntil: true, revokedAt: true } });
     const offlineRows = await prisma.offlineMembershipAuthorisation.findMany({ where: { hubInstallationId: hub.installation.id }, select: { id: true, trustedDeviceId: true, membershipId: true, homeId: true, hubInstallationId: true, publicKey: true, areaIds: true, scopes: true, policyRevision: true, issuedAt: true, revokedAt: true, revokeReason: true } });

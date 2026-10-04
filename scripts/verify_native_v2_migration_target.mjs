@@ -15,16 +15,17 @@ const databaseUrl = process.env.DATABASE_URL || envFile.DATABASE_URL || '';
 const directUrl = process.env.DIRECT_URL || envFile.DIRECT_URL || '';
 const flags = new Set(process.argv.slice(2));
 const stage4LanTls = flags.has('--stage4-lan-tls');
-const migrationName = stage4LanTls
-  ? '20261004050000_stage4_customer_lan_tls_identity'
-  : '20261003000000_native_v2_stage3_domain_schema';
+const stage5Sync = flags.has('--stage5-sync');
+const migrationName = stage5Sync
+  ? '20261004150000_stage5_hub_sync_v2'
+  : stage4LanTls ? '20261004050000_stage4_customer_lan_tls_identity' : '20261003000000_native_v2_stage3_domain_schema';
 const migrationPath = path.join(root, 'prisma/migrations', migrationName, 'migration.sql');
 const confirm = `--confirm-project=${projectRef}`;
 const expectedShaFlag = process.argv.slice(2).find((value) => value.startsWith('--expected-migration-sha256='));
 const apply = flags.has('--apply');
 const authorizedApply = flags.has('--confirm-additive-forward-migration');
 
-function fail(reason) { throw new Error(`[stage${stage4LanTls ? '4' : '3'}:target] BLOCKED: ${reason}`); }
+function fail(reason) { throw new Error(`[stage${stage5Sync ? '5' : stage4LanTls ? '4' : '3'}:target] BLOCKED: ${reason}`); }
 function safeError(value) { return String(value).replace(/postgres(?:ql)?:\/\/[^\s"'`]+/gi, '<database-url-redacted>'); }
 function parseUrl(raw, label) {
   let url;
@@ -64,8 +65,11 @@ async function inventory(client, baselineColumns = undefined) {
       const describedColumns = await tx.$queryRawUnsafe('SELECT column_name FROM information_schema.columns WHERE table_schema = \'public\' AND table_name = $1 ORDER BY ordinal_position', table_name);
       const columns = baselineColumns?.[table_name] ?? describedColumns.map((row) => row.column_name);
       columnsByTable[table_name] = columns;
-      const pairs = columns.flatMap((column) => [`'${String(column).replaceAll("'", "''")}'`, `row_record."${String(column).replaceAll('"', '""')}"`]);
-      const rowJson = `jsonb_build_object(${pairs.join(',')})`;
+      // Build the projected row from to_jsonb(record), rather than passing two
+      // arguments per column to jsonb_build_object. HubInstallation is now
+      // wide enough to exceed PostgreSQL's 100-function-argument limit.
+      const columnNames = columns.map((column) => `'${String(column).replaceAll("'", "''")}'`).join(',');
+      const rowJson = `(SELECT COALESCE(jsonb_object_agg(key, value), '{}'::jsonb) FROM jsonb_each(to_jsonb(row_record)) WHERE key IN (${columnNames}))`;
       const content = await tx.$queryRawUnsafe(`SELECT md5(COALESCE(string_agg((${rowJson})::text, E'\\n' ORDER BY (${rowJson})::text), '')) AS digest FROM public.${identifier} AS row_record`);
       rowContentDigests[table_name] = content[0].digest;
       const columnDigestExpressions = columns.map((column) => {
@@ -121,8 +125,8 @@ async function inventory(client, baselineColumns = undefined) {
 let client;
 try {
   const args = process.argv.slice(2);
-  if (flags.has('--stage3-domain-schema') && stage4LanTls) fail('select exactly one reviewed migration target');
-  if (!args.includes(confirm) || args.some((arg) => ![confirm, '--apply', '--confirm-additive-forward-migration', '--stage4-lan-tls'].includes(arg) && !arg.startsWith('--expected-migration-sha256='))) fail(`pass ${confirm}; apply additionally requires the explicit additive-forward-migration confirmation`);
+  if ([stage4LanTls, stage5Sync, flags.has('--stage3-domain-schema')].filter(Boolean).length > 1) fail('select exactly one reviewed migration target');
+  if (!args.includes(confirm) || args.some((arg) => ![confirm, '--apply', '--confirm-additive-forward-migration', '--stage4-lan-tls', '--stage5-sync', '--stage3-domain-schema'].includes(arg) && !arg.startsWith('--expected-migration-sha256='))) fail(`pass ${confirm}; apply additionally requires the explicit additive-forward-migration confirmation`);
   if (target.supabaseProjectRef !== projectRef) fail('checked-in V2 target manifest does not match the authorized project');
   if (envFile.SUPABASE_PROJECT_REF !== projectRef || envFile.VERCEL_PROJECT_ID !== target.vercelProjectId) fail('project-local environment identity does not match the authorized V2 Production target');
   const db = parseUrl(databaseUrl, 'DATABASE_URL');
@@ -156,6 +160,7 @@ try {
   const rowContentPreservationDigest = crypto.createHash('sha256').update(JSON.stringify(Object.entries(before.rowContentDigests).sort(([a], [b]) => a.localeCompare(b)))).digest('hex');
   console.log(JSON.stringify({
     ok: true,
+    stage: stage5Sync ? 5 : stage4LanTls ? 4 : 3,
     mode: apply ? 'production-additive-apply' : 'read-only-production-preflight',
     targetProjectRef: projectRef,
     databaseHostClass: db.hostname === direct.hostname ? 'same-approved-host' : 'approved-pooler-and-direct-hosts',
@@ -197,6 +202,7 @@ try {
     if (postflightViolations.length) fail(`post-migration integrity checks found violations (${postflightViolations.join(', ')})`);
     console.log(JSON.stringify({
       ok: true,
+      stage: stage5Sync ? 5 : stage4LanTls ? 4 : 3,
       migrationApplied: true,
       targetProjectRef: projectRef,
       migrationName,

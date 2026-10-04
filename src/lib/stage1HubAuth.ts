@@ -16,8 +16,9 @@ function jsonBody(raw: string): Record<string, unknown> {
   return parsed as Record<string, unknown>;
 }
 
-export async function authenticateHub(request: Request, rawBody: string, options: { allowIdentity?: boolean } = {}): Promise<AuthenticatedHub> {
-  if (rawBody.length > 256 * 1024) throw new Stage1AuthError(413, 'hub_body_too_large', 'The hub request is too large');
+export async function authenticateHub(request: Request, rawBody: string, options: { allowIdentity?: boolean; maxBodyBytes?: number } = {}): Promise<AuthenticatedHub> {
+  const maxBodyBytes = Math.min(1024 * 1024, Math.max(1, Number(options.maxBodyBytes) || 256 * 1024));
+  if (Buffer.byteLength(rawBody, 'utf8') > maxBodyBytes) throw new Stage1AuthError(413, 'hub_body_too_large', 'The hub request is too large');
   let body: Record<string, unknown>;
   try { body = jsonBody(rawBody); } catch (error) { if (error instanceof Stage1AuthError) throw error; throw new Stage1AuthError(400, 'invalid_hub_body', 'The hub request body is invalid'); }
   const serial = String(body.serial ?? '').trim();

@@ -159,6 +159,7 @@ enum NativeAutomationExecutionStatus {
   FAILED
   SKIPPED
   CANCELLED
+  INTERRUPTED
 }
 
 enum AlexaNativeLinkStatus {
@@ -861,8 +862,29 @@ model HubInstallation {
   accessPolicyRevision             Int                      @default(1)
   lastSeenAt                       DateTime?
   onlineStateEvaluatedAt           DateTime?
+  syncStreamId                     String?                  @db.VarChar(80)
+  syncAcceptedSequence             BigInt                   @default(0)
+  acknowledgedCloudRevision        Int                      @default(0)
+  cloudConfigurationRevision       Int                      @default(0)
+  cloudConfigurationChecksum       String?                  @db.VarChar(64)
+  lastSuccessfulSyncAt             DateTime?
+  lastQueueDepth                   Int                      @default(0)
+  lastSyncErrorCode                String?                  @db.VarChar(80)
+  syncGapDetected                  Boolean                  @default(false)
+  syncCriticalBacklog              Boolean                  @default(false)
+  syncTelemetryPaused              Boolean                  @default(false)
+  syncDroppedTelemetryCount        Int                      @default(0)
   runtimeVersion                   String?                  @db.VarChar(120)
   capabilitySummary                Json?
+  updateStatusRevision             Int                      @default(0)
+  updaterTrustState                String                   @default("UNAVAILABLE") @db.VarChar(20)
+  updatePhase                      String                   @default("unavailable") @db.VarChar(32)
+  updateAttemptId                  String?                  @db.VarChar(96)
+  updateReleaseId                  String?                  @db.VarChar(96)
+  activeReleaseVersion             String?                  @db.VarChar(96)
+  updateResultCode                 String?                  @db.VarChar(96)
+  updateStatusAt                   DateTime?
+  updateBusy                       Boolean                  @default(false)
   cleanupState                     String?                  @db.VarChar(80)
   cleanupGeneration                Int                      @default(0)
   permanentResolverHash            String?                  @unique @db.VarChar(128)
@@ -899,11 +921,31 @@ model HubInstallation {
   domainOutbox            NativeDomainOutbox[]
   tenantDeviceRecoveries  NativeTenantDeviceRecovery[]
   outageIncidents         NativeDeviceOutageIncident[]
+  syncReceipts            HubSyncReceipt[]
 
   @@unique([id, homeId])
   @@unique([id, manufacturingIdentityId])
   @@index([state, lastSeenAt])
   @@index([homeId, lifecycleStatus])
+}
+
+model HubSyncReceipt {
+  id                String   @id @default(uuid()) @db.Uuid
+  hubInstallationId String   @db.Uuid
+  streamId          String   @db.VarChar(80)
+  fromSequence      BigInt
+  toSequence        BigInt
+  bodyHash          String   @db.VarChar(64)
+  response          Json
+  acceptedAt        DateTime @default(now())
+  expiresAt         DateTime
+
+  hubInstallation HubInstallation @relation(fields: [hubInstallationId], references: [id], onDelete: Cascade)
+
+  @@unique([hubInstallationId, streamId, fromSequence, toSequence, bodyHash], map: "HubSyncReceipt_exact_range_body_key")
+  @@unique([hubInstallationId, streamId, fromSequence, toSequence], map: "HubSyncReceipt_one_body_per_range_key")
+  @@index([expiresAt])
+  @@index([hubInstallationId, acceptedAt])
 }
 
 model HubCredentialVersion {
@@ -1738,8 +1780,10 @@ model NativeTemperatureSample {
   homeId           String   @db.Uuid
   deviceId         String   @db.Uuid
   areaId           String   @db.Uuid
+  sourceEventKey   String?  @unique @db.VarChar(64)
   temperature      Decimal  @db.Decimal(6, 2)
   sourceObservedAt DateTime
+  validUntil       DateTime
   sourceGeneration Int
   purgeAt          DateTime
   createdAt        DateTime @default(now())
@@ -1988,6 +2032,9 @@ model NativeNotificationDeliveryReceipt {
 model NativeDeviceOutageIncident {
   id                    String    @id @default(uuid()) @db.Uuid
   homeId                String    @db.Uuid
+  sourceIncidentKey     String?   @db.VarChar(64)
+  sourceRevision        Int       @default(0)
+  sourceEventId         String?   @unique @db.Uuid
   deviceId              String?   @db.Uuid
   hubInstallationId     String?   @db.Uuid
   causedByHubIncidentId String?   @db.Uuid
@@ -2007,6 +2054,7 @@ model NativeDeviceOutageIncident {
   dependentDeviceIncidents NativeDeviceOutageIncident[] @relation("HubCausedOutage")
 
   @@unique([id, homeId])
+  @@unique([hubInstallationId, sourceIncidentKey], map: "NativeDeviceOutageIncident_hub_source_key")
   @@index([homeId, state, alertEligibleAt])
   @@index([deviceId, offlineObservedAt])
 }

@@ -27,6 +27,7 @@ export const stage1RouteInventory = [
   ['POST', '/api/hub-agent/v2/credentials/acknowledge', 'machine'],
   ['POST', '/api/hub-agent/v2/credentials/activate', 'machine'],
   ['POST', '/api/hub-agent/v2/heartbeat', 'machine'],
+  ['POST', '/api/hub-agent/v2/sync', 'machine'],
   ['POST', '/api/hub-agent/v2/pairing/acknowledge', 'manufacturing-or-machine'],
   ['POST', '/api/hub-agent/v2/pairing/challenge', 'manufacturing-or-machine'],
   ['POST', '/api/hub-agent/v2/pairing/cloud-url', 'machine'],

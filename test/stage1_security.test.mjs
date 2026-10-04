@@ -76,9 +76,11 @@ test('temporary internal day mode is disabled unless the exact opt-in is present
 
 test('native task registry dispatches business operations and daily lease cleanup to disjoint owners', async () => {
   const cleanupCalls = [];
+  const receiptCleanupCalls = [];
   const { nativeTaskRegistry, runNativeOperations, runNativeMaintenance } = loadTypeScriptModule('src/lib/nativeOperations.ts', {
     './prisma': { prisma: {
       nativeBackgroundTaskState: { updateMany: async (input) => { cleanupCalls.push(input); return { count: 3 }; } },
+      hubSyncReceipt: { deleteMany: async (input) => { receiptCleanupCalls.push(input); return { count: 2 }; } },
       $transaction: async (callback) => callback({ nativeBackgroundTaskState: { updateMany: async () => ({ count: 0 }) } }),
       supportSession: { findMany: async () => [] },
       supportAccessRequest: { findMany: async () => [], updateMany: async () => ({ count: 0 }) },
@@ -101,7 +103,9 @@ test('native task registry dispatches business operations and daily lease cleanu
   const maintenance = await runNativeMaintenance(now);
   assert.deepEqual(maintenance.tasks, ['expired_dispatch_lease_cleanup']);
   assert.equal(maintenance.expiredDispatcherLeases, 3);
+  assert.equal(maintenance.expiredSyncReceipts, 2);
   assert.deepEqual(cleanupCalls, [{ where: { taskId: { not: 'expired_dispatch_lease_cleanup' }, leaseExpiresAt: { lte: now } }, data: { leaseOwner: null, leaseExpiresAt: null } }]);
+  assert.deepEqual(receiptCleanupCalls, [{ where: { expiresAt: { lte: now } } }]);
 });
 
 test('native task registry rejects unknown tasks, duplicate tasks and dual-owner drift', () => {
@@ -386,12 +390,15 @@ test('Stage 1 database migration includes durable privacy and authority objects'
   for (const marker of ['SupportAccessRequest_scope_guard', 'HubCredentialVersion_hub_purpose_state_idx', 'REVOKE ALL PRIVILEGES']) assert.match(migration, new RegExp(marker.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
 });
 
-test('readiness requires the exact Stage 3 schema plus only reviewed additive Stage 4 migrations', () => {
+test('readiness requires the exact Stage 3 schema plus reviewed additive Stage 4 and Stage 5 migrations', () => {
   assert.match(read('src/app/api/readiness/route.ts'), /isSchemaReady\(migration, Number\(modelCount\[0\]\?\.count \?\? 0\), expectedMigrationChecksum\)/);
   assert.match(read('src/lib/foundation.ts'), /20261003000000_native_v2_stage3_domain_schema/);
   assert.match(read('src/lib/foundation.ts'), /20261004050000_stage4_customer_lan_tls_identity/);
   assert.match(read('src/lib/foundation.ts'), /8b6f9a3ed68fb00805dbc54ba750fc339da3f375bb6c4a899e286c7b3844a5d1/);
+  assert.match(read('src/lib/foundation.ts'), /20261004150000_stage5_hub_sync_v2/);
+  assert.match(read('src/lib/foundation.ts'), /0043e8c7870c0afa7f4a5e5e4dd3d290387bc39514e4728f8c9a90fea8b33203/);
   assert.match(read('src/lib/foundation.ts'), /REQUIRED_MODEL_COUNT = 65/);
+  assert.match(read('src/lib/foundation.ts'), /REQUIRED_MODEL_COUNT \+ \(hasStage5 \? 1 : 0\)/);
 });
 
 test('normal hub routes require the acknowledged machine credential', () => {

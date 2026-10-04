@@ -3,7 +3,7 @@ import { PrismaClient } from '@prisma/client';
 const prisma = new PrismaClient({ datasourceUrl: process.env.DIRECT_URL });
 const expected = new Set([
   'CustomerAccount', 'CompanyEmployeeAccount', 'TrustedDevice', 'CustomerSession', 'PolicyAcceptance', 'AuthChallenge', 'StepUpAuthorization', 'Home', 'HomeMembership', 'Area', 'TenantAreaGrant', 'NativeDevice', 'DeviceAreaAssignment', 'HubManufacturingIdentity', 'CompanyOperationalWorkItem', 'HubInstallation', 'HubCredentialVersion', 'HubProvisioningAttempt', 'MembershipInvitation', 'MembershipInvitationArea', 'AreaQrCredential', 'AreaAccessRequest', 'HomeClaimReference', 'HomeClaimChallenge', 'HomeClaimReservation', 'PendingHomeSetup', 'HomeDocument', 'MemberPreferenceDocument', 'AuditEvent', 'DeletionSecurityReceipt', 'IdempotencyRecord', 'ReplayNonce', 'AuthRateLimitBucket', 'InitialCxoBootstrap', 'EmployeeSession', 'OperatorHandoff', 'OperatorBrowserAttempt', 'StepUpChallenge', 'SupportTicket', 'SupportAccessRequest', 'SupportSession', 'OfflineMembershipAuthorisation', 'CloudUrlVerification', 'SupportAccessNotification',
-  'AreaSourceAlias', 'NativeDeviceSourceAlias', 'PermanentDeviceInstallationRequest', 'NativeCommissioningSession', 'NativeDeviceUsageBucket', 'NativeTemperatureSample', 'NativeAutomation', 'NativeAutomationTrigger', 'NativeAutomationAction', 'NativeAutomationExecution', 'AlexaNativeLink', 'AlexaNativeHomeScope', 'AlexaNativeEndpointProjection', 'AlexaNativeDirectiveReceipt', 'NativeBackgroundTaskState', 'NativeDomainOutbox', 'NativeNotificationDeliveryReceipt', 'NativeDeviceOutageIncident', 'NativeSupportTicketTimeline', 'ExceptionalOwnershipTransfer', 'NativeTenantDeviceRecovery',
+  'AreaSourceAlias', 'NativeDeviceSourceAlias', 'PermanentDeviceInstallationRequest', 'NativeCommissioningSession', 'NativeDeviceUsageBucket', 'NativeTemperatureSample', 'NativeAutomation', 'NativeAutomationTrigger', 'NativeAutomationAction', 'NativeAutomationExecution', 'AlexaNativeLink', 'AlexaNativeHomeScope', 'AlexaNativeEndpointProjection', 'AlexaNativeDirectiveReceipt', 'NativeBackgroundTaskState', 'NativeDomainOutbox', 'NativeNotificationDeliveryReceipt', 'NativeDeviceOutageIncident', 'NativeSupportTicketTimeline', 'ExceptionalOwnershipTransfer', 'NativeTenantDeviceRecovery', 'HubSyncReceipt',
 ]);
 try {
   const tables = await prisma.$queryRaw`SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE' AND table_name <> '_prisma_migrations' ORDER BY table_name`;
@@ -36,9 +36,10 @@ try {
     '20260927020000_nr4_operator_endpoint_binding',
     '20261003000000_native_v2_stage3_domain_schema',
     '20261004050000_stage4_customer_lan_tls_identity',
+    '20261004150000_stage5_hub_sync_v2',
   ];
-  if (migration.length !== required.length || required.some((name) => !migrations.has(name)) || required.some((name) => !migrations.get(name).finished_at || migrations.get(name).rolled_back_at)) throw new Error('migration ledger is not exactly the completed native baseline, Stage 1, Stage 3 and Stage 4 migrations');
-  console.log(`[test:stage4-schema] OK: ${names.size} tables, no direct anon/authenticated grants, native baseline, Stage 1, Stage 3 and additive Stage 4 migrations completed`);
+  if (migration.length !== required.length || required.some((name) => !migrations.has(name)) || required.some((name) => !migrations.get(name).finished_at || migrations.get(name).rolled_back_at)) throw new Error('migration ledger is not exactly the completed native baseline, Stage 1, Stage 3, Stage 4 and Stage 5 migrations');
+  console.log(`[test:stage5-schema] OK: ${names.size} tables, no direct anon/authenticated grants, native baseline, Stage 1, Stage 3/4 and additive Stage 5 migrations completed`);
 } finally {
   await prisma.$disconnect();
 }
