@@ -36,16 +36,22 @@ test('safe build identity prefers the real Vercel commit or deployment and never
   assert.equal(safeBuildId({ FOUNDATION_SOURCE_FINGERPRINT: 'not-a-fingerprint' }), 'local');
 });
 
-test('readiness accepts only the exact Stage 3 head plus the reviewed additive Stage 4 migration', () => {
+test('readiness accepts the exact Stage 3 head plus only reviewed additive Stage 4 and Stage 5 migrations', () => {
   const { REQUIRED_MIGRATION, REQUIRED_MODEL_COUNT, COMPATIBLE_ADDITIVE_MIGRATIONS, isSchemaReady } = loadFoundationRuntime();
   const stage3Checksum = 'b'.repeat(64);
   const stage3 = [{ migration_name: REQUIRED_MIGRATION, checksum: stage3Checksum }];
-  const stage4 = [{ migration_name: Object.keys(COMPATIBLE_ADDITIVE_MIGRATIONS)[0], checksum: Object.values(COMPATIBLE_ADDITIVE_MIGRATIONS)[0] }, ...stage3];
+  const migration = (name) => ({ migration_name: name, checksum: COMPATIBLE_ADDITIVE_MIGRATIONS[name] });
+  const stage4 = [migration('20261004050000_stage4_customer_lan_tls_identity'), ...stage3];
+  const stage5 = [migration('20261004150000_stage5_hub_sync_v2'), ...stage4];
   assert.equal(isSchemaReady(stage3, REQUIRED_MODEL_COUNT, stage3Checksum), true);
   assert.equal(isSchemaReady(stage4, REQUIRED_MODEL_COUNT, stage3Checksum), true, 'the app rollback remains ready after the additive migration');
+  assert.equal(isSchemaReady(stage5, REQUIRED_MODEL_COUNT + 1, stage3Checksum), true, 'the Stage 5 app and Stage 4 rollback remain ready on the additive Stage 5 schema');
+  assert.equal(isSchemaReady([stage5[0], ...stage3], REQUIRED_MODEL_COUNT + 1, stage3Checksum), false, 'Stage 5 cannot be accepted without its Stage 4 prerequisite');
   assert.equal(isSchemaReady([{ migration_name: 'unreviewed_migration', checksum: 'c'.repeat(64) }, ...stage4], REQUIRED_MODEL_COUNT, stage3Checksum), false);
   assert.equal(isSchemaReady([{ ...stage4[0], checksum: '0'.repeat(64) }, ...stage3], REQUIRED_MODEL_COUNT, stage3Checksum), false);
+  assert.equal(isSchemaReady([{ ...stage5[0], checksum: '0'.repeat(64) }, ...stage4], REQUIRED_MODEL_COUNT + 1, stage3Checksum), false);
   assert.equal(isSchemaReady(stage4, REQUIRED_MODEL_COUNT + 1, stage3Checksum), false);
+  assert.equal(isSchemaReady(stage5, REQUIRED_MODEL_COUNT, stage3Checksum), false);
   assert.equal(isSchemaReady(stage4, REQUIRED_MODEL_COUNT, '0'.repeat(64)), false);
 });
 
@@ -60,9 +66,10 @@ test('foundation and Stage 1 schema is exactly native and bounded', () => {
     'NativeDomainOutbox', 'NativeNotificationDeliveryReceipt', 'NativeDeviceOutageIncident',
     'NativeSupportTicketTimeline', 'ExceptionalOwnershipTransfer', 'NativeTenantDeviceRecovery',
   ];
-  assert.equal(modelNames.length, 65);
+  assert.equal(modelNames.length, 66);
+  assert.equal(modelNames.filter((name) => name === 'HubSyncReceipt').length, 1);
   assert.deepEqual(modelNames.filter((name) => stage3Models.includes(name)).sort(), [...stage3Models].sort());
-  assert.equal(modelNames.length - stage3Models.length, 44, 'Stage 1/foundation tables remain intact; Stage 3 is additive');
+  assert.equal(modelNames.length - stage3Models.length, 45, 'Stage 1/foundation and Stage 5 receipt tables remain intact; Stage 3 is additive');
   assert.doesNotMatch(schema, /HaConnection|HomeAssistant|SupportRequest|AlexaRefreshToken/);
   assert.match(schema, /model HomeMembership/);
   assert.match(schema, /model TenantAreaGrant/);
