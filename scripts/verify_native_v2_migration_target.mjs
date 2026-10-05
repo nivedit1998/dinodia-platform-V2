@@ -16,8 +16,11 @@ const directUrl = process.env.DIRECT_URL || envFile.DIRECT_URL || '';
 const flags = new Set(process.argv.slice(2));
 const stage4LanTls = flags.has('--stage4-lan-tls');
 const stage5Sync = flags.has('--stage5-sync');
-const migrationName = stage5Sync
-  ? '20261004150000_stage5_hub_sync_v2'
+const stage5IncidentDeadlines = flags.has('--stage5-incident-deadlines');
+const stage5Target = stage5Sync || stage5IncidentDeadlines;
+const migrationName = stage5IncidentDeadlines
+  ? '20261005070000_stage5_hub_incident_deadline'
+  : stage5Sync ? '20261004150000_stage5_hub_sync_v2'
   : stage4LanTls ? '20261004050000_stage4_customer_lan_tls_identity' : '20261003000000_native_v2_stage3_domain_schema';
 const migrationPath = path.join(root, 'prisma/migrations', migrationName, 'migration.sql');
 const confirm = `--confirm-project=${projectRef}`;
@@ -25,7 +28,7 @@ const expectedShaFlag = process.argv.slice(2).find((value) => value.startsWith('
 const apply = flags.has('--apply');
 const authorizedApply = flags.has('--confirm-additive-forward-migration');
 
-function fail(reason) { throw new Error(`[stage${stage5Sync ? '5' : stage4LanTls ? '4' : '3'}:target] BLOCKED: ${reason}`); }
+function fail(reason) { throw new Error(`[stage${stage5Target ? '5' : stage4LanTls ? '4' : '3'}:target] BLOCKED: ${reason}`); }
 function safeError(value) { return String(value).replace(/postgres(?:ql)?:\/\/[^\s"'`]+/gi, '<database-url-redacted>'); }
 function parseUrl(raw, label) {
   let url;
@@ -125,8 +128,8 @@ async function inventory(client, baselineColumns = undefined) {
 let client;
 try {
   const args = process.argv.slice(2);
-  if ([stage4LanTls, stage5Sync, flags.has('--stage3-domain-schema')].filter(Boolean).length > 1) fail('select exactly one reviewed migration target');
-  if (!args.includes(confirm) || args.some((arg) => ![confirm, '--apply', '--confirm-additive-forward-migration', '--stage4-lan-tls', '--stage5-sync', '--stage3-domain-schema'].includes(arg) && !arg.startsWith('--expected-migration-sha256='))) fail(`pass ${confirm}; apply additionally requires the explicit additive-forward-migration confirmation`);
+  if ([stage4LanTls, stage5Sync, stage5IncidentDeadlines, flags.has('--stage3-domain-schema')].filter(Boolean).length > 1) fail('select exactly one reviewed migration target');
+  if (!args.includes(confirm) || args.some((arg) => ![confirm, '--apply', '--confirm-additive-forward-migration', '--stage4-lan-tls', '--stage5-sync', '--stage5-incident-deadlines', '--stage3-domain-schema'].includes(arg) && !arg.startsWith('--expected-migration-sha256='))) fail(`pass ${confirm}; apply additionally requires the explicit additive-forward-migration confirmation`);
   if (target.supabaseProjectRef !== projectRef) fail('checked-in V2 target manifest does not match the authorized project');
   if (envFile.SUPABASE_PROJECT_REF !== projectRef || envFile.VERCEL_PROJECT_ID !== target.vercelProjectId) fail('project-local environment identity does not match the authorized V2 Production target');
   const db = parseUrl(databaseUrl, 'DATABASE_URL');
@@ -160,7 +163,7 @@ try {
   const rowContentPreservationDigest = crypto.createHash('sha256').update(JSON.stringify(Object.entries(before.rowContentDigests).sort(([a], [b]) => a.localeCompare(b)))).digest('hex');
   console.log(JSON.stringify({
     ok: true,
-    stage: stage5Sync ? 5 : stage4LanTls ? 4 : 3,
+    stage: stage5Target ? 5 : stage4LanTls ? 4 : 3,
     mode: apply ? 'production-additive-apply' : 'read-only-production-preflight',
     targetProjectRef: projectRef,
     databaseHostClass: db.hostname === direct.hostname ? 'same-approved-host' : 'approved-pooler-and-direct-hosts',
@@ -202,7 +205,7 @@ try {
     if (postflightViolations.length) fail(`post-migration integrity checks found violations (${postflightViolations.join(', ')})`);
     console.log(JSON.stringify({
       ok: true,
-      stage: stage5Sync ? 5 : stage4LanTls ? 4 : 3,
+      stage: stage5Target ? 5 : stage4LanTls ? 4 : 3,
       migrationApplied: true,
       targetProjectRef: projectRef,
       migrationName,

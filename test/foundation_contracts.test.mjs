@@ -42,14 +42,15 @@ test('readiness accepts the exact Stage 3 head plus only reviewed additive Stage
   const stage3 = [{ migration_name: REQUIRED_MIGRATION, checksum: stage3Checksum }];
   const migration = (name) => ({ migration_name: name, checksum: COMPATIBLE_ADDITIVE_MIGRATIONS[name] });
   const stage4 = [migration('20261004050000_stage4_customer_lan_tls_identity'), ...stage3];
-  const stage5 = [migration('20261004150000_stage5_hub_sync_v2'), ...stage4];
+  const stage5 = [migration('20261005070000_stage5_hub_incident_deadline'), migration('20261004150000_stage5_hub_sync_v2'), ...stage4];
   assert.equal(isSchemaReady(stage3, REQUIRED_MODEL_COUNT, stage3Checksum), true);
   assert.equal(isSchemaReady(stage4, REQUIRED_MODEL_COUNT, stage3Checksum), true, 'the app rollback remains ready after the additive migration');
   assert.equal(isSchemaReady(stage5, REQUIRED_MODEL_COUNT + 1, stage3Checksum), true, 'the Stage 5 app and Stage 4 rollback remain ready on the additive Stage 5 schema');
+  assert.equal(isSchemaReady([{ ...stage5[0], checksum: '0'.repeat(64) }, ...stage5.slice(1)], REQUIRED_MODEL_COUNT + 1, stage3Checksum), false, 'an unreviewed Stage 5 follow-on checksum is not schema-ready');
   assert.equal(isSchemaReady([stage5[0], ...stage3], REQUIRED_MODEL_COUNT + 1, stage3Checksum), false, 'Stage 5 cannot be accepted without its Stage 4 prerequisite');
   assert.equal(isSchemaReady([{ migration_name: 'unreviewed_migration', checksum: 'c'.repeat(64) }, ...stage4], REQUIRED_MODEL_COUNT, stage3Checksum), false);
   assert.equal(isSchemaReady([{ ...stage4[0], checksum: '0'.repeat(64) }, ...stage3], REQUIRED_MODEL_COUNT, stage3Checksum), false);
-  assert.equal(isSchemaReady([{ ...stage5[0], checksum: '0'.repeat(64) }, ...stage4], REQUIRED_MODEL_COUNT + 1, stage3Checksum), false);
+  assert.equal(isSchemaReady([{ ...stage5[1], checksum: '0'.repeat(64) }, ...stage5.slice(2)], REQUIRED_MODEL_COUNT + 1, stage3Checksum), false);
   assert.equal(isSchemaReady(stage4, REQUIRED_MODEL_COUNT + 1, stage3Checksum), false);
   assert.equal(isSchemaReady(stage5, REQUIRED_MODEL_COUNT, stage3Checksum), false);
   assert.equal(isSchemaReady(stage4, REQUIRED_MODEL_COUNT, '0'.repeat(64)), false);

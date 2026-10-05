@@ -16,7 +16,8 @@ function loadTypeScript(relative) {
   return module.exports;
 }
 
-const { validateHubSyncEnvelope } = loadTypeScript('src/lib/hubSyncEnvelope.ts');
+const { isInstallationBootstrapEvent, validateHubSyncEnvelope } = loadTypeScript('src/lib/hubSyncEnvelope.ts');
+const { parseHubSyncOutboxReport } = loadTypeScript('src/lib/hubSyncTelemetry.ts');
 const { resolveNativeInstallationSyncMode } = loadTypeScript('src/lib/nativeInstallationSyncMode.ts');
 
 test('installation sync mode permits only the current active hub or a verified, assigned, membership-free initial Area bootstrap', () => {
@@ -59,6 +60,23 @@ function envelope() {
     sentAt: '2026-10-04T12:00:00.000Z',
   };
 }
+
+test('bootstrap admits only bounded hub-level incidents and rejects device-bound incident authority', () => {
+  const safe = { type: 'incident.transition', critical: true, payload: { kind: 'hub_network_unavailable', osDeviceId: null } };
+  assert.equal(isInstallationBootstrapEvent(safe), true);
+  assert.equal(isInstallationBootstrapEvent({ ...safe, payload: { ...safe.payload, osDeviceId: 'not-yet-commissioned-device' } }), false);
+  assert.equal(isInstallationBootstrapEvent({ ...safe, payload: { ...safe.payload, kind: 'device_offline' } }), false);
+  assert.equal(isInstallationBootstrapEvent({ ...safe, critical: false }), false);
+  assert.equal(isInstallationBootstrapEvent({ type: 'device.upsert', critical: false, payload: {} }), false);
+});
+
+test('queue telemetry distinguishes a valid empty report from missing or malformed state', () => {
+  assert.equal(parseHubSyncOutboxReport(null), null);
+  assert.equal(parseHubSyncOutboxReport({ queueDepth: 0, gapDetected: false, criticalBacklog: false, telemetryPaused: false, droppedTelemetryCount: 0, lastErrorCode: null })?.queueDepth, 0);
+  assert.equal(parseHubSyncOutboxReport({ queueDepth: -1, gapDetected: false, criticalBacklog: false, telemetryPaused: false, droppedTelemetryCount: 0, lastErrorCode: null }), null);
+  assert.equal(parseHubSyncOutboxReport({ queueDepth: 5, gapDetected: false, criticalBacklog: false, telemetryPaused: false, droppedTelemetryCount: 0, lastErrorCode: 'secret=never' }), null);
+  assert.equal(parseHubSyncOutboxReport({ queueDepth: 5, gapDetected: false, criticalBacklog: false, telemetryPaused: false, droppedTelemetryCount: 0, lastErrorCode: null, privateText: 'rejected' }), null);
+});
 
 test('hub sync accepts a bounded contiguous signed-envelope shape and rejects malformed, stale and contradictory bodies', () => {
   const valid = envelope();

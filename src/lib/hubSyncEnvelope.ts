@@ -27,6 +27,14 @@ export type HubSyncEnvelope = {
   sentAt: string;
 };
 
+const INSTALLATION_BOOTSTRAP_EVENT_TYPES = new Set(['sync.compacted', 'update.status', 'area.upsert']);
+
+export function isInstallationBootstrapEvent(event: HubSyncEvent): boolean {
+  if (INSTALLATION_BOOTSTRAP_EVENT_TYPES.has(event.type)) return true;
+  return event.type === 'incident.transition' && event.critical === true
+    && event.payload.osDeviceId === null && /^(hub|integration)_/.test(String(event.payload.kind || ''));
+}
+
 function object(value: unknown): value is Record<string, unknown> {
   return Boolean(value && typeof value === 'object' && !Array.isArray(value));
 }

@@ -5,11 +5,10 @@ import { authErrorResponse, Stage1AuthError } from '@/lib/stage1Auth';
 import { authenticateHub } from '@/lib/stage1HubAuth';
 import { buildHubCloudConfiguration, finalizeHubCloudConfiguration } from '@/lib/hubCloudConfiguration';
 import { applyHubSyncEvent } from '@/lib/hubSyncIngestion';
-import { HUB_SYNC_MAX_BODY_BYTES, hubSyncBodyHash, validateHubSyncEnvelope } from '@/lib/hubSyncEnvelope';
+import { HUB_SYNC_MAX_BODY_BYTES, hubSyncBodyHash, isInstallationBootstrapEvent, validateHubSyncEnvelope } from '@/lib/hubSyncEnvelope';
 import { resolveNativeInstallationSyncMode } from '@/lib/nativeInstallationSyncMode';
 
 export const dynamic = 'force-dynamic';
-const INSTALLATION_BOOTSTRAP_EVENT_TYPES = new Set(['sync.compacted', 'update.status', 'area.upsert']);
 
 async function readBoundedBody(request: Request): Promise<string> {
   const length = Number(request.headers.get('content-length') || 0);
@@ -43,8 +42,9 @@ export async function POST(request: Request) {
       || !validateHubSyncEnvelope(envelope, raw) || envelope.hubInstallationId !== hub.installation.id) {
       throw new Stage1AuthError(400, 'hub_sync_envelope_invalid', 'The native sync envelope is invalid');
     }
-    const sentAt = Date.parse(envelope.sentAt);
-    if (!Number.isFinite(sentAt) || Math.abs(Date.now() - sentAt) > 5 * 60 * 1000) throw new Stage1AuthError(401, 'hub_sync_timestamp_invalid', 'The native sync timestamp is outside its validity window');
+    // sentAt is durable batch metadata and remains stable across process restart,
+    // response loss and retry. Freshness is enforced by authenticateHub's
+    // signed request timestamp/nonce, not by expiring this persisted body.
     const bodyHash = hubSyncBodyHash(raw);
     const rawSyncStatus = envelope.runtime.capabilities.nativeSyncOutbox;
     const syncStatus = rawSyncStatus && typeof rawSyncStatus === 'object' && !Array.isArray(rawSyncStatus)
@@ -88,7 +88,7 @@ export async function POST(request: Request) {
             || syncMode === 'UNAVAILABLE') {
             throw new Stage1AuthError(401, 'hub_sync_authority_changed', 'The enrolled hub no longer has current synchronization authority');
           }
-          if (syncMode === 'INSTALLATION_BOOTSTRAP' && (envelope.events.length === 0 || envelope.events.some((event) => !INSTALLATION_BOOTSTRAP_EVENT_TYPES.has(event.type)))) {
+          if (syncMode === 'INSTALLATION_BOOTSTRAP' && (envelope.events.length === 0 || envelope.events.some((event) => !isInstallationBootstrapEvent(event)))) {
             throw new Stage1AuthError(409, envelope.events.length === 0 ? 'hub_sync_installation_area_required' : 'hub_sync_installation_area_only', 'An assigned in-progress installation may synchronize only safe updater status, compaction and OS-owned Area events');
           }
 

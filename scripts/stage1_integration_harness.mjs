@@ -1820,6 +1820,14 @@ async function customerAuthorizationChecks(deliveryEnv) {
   await hub.store.saveArea({ name: 'Stage 5 loopback reconciliation', icon: 'room' }, syncAreaId);
   const syncBatch = await hub.store.prepareSyncBatch(hubOne.id, hub.pairing.runtime, Date.now());
   if (!syncBatch || syncBatch.events.length !== 1 || syncBatch.events[0].type !== 'area.upsert') fail('The local durable outbox did not prepare the expected single area event');
+  // Persist an old batch creation timestamp, then submit the unchanged body
+  // under the helper's fresh machine-authentication timestamp and nonce.
+  const savedBatchTime = new Date(Date.now() - 6 * 60 * 1000).toISOString();
+  syncBatch.sentAt = savedBatchTime;
+  await hub.store.mutateAtomically((state) => {
+    if (!state.syncOutbox?.inFlight) throw new Error('Expected a persisted in-flight batch for the aged retry proof');
+    state.syncOutbox.inFlight.sentAt = savedBatchTime;
+  });
   const syncCursorBeforeDenial = await prisma.hubInstallation.findUniqueOrThrow({ where: { id: hubOne.id }, select: { syncAcceptedSequence: true } });
   const signedSyncBody = (envelope) => ({ serial: identityOne.serialNumber, identityGeneration: identityOne.identityGeneration, ...envelope });
   const deniedSync = await machineRequest({ base: platformBase, path: '/api/hub-agent/v2/sync', machineSecret: `${machineSecret}-wrong`, body: signedSyncBody(syncBatch) });
@@ -1991,6 +1999,11 @@ async function installationBootstrapChecks() {
   } });
   const tokenState = await machineRequest({ base, path: '/api/hub-agent/token-state', machineSecret, body: { serial, identityGeneration: identity.identityGeneration, agentSeenVersion: 0, operatorCredentialVersion: 0 } });
   if (tokenState.response.status !== 200 || tokenState.body.installationSyncMode !== 'INSTALLATION_BOOTSTRAP' || tokenState.body.hubInstallId !== hub.id || Number(tokenState.body.syncAcceptedSequence) !== 0) fail(`A verified assigned unclaimed installation did not receive the bounded bootstrap mode (${tokenState.response.status}/${tokenState.body.installationSyncMode || tokenState.body.errorCode || 'no-mode'})`);
+  const assignedStatusUrl = `${base}/api/installer/home-support/homes/${encodeURIComponent(home.id)}/os-access/status?workflowId=${encodeURIComponent(work.id)}`;
+  const unreportedStatus = await fetchJson(assignedStatusUrl, { headers: { 'x-dinodia-employee-session': customerFixture.operatorToken } });
+  if (unreportedStatus.response.status !== 200 || unreportedStatus.body.sync?.statusState !== 'UNKNOWN' || unreportedStatus.body.sync?.queueDepth !== null) {
+    fail('An installation with no queue telemetry report was represented as an empty/healthy queue');
+  }
 
   const forbiddenBefore = event(1, 'device.tombstone', 'private-device', { osDeviceId: 'private-device', removedAt: now.toISOString() });
   const denied = await send([forbiddenBefore]);
@@ -2016,19 +2029,58 @@ async function installationBootstrapChecks() {
     fail('Installation completion without a real synchronized Area did not deny atomically with zero authority/idempotency effects');
   }
 
-  const statusEvent = event(1, 'update.status', 'hub-updater', {
+  const incidentKey = sha256('bootstrap-safe-hub-incident');
+  const incidentEvent = event(1, 'incident.transition', incidentKey, {
+    incidentKey, revision: 1, kind: 'hub_network_unavailable', state: 'open', severity: 'critical',
+    occurredAt: now.toISOString(), firstObservedAt: new Date(now.getTime() - 60_000).toISOString(),
+    lastObservedAt: now.toISOString(), resolvedAt: null, osDeviceId: null,
+  });
+  const statusEvent = event(2, 'update.status', 'hub-updater', {
     trustState: 'unprovisioned', phase: 'idle', activeReleaseVersion: null, attemptId: null, releaseId: null,
     attemptPhase: null, resultCode: null, updatedAt: null, busy: false, revision: 1,
   });
-  const areaEvent = event(2, 'area.upsert', 'os-kitchen', { osAreaId: 'os-kitchen', name: 'Kitchen', icon: 'room' });
-  const accepted = await send([statusEvent, areaEvent]);
+  const areaEvent = event(3, 'area.upsert', 'os-kitchen', { osAreaId: 'os-kitchen', name: 'Kitchen', icon: 'room' });
+  const accepted = await send([incidentEvent, statusEvent, areaEvent]);
   const area = await prisma.area.findUnique({ where: { homeId_osAreaId: { homeId: home.id, osAreaId: 'os-kitchen' } }, select: { id: true, originalName: true, status: true } });
   const acceptedCursor = await prisma.hubInstallation.findUniqueOrThrow({ where: { id: hub.id }, select: { syncAcceptedSequence: true, syncStreamId: true } });
-  if (accepted.response.status !== 200 || Number(accepted.body.acceptedThroughSequence) !== 2 || !area || area.originalName !== 'Kitchen'
-    || area.status !== 'ACTIVE' || acceptedCursor.syncStreamId !== streamId || Number(acceptedCursor.syncAcceptedSequence) !== 2) fail(`The authenticated bootstrap did not accept only the OS Area projection (${accepted.response.status}/${accepted.body.errorCode || 'no-code'})`);
+  const bootstrapIncident = await prisma.nativeDeviceOutageIncident.findFirst({ where: { hubInstallationId: hub.id, sourceIncidentKey: incidentKey }, select: { state: true, deviceId: true, offlineObservedAt: true, alertEligibleAt: true } });
+  if (accepted.response.status !== 200 || Number(accepted.body.acceptedThroughSequence) !== 3 || !area || area.originalName !== 'Kitchen'
+    || area.status !== 'ACTIVE' || acceptedCursor.syncStreamId !== streamId || Number(acceptedCursor.syncAcceptedSequence) !== 3
+    || !bootstrapIncident || bootstrapIncident.deviceId !== null
+    || bootstrapIncident.alertEligibleAt.getTime() - bootstrapIncident.offlineObservedAt.getTime() !== 7 * 60_000) fail(`The authenticated bootstrap did not advance its bounded hub incident, seven-minute deadline, updater status and OS Area prefix (${accepted.response.status}/${accepted.body.errorCode || 'no-code'})`);
   if (await prisma.homeMembership.count({ where: { homeId: home.id, status: 'ACTIVE' } }) !== 0
     || await prisma.nativeDevice.count({ where: { homeId: home.id } }) !== 0) fail('Initial Area bootstrap created customer membership or a device authority record');
-  const statusBeforeCompletion = await fetchJson(`${base}/api/installer/home-support/homes/${encodeURIComponent(home.id)}/os-access/status?workflowId=${encodeURIComponent(work.id)}`, { headers: { 'x-dinodia-employee-session': customerFixture.operatorToken } });
+  const queueStatusReport = { queueDepth: 6, gapDetected: true, criticalBacklog: true, telemetryPaused: false, droppedTelemetryCount: 2, lastErrorCode: 'inventory_backlog' };
+  const acceptedSyncAtBeforeHeartbeat = acceptedCursor.syncAcceptedSequence;
+  const lastSuccessfulSyncBeforeHeartbeat = (await prisma.hubInstallation.findUniqueOrThrow({ where: { id: hub.id }, select: { lastSuccessfulSyncAt: true } })).lastSuccessfulSyncAt;
+  const heartbeat = await machineRequest({ base, path: '/api/hub-agent/v2/heartbeat', machineSecret, body: {
+    serial, identityGeneration: identity.identityGeneration,
+    hubRuntime: { kind: 'dinodia_os', version: 'integration-test', capabilities: { nativeSyncOutbox: queueStatusReport } },
+  } });
+  const heartbeatRow = await prisma.hubInstallation.findUniqueOrThrow({ where: { id: hub.id }, select: { syncAcceptedSequence: true, lastSuccessfulSyncAt: true, lastQueueDepth: true, lastSyncErrorCode: true, syncGapDetected: true, syncCriticalBacklog: true, syncDroppedTelemetryCount: true } });
+  const reportedStatus = await fetchJson(assignedStatusUrl, { headers: { 'x-dinodia-employee-session': customerFixture.operatorToken } });
+  if (heartbeat.response.status !== 200 || heartbeatRow.syncAcceptedSequence !== acceptedSyncAtBeforeHeartbeat
+    || heartbeatRow.lastSuccessfulSyncAt?.getTime() !== lastSuccessfulSyncBeforeHeartbeat?.getTime()
+    || heartbeatRow.lastQueueDepth !== 6 || heartbeatRow.lastSyncErrorCode !== 'inventory_backlog'
+    || !heartbeatRow.syncGapDetected || !heartbeatRow.syncCriticalBacklog || heartbeatRow.syncDroppedTelemetryCount !== 2
+    || reportedStatus.response.status !== 200 || reportedStatus.body.sync?.statusState !== 'FRESH'
+    || reportedStatus.body.sync?.queueDepth !== 6 || reportedStatus.body.sync?.errorCode !== 'inventory_backlog') {
+    fail('A signed heartbeat did not update truthful queue/error status independently of the accepted sync cursor/receipt');
+  }
+  const staleAt = new Date(Date.now() - 7 * 60 * 1000);
+  await prisma.hubInstallation.update({ where: { id: hub.id }, data: { lastSeenAt: staleAt } });
+  const staleStatus = await fetchJson(assignedStatusUrl, { headers: { 'x-dinodia-employee-session': customerFixture.operatorToken } });
+  if (staleStatus.body.sync?.statusState !== 'STALE' || staleStatus.body.sync?.queueDepth !== 6
+    || new Date(staleStatus.body.sync?.statusReportedAt).getTime() !== staleAt.getTime()) fail('An old queue report was not labelled stale with its real observation timestamp');
+  const malformedHeartbeat = await machineRequest({ base, path: '/api/hub-agent/v2/heartbeat', machineSecret, body: {
+    serial, identityGeneration: identity.identityGeneration,
+    hubRuntime: { kind: 'dinodia_os', version: 'integration-test', capabilities: { nativeSyncOutbox: { ...queueStatusReport, queueDepth: -1 } } },
+  } });
+  const malformedStatus = await fetchJson(assignedStatusUrl, { headers: { 'x-dinodia-employee-session': customerFixture.operatorToken } });
+  if (malformedHeartbeat.response.status !== 200 || malformedStatus.body.sync?.statusState !== 'UNKNOWN'
+    || malformedStatus.body.sync?.queueDepth !== null) fail('Malformed queue telemetry was accepted as a fresh or empty status report');
+  console.log('[stage5:integration] PASS: real signed heartbeat reports current backlog/error separately from successful sync and cursor; status distinguishes unknown, fresh and stale telemetry');
+  const statusBeforeCompletion = await fetchJson(assignedStatusUrl, { headers: { 'x-dinodia-employee-session': customerFixture.operatorToken } });
   if (statusBeforeCompletion.response.status !== 200 || statusBeforeCompletion.body.installation?.canComplete !== true || statusBeforeCompletion.body.installation?.activeAreaCount !== 1) fail(`The assigned installer did not receive the exact ready-to-complete status (${statusBeforeCompletion.response.status}/${statusBeforeCompletion.body.installation?.blockReason || 'not-ready'})`);
 
   const idempotencyKey = `install-complete-${crypto.randomUUID()}`;
@@ -2045,17 +2097,17 @@ async function installationBootstrapChecks() {
     || completions.filter((result) => result.body.idempotentReplay === false).length !== 1
     || completions.filter((result) => result.body.idempotentReplay === true).length !== 1
     || completedHome.lifecycle !== 'PENDING_INSTALLATION' || completedHome.installationStatus !== 'COMPLETE' || completedHome.activeHubInstallationId !== hub.id
-    || completedHub.state !== 'ACTIVE' || completedHub.lifecycleStatus !== 'ACTIVE' || Number(completedHub.syncAcceptedSequence) !== 2
+    || completedHub.state !== 'ACTIVE' || completedHub.lifecycleStatus !== 'ACTIVE' || Number(completedHub.syncAcceptedSequence) !== 3
     || completedWork.state !== 'COMPLETED' || completionEvents !== 1
       || await prisma.homeMembership.count({ where: { homeId: home.id, status: 'ACTIVE' } }) !== 0) {
     fail(`Installation completion did not atomically activate the verified hub/Home once under duplicate idempotent requests (${completions.map((result) => `${result.response.status}/${result.body.errorCode || 'no-code'}/${result.body.idempotentReplay}`).join(',')}; home=${completedHome.lifecycle}/${completedHome.installationStatus}; hub=${completedHub.state}/${completedHub.lifecycleStatus}; work=${completedWork.state}; audit=${completionEvents})`);
   }
   const activeState = await machineRequest({ base, path: '/api/hub-agent/token-state', machineSecret, body: { serial, identityGeneration: identity.identityGeneration, agentSeenVersion: 0, operatorCredentialVersion: 0 } });
-  const afterActivationEvent = event(3, 'device.tombstone', 'private-device', { osDeviceId: 'private-device', removedAt: now.toISOString() });
+  const afterActivationEvent = event(4, 'device.tombstone', 'private-device', { osDeviceId: 'private-device', removedAt: now.toISOString() });
   const activeSync = await send([afterActivationEvent]);
   const finalCursor = await prisma.hubInstallation.findUniqueOrThrow({ where: { id: hub.id }, select: { syncAcceptedSequence: true } });
   if (activeState.response.status !== 200 || activeState.body.installationSyncMode !== 'ACTIVE'
-    || activeSync.response.status !== 200 || Number(activeSync.body.acceptedThroughSequence) !== 3 || Number(finalCursor.syncAcceptedSequence) !== 3) {
+    || activeSync.response.status !== 200 || Number(activeSync.body.acceptedThroughSequence) !== 4 || Number(finalCursor.syncAcceptedSequence) !== 4) {
     fail(`The completed installation did not transition to normal ordered sync (${activeState.response.status}/${activeState.body.installationSyncMode}, ${activeSync.response.status}/${activeSync.body.errorCode || 'no-code'})`);
   }
   console.log('[stage5:integration] PASS: actual machine-authenticated routes permit only a verified assigned initial installation to sync safe updater status and real Area projection, deny device events with zero rows/cursor/receipt effects, expose the guarded assigned completion action, commit Home/Hub/work atomically and idempotently, then restore normal ordered sync');

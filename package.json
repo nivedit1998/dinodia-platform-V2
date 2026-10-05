@@ -32,6 +32,7 @@
     "stage3:migration:target": "node scripts/verify_native_v2_migration_target.mjs",
     "stage4:migration:target": "node scripts/verify_native_v2_migration_target.mjs --stage4-lan-tls",
     "stage5:migration:target": "node scripts/verify_native_v2_migration_target.mjs --stage5-sync",
+    "stage5:incident-deadline:migration:target": "node scripts/verify_native_v2_migration_target.mjs --stage5-incident-deadlines",
     "evidence:production-read-only": "node scripts/read_only_production_inventory.mjs",
     "foundation:target": "node scripts/assert_v2_target.mjs --mode local",
     "db:validate-target": "node scripts/assert_v2_target.mjs --mode \"${V2_ENVIRONMENT:-local}\"",

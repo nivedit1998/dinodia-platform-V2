@@ -37,6 +37,7 @@ try {
     '20261003000000_native_v2_stage3_domain_schema',
     '20261004050000_stage4_customer_lan_tls_identity',
     '20261004150000_stage5_hub_sync_v2',
+    '20261005070000_stage5_hub_incident_deadline',
   ];
   if (migration.length !== required.length || required.some((name) => !migrations.has(name)) || required.some((name) => !migrations.get(name).finished_at || migrations.get(name).rolled_back_at)) throw new Error('migration ledger is not exactly the completed native baseline, Stage 1, Stage 3, Stage 4 and Stage 5 migrations');
   console.log(`[test:stage5-schema] OK: ${names.size} tables, no direct anon/authenticated grants, native baseline, Stage 1, Stage 3/4 and additive Stage 5 migrations completed`);

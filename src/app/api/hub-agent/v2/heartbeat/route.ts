@@ -6,14 +6,22 @@ import { authenticateHub } from '@/lib/stage1HubAuth';
 import { validateLanEndpointObservation, validateLanTlsIdentity } from '@/lib/lanEndpoint';
 import { enforcePersistentRateLimit } from '@/lib/rateLimit';
 import { sha256 } from '@/lib/stage1Crypto';
+import { parseHubSyncOutboxReport } from '@/lib/hubSyncTelemetry';
 
 export const dynamic = 'force-dynamic';
+
+function nativeSyncOutboxReport(runtime: Record<string, unknown>) {
+  const capabilities = runtime.capabilities && typeof runtime.capabilities === 'object' && !Array.isArray(runtime.capabilities)
+    ? runtime.capabilities as Record<string, unknown> : null;
+  return parseHubSyncOutboxReport(capabilities?.nativeSyncOutbox);
+}
 
 export async function POST(request: Request) {
   try {
     const raw = await request.text();
     const hub = await authenticateHub(request, raw);
     const runtime = hub.body.hubRuntime && typeof hub.body.hubRuntime === 'object' ? hub.body.hubRuntime as Record<string, unknown> : {};
+    const syncReport = nativeSyncOutboxReport(runtime);
     const now = new Date();
 
     // Liveness is a separate signal: a malformed or stale endpoint report can
@@ -23,6 +31,14 @@ export async function POST(request: Request) {
       onlineStateEvaluatedAt: now,
       runtimeVersion: String(runtime.version ?? '').slice(0, 120) || undefined,
       capabilitySummary: runtime.capabilities && typeof runtime.capabilities === 'object' ? runtime.capabilities : undefined,
+      ...(syncReport ? {
+        lastQueueDepth: syncReport.queueDepth,
+        lastSyncErrorCode: syncReport.lastErrorCode,
+        syncGapDetected: syncReport.gapDetected,
+        syncCriticalBacklog: syncReport.criticalBacklog,
+        syncTelemetryPaused: syncReport.telemetryPaused,
+        syncDroppedTelemetryCount: syncReport.droppedTelemetryCount,
+      } : {}),
     } });
 
     if (hub.body.lanEndpoint === undefined && hub.body.lanTlsIdentity === undefined) {
