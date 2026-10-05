@@ -37,16 +37,16 @@ test('Stage 3 preservation proof isolates only volatile ReplayNonce runtime chur
   const hubBefore = {
     rowCounts: { HubInstallation: '1' },
     rowContentDigests: { HubInstallation: 'hub-before' },
-    columnContentDigests: { HubInstallation: { id: 'id', lastSeenAt: 't1', onlineStateEvaluatedAt: 't1', updatedAt: 't1', baseUrl: 'endpoint1' } },
+    columnContentDigests: { HubInstallation: { id: 'id', lastSeenAt: 't1', onlineStateEvaluatedAt: 't1', updatedAt: 't1', lanEndpointReportedAt: 't1', lanTlsReportedAt: 't1', baseUrl: 'endpoint1' } },
   };
   const hubAfter = {
     rowCounts: { HubInstallation: '1' },
     rowContentDigests: { HubInstallation: 'hub-after' },
-    columnContentDigests: { HubInstallation: { id: 'id', lastSeenAt: 't2', onlineStateEvaluatedAt: 't2', updatedAt: 't2', baseUrl: 'endpoint1' } },
+    columnContentDigests: { HubInstallation: { id: 'id', lastSeenAt: 't2', onlineStateEvaluatedAt: 't2', updatedAt: 't2', lanEndpointReportedAt: 't2', lanTlsReportedAt: 't2', baseUrl: 'endpoint1' } },
   };
   assert.deepEqual(compareExistingTablePreservation(hubBefore, hubAfter).volatileChanges, [{
     table: 'HubInstallation', rowCountChanged: false, rowContentChanged: true,
-    changedColumns: ['lastSeenAt', 'onlineStateEvaluatedAt', 'updatedAt'],
+    changedColumns: ['lastSeenAt', 'onlineStateEvaluatedAt', 'updatedAt', 'lanEndpointReportedAt', 'lanTlsReportedAt'],
   }]);
   assert.throws(() => compareExistingTablePreservation(hubBefore, {
     ...hubAfter,
