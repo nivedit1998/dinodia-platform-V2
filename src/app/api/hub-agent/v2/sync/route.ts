@@ -10,6 +10,15 @@ import { resolveNativeInstallationSyncMode } from '@/lib/nativeInstallationSyncM
 
 export const dynamic = 'force-dynamic';
 
+function isSyncReceiptUniqueConflict(error: unknown): boolean {
+  if (!error || typeof error !== 'object' || !('meta' in error)) return false;
+  const target = (error as { meta?: { target?: unknown } }).meta?.target;
+  const description = Array.isArray(target) ? target.map(String).join(',') : typeof target === 'string' ? target : '';
+  return description.includes('HubSyncReceipt_one_body_per_range_key')
+    || description.includes('HubSyncReceipt_exact_range_body_key')
+    || ['streamId', 'fromSequence', 'toSequence'].every((field) => description.includes(field));
+}
+
 async function readBoundedBody(request: Request): Promise<string> {
   const length = Number(request.headers.get('content-length') || 0);
   if (Number.isFinite(length) && length > HUB_SYNC_MAX_BODY_BYTES) throw new Stage1AuthError(413, 'hub_body_too_large', 'The hub request is too large');
@@ -212,8 +221,10 @@ export async function POST(request: Request) {
         return NextResponse.json(result, { headers: { 'Cache-Control': 'no-store', Pragma: 'no-cache' } });
       } catch (error) {
         const code = typeof error === 'object' && error && 'code' in error ? String((error as { code?: unknown }).code) : '';
-        if ((code === 'P2034' || code === 'P2002') && attempt < 2) continue;
-        if (code === 'P2002') throw new Stage1AuthError(409, 'hub_sync_range_conflict', 'A conflicting sync batch already owns this sequence range');
+        const receiptConflict = code === 'P2002' && isSyncReceiptUniqueConflict(error);
+        if ((code === 'P2034' || receiptConflict) && attempt < 2) continue;
+        if (receiptConflict) throw new Stage1AuthError(409, 'hub_sync_receipt_race', 'A concurrent sync receipt could not be reconciled; retry the same durable batch');
+        if (code === 'P2002') throw new Stage1AuthError(409, 'hub_sync_event_conflict', 'A synchronized event conflicts with current cloud state; no events were accepted');
         throw error;
       }
     }

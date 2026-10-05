@@ -2033,6 +2033,7 @@ model NativeDeviceOutageIncident {
   id                    String    @id @default(uuid()) @db.Uuid
   homeId                String    @db.Uuid
   sourceIncidentKey     String?   @db.VarChar(64)
+  sourceKind            String    @default("hub_unknown") @db.VarChar(80)
   sourceRevision        Int       @default(0)
   sourceEventId         String?   @unique @db.Uuid
   deviceId              String?   @db.Uuid

@@ -12,6 +12,7 @@ export const REQUIRED_MIGRATION = '20261003000000_native_v2_stage3_domain_schema
 export const REQUIRED_MODEL_COUNT = 65;
 export const COMPATIBLE_ADDITIVE_MIGRATIONS: Readonly<Record<string, string>> = Object.freeze({
   '20261005070000_stage5_hub_incident_deadline': 'f6c5fed31a31184e4c2ae42a98be8a89fe1628415ae4cfc1bef61033ab95b44e',
+  '20261005100000_stage5_incident_source_kind': '4b7763f5906566bba108196a4fa6ef37acb3623cb2dac33193b4ee836c6bec04',
   '20261004150000_stage5_hub_sync_v2': '0043e8c7870c0afa7f4a5e5e4dd3d290387bc39514e4728f8c9a90fea8b33203',
   '20261004050000_stage4_customer_lan_tls_identity': '8b6f9a3ed68fb00805dbc54ba750fc339da3f375bb6c4a899e286c7b3844a5d1',
 });

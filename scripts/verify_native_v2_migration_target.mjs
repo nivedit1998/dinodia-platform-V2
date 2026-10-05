@@ -17,8 +17,11 @@ const flags = new Set(process.argv.slice(2));
 const stage4LanTls = flags.has('--stage4-lan-tls');
 const stage5Sync = flags.has('--stage5-sync');
 const stage5IncidentDeadlines = flags.has('--stage5-incident-deadlines');
-const stage5Target = stage5Sync || stage5IncidentDeadlines;
-const migrationName = stage5IncidentDeadlines
+const stage5IncidentSourceKind = flags.has('--stage5-incident-source-kind');
+const stage5Target = stage5Sync || stage5IncidentDeadlines || stage5IncidentSourceKind;
+const migrationName = stage5IncidentSourceKind
+  ? '20261005100000_stage5_incident_source_kind'
+  : stage5IncidentDeadlines
   ? '20261005070000_stage5_hub_incident_deadline'
   : stage5Sync ? '20261004150000_stage5_hub_sync_v2'
   : stage4LanTls ? '20261004050000_stage4_customer_lan_tls_identity' : '20261003000000_native_v2_stage3_domain_schema';
@@ -128,8 +131,8 @@ async function inventory(client, baselineColumns = undefined) {
 let client;
 try {
   const args = process.argv.slice(2);
-  if ([stage4LanTls, stage5Sync, stage5IncidentDeadlines, flags.has('--stage3-domain-schema')].filter(Boolean).length > 1) fail('select exactly one reviewed migration target');
-  if (!args.includes(confirm) || args.some((arg) => ![confirm, '--apply', '--confirm-additive-forward-migration', '--stage4-lan-tls', '--stage5-sync', '--stage5-incident-deadlines', '--stage3-domain-schema'].includes(arg) && !arg.startsWith('--expected-migration-sha256='))) fail(`pass ${confirm}; apply additionally requires the explicit additive-forward-migration confirmation`);
+  if ([stage4LanTls, stage5Sync, stage5IncidentDeadlines, stage5IncidentSourceKind, flags.has('--stage3-domain-schema')].filter(Boolean).length > 1) fail('select exactly one reviewed migration target');
+  if (!args.includes(confirm) || args.some((arg) => ![confirm, '--apply', '--confirm-additive-forward-migration', '--stage4-lan-tls', '--stage5-sync', '--stage5-incident-deadlines', '--stage5-incident-source-kind', '--stage3-domain-schema'].includes(arg) && !arg.startsWith('--expected-migration-sha256='))) fail(`pass ${confirm}; apply additionally requires the explicit additive-forward-migration confirmation`);
   if (target.supabaseProjectRef !== projectRef) fail('checked-in V2 target manifest does not match the authorized project');
   if (envFile.SUPABASE_PROJECT_REF !== projectRef || envFile.VERCEL_PROJECT_ID !== target.vercelProjectId) fail('project-local environment identity does not match the authorized V2 Production target');
   const db = parseUrl(databaseUrl, 'DATABASE_URL');

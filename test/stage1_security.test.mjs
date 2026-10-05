@@ -427,6 +427,10 @@ test('readiness requires the exact Stage 3 schema plus reviewed additive Stage 4
   assert.match(read('src/lib/foundation.ts'), /0043e8c7870c0afa7f4a5e5e4dd3d290387bc39514e4728f8c9a90fea8b33203/);
   assert.match(read('src/lib/foundation.ts'), /20261005070000_stage5_hub_incident_deadline/);
   assert.match(read('src/lib/foundation.ts'), /f6c5fed31a31184e4c2ae42a98be8a89fe1628415ae4cfc1bef61033ab95b44e/);
+  assert.match(read('src/lib/foundation.ts'), /20261005100000_stage5_incident_source_kind/);
+  assert.match(read('src/lib/foundation.ts'), /4b7763f5906566bba108196a4fa6ef37acb3623cb2dac33193b4ee836c6bec04/);
+  assert.match(read('scripts/verify_native_v2_migration_target.mjs'), /--stage5-incident-source-kind/);
+  assert.match(read('package.json'), /stage5:incident-source-kind:migration:target/);
   assert.match(read('src/lib/foundation.ts'), /REQUIRED_MODEL_COUNT = 65/);
   assert.match(read('src/lib/foundation.ts'), /REQUIRED_MODEL_COUNT \+ \(hasStage5 \? 1 : 0\)/);
 });

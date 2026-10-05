@@ -297,11 +297,23 @@ export async function applyHubSyncEvent(tx: Prisma.TransactionClient, input: {
   if (event.type === 'incident.transition') {
     const incidentKey = String(payload.incidentKey);
     const revision = Number(payload.revision);
+    const sourceKind = String(payload.kind);
     const prior = await tx.nativeDeviceOutageIncident.findUnique({
       where: { hubInstallationId_sourceIncidentKey: { hubInstallationId, sourceIncidentKey: incidentKey } },
-      select: { id: true, sourceRevision: true },
+      select: { id: true, sourceKind: true, sourceRevision: true },
     });
-    if (prior && prior.sourceRevision >= revision) return;
+    if (prior && prior.sourceKind !== 'hub_unknown' && prior.sourceKind !== sourceKind) {
+      invalid('hub_sync_incident_kind_conflict', 'A stable incident identity cannot change its source kind');
+    }
+    if (prior && prior.sourceRevision >= revision) {
+      // Stage 5 introduced sourceKind after the original incident table. A
+      // current signed revision can safely classify an older row without
+      // rewinding its revision or replacing its original source event.
+      if (prior.sourceKind === 'hub_unknown') await tx.nativeDeviceOutageIncident.updateMany({
+        where: { id: prior.id, sourceKind: 'hub_unknown' }, data: { sourceKind },
+      });
+      return;
+    }
     let deviceId: string | null = null;
     if (payload.osDeviceId !== null) {
       const device = await tx.nativeDevice.findUnique({ where: { hubInstallationId_osDeviceId: { hubInstallationId, osDeviceId: String(payload.osDeviceId) } }, select: { id: true, homeId: true } });
@@ -311,11 +323,12 @@ export async function applyHubSyncEvent(tx: Prisma.TransactionClient, input: {
     const firstObservedAt = strictDate(payload.firstObservedAt, now);
     strictDate(payload.lastObservedAt, now);
     const resolvedAt = payload.state === 'resolved' && payload.resolvedAt !== null ? strictDate(payload.resolvedAt, now) : null;
-    const isHubIncident = /^(hub|integration)_/.test(String(payload.kind));
+    const isHubIncident = /^(hub|integration)_/.test(sourceKind);
     const alertEligibleAt = new Date(firstObservedAt.getTime() + (isHubIncident ? 7 * 60_000 : 60 * 60_000));
     const data = {
       homeId,
       sourceIncidentKey: incidentKey,
+      sourceKind,
       sourceRevision: revision,
       sourceEventId: event.id,
       deviceId,

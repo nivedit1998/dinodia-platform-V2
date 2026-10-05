@@ -1816,6 +1816,123 @@ async function customerAuthorizationChecks(deliveryEnv) {
     const finalOutbox = hub.store.getSyncOutbox();
     fail(`The bounded initial OS snapshot did not drain through the real sync route before the isolated event proof (${JSON.stringify({ queueDepth: finalOutbox.events.filter((event) => event.sequence > finalOutbox.acknowledgedSequence).length, acknowledgedSequence: finalOutbox.acknowledgedSequence, nextSequence: finalOutbox.nextSequence, inFlight: Boolean(finalOutbox.inFlight), lastErrorCode: finalOutbox.lastErrorCode, queuedTypes: [...new Set(finalOutbox.events.filter((event) => event.sequence > finalOutbox.acknowledgedSequence).map((event) => event.type))] })})`);
   }
+  // Reproduce the real installation backlog shape: multiple critical
+  // integration incidents can retain successive revisions in one contiguous
+  // batch. Revisions of a stable incident key must update one projection, not
+  // collide with the distinct batch-receipt/source-event identities.
+  const incidentBatchStart = Date.now();
+  const incidentKeys = {
+    a: sha256(`stage5-sync-incident-a-${crypto.randomUUID()}`),
+    b: sha256(`stage5-sync-incident-b-${crypto.randomUUID()}`),
+    c: sha256(`stage5-sync-incident-c-${crypto.randomUUID()}`),
+  };
+  const incidentTransitions = [
+    { key: incidentKeys.a, revision: 1, state: 'open' },
+    { key: incidentKeys.b, revision: 1, state: 'open' },
+    { key: incidentKeys.b, revision: 2, state: 'resolved' },
+    { key: incidentKeys.a, revision: 2, state: 'resolved' },
+    { key: incidentKeys.c, revision: 1, state: 'open' },
+  ];
+  for (const transition of incidentTransitions) {
+    const occurredAt = new Date(incidentBatchStart).toISOString();
+    await hub.store.queueSyncEvent('incident.transition', transition.key, {
+      incidentKey: transition.key,
+      revision: transition.revision,
+      kind: 'integration_offline',
+      state: transition.state,
+      severity: 'critical',
+      occurredAt,
+      firstObservedAt: new Date(incidentBatchStart - 60_000).toISOString(),
+      lastObservedAt: occurredAt,
+      resolvedAt: transition.state === 'resolved' ? occurredAt : null,
+      osDeviceId: null,
+    }, { now: incidentBatchStart, critical: true, dedupeRevision: transition.revision });
+  }
+  const incidentCursorBefore = await prisma.hubInstallation.findUniqueOrThrow({ where: { id: hubOne.id }, select: { syncAcceptedSequence: true } });
+  const incidentSequenceStart = Number(incidentCursorBefore.syncAcceptedSequence) + 1;
+  const incidentBatch = await hub.store.prepareSyncBatch(hubOne.id, hub.pairing.runtime, Date.now());
+  const incidentAttempt = await machineRequest({ base: platformBase, path: '/api/hub-agent/v2/sync', machineSecret, body: {
+    serial: identityOne.serialNumber, identityGeneration: identityOne.identityGeneration, ...incidentBatch,
+  } });
+  if (incidentAttempt.response.status === 200) {
+    await hub.store.acknowledgeSyncBatch({
+      streamId: incidentAttempt.body.streamId,
+      acceptedThroughSequence: Number(incidentAttempt.body.acceptedThroughSequence),
+      cloudRevision: Number(incidentAttempt.body.cloudRevision),
+      configurationAppliedRevision: Number(incidentAttempt.body.configurationAppliedRevision),
+      resnapshotRequired: incidentAttempt.body.resnapshotRequired === true,
+    });
+  }
+  const incidentCursorAfter = await prisma.hubInstallation.findUniqueOrThrow({ where: { id: hubOne.id }, select: { syncStreamId: true, syncAcceptedSequence: true, acknowledgedCloudRevision: true } });
+  const incidentRows = await prisma.nativeDeviceOutageIncident.findMany({
+    where: { hubInstallationId: hubOne.id, sourceIncidentKey: { in: Object.values(incidentKeys) } },
+    select: { sourceIncidentKey: true, sourceKind: true, sourceRevision: true, state: true, deviceId: true },
+  });
+  const incidentReceiptCount = await prisma.hubSyncReceipt.count({ where: {
+    hubInstallationId: hubOne.id, streamId: hub.store.getSyncOutbox().streamId,
+    fromSequence: BigInt(incidentSequenceStart), toSequence: BigInt(incidentSequenceStart + incidentTransitions.length - 1),
+  } });
+  const expectedIncidentStates = [
+    { key: incidentKeys.a, revision: 2, state: 'RESOLVED' },
+    { key: incidentKeys.b, revision: 2, state: 'RESOLVED' },
+    { key: incidentKeys.c, revision: 1, state: 'OPEN' },
+  ];
+  if (hub.pairing.lastError || Number(incidentCursorAfter.syncAcceptedSequence) !== incidentSequenceStart + incidentTransitions.length - 1
+    || hub.store.getSyncOutbox().acknowledgedSequence < incidentSequenceStart + incidentTransitions.length - 1
+    || incidentReceiptCount !== 1 || incidentRows.length !== expectedIncidentStates.length
+    || expectedIncidentStates.some((expected) => !incidentRows.some((actual) => actual.sourceIncidentKey === expected.key
+      && actual.sourceKind === 'integration_offline' && actual.sourceRevision === expected.revision
+      && actual.state === expected.state && actual.deviceId === null))) {
+    fail(`The real signed sync route did not accept repeated monotonic incident revisions exactly once (${JSON.stringify({ status: incidentAttempt.response.status, errorCode: incidentAttempt.body.errorCode || null, accepted: Number(incidentCursorAfter.syncAcceptedSequence) - Number(incidentCursorBefore.syncAcceptedSequence), localAcknowledged: hub.store.getSyncOutbox().acknowledgedSequence, receiptCount: incidentReceiptCount, projectionCount: incidentRows.length })})`);
+  }
+  console.log('[stage5:integration] PASS: actual loopback sync accepts five ordered incident transitions across three stable keys as three final projections and one receipt');
+  const hubOutageKey = sha256(`stage5-sync-hub-outage-${crypto.randomUUID()}`);
+  const hubOutageTime = new Date().toISOString();
+  await hub.store.queueSyncEvent('incident.transition', hubOutageKey, {
+    incidentKey: hubOutageKey, revision: 1, kind: 'hub_network_unavailable', state: 'open', severity: 'critical',
+    occurredAt: hubOutageTime, firstObservedAt: hubOutageTime, lastObservedAt: hubOutageTime, resolvedAt: null, osDeviceId: null,
+  }, { now: Date.parse(hubOutageTime), critical: true, dedupeRevision: 1 });
+  const acceptedHubOutageBatch = await hub.store.prepareSyncBatch(hubOne.id, hub.pairing.runtime, Date.now());
+  const acceptedHubOutage = await machineRequest({ base: platformBase, path: '/api/hub-agent/v2/sync', machineSecret, body: {
+    serial: identityOne.serialNumber, identityGeneration: identityOne.identityGeneration, ...acceptedHubOutageBatch,
+  } });
+  if (acceptedHubOutage.response.status !== 200) fail(`The actual hub outage event failed (${acceptedHubOutage.response.status}/${acceptedHubOutage.body.errorCode || 'no-code'})`);
+  await hub.store.acknowledgeSyncBatch({ streamId: acceptedHubOutage.body.streamId, acceptedThroughSequence: Number(acceptedHubOutage.body.acceptedThroughSequence), cloudRevision: Number(acceptedHubOutage.body.cloudRevision), configurationAppliedRevision: Number(acceptedHubOutage.body.configurationAppliedRevision) });
+  const hubOutageBeforeConflict = await prisma.nativeDeviceOutageIncident.findMany({
+    where: { hubInstallationId: hubOne.id, sourceKind: { startsWith: 'hub_' }, state: 'OPEN' },
+    select: { id: true, sourceIncidentKey: true, sourceKind: true, sourceRevision: true, state: true },
+  });
+  if (hubOutageBeforeConflict.length !== 1 || hubOutageBeforeConflict[0].sourceIncidentKey !== hubOutageKey) fail('The real hub-outage uniqueness invariant did not retain exactly one open hub outage');
+  const duplicateHubOutageKey = sha256(`stage5-sync-second-hub-outage-${crypto.randomUUID()}`);
+  const hubCursorBeforeConflict = await prisma.hubInstallation.findUniqueOrThrow({ where: { id: hubOne.id }, select: { syncStreamId: true, syncAcceptedSequence: true, acknowledgedCloudRevision: true } });
+  const hubReceiptCountBeforeConflict = await prisma.hubSyncReceipt.count({ where: { hubInstallationId: hubOne.id } });
+  const deniedHubOutageBatch = {
+    schemaVersion: 1, hubInstallationId: hubOne.id, streamId: String(hubCursorBeforeConflict.syncStreamId),
+    fromSequence: Number(hubCursorBeforeConflict.syncAcceptedSequence) + 1,
+    toSequence: Number(hubCursorBeforeConflict.syncAcceptedSequence) + 1, queueDepth: 1,
+    acknowledgedCloudRevision: Number(hubCursorBeforeConflict.acknowledgedCloudRevision),
+    runtime: hub.store.getSyncRuntime(hub.pairing.runtime), sentAt: new Date().toISOString(),
+    events: [{ id: crypto.randomUUID(), sequence: Number(hubCursorBeforeConflict.syncAcceptedSequence) + 1,
+      type: 'incident.transition', aggregateId: duplicateHubOutageKey, occurredAt: new Date().toISOString(), critical: true,
+      payload: { incidentKey: duplicateHubOutageKey, revision: 1, kind: 'hub_network_unavailable', state: 'open', severity: 'critical',
+        occurredAt: new Date().toISOString(), firstObservedAt: new Date().toISOString(), lastObservedAt: new Date().toISOString(), resolvedAt: null, osDeviceId: null } }],
+  };
+  const deniedHubOutage = await machineRequest({ base: platformBase, path: '/api/hub-agent/v2/sync', machineSecret, body: {
+    serial: identityOne.serialNumber, identityGeneration: identityOne.identityGeneration, ...deniedHubOutageBatch,
+  } });
+  const hubCursorAfterConflict = await prisma.hubInstallation.findUniqueOrThrow({ where: { id: hubOne.id }, select: { syncAcceptedSequence: true } });
+  const hubReceiptCountAfterConflict = await prisma.hubSyncReceipt.count({ where: { hubInstallationId: hubOne.id } });
+  const hubOutageAfterConflict = await prisma.nativeDeviceOutageIncident.findMany({
+    where: { hubInstallationId: hubOne.id, sourceKind: { startsWith: 'hub_' }, state: 'OPEN' },
+    select: { id: true, sourceIncidentKey: true, sourceKind: true, sourceRevision: true, state: true },
+  });
+  if (deniedHubOutage.response.status !== 409 || deniedHubOutage.body.errorCode !== 'hub_sync_event_conflict'
+    || hubCursorAfterConflict.syncAcceptedSequence !== hubCursorBeforeConflict.syncAcceptedSequence
+    || hubReceiptCountAfterConflict !== hubReceiptCountBeforeConflict
+    || JSON.stringify(hubOutageAfterConflict) !== JSON.stringify(hubOutageBeforeConflict)) {
+    fail('A second open hub outage was not denied as a domain conflict with zero receipt, cursor or incident-row effects');
+  }
+  console.log('[stage5:integration] PASS: one-open-hub-outage policy remains enforced and domain uniqueness is not mislabeled as a sync-range conflict');
   const syncAreaId = `stage5-loopback-${crypto.randomUUID()}`;
   await hub.store.saveArea({ name: 'Stage 5 loopback reconciliation', icon: 'room' }, syncAreaId);
   const syncBatch = await hub.store.prepareSyncBatch(hubOne.id, hub.pairing.runtime, Date.now());
