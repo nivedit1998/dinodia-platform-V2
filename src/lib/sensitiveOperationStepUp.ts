@@ -32,7 +32,7 @@ export function operationDigest(input: { operationKind?: string; operation?: str
   }), 'utf8').digest('hex');
 }
 
-export const ALLOWED_OPERATIONS = new Set(['trusted_device_remove', 'support_ticket_close', 'support_access_approve', 'support_access_revoke', 'alexa_unlink', 'heating_sensitive_command', 'device_sensitive_command']);
+export const ALLOWED_OPERATIONS = new Set(['trusted_device_remove', 'customer_password_change', 'customer_profile_change', 'customer_email_change', 'tenant_membership_remove', 'support_ticket_close', 'support_access_approve', 'support_access_revoke', 'alexa_unlink', 'heating_sensitive_command', 'device_sensitive_command']);
 
 function platformPrivateKey(): crypto.KeyObject {
   const pem = String(process.env.DINODIA_APP_SESSION_PRIVATE_KEY ?? '').replaceAll('\\n', '\n');
@@ -58,22 +58,47 @@ export function verifyTrustedDeviceAssertion(input: { publicKey: string; signatu
   } catch { throw new Stage1AuthError(403, 'step_up_assertion_invalid', 'A valid trusted-device confirmation is required'); }
 }
 
-export async function issueStepUp(input: { customerAccountId: string; customerSessionId: string; trustedDeviceId: string; trustedDevicePublicKey: string; assertionSignature: string; assertionNonce: string; challengeId: string }) {
+export async function issueStepUp(input: { customerAccountId: string; customerSessionId: string; trustedDeviceId: string; trustedDevicePublicKey: string; expectedSecurityVersion?: number; expectedDeviceSessionVersion?: number; expectedRefreshTokenHash?: string; assertionSignature: string; assertionNonce: string; challengeId: string }) {
   const challenge = await prisma.stepUpChallenge.findUnique({ where: { id: input.challengeId } });
   const now = new Date();
   if (!challenge || challenge.customerAccountId !== input.customerAccountId || challenge.customerSessionId !== input.customerSessionId || challenge.trustedDeviceId !== input.trustedDeviceId || challenge.consumedAt || challenge.cancelledAt || challenge.expiresAt <= now) throw new Stage1AuthError(403, 'step_up_challenge_invalid', 'The trusted-device challenge is invalid or expired');
   if (crypto.createHash('sha256').update(input.assertionNonce, 'utf8').digest('hex') !== challenge.nonceHash) throw new Stage1AuthError(403, 'step_up_challenge_invalid', 'The trusted-device challenge nonce is invalid');
   verifyTrustedDeviceAssertion({ publicKey: input.trustedDevicePublicKey, signature: input.assertionSignature, nonce: input.assertionNonce, challengeId: challenge.id, operationDigest: challenge.normalizedValueDigest });
-  const nowSeconds = Math.floor(Date.now() / 1000);
-  const unsigned = { jti: crypto.randomUUID(), actorId: input.customerAccountId, trustedDeviceId: input.trustedDeviceId, customerSessionId: input.customerSessionId, homeId: challenge.homeId, membershipId: challenge.membershipId, hubInstallId: challenge.hubInstallationId, operationDigest: challenge.normalizedValueDigest, issuedAt: nowSeconds, expiresAt: nowSeconds + 60 };
-  const proof = signStepUpPayload(unsigned, platformPrivateKey());
-  const expiresAt = new Date((nowSeconds + 60) * 1000);
   const result = await prisma.$transaction(async (tx) => {
-    const consumed = await tx.stepUpChallenge.updateMany({ where: { id: challenge.id, consumedAt: null, cancelledAt: null, expiresAt: { gt: now } }, data: { consumedAt: now } });
+    await tx.$queryRaw`SELECT "id" FROM "CustomerAccount" WHERE "id" = ${input.customerAccountId}::uuid FOR UPDATE`;
+    await tx.$queryRaw`SELECT "id" FROM "CustomerSession" WHERE "id" = ${input.customerSessionId}::uuid FOR UPDATE`;
+    await tx.$queryRaw`SELECT "id" FROM "TrustedDevice" WHERE "id" = ${input.trustedDeviceId}::uuid FOR UPDATE`;
+    await tx.$queryRaw`SELECT "id" FROM "StepUpChallenge" WHERE "id" = ${challenge.id}::uuid FOR UPDATE`;
+    const [current, account, session, device] = await Promise.all([
+      tx.stepUpChallenge.findUnique({ where: { id: challenge.id } }),
+      tx.customerAccount.findUnique({ where: { id: input.customerAccountId }, select: { status: true, securityVersion: true } }),
+      tx.customerSession.findUnique({ where: { id: input.customerSessionId }, select: { customerAccountId: true, trustedDeviceId: true, refreshTokenHash: true, securityVersion: true, trustedDeviceSessionVersion: true, revokedAt: true, expiresAt: true, absoluteExpiresAt: true } }),
+      tx.trustedDevice.findUnique({ where: { id: input.trustedDeviceId }, select: { customerAccountId: true, publicKey: true, sessionVersion: true, revokedAt: true } }),
+    ]);
+    const lockedAt = new Date();
+    if (!account || account.status !== 'ACTIVE' || (input.expectedSecurityVersion !== undefined && account.securityVersion !== input.expectedSecurityVersion)
+      || !session || session.customerAccountId !== input.customerAccountId || session.trustedDeviceId !== input.trustedDeviceId
+      || (input.expectedRefreshTokenHash !== undefined && session.refreshTokenHash !== input.expectedRefreshTokenHash)
+      || (input.expectedSecurityVersion !== undefined && session.securityVersion !== input.expectedSecurityVersion)
+      || session.trustedDeviceSessionVersion !== device?.sessionVersion || (input.expectedDeviceSessionVersion !== undefined && session.trustedDeviceSessionVersion !== input.expectedDeviceSessionVersion) || session.revokedAt
+      || session.expiresAt <= lockedAt || session.absoluteExpiresAt <= lockedAt
+      || !device || device.customerAccountId !== input.customerAccountId || device.publicKey !== input.trustedDevicePublicKey
+      || (input.expectedDeviceSessionVersion !== undefined && device.sessionVersion !== input.expectedDeviceSessionVersion) || device.revokedAt
+      || !current || current.customerAccountId !== input.customerAccountId || current.customerSessionId !== input.customerSessionId
+      || current.trustedDeviceId !== input.trustedDeviceId || current.operationKind !== challenge.operationKind
+      || current.normalizedValueDigest !== challenge.normalizedValueDigest || current.targetDigest !== challenge.targetDigest
+      || current.policyRevision !== challenge.policyRevision || current.consumedAt || current.cancelledAt || current.expiresAt <= lockedAt) {
+      throw new Stage1AuthError(403, 'step_up_challenge_invalid', 'The trusted-device challenge is invalid, expired or no longer current');
+    }
+    const consumed = await tx.stepUpChallenge.updateMany({ where: { id: challenge.id, consumedAt: null, cancelledAt: null, expiresAt: { gt: lockedAt } }, data: { consumedAt: lockedAt } });
     if (consumed.count !== 1) throw new Stage1AuthError(403, 'step_up_challenge_replayed', 'The trusted-device challenge has already been consumed');
-    const row = await tx.stepUpAuthorization.create({ data: { customerAccountId: input.customerAccountId, customerSessionId: input.customerSessionId, trustedDeviceId: input.trustedDeviceId, homeId: challenge.homeId, membershipId: challenge.membershipId, operationKind: challenge.operationKind, targetDigest: challenge.targetDigest, normalizedValueDigest: challenge.normalizedValueDigest, policyRevision: challenge.policyRevision, nonceHash: crypto.createHash('sha256').update(proof).digest('hex'), issuedAt: now, expiresAt }, select: { id: true, expiresAt: true } });
+    const nowSeconds = Math.floor(lockedAt.getTime() / 1000);
+    const unsigned = { jti: crypto.randomUUID(), actorId: input.customerAccountId, trustedDeviceId: input.trustedDeviceId, customerSessionId: input.customerSessionId, homeId: current.homeId, membershipId: current.membershipId, hubInstallId: current.hubInstallationId, operationDigest: current.normalizedValueDigest, issuedAt: nowSeconds, expiresAt: nowSeconds + 60 };
+    const proof = signStepUpPayload(unsigned, platformPrivateKey());
+    const authorizationExpiresAt = new Date(lockedAt.getTime() + 60_000);
+    const row = await tx.stepUpAuthorization.create({ data: { customerAccountId: input.customerAccountId, customerSessionId: input.customerSessionId, trustedDeviceId: input.trustedDeviceId, homeId: challenge.homeId, membershipId: challenge.membershipId, operationKind: challenge.operationKind, targetDigest: challenge.targetDigest, normalizedValueDigest: challenge.normalizedValueDigest, policyRevision: challenge.policyRevision, nonceHash: crypto.createHash('sha256').update(proof).digest('hex'), issuedAt: lockedAt, expiresAt: authorizationExpiresAt }, select: { id: true, expiresAt: true } });
     return { proof, proofId: row.id, operationId: unsigned.jti, expiresAt: row.expiresAt };
-  });
+  }, { isolationLevel: 'Serializable' });
   return result;
 }
 

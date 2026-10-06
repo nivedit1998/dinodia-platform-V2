@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 import dotenv from 'dotenv';
 import { PrismaClient } from '@prisma/client';
 import { assertMigrationDoesNotReferenceVolatileRuntimeTables, compareExistingTablePreservation } from './native_migration_preservation.mjs';
+import { migrationBundleIdentity, STAGE6_CUSTOMER_MIGRATIONS, unexpectedPendingMigrations } from './native_migration_bundle.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const projectRef = 'fppzzesvukjbsfmxmfxe';
@@ -18,20 +19,23 @@ const stage4LanTls = flags.has('--stage4-lan-tls');
 const stage5Sync = flags.has('--stage5-sync');
 const stage5IncidentDeadlines = flags.has('--stage5-incident-deadlines');
 const stage5IncidentSourceKind = flags.has('--stage5-incident-source-kind');
+const stage6CustomerAuth = flags.has('--stage6-customer-auth');
 const stage5Target = stage5Sync || stage5IncidentDeadlines || stage5IncidentSourceKind;
-const migrationName = stage5IncidentSourceKind
+const selectedStage = stage6CustomerAuth ? 6 : stage5Target ? 5 : stage4LanTls ? 4 : 3;
+const migrationNames = stage6CustomerAuth ? [...STAGE6_CUSTOMER_MIGRATIONS] : [stage5IncidentSourceKind
   ? '20261005100000_stage5_incident_source_kind'
   : stage5IncidentDeadlines
   ? '20261005070000_stage5_hub_incident_deadline'
   : stage5Sync ? '20261004150000_stage5_hub_sync_v2'
-  : stage4LanTls ? '20261004050000_stage4_customer_lan_tls_identity' : '20261003000000_native_v2_stage3_domain_schema';
-const migrationPath = path.join(root, 'prisma/migrations', migrationName, 'migration.sql');
+  : stage4LanTls ? '20261004050000_stage4_customer_lan_tls_identity' : '20261003000000_native_v2_stage3_domain_schema'];
+const migrationName = migrationNames[0];
 const confirm = `--confirm-project=${projectRef}`;
 const expectedShaFlag = process.argv.slice(2).find((value) => value.startsWith('--expected-migration-sha256='));
+const expectedBundleShaFlag = process.argv.slice(2).find((value) => value.startsWith('--expected-migrations-sha256='));
 const apply = flags.has('--apply');
 const authorizedApply = flags.has('--confirm-additive-forward-migration');
 
-function fail(reason) { throw new Error(`[stage${stage5Target ? '5' : stage4LanTls ? '4' : '3'}:target] BLOCKED: ${reason}`); }
+function fail(reason) { throw new Error(`[stage${selectedStage}:target] BLOCKED: ${reason}`); }
 function safeError(value) { return String(value).replace(/postgres(?:ql)?:\/\/[^\s"'`]+/gi, '<database-url-redacted>'); }
 function parseUrl(raw, label) {
   let url;
@@ -131,49 +135,60 @@ async function inventory(client, baselineColumns = undefined) {
 let client;
 try {
   const args = process.argv.slice(2);
-  if ([stage4LanTls, stage5Sync, stage5IncidentDeadlines, stage5IncidentSourceKind, flags.has('--stage3-domain-schema')].filter(Boolean).length > 1) fail('select exactly one reviewed migration target');
-  if (!args.includes(confirm) || args.some((arg) => ![confirm, '--apply', '--confirm-additive-forward-migration', '--stage4-lan-tls', '--stage5-sync', '--stage5-incident-deadlines', '--stage5-incident-source-kind', '--stage3-domain-schema'].includes(arg) && !arg.startsWith('--expected-migration-sha256='))) fail(`pass ${confirm}; apply additionally requires the explicit additive-forward-migration confirmation`);
+  if ([stage4LanTls, stage5Sync, stage5IncidentDeadlines, stage5IncidentSourceKind, stage6CustomerAuth, flags.has('--stage3-domain-schema')].filter(Boolean).length > 1) fail('select exactly one reviewed migration target');
+  if (!args.includes(confirm) || args.some((arg) => ![confirm, '--apply', '--confirm-additive-forward-migration', '--stage4-lan-tls', '--stage5-sync', '--stage5-incident-deadlines', '--stage5-incident-source-kind', '--stage6-customer-auth', '--stage3-domain-schema'].includes(arg) && !arg.startsWith('--expected-migration-sha256=') && !arg.startsWith('--expected-migrations-sha256='))) fail(`pass ${confirm}; apply additionally requires the explicit additive-forward-migration confirmation`);
   if (target.supabaseProjectRef !== projectRef) fail('checked-in V2 target manifest does not match the authorized project');
   if (envFile.SUPABASE_PROJECT_REF !== projectRef || envFile.VERCEL_PROJECT_ID !== target.vercelProjectId) fail('project-local environment identity does not match the authorized V2 Production target');
   const db = parseUrl(databaseUrl, 'DATABASE_URL');
   const direct = parseUrl(directUrl, 'DIRECT_URL');
   if (decodeURIComponent(db.pathname) !== decodeURIComponent(direct.pathname)) fail('DATABASE_URL and DIRECT_URL target different databases');
-  const migrationSha = crypto.createHash('sha256').update(fs.readFileSync(migrationPath)).digest('hex');
-  assertMigrationDoesNotReferenceVolatileRuntimeTables(fs.readFileSync(migrationPath, 'utf8'));
-  if (apply && (!authorizedApply || !expectedShaFlag || expectedShaFlag.slice('--expected-migration-sha256='.length) !== migrationSha)) fail('apply requires explicit authorization and the exact reviewed migration SHA-256');
+  const checksums = migrationChecksums();
+  const bundle = migrationBundleIdentity(migrationNames, checksums);
+  const migrationSha = checksums.get(migrationName);
+  for (const name of migrationNames) assertMigrationDoesNotReferenceVolatileRuntimeTables(fs.readFileSync(path.join(root, 'prisma/migrations', name, 'migration.sql'), 'utf8'));
+  const expectedIdentityMatches = stage6CustomerAuth
+    ? expectedBundleShaFlag?.slice('--expected-migrations-sha256='.length) === bundle.sha256
+    : expectedShaFlag?.slice('--expected-migration-sha256='.length) === migrationSha;
+  if (apply && (!authorizedApply || !expectedIdentityMatches)) fail(stage6CustomerAuth
+    ? 'Stage 6 apply requires explicit authorization and the exact reviewed migration-bundle SHA-256'
+    : 'apply requires explicit authorization and the exact reviewed migration SHA-256');
   const projectFile = JSON.parse(fs.readFileSync(path.join(root, '.vercel/project.json'), 'utf8'));
   if (projectFile.projectId !== target.vercelProjectId || projectFile.orgId !== target.vercelOrgId) fail('linked Vercel project does not match the approved V2 target');
   if (apply) {
     const status = spawnSync('git', ['status', '--porcelain=v1'], { cwd: root, encoding: 'utf8' });
     if (status.status !== 0 || status.stdout.trim()) fail('Production apply requires the reviewed candidate committed with a clean worktree');
-    const tracked = spawnSync('git', ['ls-files', '--error-unmatch', `prisma/migrations/${migrationName}/migration.sql`], { cwd: root, encoding: 'utf8' });
-    if (tracked.status !== 0) fail('the exact migration artifact is not committed');
+    for (const name of migrationNames) {
+      const tracked = spawnSync('git', ['ls-files', '--error-unmatch', `prisma/migrations/${name}/migration.sql`], { cwd: root, encoding: 'utf8' });
+      if (tracked.status !== 0) fail('every exact migration artifact in the selected bundle must be committed');
+    }
   }
 
   const connectionEnv = { ...process.env, DATABASE_URL: databaseUrl, DIRECT_URL: directUrl, PRISMA_TELEMETRY_DISABLED: '1' };
   client = new PrismaClient({ datasourceUrl: direct.toString(), log: [] });
   const beforeFingerprint = runFingerprint(connectionEnv);
   const before = await inventory(client);
-  const checksums = migrationChecksums();
   const applied = before.migrationRows.filter((row) => row.finished_at && !row.rolled_back_at);
   const mismatched = applied.filter((row) => checksums.get(row.migration_name) !== row.checksum).map((row) => row.migration_name);
   const pending = [...checksums.keys()].filter((name) => !applied.some((row) => row.migration_name === name));
   if (mismatched.length) fail(`applied migration checksums disagree with reviewed source (${mismatched.length} mismatch(es))`);
-  if (pending.some((name) => name !== migrationName)) fail(`unexpected pending migrations: ${pending.join(', ')}`);
+  const unexpectedPending = unexpectedPendingMigrations(pending, migrationNames);
+  if (unexpectedPending.length) fail(`unexpected pending migrations: ${unexpectedPending.join(', ')}`);
   const unsafe = Object.values(before.dataPreflight).some((count) => Number(count) > 0);
   if (unsafe) fail(`existing Production data violates the native schema integrity preflight (${Object.entries(before.dataPreflight).filter(([, count]) => Number(count) > 0).map(([name]) => name).join(', ')})`);
   const rowCountDigest = crypto.createHash('sha256').update(JSON.stringify(Object.entries(before.rowCounts).sort(([a], [b]) => a.localeCompare(b)))).digest('hex');
   const rowContentPreservationDigest = crypto.createHash('sha256').update(JSON.stringify(Object.entries(before.rowContentDigests).sort(([a], [b]) => a.localeCompare(b)))).digest('hex');
   console.log(JSON.stringify({
     ok: true,
-    stage: stage5Target ? 5 : stage4LanTls ? 4 : 3,
+    stage: selectedStage,
     mode: apply ? 'production-additive-apply' : 'read-only-production-preflight',
     targetProjectRef: projectRef,
     databaseHostClass: db.hostname === direct.hostname ? 'same-approved-host' : 'approved-pooler-and-direct-hosts',
-    migrationName,
+    migrationName: stage6CustomerAuth ? 'stage6-customer-auth-bundle' : migrationName,
+    selectedMigrations: bundle.migrations,
+    migrationBundleSha256: bundle.sha256,
     migrationSha256: migrationSha,
     pendingMigrationCount: pending.length,
-    onlySelectedMigrationPending: pending.length === 0 || (pending.length === 1 && pending[0] === migrationName),
+    onlySelectedMigrationPending: unexpectedPending.length === 0,
     priorSchemaFingerprint: beforeFingerprint,
     preMigrationBaseTableCount: Object.keys(before.rowCounts).length,
     preMigrationRowCountDigest: rowCountDigest,
@@ -201,17 +216,22 @@ try {
     try { preservation = compareExistingTablePreservation(before, after); }
     catch (error) { fail(error instanceof Error ? error.message : 'existing Production rows changed'); }
     const { volatileChanges } = preservation;
-    const appliedNow = after.migrationRows.filter((row) => row.finished_at && !row.rolled_back_at && row.migration_name === migrationName);
-    const checksumMatch = appliedNow.length === 1 && appliedNow[0].checksum === migrationSha;
+    const appliedNow = after.migrationRows.filter((row) => row.finished_at && !row.rolled_back_at && migrationNames.includes(row.migration_name));
+    const checksumMatch = migrationNames.every((name) => {
+      const rows = appliedNow.filter((row) => row.migration_name === name);
+      return rows.length === 1 && rows[0].checksum === checksums.get(name);
+    });
     if (!checksumMatch) fail('Production migration ledger does not contain the exact reviewed migration checksum');
     const postflightViolations = Object.entries(after.dataPreflight).filter(([, count]) => Number(count) > 0).map(([name]) => name);
     if (postflightViolations.length) fail(`post-migration integrity checks found violations (${postflightViolations.join(', ')})`);
     console.log(JSON.stringify({
       ok: true,
-      stage: stage5Target ? 5 : stage4LanTls ? 4 : 3,
+      stage: selectedStage,
       migrationApplied: true,
       targetProjectRef: projectRef,
-      migrationName,
+      migrationName: stage6CustomerAuth ? 'stage6-customer-auth-bundle' : migrationName,
+      selectedMigrations: bundle.migrations,
+      migrationBundleSha256: bundle.sha256,
       migrationSha256: migrationSha,
       priorSchemaFingerprint: beforeFingerprint,
       productionSchemaFingerprint: afterFingerprint,

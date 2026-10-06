@@ -4,7 +4,7 @@ import { prisma } from '@/lib/prisma';
 import { signStage1Token } from '@/lib/stage1Crypto';
 import { validateCustomerHubSession } from '@/lib/contracts/dinodiaV1';
 import { nativeV1ErrorResponse } from '@/lib/contracts/nativeV1Error';
-import { Stage1AuthError, cookieToken } from '@/lib/stage1Auth';
+import { Stage1AuthError, cookieToken, requireCustomerAccountSession } from '@/lib/stage1Auth';
 import { NativeAccessDenied, resolveNativeHomeContext } from '@/lib/nativeHomeContext';
 import { verifiedCustomerLanEndpoint } from '@/lib/lanEndpoint';
 
@@ -24,8 +24,12 @@ function verifiedHubEndpoint(hub: { cloudUrl: string | null; cloudUrlVerifiedAt:
 
 export async function POST(request: Request) {
   try {
+    const authorization = request.headers.get('authorization') ?? '';
+    const mobileAccess = /^Bearer dno-customer-access-[A-Za-z0-9_-]{32,160}$/.test(authorization);
+    const accountSession = mobileAccess ? await requireCustomerAccountSession(request) : null;
+    if (accountSession && request.headers.has('x-dinodia-session')) throw new Stage1AuthError(400, 'customer_credential_ambiguous', 'Use one customer session credential per request');
     const rawSession = request.headers.get('x-dinodia-session') || cookieToken(request, 'dinodia_customer_session');
-    if (!rawSession) throw new Stage1AuthError(401, 'customer_session_required', 'A customer session is required');
+    if (!accountSession && !rawSession) throw new Stage1AuthError(401, 'customer_session_required', 'A customer session is required');
     let body: unknown;
     try { body = await request.json(); } catch { throw new Stage1AuthError(400, 'selected_home_request_invalid', 'A selected home is required'); }
     const bodyRecord = body && typeof body === 'object' && !Array.isArray(body) ? body as Record<string, unknown> : null;
@@ -33,12 +37,15 @@ export async function POST(request: Request) {
       throw new Stage1AuthError(400, 'selected_home_request_invalid', 'A selected home is required');
     }
     const homeId = bodyRecord.homeId.trim();
-    const sessionHash = crypto.createHash('sha256').update(rawSession).digest('hex');
-    const session = await prisma.customerSession.findUnique({ where: { refreshTokenHash: sessionHash }, select: { id: true, customerAccountId: true, trustedDeviceId: true, trustedDeviceSessionVersion: true, securityVersion: true, revokedAt: true, expiresAt: true } });
-    if (!session || session.revokedAt || session.expiresAt <= new Date()) throw new Stage1AuthError(401, 'customer_session_invalid', 'The customer session is invalid');
-    const account = await prisma.customerAccount.findUnique({ where: { id: session.customerAccountId }, select: { id: true, status: true, securityVersion: true } });
+    const sessionHash = rawSession ? crypto.createHash('sha256').update(rawSession).digest('hex') : null;
+    const session = accountSession
+      ? await prisma.customerSession.findFirst({ where: { id: accountSession.sessionId, customerAccountId: accountSession.id, refreshTokenHash: accountSession.refreshTokenHash }, select: { id: true, customerAccountId: true, trustedDeviceId: true, trustedDeviceSessionVersion: true, securityVersion: true, revokedAt: true, expiresAt: true, absoluteExpiresAt: true } })
+      : await prisma.customerSession.findUnique({ where: { refreshTokenHash: sessionHash! }, select: { id: true, customerAccountId: true, trustedDeviceId: true, trustedDeviceSessionVersion: true, securityVersion: true, revokedAt: true, expiresAt: true, absoluteExpiresAt: true } });
+    if (!session || session.revokedAt || session.expiresAt <= new Date() || session.absoluteExpiresAt <= new Date()) throw new Stage1AuthError(401, 'customer_session_invalid', 'The customer session is invalid');
+    const account = await prisma.customerAccount.findUnique({ where: { id: session.customerAccountId }, select: { id: true, status: true, securityVersion: true, mustChangePassword: true } });
     const trusted = await prisma.trustedDevice.findUnique({ where: { id: session.trustedDeviceId }, select: { id: true, customerAccountId: true, revokedAt: true, sessionVersion: true } });
     if (!account || account.status !== 'ACTIVE' || session.securityVersion !== account.securityVersion || !trusted || trusted.customerAccountId !== account.id || trusted.revokedAt || session.trustedDeviceSessionVersion !== trusted.sessionVersion) throw new Stage1AuthError(401, 'customer_session_invalid', 'The customer session is no longer active');
+    if (account.mustChangePassword) throw new Stage1AuthError(403, 'customer_password_change_required', 'Change your password before selecting a property');
     let membership;
     try {
       membership = await resolveNativeHomeContext(prisma, { customerAccountId: session.customerAccountId, homeId });

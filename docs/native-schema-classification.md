@@ -71,6 +71,7 @@ Reviewed source is the post-Stage-2 Prisma schema and the additive migration `20
 | NativeSupportTicketTimeline | Add native |
 | ExceptionalOwnershipTransfer | Add native |
 | NativeTenantDeviceRecovery | Add native |
+| HubSyncReceipt | Add native |
 
 `Evolve` changes preserve the existing authority: account and membership identity remain global-account plus `HomeMembership`; Home/HubInstallation gain explicit current installation and replacement lifecycle; TrustedDevice gains APNs registration on the same installation identity; NativeDevice remains the sole inventory projection and narrows `customerLabel` to the frozen 40-character bound; SupportTicket remains the single ticket authority. Reverse Prisma relations alone do not create a second SQL authority.
 
@@ -99,6 +100,7 @@ Reviewed source is the post-Stage-2 Prisma schema and the additive migration `20
 | NativeSupportTicketTimeline | Append-only safe customer-visible or employee-only ticket transition | Ticket/home composite reference; redact private tenant device fields by audience | Indexed ticket/time and purge timestamp; 12-month ticket timeline; support activity, Stage 8 |
 | ExceptionalOwnershipTransfer | Restricted staff-verification case that can issue an ordinary transfer claim but cannot mutate owner membership | Current owner and optional claim are home-bound; employee roles restricted to CXO/Senior Operations Manager | One open case per Home; encrypted proposed contact, key version, audit transitions; support/installer, Stage 8 |
 | NativeTenantDeviceRecovery | Encrypted 30-day private recommission snapshot for an existing tenant-owned device | Device owner membership, replacement hub and Home are bound; invisible to owners/managers | Unique device/replacement hub; exact 30-day expiry; tenant recovery, Stage 5 |
+| HubSyncReceipt | Platform-owned acknowledgement of one signed OS outbox range and exact body hash | Bound to one enrolled hub installation and stream; contains no device command authority | Unique exact range/body plus one-body-per-range conflict guard; bounded expiry; retry/reconciliation, Stage 5 |
 
 ## Absent by design
 

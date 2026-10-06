@@ -489,7 +489,6 @@ test('every real step-up consumer remains bound to the selected hub installation
   const primitive = read('src/lib/sensitiveOperationStepUp.ts');
   assert.match(primitive, /hubInstallationId: string/);
   for (const route of [
-    'src/app/api/v2/support/tickets/[ticketId]/route.ts',
     'src/app/api/v2/support/tickets/[ticketId]/access-requests/[requestId]/approve/route.ts',
     'src/app/api/v2/trusted-devices/[trustedDeviceId]/route.ts',
     'src/app/api/v2/security/step-up/consume/route.ts',
@@ -498,6 +497,22 @@ test('every real step-up consumer remains bound to the selected hub installation
     assert.match(source, /consumeStepUp\(/);
     assert.match(source, /hubInstallationId:\s*customer\.hubInstallationId/);
   }
+  const supportClose = read('src/app/api/v2/support/tickets/[ticketId]/route.ts');
+  assert.match(supportClose, /operationKind:\s*'support_ticket_close'/);
+  assert.match(supportClose, /hubInstallationId:\s*customer\.hubInstallationId/);
+  assert.match(supportClose, /tx\.stepUpAuthorization\.updateMany\(/);
+  assert.match(supportClose, /targetDigest:\s*targetDigest\(\[ticketId\]\)/);
+  assert.match(supportClose, /normalizedValueDigest:\s*digest/);
+  assert.match(supportClose, /consumedAt:\s*null,\s*revokedAt:\s*null,\s*expiresAt:\s*\{\s*gt:\s*now\s*\}/);
+  const tenantRemoval = read('src/app/api/v2/homes/[homeId]/tenant/access/route.ts');
+  assert.match(tenantRemoval, /operationDigest\(/);
+  assert.match(tenantRemoval, /hubInstallationId:\s*selected\.hubInstallationId/);
+  assert.match(tenantRemoval, /tx\.stepUpAuthorization\.updateMany\(/);
+  assert.match(tenantRemoval, /consumedAt:\s*null,\s*revokedAt:\s*null,\s*expiresAt:\s*\{\s*gt:\s*now\s*\}/);
+  assert.match(tenantRemoval, /targetDigest\(\[membershipId, homeId\]\)/);
+  assert.match(tenantRemoval, /normalizedValueDigest:\s*digest/);
+  assert.match(tenantRemoval, /policyRevision:\s*selected\.policyRevision/);
+  assert.doesNotMatch(tenantRemoval, /consumeStepUp\(/, 'final-account cleanup atomically consumes its exact proof before cascading the account/session rows');
 });
 
 test('Platform step-up operation digest matches the published cross-runtime vector', () => {
@@ -648,9 +663,15 @@ test('R4 production paths use opaque browser-bound handoffs, committed claim cle
   assert.match(supportIssue, /employeeHandoffEnvelope/);
   assert.doesNotMatch(supportIssue, /NextResponse\.json\(\{[^\n]*employeeProofEnvelope/);
   assert.doesNotMatch(supportPortal, /employeeProofEnvelope/);
-  assert.doesNotMatch(supportPortal, /issuedCode|body\.code/);
+  assert.match(supportPortal, /body\.oneUseCode/);
+  assert.doesNotMatch(supportPortal, /body\.code\b|employeeProofEnvelope/);
   assert.doesNotMatch(supportIssue, /NextResponse\.json\([\s\S]{0,500}\bcode\s*[,}]/);
-  assert.match(read('src/app/api/v2/support/tickets/[ticketId]/access-requests/[requestId]/approve/route.ts'), /oneUseCode/);
+  const supportApproval = read('src/app/api/v2/support/tickets/[ticketId]/access-requests/[requestId]/approve/route.ts');
+  assert.doesNotMatch(supportApproval, /oneUseCode/);
+  assert.match(supportApproval, /status: approve \? 'APPROVED' : 'DENIED'/);
+  assert.match(supportIssue, /const oneUseCode = `DNO-S-\$\{randomSecret\(18\)\}`/);
+  assert.match(supportIssue, /validateSupportAccessIssueReceipt\(receipt\)/);
+  assert.match(supportIssue, /only plaintext disclosure[\s\S]*assigned, recently[\s\S]*employee's Company Portal response/i);
   assert.doesNotMatch(readOs('public/setup.js'), /supportProof|employeeProofEnvelope/);
   assert.doesNotMatch(support, /employeeHandoff\s*\}\)/);
   assert.match(support, /employeeHandoffConsumedAt/);

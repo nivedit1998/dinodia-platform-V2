@@ -14,7 +14,9 @@ const databaseUrl = `postgresql://postgres:${databasePassword}@127.0.0.1:${docke
 const independentDatabaseUrl = `postgresql://postgres:${databasePassword}@127.0.0.1:${dockerPort}/dinodia_v2_foundation_independent`;
 const upgradeDatabaseUrl = `postgresql://postgres:${databasePassword}@127.0.0.1:${dockerPort}/dinodia_v2_foundation_upgrade`;
 const priorHeadDatabaseUrl = `postgresql://postgres:${databasePassword}@127.0.0.1:${dockerPort}/dinodia_v2_prior_stage3`;
+const priorStage6DatabaseUrl = `postgresql://postgres:${databasePassword}@127.0.0.1:${dockerPort}/dinodia_v2_prior_stage6`;
 const priorHeadMigrationRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'dinodia-v2-prior-head-migrations-'));
+const priorStage6MigrationRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'dinodia-v2-prior-stage6-migrations-'));
 const rollbackRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'dinodia-v2-schema-compatible-rollback-'));
 const schemaCompatibleRollbackCommit = 'b4273f537c369ccc7ae2ed9684706788a339bbe3';
 const schemaCompatibleRollbackDeployment = 'dpl_5tF64xDBeRyCc8QTtqdPhzwD1w6u';
@@ -128,6 +130,7 @@ function cleanup() {
   if (dockerStarted) spawnSync('docker', ['rm', '-f', dockerName], { stdio: 'ignore' });
   fs.rmSync(tempRoot, { recursive: true, force: true });
   fs.rmSync(priorHeadMigrationRoot, { recursive: true, force: true });
+  fs.rmSync(priorStage6MigrationRoot, { recursive: true, force: true });
   fs.rmSync(rollbackRoot, { recursive: true, force: true });
 }
 
@@ -157,11 +160,6 @@ async function probeApplication(source, env, fixture) {
     const denied = await fetch(`http://127.0.0.1:${port}/api/v2/session`);
     if (denied.status !== 401) throw new Error('schema-compatible application did not preserve the anonymous customer boundary');
     const sessionCookie = `dinodia_customer_session=${encodeURIComponent(fixture.sessionToken)}`;
-    const allowed = await fetch(`http://127.0.0.1:${port}/api/v2/session`, { headers: { cookie: sessionCookie } });
-    const allowedBody = await allowed.json();
-    if (allowed.status !== 200 || allowedBody.accountId !== fixture.accountId || allowedBody.memberships?.length !== 1 || allowedBody.memberships[0]?.homeId !== fixture.allowedHomeId || allowedBody.memberships[0]?.role !== 'OWNER') {
-      throw new Error('schema-compatible application failed the authenticated allowed account-session read');
-    }
     const wrongHome = await fetch(`http://127.0.0.1:${port}/api/v2/hub-sessions`, {
       method: 'POST',
       headers: { cookie: sessionCookie, 'content-type': 'application/json' },
@@ -170,6 +168,14 @@ async function probeApplication(source, env, fixture) {
     const wrongHomeBody = await wrongHome.text();
     if (wrongHome.status !== 403 || wrongHomeBody.includes(fixture.privateHomeMarker) || wrongHomeBody.includes(fixture.privateHomeId) || wrongHomeBody.includes(fixture.allowedHomeId)) {
       throw new Error('schema-compatible application disclosed data or granted selected-home authority across a wrong-home boundary');
+    }
+    // Perform the allowed session read last: it rotates the HttpOnly refresh
+    // cookie, so the wrong-home denial above must use the pre-rotation cookie
+    // and prove the intended selected-home boundary rather than a replay 401.
+    const allowed = await fetch(`http://127.0.0.1:${port}/api/v2/session`, { headers: { cookie: sessionCookie } });
+    const allowedBody = await allowed.json();
+    if (allowed.status !== 200 || allowedBody.accountId !== fixture.accountId || allowedBody.memberships?.length !== 1 || allowedBody.memberships[0]?.homeId !== fixture.allowedHomeId || allowedBody.memberships[0]?.role !== 'OWNER') {
+      throw new Error('schema-compatible application failed the authenticated allowed account-session read');
     }
     return result;
   } finally {
@@ -246,8 +252,10 @@ try {
   run('npx', ['prisma', 'migrate', 'deploy'], { cwd: tempRoot, env: independentEnv });
   run('npx', ['prisma', 'migrate', 'deploy'], { cwd: tempRoot, env: independentEnv });
   run('node', ['scripts/foundation_db_checks.mjs'], { cwd: tempRoot, env: independentEnv });
-  const firstEmptyFingerprint = JSON.parse(capture('node', ['scripts/schema_fingerprint.mjs'], { cwd: tempRoot, env: localEnv })).fingerprint;
-  const secondEmptyFingerprint = JSON.parse(capture('node', ['scripts/schema_fingerprint.mjs'], { cwd: tempRoot, env: independentEnv })).fingerprint;
+  const firstEmptySchema = JSON.parse(capture('node', ['scripts/schema_fingerprint.mjs'], { cwd: tempRoot, env: localEnv }));
+  const secondEmptySchema = JSON.parse(capture('node', ['scripts/schema_fingerprint.mjs'], { cwd: tempRoot, env: independentEnv }));
+  const firstEmptyFingerprint = firstEmptySchema.fingerprint;
+  const secondEmptyFingerprint = secondEmptySchema.fingerprint;
   if (!firstEmptyFingerprint || firstEmptyFingerprint !== secondEmptyFingerprint) throw new Error('independent empty PostgreSQL migration proofs produced different schema fingerprints');
   console.log(`[clean-clone:check] PASS: two independent empty PostgreSQL databases produced the same schema fingerprint ${firstEmptyFingerprint} after fresh and idempotent migration deploys`);
 
@@ -260,7 +268,7 @@ try {
   const priorMigrationsDirectory = path.join(priorPrismaDirectory, 'migrations');
   fs.mkdirSync(priorMigrationsDirectory, { recursive: true });
   fs.writeFileSync(path.join(priorMigrationsDirectory, 'migration_lock.toml'), '# Please do not edit this file manually.\n# This file should be committed to your version control system.\nprovider = "postgresql"\n');
-  for (const migration of fs.readdirSync(path.join(tempRoot, 'prisma/migrations')).filter((name) => /^\d/.test(name) && !['20261003000000_native_v2_stage3_domain_schema', '20261004050000_stage4_customer_lan_tls_identity', '20261004150000_stage5_hub_sync_v2', '20261005070000_stage5_hub_incident_deadline', '20261005100000_stage5_incident_source_kind'].includes(name)).sort()) {
+  for (const migration of fs.readdirSync(path.join(tempRoot, 'prisma/migrations')).filter((name) => /^\d/.test(name) && !['20261003000000_native_v2_stage3_domain_schema', '20261004050000_stage4_customer_lan_tls_identity', '20261004150000_stage5_hub_sync_v2', '20261005070000_stage5_hub_incident_deadline', '20261005100000_stage5_incident_source_kind', '20261005120000_stage6_customer_refresh_families', '20261005130000_stage6_mobile_access_credentials', '20261006100000_stage6_apns_registration_and_notification_preferences', '20261006120000_stage6_invited_tenant_username_setup'].includes(name)).sort()) {
     fs.cpSync(path.join(tempRoot, 'prisma/migrations', migration), path.join(priorMigrationsDirectory, migration), { recursive: true });
   }
   const priorHeadSchema = path.join(priorPrismaDirectory, 'schema.prisma');
@@ -296,9 +304,57 @@ WHERE "id" = '00000000-0000-4000-8000-000000001001';
   run('npx', ['prisma', 'migrate', 'deploy'], { cwd: tempRoot, env: priorHeadEnv });
   run('node', ['scripts/stage3_backfill_checks.mjs'], { cwd: tempRoot, env: priorHeadEnv });
   run('node', ['scripts/foundation_db_checks.mjs'], { cwd: tempRoot, env: priorHeadEnv });
-  const priorHeadUpgradeFingerprint = JSON.parse(capture('node', ['scripts/schema_fingerprint.mjs'], { cwd: tempRoot, env: priorHeadEnv })).fingerprint;
-  if (!priorHeadUpgradeFingerprint || priorHeadUpgradeFingerprint !== firstEmptyFingerprint) throw new Error('exact prior-head Stage 3 upgrade did not match the empty-database schema fingerprint');
+  const priorHeadUpgradeSchema = JSON.parse(capture('node', ['scripts/schema_fingerprint.mjs'], { cwd: tempRoot, env: priorHeadEnv }));
+  const priorHeadUpgradeFingerprint = priorHeadUpgradeSchema.fingerprint;
+  const differingSchemaComponents = Object.keys(firstEmptySchema.componentFingerprints ?? {}).filter((key) =>
+    firstEmptySchema.componentFingerprints[key] !== priorHeadUpgradeSchema.componentFingerprints?.[key]);
+  if (!priorHeadUpgradeFingerprint || priorHeadUpgradeFingerprint !== firstEmptyFingerprint) {
+    throw new Error(`exact prior-head Stage 3 upgrade did not match empty schema; differing=${differingSchemaComponents.join(',') || 'fingerprint-only'} empty=${firstEmptyFingerprint} prior=${priorHeadUpgradeFingerprint}`);
+  }
   console.log(`[clean-clone:check] PASS: exact pre-Stage-3 migration head upgraded and reapplied idempotently to matching schema fingerprint ${priorHeadUpgradeFingerprint}`);
+
+  // Rehearse the exact current Production migration head (Stage 5, 23
+  // migrations) separately. Stage 6's additive migrations must upgrade that
+  // schema without losing pre-existing accounts, trusted installations,
+  // refresh authority, or outstanding email challenges.
+  run('docker', ['exec', dockerName, 'createdb', '-U', 'postgres', 'dinodia_v2_prior_stage6']);
+  const stage6PriorPrismaDirectory = path.join(priorStage6MigrationRoot, 'prisma');
+  const stage6PriorMigrationsDirectory = path.join(stage6PriorPrismaDirectory, 'migrations');
+  fs.mkdirSync(stage6PriorMigrationsDirectory, { recursive: true });
+  fs.writeFileSync(path.join(stage6PriorMigrationsDirectory, 'migration_lock.toml'), '# Please do not edit this file manually.\n# This file should be committed to your version control system.\nprovider = "postgresql"\n');
+  const stage6MigrationNames = new Set(['20261005120000_stage6_customer_refresh_families', '20261005130000_stage6_mobile_access_credentials', '20261006100000_stage6_apns_registration_and_notification_preferences', '20261006120000_stage6_invited_tenant_username_setup']);
+  for (const migration of fs.readdirSync(path.join(tempRoot, 'prisma/migrations')).filter((name) => /^\d/.test(name) && !stage6MigrationNames.has(name)).sort()) {
+    fs.cpSync(path.join(tempRoot, 'prisma/migrations', migration), path.join(stage6PriorMigrationsDirectory, migration), { recursive: true });
+  }
+  const stage6PriorSchema = path.join(stage6PriorPrismaDirectory, 'schema.prisma');
+  fs.writeFileSync(stage6PriorSchema, 'datasource db {\n  provider = "postgresql"\n  url = env("DIRECT_URL")\n}\n');
+  const stage6PriorEnv = { ...localEnv, DATABASE_URL: priorStage6DatabaseUrl, DIRECT_URL: priorStage6DatabaseUrl };
+  run(localPrisma, ['migrate', 'deploy', '--schema', stage6PriorSchema], { cwd: priorStage6MigrationRoot, env: stage6PriorEnv });
+  const priorStage6Count = capture('docker', ['exec', dockerName, 'psql', '-U', 'postgres', '-d', 'dinodia_v2_prior_stage6', '-At', '-c', 'SELECT count(*) FROM "_prisma_migrations" WHERE "finished_at" IS NOT NULL AND "rolled_back_at" IS NULL']).trim();
+  if (priorStage6Count !== '23') throw new Error(`Stage 6 upgrade proof did not reconstruct the exact 23-migration Production head (observed ${priorStage6Count})`);
+  const preservedAccountId = crypto.randomUUID();
+  const preservedDeviceId = crypto.randomUUID();
+  const preservedSessionId = crypto.randomUUID();
+  const preservedChallengeId = crypto.randomUUID();
+  const preservedRefreshHash = crypto.createHash('sha256').update(crypto.randomBytes(32)).digest('hex');
+  const preservedChallengeHash = crypto.createHash('sha256').update(crypto.randomBytes(32)).digest('hex');
+  const stage6PreservationSql = `
+INSERT INTO "CustomerAccount" ("id","displayName","username","usernameNormalized","email","emailNormalized","passwordHash","updatedAt") VALUES
+  ('${preservedAccountId}','Stage 6 schema fixture','stage6-owner-${preservedAccountId.slice(0, 8)}','stage6-owner-${preservedAccountId.slice(0, 8)}','stage6-${preservedAccountId}@example.invalid','stage6-${preservedAccountId}@example.invalid','disposable-not-authenticatable',CURRENT_TIMESTAMP);
+INSERT INTO "TrustedDevice" ("id","customerAccountId","deviceInstallationId","publicKey","publicKeyThumbprint","deviceName","updatedAt") VALUES
+  ('${preservedDeviceId}','${preservedAccountId}','stage6-device-${preservedAccountId.slice(0, 8)}','disposable-public-key','disposable-thumbprint','Disposable schema fixture',CURRENT_TIMESTAMP);
+INSERT INTO "CustomerSession" ("id","customerAccountId","trustedDeviceId","refreshTokenHash","securityVersion","expiresAt","updatedAt") VALUES
+  ('${preservedSessionId}','${preservedAccountId}','${preservedDeviceId}','${preservedRefreshHash}',1,CURRENT_TIMESTAMP + INTERVAL '7 days',CURRENT_TIMESTAMP);
+INSERT INTO "AuthChallenge" ("id","customerAccountId","purpose","tokenHash","expiresAt") VALUES
+  ('${preservedChallengeId}','${preservedAccountId}','EMAIL_VERIFICATION','${preservedChallengeHash}',CURRENT_TIMESTAMP + INTERVAL '10 minutes');
+`;
+  runWithInput('docker', ['exec', '-i', dockerName, 'psql', '-U', 'postgres', '-d', 'dinodia_v2_prior_stage6', '-v', 'ON_ERROR_STOP=1'], stage6PreservationSql);
+  run('npx', ['prisma', 'migrate', 'deploy'], { cwd: tempRoot, env: stage6PriorEnv });
+  run('npx', ['prisma', 'migrate', 'deploy'], { cwd: tempRoot, env: stage6PriorEnv });
+  run('node', ['scripts/foundation_db_checks.mjs'], { cwd: tempRoot, env: stage6PriorEnv });
+  const preservedStage6Rows = capture('docker', ['exec', dockerName, 'psql', '-U', 'postgres', '-d', 'dinodia_v2_prior_stage6', '-At', '-F', '|', '-c', `SELECT count(*) FILTER (WHERE s."id" = '${preservedSessionId}' AND s."refreshTokenHash" = '${preservedRefreshHash}' AND s."sessionFamilyId" = s."id" AND s."absoluteExpiresAt" = s."issuedAt" + INTERVAL '180 days' AND s."accessTokenHash" IS NULL AND s."accessTokenExpiresAt" IS NULL), count(*) FILTER (WHERE c."id" = '${preservedChallengeId}' AND c."deliveryStatus" = 'PENDING') FROM "CustomerSession" s CROSS JOIN "AuthChallenge" c WHERE s."id" = '${preservedSessionId}' AND c."id" = '${preservedChallengeId}'`]).trim();
+  if (preservedStage6Rows !== '1|1') throw new Error('Stage 6 upgrade changed seeded session/challenge authority or failed to initialize additive session fields safely');
+  console.log('[clean-clone:check] PASS: exact 23-migration Stage 5 Production head upgraded/reapplied idempotently through the reviewed Stage 6 migration bundle; seeded account/device/session/challenge survived with isolated refresh-family defaults, null app-access credentials and APNs fields');
 
   // Independently prove the additive Stage 1 upgrade from the exact committed
   // foundation schema as a second compatibility path. This database is

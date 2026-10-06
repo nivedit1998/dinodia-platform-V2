@@ -28,8 +28,13 @@ test('Native V1 auth errors use the canonical nested error envelope and preserve
 test('Native V1 maps expiry, scope, freshness and infrastructure failures to canonical codes', async () => {
   for (const [failure, expected] of [
     [{ status: 401, code: 'customer_session_invalid', message: 'Expired' }, 'TOKEN_EXPIRED'],
+    [{ status: 401, code: 'customer_access_token_expired', message: 'Refresh required' }, 'CUSTOMER_ACCESS_EXPIRED'],
     [{ status: 403, code: 'home_membership_forbidden', message: 'Wrong home' }, 'SCOPE_DENIED'],
     [{ status: 401, code: 'area_policy_stale', message: 'Refresh' }, 'UPDATE_REQUIRED'],
+    [{ status: 409, code: 'claim_policy_required', message: 'Accept the current customer policy' }, 'UPDATE_REQUIRED'],
+    [{ status: 409, code: 'claim_address_confirmation_required', message: 'Confirm the current address' }, 'REVISION_CONFLICT'],
+    [{ status: 409, code: 'FINAL_RELATIONSHIP_CONFIRMATION_REQUIRED', message: 'Confirm whole-account deletion' }, 'FINAL_RELATIONSHIP_CONFIRMATION_REQUIRED'],
+    [{ status: 409, code: 'claim_reservation_expired', message: 'The claim expired' }, 'RESOURCE_NOT_FOUND'],
     [{ status: 503, code: 'home_hub_unavailable', message: 'Offline' }, 'HUB_UNAVAILABLE'],
   ]) {
     const response = nativeV1ErrorResponse(failure);

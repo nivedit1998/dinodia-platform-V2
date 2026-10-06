@@ -16,10 +16,18 @@ export async function serializableTransaction<T>(
         isolationLevel: Prisma.TransactionIsolationLevel.Serializable,
       });
     } catch (error) {
-      const code = typeof error === 'object' && error !== null && 'code' in error
-        ? String((error as { code?: unknown }).code)
-        : '';
-      if (code !== 'P2034' || attempt === attempts - 1) throw error;
+      const record = typeof error === 'object' && error !== null
+        ? error as { code?: unknown; meta?: { code?: unknown; sqlState?: unknown; sqlstate?: unknown } }
+        : {};
+      const prismaCode = String(record.code ?? '');
+      const sqlState = String(record.meta?.code ?? record.meta?.sqlState ?? record.meta?.sqlstate ?? '');
+      // Prisma reports serializable conflicts as P2034 and raw PostgreSQL
+      // deadlocks/serialization failures as P2010 with SQLSTATE in meta.
+      // Retrying is safe here because callbacks contain database work only;
+      // network, email, secret disclosure and other external effects stay out.
+      const retryable = prismaCode === 'P2034' || prismaCode === '40P01' || prismaCode === '40001'
+        || (prismaCode === 'P2010' && (sqlState === '40P01' || sqlState === '40001'));
+      if (!retryable || attempt === attempts - 1) throw error;
       await new Promise((resolve) => setTimeout(resolve, 8 * (attempt + 1)));
     }
   }

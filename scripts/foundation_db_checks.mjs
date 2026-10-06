@@ -39,9 +39,13 @@ try {
     '20261004150000_stage5_hub_sync_v2',
     '20261005070000_stage5_hub_incident_deadline',
     '20261005100000_stage5_incident_source_kind',
+    '20261005120000_stage6_customer_refresh_families',
+    '20261005130000_stage6_mobile_access_credentials',
+    '20261006100000_stage6_apns_registration_and_notification_preferences',
+    '20261006120000_stage6_invited_tenant_username_setup',
   ];
-  if (migration.length !== required.length || required.some((name) => !migrations.has(name)) || required.some((name) => !migrations.get(name).finished_at || migrations.get(name).rolled_back_at)) throw new Error('migration ledger is not exactly the completed native baseline, Stage 1, Stage 3, Stage 4 and Stage 5 migrations');
-  console.log(`[test:stage5-schema] OK: ${names.size} tables, no direct anon/authenticated grants, native baseline, Stage 1, Stage 3/4 and additive Stage 5 migrations completed`);
+  if (migration.length !== required.length || required.some((name) => !migrations.has(name)) || required.some((name) => !migrations.get(name).finished_at || migrations.get(name).rolled_back_at)) throw new Error('migration ledger is not exactly the completed native baseline, Stage 1 through Stage 6 migrations');
+  console.log(`[test:stage6-schema] OK: ${names.size} tables, no direct anon/authenticated grants, native baseline and additive Stage 1 through Stage 6 migrations completed`);
 } finally {
   await prisma.$disconnect();
 }

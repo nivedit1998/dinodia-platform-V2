@@ -4,6 +4,7 @@ import { prisma } from './prisma';
 import { headerToken, parsePublicKeys, sha256, verifyStage1Token } from './stage1Crypto';
 import { validateMembership } from './contracts/dinodiaV1';
 import { DEFAULT_EMPLOYEE_SESSION_SECONDS, INTERNAL_EMPLOYEE_SESSION_SECONDS, INTERNAL_OPERATOR_DAY_SESSION_POLICY, internalOperatorDaySessionEnabled, stage1NowMs } from './internalOperatorDaySession';
+import { currentCustomerPolicy } from './customerPolicyConfig';
 
 export class Stage1AuthError extends Error {
   readonly status: number;
@@ -39,6 +40,28 @@ export type CustomerPrincipal = {
   sessionId: string;
   tokenHash: string;
   trustedDevicePublicKey: string;
+  credentialKind?: 'legacy_app' | 'account_access' | 'account_refresh';
+  tokenExpiresAt?: number;
+};
+
+export type CustomerAccountSessionPrincipal = {
+  kind: 'customer_account';
+  id: string;
+  sessionId: string;
+  sessionFamilyId: string;
+  trustedDeviceId: string;
+  email: string;
+  emailVerifiedAt: Date | null;
+  mustChangePassword: boolean;
+  usernameSelectionRequired: boolean;
+  securityVersion: number;
+  trustedDeviceSessionVersion: number;
+  credentialKind: 'access'|'refresh';
+  accessTokenHash: string|null;
+  accessTokenExpiresAt: Date|null;
+  refreshTokenHash: string;
+  expiresAt: Date;
+  absoluteExpiresAt: Date;
 };
 
 function keys(name: string): crypto.KeyObject[] {
@@ -99,10 +122,74 @@ export async function requireCustomer(request: Request): Promise<CustomerPrincip
   const currentPolicyRevision = Math.max(membership.accessRevision, hub?.accessPolicyRevision ?? 0);
   if (!hub || hub.homeId !== verified.homeId || verified.policyRevision !== currentPolicyRevision) fail(new Stage1AuthError(401, 'policy_stale', 'The app session must refresh its home policy'));
   const trustedDevice = await prisma.trustedDevice.findUnique({ where: { id: verified.trustedDeviceId }, select: { id: true, customerAccountId: true, publicKey: true, revokedAt: true, sessionVersion: true } });
-  const session = await prisma.customerSession.findUnique({ where: { id: verified.sessionId }, select: { id: true, customerAccountId: true, trustedDeviceId: true, revokedAt: true, expiresAt: true, securityVersion: true, trustedDeviceSessionVersion: true } });
+  const session = await prisma.customerSession.findUnique({ where: { id: verified.sessionId }, select: { id: true, customerAccountId: true, trustedDeviceId: true, revokedAt: true, expiresAt: true, absoluteExpiresAt: true, securityVersion: true, trustedDeviceSessionVersion: true } });
   const account = await prisma.customerAccount.findUnique({ where: { id: verified.id }, select: { id: true, status: true, securityVersion: true } });
-  if (!account || account.status !== 'ACTIVE' || session?.securityVersion !== account.securityVersion || !trustedDevice || trustedDevice.customerAccountId !== verified.id || trustedDevice.revokedAt || !session || session.customerAccountId !== verified.id || session.trustedDeviceId !== trustedDevice.id || session.trustedDeviceSessionVersion !== trustedDevice.sessionVersion || session.revokedAt || session.expiresAt <= new Date()) fail(new Stage1AuthError(401, 'customer_session_invalid', 'The app session is no longer active'));
-  return { kind: 'customer', id: verified.id, membershipId: membership.id, trustedDeviceId: trustedDevice.id, trustedDevicePublicKey: trustedDevice.publicKey, homeId: membership.homeId, hubInstallationId: hub.id, role: membership.role, areaIds: verified.areaIds, scopes: verified.scopes, policyRevision: verified.policyRevision, sessionId: verified.sessionId, tokenHash: sha256(token) };
+  const sessionNow = new Date();
+  if (!account || account.status !== 'ACTIVE' || session?.securityVersion !== account.securityVersion || !trustedDevice || trustedDevice.customerAccountId !== verified.id || trustedDevice.revokedAt || !session || session.customerAccountId !== verified.id || session.trustedDeviceId !== trustedDevice.id || session.trustedDeviceSessionVersion !== trustedDevice.sessionVersion || session.revokedAt || session.expiresAt <= sessionNow || session.absoluteExpiresAt <= sessionNow) fail(new Stage1AuthError(401, 'customer_session_invalid', 'The app session is no longer active'));
+  await prisma.customerSession.updateMany({
+    where: { id: session.id, revokedAt: null, expiresAt: { gt: sessionNow }, absoluteExpiresAt: { gt: sessionNow } },
+    data: { lastUsedAt: sessionNow, expiresAt: new Date(Math.min(sessionNow.getTime() + 30 * 24 * 60 * 60 * 1000, session.absoluteExpiresAt.getTime())) },
+  });
+  return { kind: 'customer', id: verified.id, membershipId: membership.id, trustedDeviceId: trustedDevice.id, trustedDevicePublicKey: trustedDevice.publicKey, homeId: membership.homeId, hubInstallationId: hub.id, role: membership.role, areaIds: verified.areaIds, scopes: verified.scopes, policyRevision: verified.policyRevision, sessionId: verified.sessionId, tokenHash: sha256(token), credentialKind: 'legacy_app', tokenExpiresAt: verified.expiresAt * 1000 };
+}
+
+/** Account-global cookie authority, deliberately independent of any Home or hub bearer. */
+export async function requireCustomerAccountSession(request: Request, options: { allowPasswordChangeOnly?: boolean; allowPolicyGate?: boolean; allowMandatoryPasswordChange?: boolean; allowUsernameSetup?: boolean } = {}): Promise<CustomerAccountSessionPrincipal> {
+  const authorization = request.headers.get('authorization') ?? '';
+  const bearer = /^Bearer (dno-customer-access-[A-Za-z0-9_-]{32,160})$/.exec(authorization)?.[1] ?? '';
+  const cookie = cookieToken(request, 'dinodia_customer_session');
+  if (bearer && cookie) fail(new Stage1AuthError(400, 'customer_credential_ambiguous', 'Use one customer session credential per request'));
+  const token = bearer || cookie;
+  if (!token) fail(new Stage1AuthError(401, 'customer_session_required', 'A customer account session is required'));
+  const presentedHash = sha256(token);
+  const now = new Date();
+  const session = await prisma.customerSession.findFirst({ where: bearer
+    ? { accessTokenHash: presentedHash }
+    : { refreshTokenHash: presentedHash }, select: {
+    id: true, customerAccountId: true, trustedDeviceId: true, sessionFamilyId: true, refreshTokenHash: true, accessTokenHash: true, accessTokenExpiresAt: true,
+    securityVersion: true, trustedDeviceSessionVersion: true, revokedAt: true, expiresAt: true, absoluteExpiresAt: true,
+    customerAccount: { select: { id: true, email: true, emailVerifiedAt: true, status: true, securityVersion: true, mustChangePassword: true, usernameSelectionRequired: true } },
+    trustedDevice: { select: { id: true, customerAccountId: true, revokedAt: true, sessionVersion: true } },
+  } });
+  if (bearer && session && session.accessTokenHash === presentedHash && session.accessTokenExpiresAt && session.accessTokenExpiresAt <= now) {
+    fail(new Stage1AuthError(401, 'customer_access_token_expired', 'Refresh the customer app session before retrying'));
+  }
+  if (!session || (bearer && (session.accessTokenHash !== presentedHash || !session.accessTokenExpiresAt))
+    || session.revokedAt || session.expiresAt <= now || session.absoluteExpiresAt <= now
+    || session.customerAccount.status !== 'ACTIVE' || session.customerAccount.id !== session.customerAccountId
+    || session.customerAccount.securityVersion !== session.securityVersion
+    || session.trustedDevice.id !== session.trustedDeviceId || session.trustedDevice.customerAccountId !== session.customerAccountId
+    || session.trustedDevice.revokedAt || session.trustedDevice.sessionVersion !== session.trustedDeviceSessionVersion) {
+    fail(new Stage1AuthError(401, 'customer_session_invalid', 'The customer account session is no longer active'));
+  }
+  const mandatoryPasswordGate = Boolean(session.customerAccount.mustChangePassword && options.allowPasswordChangeOnly && options.allowMandatoryPasswordChange);
+  if (session.customerAccount.mustChangePassword && !options.allowPasswordChangeOnly) {
+    fail(new Stage1AuthError(403, 'customer_password_change_required', 'Change your password before continuing'));
+  }
+  if (session.customerAccount.usernameSelectionRequired && !options.allowUsernameSetup && !mandatoryPasswordGate) {
+    fail(new Stage1AuthError(403, 'customer_username_selection_required', 'Choose your username before continuing'));
+  }
+  if (!options.allowPolicyGate && !mandatoryPasswordGate) {
+    const policy = currentCustomerPolicy();
+    if (!policy) fail(new Stage1AuthError(503, 'customer_policy_unavailable', 'Customer access is unavailable until the current policy is configured'));
+    const acceptance = await prisma.policyAcceptance.findUnique({ where: { customerAccountId_policyKind_policyVersion: {
+      customerAccountId: session.customerAccountId, policyKind: 'DINODIA_NATIVE', policyVersion: policy.version,
+    } }, select: { id: true } });
+    if (!acceptance) fail(new Stage1AuthError(403, 'customer_policy_acceptance_required', 'Review and accept the current customer policy before continuing'));
+  }
+  const expiresAt = new Date(Math.min(now.getTime() + 30 * 24 * 60 * 60 * 1000, session.absoluteExpiresAt.getTime()));
+  await prisma.customerSession.updateMany({ where: { id: session.id, revokedAt: null, expiresAt: { gt: now }, absoluteExpiresAt: { gt: now } }, data: { lastUsedAt: now, expiresAt } });
+  await prisma.trustedDevice.update({ where: { id: session.trustedDeviceId }, data: { lastUsedAt: now } });
+  return {
+    kind: 'customer_account', id: session.customerAccountId, sessionId: session.id, sessionFamilyId: session.sessionFamilyId,
+    trustedDeviceId: session.trustedDeviceId, email: session.customerAccount.email,
+    emailVerifiedAt: session.customerAccount.emailVerifiedAt, mustChangePassword: session.customerAccount.mustChangePassword,
+    usernameSelectionRequired: session.customerAccount.usernameSelectionRequired,
+    securityVersion: session.securityVersion, trustedDeviceSessionVersion: session.trustedDeviceSessionVersion,
+    credentialKind: bearer ? 'access' : 'refresh', accessTokenHash: session.accessTokenHash,
+    accessTokenExpiresAt: session.accessTokenExpiresAt,
+    refreshTokenHash: session.refreshTokenHash, expiresAt, absoluteExpiresAt: session.absoluteExpiresAt,
+  };
 }
 
 export function cookieToken(request: Request, name: string): string {

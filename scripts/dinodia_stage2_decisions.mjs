@@ -488,6 +488,29 @@ function executeSemanticFixture(path, value, adapters) {
     case "account-relationship-lifecycle.json": {
       return result("accepted", assertAccountRelationshipLifecycle(value));
     }
+    case "tenant-membership-removal-request.json": {
+      assert(schema("tenantMembershipRemovalRequest", value) && value.expectedAccessRevision > 0 &&
+        value.expectedManagementRevision > 0 && typeof value.confirmFinalAccountDeletion === "boolean",
+      "tenant removal request must be revision-bound and cannot carry caller-selected membership/home authority");
+      return result("accepted", { protectedEffects: 0 });
+    }
+    case "invalid/tenant-membership-removal-unscoped.json": {
+      return deniedWithNoEffects(!schema("tenantMembershipRemovalRequest", value) &&
+        !Object.hasOwn(value, "homeMembershipId"), path);
+    }
+    case "tenant-membership-removal-final-warning.json": {
+      assert(schema("tenantMembershipRemovalPreview", value) && value.willDeleteAccount === true &&
+        value.otherRelationshipsRemain === false,
+      "final relationship preview must explicitly warn that account-wide cleanup will follow");
+      return result("accepted", { protectedEffects: 0 });
+    }
+    case "tenant-membership-removal-other-home-preserved.json": {
+      assert(schema("tenantMembershipRemovalReceipt", value) && value.accountDeleted === false &&
+        value.otherRelationshipsRemain === true && value.nextAction === "SELECT_HOME" &&
+        value.anonymousReference === null && value.hubEnforcement === "PENDING",
+      "scoped tenant removal must preserve another home and truthfully report pending hub enforcement");
+      return result("accepted", { protectedEffects: 0 });
+    }
     case "customer-recovery-lifecycle.json":
       assert(value.cases.length >= 2 && value.cases.every((item) => item.accountExistsDisclosed === false && item.sessionIssued === false) &&
         value.cases[0].responseClass === value.cases[1].responseClass,
@@ -659,7 +682,9 @@ function executeSemanticFixture(path, value, adapters) {
     case "support-ticket-private.json": {
       assert(schema("supportTicket", value) && value.homeId && value.homeMembershipId &&
         value.status === "ACCESS_REQUESTED" && Array.isArray(value.customerVisibleUpdates) &&
-        value.customerVisibleUpdates.every((update) => Object.keys(update).every((key) => ["kind", "text"].includes(key))),
+        value.customerVisibleUpdates.every((update) => Object.keys(update).every((key) => ["id", "code", "summary", "createdAt"].includes(key))
+          && typeof update.id === "string" && typeof update.code === "string" && typeof update.createdAt === "string"
+          && (update.summary === null || typeof update.summary === "string")),
       "tenant support DTO must remain bound to its membership and contain only customer-visible updates");
       return result("accepted", { updates: value.customerVisibleUpdates.length });
     }

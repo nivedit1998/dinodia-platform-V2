@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
 import { nativeV1ErrorResponse } from '@/lib/contracts/nativeV1Error';
-import { requireCustomer, Stage1AuthError } from '@/lib/stage1Auth';
+import { Stage1AuthError } from '@/lib/stage1Auth';
+import { requireCustomerSelectedHome } from '@/lib/customerSelectedHome';
 import { issueStepUp } from '@/lib/sensitiveOperationStepUp';
 import { validateStepUpIssueRequest, validateStepUpProofReceipt } from '@/lib/contracts/dinodiaV1';
 
@@ -8,7 +9,7 @@ export const dynamic = 'force-dynamic';
 
 export async function POST(request: Request) {
   try {
-    const customer = await requireCustomer(request);
+    const customer = await requireCustomerSelectedHome(request);
     const body = await request.json().catch(() => null) as Record<string, unknown> | null;
     const normalized = body && typeof body === 'object' && !Array.isArray(body) ? {
       challengeId: body.challengeId,

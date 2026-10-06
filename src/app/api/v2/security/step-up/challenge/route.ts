@@ -1,7 +1,8 @@
 import crypto from 'node:crypto';
 import { NextResponse } from 'next/server';
 import { nativeV1ErrorResponse } from '@/lib/contracts/nativeV1Error';
-import { assertCustomerCanCommand, requireCustomer, Stage1AuthError } from '@/lib/stage1Auth';
+import { assertCustomerCanCommand, Stage1AuthError } from '@/lib/stage1Auth';
+import { requireCustomerSelectedHome } from '@/lib/customerSelectedHome';
 import { ALLOWED_OPERATIONS, descriptorBoundValue, operationDigest, targetDigest } from '@/lib/sensitiveOperationStepUp';
 import { prisma } from '@/lib/prisma';
 import { canonicalStepUpDescriptor } from '@/lib/stage1HubAuth';
@@ -12,7 +13,7 @@ export const dynamic = 'force-dynamic';
 
 export async function POST(request: Request) {
   try {
-    const customer = await requireCustomer(request);
+    const customer = await requireCustomerSelectedHome(request);
     const body = await request.json().catch(() => null) as Record<string, unknown> | null;
     if (!body || !validateStepUpChallengeRequest(body)) throw new Stage1AuthError(400, 'step_up_fields_invalid', 'A supported operation and unique targets are required');
     const operationKind = String(body.operationKind ?? '').trim();
@@ -78,13 +79,17 @@ export async function POST(request: Request) {
       } catch (error) { if (error && typeof error === 'object' && 'code' in error && (error as { code?: string }).code === 'P2002') throw new Stage1AuthError(403, 'step_up_descriptor_replayed', 'The hub descriptor challenge has already been used'); throw error; }
     }
     if (operationKind === 'support_access_approve') {
-      if (customer.role !== 'OWNER' && customer.role !== 'PROPERTY_MANAGER') throw new Stage1AuthError(403, 'support_approval_denied', 'Only a homeowner or permitted property manager can approve property support');
       if (targetIds.length !== 2) throw new Stage1AuthError(400, 'step_up_target_invalid', 'A support ticket and access request are required');
       const [ticketId, requestId] = targetIds;
-      const accessRequest = await prisma.supportAccessRequest.findUnique({ where: { id: requestId }, select: { id: true, ticketId: true, homeId: true, requestedScope: true, status: true } });
+      const accessRequest = await prisma.supportAccessRequest.findUnique({ where: { id: requestId }, select: { id: true, ticketId: true, homeId: true, requestedScope: true, targetMembershipId: true, targetUserId: true, status: true } });
       const ticket = accessRequest ? await prisma.supportTicket.findUnique({ where: { id: accessRequest.ticketId }, select: { id: true, homeId: true, status: true } }) : null;
-      if (!accessRequest || !ticket || ticket.id !== ticketId || accessRequest.requestedScope !== 'PROPERTY_SCOPE' || accessRequest.status !== 'REQUESTED' || ticket.status !== 'OPEN' || ticket.homeId !== customer.homeId) throw new Stage1AuthError(403, 'support_approval_denied', 'This property support request is not available for the selected home');
-      if (String(value) !== 'I approve this support access for my property') throw new Stage1AuthError(400, 'support_confirmation_required', 'Type the exact support confirmation before approving property diagnostics');
+      const isPropertyApprover = (customer.role === 'OWNER' || customer.role === 'PROPERTY_MANAGER') && accessRequest?.requestedScope === 'PROPERTY_SCOPE';
+      const isOwnTenantApprover = customer.role === 'TENANT' && accessRequest?.requestedScope === 'TENANT_SCOPE'
+        && accessRequest.targetMembershipId === customer.membershipId && accessRequest.targetUserId === customer.id;
+      if (!accessRequest || !ticket || ticket.id !== ticketId || (!isPropertyApprover && !isOwnTenantApprover) || accessRequest.status !== 'REQUESTED' || ticket.status !== 'OPEN' || ticket.homeId !== customer.homeId) throw new Stage1AuthError(403, 'support_approval_denied', 'This support request is not available for the selected membership');
+      const expectedConfirmation = accessRequest.requestedScope === 'PROPERTY_SCOPE'
+        ? 'I approve this support access for my property' : 'I approve this support access for me';
+      if (String(value) !== expectedConfirmation) throw new Stage1AuthError(400, 'support_confirmation_required', 'The support approval confirmation does not match this request');
     }
     if (operationKind === 'support_access_revoke') {
       if (customer.role !== 'OWNER' && customer.role !== 'PROPERTY_MANAGER') throw new Stage1AuthError(403, 'support_revoke_denied', 'Only a homeowner or permitted property manager can revoke property support');
@@ -94,6 +99,35 @@ export async function POST(request: Request) {
       const ticket = accessRequest ? await prisma.supportTicket.findUnique({ where: { id: accessRequest.ticketId }, select: { id: true, homeId: true, status: true } }) : null;
       if (!accessRequest || !ticket || ticket.id !== ticketId || accessRequest.requestedScope !== 'PROPERTY_SCOPE' || accessRequest.approvedByMembershipId !== customer.membershipId || !['APPROVED', 'ISSUED', 'REDEEMED'].includes(accessRequest.status) || ticket.status !== 'OPEN' || ticket.homeId !== customer.homeId) throw new Stage1AuthError(403, 'support_revoke_denied', 'This property support request is not available for the selected approving membership');
       if (String(value) !== 'I revoke this support access for my property') throw new Stage1AuthError(400, 'support_confirmation_required', 'Type the exact support confirmation before revoking property diagnostics');
+    }
+    if (operationKind === 'tenant_membership_remove') {
+      if (customer.role !== 'TENANT' || targetIds.length !== 2
+        || targetIds[0] !== customer.membershipId || targetIds[1] !== customer.homeId
+        || !value || typeof value !== 'object' || Array.isArray(value)) {
+        throw new Stage1AuthError(403, 'MEMBERSHIP_FORBIDDEN', 'Only the selected tenant can confirm removal of this Home access');
+      }
+      const removalValue = value as Record<string, unknown>;
+      if (Object.keys(removalValue).length !== 3
+        || !Number.isSafeInteger(removalValue.accessRevision) || Number(removalValue.accessRevision) < 1
+        || !Number.isSafeInteger(removalValue.homeManagementRevision) || Number(removalValue.homeManagementRevision) < 1
+        || typeof removalValue.confirmFinalAccountDeletion !== 'boolean') {
+        throw new Stage1AuthError(400, 'step_up_fields_invalid', 'The exact tenant access revision and deletion confirmation are required');
+      }
+      const [membership, home] = await Promise.all([
+        prisma.homeMembership.findFirst({ where: { id: customer.membershipId, customerAccountId: customer.id, homeId: customer.homeId, role: 'TENANT', status: 'ACTIVE' }, select: { accessRevision: true } }),
+        prisma.home.findFirst({ where: { id: customer.homeId, lifecycle: 'ACTIVE', installationStatus: 'COMPLETE' }, select: { managementRevision: true } }),
+      ]);
+      if (!membership || !home || membership.accessRevision !== removalValue.accessRevision || home.managementRevision !== removalValue.homeManagementRevision) {
+        throw new Stage1AuthError(409, 'REVISION_CONFLICT', 'Refresh the selected Home before confirming access removal');
+      }
+    }
+    if (operationKind === 'support_ticket_close') {
+      if (targetIds.length !== 1) throw new Stage1AuthError(400, 'step_up_target_invalid', 'A single selected-home support request is required');
+      const ticket = await prisma.supportTicket.findFirst({ where: {
+        id: targetIds[0], customerAccountId: customer.id, homeId: customer.homeId,
+        selectedMembershipId: customer.membershipId, status: { not: 'CLOSED' },
+      }, select: { id: true } });
+      if (!ticket) throw new Stage1AuthError(404, 'support_ticket_not_found', 'This support request is not available to the selected account and Home');
     }
     const digest = operationDigest({ customerAccountId: customer.id, customerSessionId: customer.sessionId, trustedDeviceId: customer.trustedDeviceId, homeId: customer.homeId, membershipId: customer.membershipId, hubInstallationId: customer.hubInstallationId, operationKind, targetIds, value: operationValue });
     const nonce = crypto.randomBytes(32).toString('base64url');
@@ -107,7 +141,7 @@ export async function POST(request: Request) {
 
 export async function DELETE(request: Request) {
   try {
-    const customer = await requireCustomer(request);
+    const customer = await requireCustomerSelectedHome(request);
     const body = await request.json().catch(() => null) as Record<string, unknown> | null;
     if (!body || !validateStepUpCancellationRequest(body)) throw new Stage1AuthError(400, 'step_up_fields_invalid', 'A valid challenge identifier is required');
     const challengeId = String(body.challengeId ?? '').trim();

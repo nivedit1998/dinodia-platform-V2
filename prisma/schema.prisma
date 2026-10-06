@@ -356,6 +356,8 @@ enum MemberPreferenceKind {
   DASHBOARD_LAYOUT
   FILTER_STATE
   QUIET_HOURS
+  NOTIFICATION_PREFERENCES
+  MANAGER_NOTIFICATION_ASSIGNMENT
 }
 
 enum AuditActorType {
@@ -385,6 +387,7 @@ model CustomerAccount {
   phoneNumber            String?        @db.VarChar(40)
   passwordHash           String         @db.VarChar(255)
   mustChangePassword     Boolean        @default(false)
+  usernameSelectionRequired Boolean     @default(false)
   passwordChangedAt      DateTime?
   status                 CustomerStatus @default(ACTIVE)
   securityVersion        Int            @default(1)
@@ -453,6 +456,7 @@ model TrustedDevice {
   revokedAt            DateTime?
   sessionVersion       Int                    @default(1)
   apnsTokenCiphertext  String?                @db.Text
+  apnsTokenDigest      String?                @unique @db.VarChar(64)
   apnsKeyVersion       Int?
   apnsEnvironment      NativeApnsEnvironment?
   apnsTokenRevision    Int                    @default(0)
@@ -478,11 +482,15 @@ model CustomerSession {
   id                          String    @id @default(uuid()) @db.Uuid
   customerAccountId           String    @db.Uuid
   trustedDeviceId             String    @db.Uuid
+  sessionFamilyId             String    @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   refreshTokenHash            String    @unique @db.VarChar(128)
+  accessTokenHash             String?   @unique @db.VarChar(128)
+  accessTokenExpiresAt        DateTime?
   securityVersion             Int
   trustedDeviceSessionVersion Int       @default(1)
   issuedAt                    DateTime  @default(now())
   expiresAt                   DateTime
+  absoluteExpiresAt           DateTime  @default(dbgenerated("(CURRENT_TIMESTAMP + INTERVAL '180 days')"))
   lastUsedAt                  DateTime  @default(now())
   revokedAt                   DateTime?
   revokeReason                String?   @db.VarChar(160)
@@ -494,6 +502,9 @@ model CustomerSession {
 
   @@index([customerAccountId, revokedAt, expiresAt])
   @@index([trustedDeviceId, revokedAt])
+  @@index([sessionFamilyId, revokedAt])
+  @@index([customerAccountId, absoluteExpiresAt])
+  @@index([accessTokenExpiresAt, revokedAt])
 }
 
 model PolicyAcceptance {
@@ -512,18 +523,20 @@ model PolicyAcceptance {
 }
 
 model AuthChallenge {
-  id                String    @id @default(uuid()) @db.Uuid
-  customerAccountId String?   @db.Uuid
-  purpose           String    @db.VarChar(80)
-  targetEmail       String?   @db.VarChar(320)
-  tokenHash         String    @unique @db.VarChar(128)
-  expiresAt         DateTime
-  approvedAt        DateTime?
-  consumedAt        DateTime?
-  revokedAt         DateTime?
-  attemptCount      Int       @default(0)
-  supersededById    String?   @db.Uuid
-  createdAt         DateTime  @default(now())
+  id                  String    @id @default(uuid()) @db.Uuid
+  customerAccountId   String?   @db.Uuid
+  purpose             String    @db.VarChar(80)
+  targetEmail         String?   @db.VarChar(320)
+  tokenHash           String    @unique @db.VarChar(128)
+  expiresAt           DateTime
+  approvedAt          DateTime?
+  consumedAt          DateTime?
+  revokedAt           DateTime?
+  attemptCount        Int       @default(0)
+  deliveryStatus      String    @default("PENDING") @db.VarChar(24)
+  deliveryAttemptedAt DateTime?
+  supersededById      String?   @db.Uuid
+  createdAt           DateTime  @default(now())
 
   customerAccount CustomerAccount? @relation(fields: [customerAccountId], references: [id], onDelete: Cascade)
 
@@ -838,14 +851,14 @@ model HubInstallation {
   lanTlsState                      String                   @default("UNKNOWN") @db.VarChar(24)
   lanTlsIdentityGeneration         Int?
   lanTlsCertificateGeneration      Int?
-  lanTlsCurrentSpkiPin              String?                  @db.VarChar(64)
-  lanTlsCurrentNotBefore            DateTime?
-  lanTlsCurrentNotAfter             DateTime?
+  lanTlsCurrentSpkiPin             String?                  @db.VarChar(64)
+  lanTlsCurrentNotBefore           DateTime?
+  lanTlsCurrentNotAfter            DateTime?
   lanTlsNextCertificateGeneration  Int?
-  lanTlsNextSpkiPin                 String?                  @db.VarChar(64)
-  lanTlsNextNotBefore               DateTime?
-  lanTlsNextNotAfter                DateTime?
-  lanTlsAcknowledgedGeneration      Int                      @default(0)
+  lanTlsNextSpkiPin                String?                  @db.VarChar(64)
+  lanTlsNextNotBefore              DateTime?
+  lanTlsNextNotAfter               DateTime?
+  lanTlsAcknowledgedGeneration     Int                      @default(0)
   cloudUrl                         String?                  @db.VarChar(500)
   cloudUrlVerifiedAt               DateTime?
   cloudflareTunnelId               String?                  @db.VarChar(200)
@@ -1085,10 +1098,10 @@ model AreaAccessRequest {
   area         Area             @relation(fields: [areaId], references: [id], onDelete: Restrict)
   requester    CustomerAccount  @relation(fields: [requesterAccountId], references: [id], onDelete: Cascade)
 
+  @@unique([id, areaId, homeId])
   @@index([requesterAccountId, status, expiresAt])
   @@index([areaId, status, expiresAt])
   @@index([areaQrCredentialId, status])
-  @@unique([id, areaId, homeId])
 }
 
 model HomeClaimReference {
@@ -1169,9 +1182,9 @@ model HomeClaimReservation {
   releasedBy      CompanyEmployeeAccount? @relation("ReservationReleaser", fields: [releasedByEmployeeId], references: [id], onDelete: SetNull)
   pendingSetup    PendingHomeSetup?
 
+  @@unique([id, claimReferenceId, customerAccountId])
   @@index([claimReferenceId, state, expiresAt])
   @@index([customerAccountId, state])
-  @@unique([id, claimReferenceId, customerAccountId])
 }
 
 model PendingHomeSetup {
@@ -1460,9 +1473,9 @@ model StepUpChallenge {
   customerAccountId      String    @db.Uuid
   customerSessionId      String    @db.Uuid
   trustedDeviceId        String    @db.Uuid
-  homeId                 String    @db.Uuid
-  membershipId           String    @db.Uuid
-  hubInstallationId      String    @db.Uuid
+  homeId                 String?   @db.Uuid
+  membershipId           String?   @db.Uuid
+  hubInstallationId      String?   @db.Uuid
   operationKind          String    @db.VarChar(120)
   targetDigest           String    @db.VarChar(128)
   normalizedValueDigest  String    @db.VarChar(128)
@@ -1546,11 +1559,11 @@ model SupportAccessRequest {
   updatedAt                     DateTime                    @updatedAt
   notifications                 SupportAccessNotification[]
 
+  @@unique([id, homeId])
   @@index([ticketId, status])
   @@index([homeId, status])
   @@index([requestedByEmployeeId, status])
   @@index([codeHash, codeExpiresAt])
-  @@unique([id, homeId])
 }
 
 model SupportSession {
@@ -1575,9 +1588,9 @@ model SupportSession {
   updatedAt          DateTime                    @updatedAt
   notifications      SupportAccessNotification[]
 
+  @@unique([id, homeId])
   @@index([ticketId, status])
   @@index([hubInstallationId, status, expiresAt])
-  @@unique([id, homeId])
 }
 
 // Durable, privacy-scoped customer notification records for support access.

@@ -34,6 +34,7 @@
     "stage5:migration:target": "node scripts/verify_native_v2_migration_target.mjs --stage5-sync",
     "stage5:incident-deadline:migration:target": "node scripts/verify_native_v2_migration_target.mjs --stage5-incident-deadlines",
     "stage5:incident-source-kind:migration:target": "node scripts/verify_native_v2_migration_target.mjs --stage5-incident-source-kind",
+    "stage6:migration:target": "node scripts/verify_native_v2_migration_target.mjs --stage6-customer-auth",
     "evidence:production-read-only": "node scripts/read_only_production_inventory.mjs",
     "foundation:target": "node scripts/assert_v2_target.mjs --mode local",
     "db:validate-target": "node scripts/assert_v2_target.mjs --mode \"${V2_ENVIRONMENT:-local}\"",

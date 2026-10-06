@@ -47,6 +47,14 @@ let seededWork;
 let sesServer;
 let sesShouldFail = false;
 let capturedInvitation;
+let capturedCustomerInvitation;
+let capturedCustomerInvitationTempPassword;
+let customerInvitationEmailCount = 0;
+let capturedCustomerVerification;
+let capturedCustomerEmailChange;
+let capturedCustomerReset;
+let capturedPublicSupportCode;
+let capturedCustomerAuthPath;
 let customerFixture;
 let fakePhysicalCommandCount = 0;
 let osHarnessNow = Date.now();
@@ -99,7 +107,7 @@ function loadNativeV1Contract() {
   const source = fs.readFileSync(path.join(root, 'src/lib/contracts/dinodiaV1.ts'), 'utf8');
   const compiled = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText;
   const loaded = { exports: {} };
-  new Function('module', 'exports', compiled)(loaded, loaded.exports);
+  new Function('require', 'module', 'exports', compiled)(require, loaded, loaded.exports);
   return loaded.exports;
 }
 const nativeV1Contract = loadNativeV1Contract();
@@ -257,6 +265,7 @@ function baseEnv() {
   const company = keyPair();
   const app = keyPair();
   const operator = keyPair();
+  const disposablePolicyText = 'Disposable test-only customer policy for the Stage 6 integration harness. It is not Production legal copy.';
   return {
     ...safeProcessEnvironment(),
     CI: '1', NODE_ENV: 'production', V2_ENVIRONMENT: 'test', STAGE1_INTERNAL_OPERATOR_DAY_SESSION: 'true',
@@ -275,6 +284,9 @@ function baseEnv() {
     JWT_SECRET: crypto.randomBytes(32).toString('base64url'), PLATFORM_DATA_ENCRYPTION_KEY: crypto.randomBytes(32).toString('base64'),
     CLAIM_REFERENCE_PEPPER: crypto.randomBytes(32).toString('base64url'), AUDIT_LOG_HASH_SALT: crypto.randomBytes(32).toString('base64url'),
     DINODIA_NATIVE_POLICY_VERSION: `harness-current-policy-${crypto.randomUUID()}`,
+    DINODIA_NATIVE_POLICY_TITLE: 'Disposable Stage 6 policy fixture',
+    DINODIA_NATIVE_POLICY_TEXT: disposablePolicyText,
+    DINODIA_NATIVE_POLICY_CONTENT_SHA256: sha256(disposablePolicyText),
     CRON_SECRET: crypto.randomBytes(32).toString('base64url'), STAGE1_CONTRACT_SECRET: crypto.randomBytes(32).toString('base64url'),
     COMPANY_PORTAL_SESSION_PRIVATE_KEY: company.privateKey, COMPANY_PORTAL_SESSION_PUBLIC_KEYS: company.publicKey,
     DINODIA_APP_SESSION_PRIVATE_KEY: app.privateKey, DINODIA_APP_PUBLIC_KEYS: app.publicKey,
@@ -403,7 +415,22 @@ async function startFakeSes() {
     request.on('data', (chunk) => chunks.push(Buffer.from(chunk)));
     request.on('end', () => {
       const body = Buffer.concat(chunks).toString('utf8');
-      if (!sesShouldFail) capturedInvitation = body.match(/#invitation=([A-Za-z0-9_-]+)/)?.[1] || capturedInvitation;
+      if (!sesShouldFail) {
+        capturedInvitation = body.match(/#invitation=([A-Za-z0-9_-]{40,64})/)?.[1] || capturedInvitation;
+        const customerInvitation = body.match(/#invitation=([0-9a-f-]{36})/i)?.[1];
+        if (customerInvitation) { capturedCustomerInvitation = customerInvitation; customerInvitationEmailCount += 1; }
+        capturedCustomerInvitationTempPassword = body.match(/One-time temporary password: ([A-Za-z0-9_-]{24,160})/i)?.[1] || capturedCustomerInvitationTempPassword;
+        const verification = body.match(/#verify-email=([A-Za-z0-9_-]{40,64})&challenge=([0-9a-f-]{36})/i);
+        const emailChange = body.match(/#change-email=([A-Za-z0-9_-]{40,64})&challenge=([0-9a-f-]{36})/i);
+        const reset = body.match(/#reset-password=([A-Za-z0-9_-]{40,64})&challenge=([0-9a-f-]{36})/i);
+        const customerAuthPath = body.match(/https:\/\/dinodia-platform-v2\.vercel\.app(\/app\/auth)#(?:verify-email|change-email|reset-password)=/i);
+        if (customerAuthPath) capturedCustomerAuthPath = customerAuthPath[1];
+        if (verification) capturedCustomerVerification = { token: verification[1], challengeId: verification[2] };
+        if (emailChange) capturedCustomerEmailChange = { token: emailChange[1], challengeId: emailChange[2] };
+        if (reset) capturedCustomerReset = { token: reset[1], challengeId: reset[2] };
+        const publicSupportCode = body.match(/one-time support verification code is (\d{6})/i);
+        if (publicSupportCode) capturedPublicSupportCode = publicSupportCode[1];
+      }
       response.statusCode = sesShouldFail ? 500 : 200;
       response.setHeader('content-type', 'application/json');
       response.end(sesShouldFail ? '{}' : JSON.stringify({ MessageId: 'stage1-test-message' }));
@@ -432,7 +459,17 @@ async function stopPlatform() {
 }
 
 async function startPlatform(runEnv) {
-  platformProcess = spawn(process.execPath, ['node_modules/next/dist/bin/next', 'start', '-p', appPort], { cwd: root, env: runEnv, stdio: 'ignore' });
+  platformProcess = spawn(process.execPath, ['node_modules/next/dist/bin/next', 'start', '-p', appPort], { cwd: root, env: runEnv, stdio: ['ignore', 'pipe', 'pipe'] });
+  // Keep only deliberately value-free test diagnostics. Next/runtime output
+  // can contain request context; discard it rather than forwarding raw logs.
+  for (const stream of [platformProcess.stdout, platformProcess.stderr]) {
+    let pending = '';
+    stream?.on('data', (chunk) => {
+      pending = `${pending}${chunk.toString('utf8')}`.slice(-4096);
+      const lines = pending.split(/\r?\n/);
+      pending = lines.pop() ?? '';
+    });
+  }
   await waitFor(async () => { try { return (await fetch(`http://127.0.0.1:${appPort}/api/health`)).status === 200; } catch { return false; } }, 'Platform server');
 }
 
@@ -730,19 +767,28 @@ async function customerAuthorizationChecks(deliveryEnv) {
   console.log('[stage2:integration] PASS: actual customer login rejects unknown authority fields before creating a session');
   const customerLogin = await fetchJson(`${base}/api/v2/session`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ email, password: customerPassword, deviceInstallationId: trustedInstallationId, publicKey: phone.publicKey, deviceName: 'Harness phone', model: 'integration-test', osFamily: 'test', osVersion: 'test' }) });
   updateCookieJar(customerCookieJar, customerLogin.response);
-  const rawSession = cookieValue(customerCookieJar, 'dinodia_customer_session');
+  let rawSession = cookieValue(customerCookieJar, 'dinodia_customer_session');
+  const initialRawSession = rawSession;
   const loginReceiptKeys = Object.keys(customerLogin.body || {}).sort().join(',');
   if (customerLogin.response.status !== 200 || !rawSession || loginReceiptKeys !== 'accountId,expiresAt,ok,sessionId,trustedDeviceId' || Object.hasOwn(customerLogin.body || {}, 'token') || Object.hasOwn(customerLogin.body || {}, 'refreshToken') || !nativeV1Contract.validateCustomerSessionReceipt(customerLogin.body)) fail(`Canonical customer login did not issue a valid metadata receipt plus HttpOnly session cookie (${customerLogin.response.status})`);
-  const session = await prisma.customerSession.findFirstOrThrow({ where: { customerAccountId: account.id, trustedDeviceId: trusted.id, revokedAt: null }, orderBy: { createdAt: 'desc' } });
+  let session = await prisma.customerSession.findFirstOrThrow({ where: { customerAccountId: account.id, trustedDeviceId: trusted.id, revokedAt: null }, orderBy: { createdAt: 'desc' } });
   const sessionWithoutCookie = await fetchJson(`${base}/api/v2/session`);
   if (sessionWithoutCookie.response.status !== 401 || sessionWithoutCookie.body.error?.code !== 'AUTH_REQUIRED' || !sessionWithoutCookie.body.error?.requestId || Object.hasOwn(sessionWithoutCookie.body, 'errorCode')) fail(`Account session restore did not return the canonical Native V1 authentication error (${sessionWithoutCookie.response.status})`);
   const restoredAccount = await fetchJson(`${base}/api/v2/session`, { headers: { cookie: `dinodia_customer_session=${encodeURIComponent(rawSession)}` } });
+  updateCookieJar(customerCookieJar, restoredAccount.response);
+  rawSession = cookieValue(customerCookieJar, 'dinodia_customer_session');
+  session = await prisma.customerSession.findFirstOrThrow({ where: { customerAccountId: account.id, trustedDeviceId: trusted.id, revokedAt: null }, orderBy: { createdAt: 'desc' } });
+  const initialSession = await prisma.customerSession.findUniqueOrThrow({ where: { refreshTokenHash: sha256(initialRawSession) }, select: { id: true, revokedAt: true, revokeReason: true, sessionFamilyId: true, absoluteExpiresAt: true, issuedAt: true } });
   const restoredMemberships = restoredAccount.body.memberships || [];
   const restoredTenant = restoredMemberships.find((membership) => membership.homeMembershipId === tenantMembership.id);
   const restoredOwner = restoredMemberships.find((membership) => membership.homeMembershipId === ownerMembership.id);
-  if (restoredAccount.response.status !== 200 || !nativeV1Contract.validateAccountSessionContext(restoredAccount.body) || restoredAccount.body.accountId !== account.id || restoredAccount.body.sessionId !== session.id || restoredAccount.body.trustedDeviceId !== trusted.id || restoredMemberships.length !== 2 || restoredTenant?.role !== 'TENANT' || JSON.stringify(restoredTenant?.areaIds) !== JSON.stringify([areaOne.id]) || restoredTenant?.areaIds?.includes(areaOne.osAreaId) || restoredOwner?.role !== 'OWNER' || restoredOwner?.areaIds?.length !== 0 || Object.hasOwn(restoredAccount.body, 'token') || Object.hasOwn(restoredAccount.body, 'hubInstallationId')) fail(`Canonical account restore did not return the current opaque proof context and only canonical Platform Area UUIDs for this account's active membership context (${restoredAccount.response.status})`);
+  if (restoredAccount.response.status !== 200 || !nativeV1Contract.validateAccountSessionContext(restoredAccount.body) || restoredAccount.body.accountId !== account.id || restoredAccount.body.sessionId !== session.id || restoredAccount.body.trustedDeviceId !== trusted.id || restoredMemberships.length !== 2 || restoredTenant?.role !== 'TENANT' || JSON.stringify(restoredTenant?.areaIds) !== JSON.stringify([areaOne.id]) || restoredTenant?.areaIds?.includes(areaOne.osAreaId) || restoredOwner?.role !== 'OWNER' || restoredOwner?.areaIds?.length !== 0 || Object.hasOwn(restoredAccount.body, 'token') || Object.hasOwn(restoredAccount.body, 'hubInstallationId') || !initialSession.revokedAt || initialSession.revokeReason !== 'refresh_token_rotated' || session.sessionFamilyId !== initialSession.sessionFamilyId || session.absoluteExpiresAt.getTime() !== initialSession.absoluteExpiresAt.getTime() || session.absoluteExpiresAt.getTime() > initialSession.issuedAt.getTime() + 180 * 24 * 60 * 60 * 1000 + 1000) fail(`Canonical account restore did not return current membership context and bounded, rotated refresh authority (${restoredAccount.response.status})`);
   const restoredLegacyPath = await fetchJson(`${base}/api/v2/auth/session`, { headers: { cookie: `dinodia_customer_session=${encodeURIComponent(rawSession)}` } });
-  if (restoredLegacyPath.response.status !== 200 || JSON.stringify(restoredLegacyPath.body) !== JSON.stringify(restoredAccount.body)) fail('The compatibility session path drifted from the canonical account-session DTO');
+  updateCookieJar(customerCookieJar, restoredLegacyPath.response);
+  const afterLegacyRawSession = cookieValue(customerCookieJar, 'dinodia_customer_session');
+  if (restoredLegacyPath.response.status !== 200 || restoredLegacyPath.body.accountId !== restoredAccount.body.accountId || JSON.stringify(restoredLegacyPath.body.memberships) !== JSON.stringify(restoredAccount.body.memberships) || afterLegacyRawSession === rawSession || restoredLegacyPath.body.sessionId === restoredAccount.body.sessionId) fail('The compatibility session path did not preserve the account DTO while rotating the refresh cookie');
+  rawSession = afterLegacyRawSession;
+  session = await prisma.customerSession.findFirstOrThrow({ where: { customerAccountId: account.id, trustedDeviceId: trusted.id, revokedAt: null }, orderBy: { createdAt: 'desc' } });
   const sessionExpiry = session.expiresAt;
   await prisma.customerSession.update({ where: { id: session.id }, data: { expiresAt: new Date(Date.now() - 1) } });
   const expiredRestore = await fetchJson(`${base}/api/v2/session`, { headers: { cookie: `dinodia_customer_session=${encodeURIComponent(rawSession)}` } });
@@ -761,6 +807,21 @@ async function customerAuthorizationChecks(deliveryEnv) {
   const logoutRow = await prisma.customerSession.findUnique({ where: { refreshTokenHash: sha256(logoutRawSession) }, select: { revokedAt: true } });
   const afterLogoutRestore = await fetchJson(`${base}/api/v2/session`, { headers: { cookie: `dinodia_customer_session=${encodeURIComponent(logoutRawSession)}` } });
   if (logoutRequest.response.status !== 200 || !nativeV1Contract.validateCustomerSessionLogoutReceipt(logoutRequest.body) || !logoutRow?.revokedAt || afterLogoutRestore.response.status !== 401) fail('Canonical logout did not return the exact receipt, durably revoke its session and deny a subsequent restore');
+  const replayPhone = keyPair();
+  const replayInstallationId = `harness-refresh-replay-${crypto.randomUUID()}`;
+  const replayLogin = await fetchJson(`${base}/api/v2/session`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ email, password: customerPassword, deviceInstallationId: replayInstallationId, publicKey: replayPhone.publicKey, deviceName: 'Harness refresh replay phone', model: 'integration-test', osFamily: 'test', osVersion: 'test' }) });
+  const replayJar = {};
+  updateCookieJar(replayJar, replayLogin.response);
+  const replayOldToken = cookieValue(replayJar, 'dinodia_customer_session');
+  const replayRestore = await fetchJson(`${base}/api/v2/session`, { headers: { cookie: `dinodia_customer_session=${encodeURIComponent(replayOldToken)}` } });
+  updateCookieJar(replayJar, replayRestore.response);
+  const replayCurrentToken = cookieValue(replayJar, 'dinodia_customer_session');
+  const replayCurrentRow = await prisma.customerSession.findUniqueOrThrow({ where: { refreshTokenHash: sha256(replayCurrentToken) }, select: { sessionFamilyId: true } });
+  const replayedOldToken = await fetchJson(`${base}/api/v2/session`, { headers: { cookie: `dinodia_customer_session=${encodeURIComponent(replayOldToken)}` } });
+  const revokedReplayFamily = await prisma.customerSession.findMany({ where: { sessionFamilyId: replayCurrentRow.sessionFamilyId }, select: { revokedAt: true, revokeReason: true } });
+  const unrelatedPhoneRemains = await prisma.customerSession.findUnique({ where: { refreshTokenHash: sha256(rawSession) }, select: { revokedAt: true } });
+  if (replayLogin.response.status !== 200 || replayRestore.response.status !== 200 || replayedOldToken.response.status !== 401 || revokedReplayFamily.length !== 2 || revokedReplayFamily.some((row) => !row.revokedAt || !['refresh_token_rotated','refresh_token_reuse'].includes(row.revokeReason || '')) || !unrelatedPhoneRemains || unrelatedPhoneRemains.revokedAt) fail('Refresh-token replay did not revoke only the reused phone family while preserving another trusted installation');
+  console.log('[stage1:integration] PASS: refresh rotates, bounds inactivity/absolute expiry and revokes reused-token family without signing out another phone');
   console.log('[stage1:integration] PASS: actual customer login cookie restores the canonical two-home membership context; canonical logout revokes that cookie-backed session durably');
   console.log('[stage1:integration] PASS: real account-session route restores two role-distinct homes and tenant area grants, denies anonymous restore, and returns no hub bearer');
   const propertyPhone = keyPair();
@@ -773,6 +834,42 @@ async function customerAuthorizationChecks(deliveryEnv) {
   const managerTrusted = await prisma.trustedDevice.create({ data: { customerAccountId: managerAccount.id, deviceInstallationId: `harness-manager-phone-${crypto.randomUUID()}`, publicKey: managerPhone.publicKey, publicKeyThumbprint: managerPhoneThumbprint, deviceName: 'Harness property-manager phone' } });
   const managerRawSession = `harness-manager-session-${crypto.randomUUID()}`;
   const managerSession = await prisma.customerSession.create({ data: { customerAccountId: managerAccount.id, trustedDeviceId: managerTrusted.id, refreshTokenHash: sha256(managerRawSession), securityVersion: managerAccount.securityVersion, trustedDeviceSessionVersion: managerTrusted.sessionVersion, expiresAt: new Date(Date.now() + 60 * 60 * 1000) } });
+  // Selected-home preferences are behind the account-global policy gate. These
+  // synthetic owner/manager/tenant identities are disposable integration
+  // fixtures, so seed the server-current acceptance explicitly before testing
+  // the preference route rather than mistaking AUTH_REQUIRED/policy denial
+  // for a role-catalogue result.
+  await prisma.policyAcceptance.createMany({ data: [propertyAccount.id, managerAccount.id, account.id].map((customerAccountId) => ({
+    customerAccountId, policyKind: 'DINODIA_NATIVE', policyVersion: deliveryEnv.DINODIA_NATIVE_POLICY_VERSION,
+  })), skipDuplicates: true });
+  const preferenceHeaders = (raw, homeId) => ({ cookie: `dinodia_customer_session=${encodeURIComponent(raw)}`, 'x-dinodia-home-id': homeId, 'content-type': 'application/json' });
+  const ownerAssignments = await fetchJson(`${base}/api/v2/homes/${homeOne.id}/preferences`, { method: 'PUT', headers: preferenceHeaders(propertyRawSession, homeOne.id), body: JSON.stringify({ kind: 'MANAGER_NOTIFICATION_ASSIGNMENT', expectedRevision: 0, document: { version: 1, assignments: [{ membershipId: managerMembership.id, enabledFamilies: ['hub_availability', 'installation_updates'] }] } }) });
+  const managerFamilyChoice = await fetchJson(`${base}/api/v2/homes/${homeOne.id}/preferences`, { method: 'PUT', headers: preferenceHeaders(managerRawSession, homeOne.id), body: JSON.stringify({ kind: 'NOTIFICATION_PREFERENCES', expectedRevision: 0, document: { version: 1, enabledFamilies: ['hub_availability'] } }) });
+  const managerUnassignedChoice = await fetchJson(`${base}/api/v2/homes/${homeOne.id}/preferences`, { method: 'PUT', headers: preferenceHeaders(managerRawSession, homeOne.id), body: JSON.stringify({ kind: 'NOTIFICATION_PREFERENCES', expectedRevision: 1, document: { version: 1, enabledFamilies: ['automation_activity'] } }) });
+  const managerPreferenceAfterDenial = await prisma.memberPreferenceDocument.findUnique({ where: { membershipId_kind: { membershipId: managerMembership.id, kind: 'NOTIFICATION_PREFERENCES' } }, select: { revision: true, document: true } });
+  const tenantAllowedPreference = await fetchJson(`${base}/api/v2/homes/${homeOne.id}/preferences`, { method: 'PUT', headers: preferenceHeaders(rawSession, homeOne.id), body: JSON.stringify({ kind: 'NOTIFICATION_PREFERENCES', expectedRevision: 0, document: { version: 1, enabledFamilies: ['own_tenant_device_outages'] } }) });
+  const tenantOwnerFamilyDenial = await fetchJson(`${base}/api/v2/homes/${homeOne.id}/preferences`, { method: 'PUT', headers: preferenceHeaders(rawSession, homeOne.id), body: JSON.stringify({ kind: 'NOTIFICATION_PREFERENCES', expectedRevision: 1, document: { version: 1, enabledFamilies: ['tenant_access_requests'] } }) });
+  const invalidManagerTarget = await fetchJson(`${base}/api/v2/homes/${homeOne.id}/preferences`, { method: 'PUT', headers: preferenceHeaders(propertyRawSession, homeOne.id), body: JSON.stringify({ kind: 'MANAGER_NOTIFICATION_ASSIGNMENT', expectedRevision: 1, document: { version: 1, assignments: [{ membershipId: tenantMembership.id, enabledFamilies: ['hub_availability'] }] } }) });
+  const ownerPreferenceCatalogue = await fetchJson(`${base}/api/v2/homes/${homeOne.id}/preferences`, { headers: preferenceHeaders(propertyRawSession, homeOne.id) });
+  const managerPreferenceCatalogue = await fetchJson(`${base}/api/v2/homes/${homeOne.id}/preferences`, { headers: preferenceHeaders(managerRawSession, homeOne.id) });
+  const tenantPreferenceCatalogue = await fetchJson(`${base}/api/v2/homes/${homeOne.id}/preferences`, { headers: preferenceHeaders(rawSession, homeOne.id) });
+  const ownerAssignmentsAfterDenial = await prisma.memberPreferenceDocument.findUnique({ where: { membershipId_kind: { membershipId: propertyMembership.id, kind: 'MANAGER_NOTIFICATION_ASSIGNMENT' } }, select: { revision: true } });
+  if (ownerAssignments.response.status !== 200 || ownerAssignments.body?.revision !== 1
+    || managerFamilyChoice.response.status !== 200 || managerFamilyChoice.body?.revision !== 1
+    || managerUnassignedChoice.response.status !== 403 || managerPreferenceAfterDenial?.revision !== 1
+    || tenantAllowedPreference.response.status !== 200 || tenantAllowedPreference.body?.revision !== 1
+    || tenantOwnerFamilyDenial.response.status !== 400
+    || invalidManagerTarget.response.status !== 400 || ownerAssignmentsAfterDenial?.revision !== 1
+    || ownerPreferenceCatalogue.body?.notificationCatalogue?.role !== 'OWNER'
+    || ownerPreferenceCatalogue.body?.notificationCatalogue?.availableFamilies?.length !== 6
+    || managerPreferenceCatalogue.body?.notificationCatalogue?.role !== 'PROPERTY_MANAGER'
+    || JSON.stringify(managerPreferenceCatalogue.body?.notificationCatalogue?.availableFamilies?.slice().sort()) !== JSON.stringify(['hub_availability', 'installation_updates'].sort())
+    || tenantPreferenceCatalogue.body?.notificationCatalogue?.role !== 'TENANT'
+    || tenantPreferenceCatalogue.body?.notificationCatalogue?.availableFamilies?.length !== 6
+    || !ownerPreferenceCatalogue.body?.notificationCatalogue?.mandatoryFamilies?.includes('support_security')) {
+    fail(`Role notification preference boundary failed (owner=${ownerAssignments.response.status}/${ownerAssignments.body?.error?.code ?? 'no-code'}, manager=${managerFamilyChoice.response.status}/${managerUnassignedChoice.response.status}, tenant=${tenantAllowedPreference.response.status}/${tenantOwnerFamilyDenial.response.status}, invalidTarget=${invalidManagerTarget.response.status})`);
+  }
+  console.log('[stage6:integration] PASS: notification preferences are role-catalogue constrained, the original owner alone assigns manager families, and denied role/target changes preserve stored revisions');
   const issue = async (homeId) => fetchJson(`${base}/api/v2/hub-sessions`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-session': rawSession }, body: JSON.stringify({ homeId }) });
   const issueProperty = async () => fetchJson(`${base}/api/v2/hub-sessions`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-session': propertyRawSession }, body: JSON.stringify({ homeId: homeOne.id }) });
   const issueManager = async () => fetchJson(`${base}/api/v2/hub-sessions`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-session': managerRawSession }, body: JSON.stringify({ homeId: homeOne.id }) });
@@ -1327,7 +1424,10 @@ async function customerAuthorizationChecks(deliveryEnv) {
       ...(method === 'GET' ? {} : { body: '{}' }),
     });
     if (response.response.status !== 401) fail(`${label}: cross-principal request was not denied with HTTP 401 (${response.response.status})`);
-    if (route.startsWith('/api/v2/')) {
+    // The authenticated Room-request endpoint lives under /api/public only
+    // because its QR reference is public; the operation itself is a native
+    // customer-session route and must retain the canonical Native V2 error.
+    if (route.startsWith('/api/v2/') || route === '/api/public/areas/request-access') {
       if (response.body?.error?.code !== expectedCode || !response.body?.error?.requestId || Object.hasOwn(response.body || {}, 'errorCode')) fail(`${label}: Native V2 denial did not return canonical 401 ${expectedCode} (${response.response.status}/${response.body?.error?.code || 'no_code'})`);
     } else if (response.body?.errorCode !== expectedCode || typeof response.body?.error !== 'string' || response.body?.error?.code) {
       fail(`${label}: Stage 1 employee boundary did not retain its bounded employee-authentication denial (${response.response.status}/${response.body?.errorCode || 'no_code'})`);
@@ -1346,9 +1446,37 @@ async function customerAuthorizationChecks(deliveryEnv) {
   const invalidCategoryTicket = await fetchJson(`${base}/api/v2/support/tickets`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-app-token': tenantToken.body.token }, body: JSON.stringify({ category: 'HARNESS_PRIVATE', description: 'Must be rejected before persistence' }) });
   const ticketCountAfterInvalidCategory = await prisma.supportTicket.count({ where: { customerAccountId: account.id } });
   if (invalidCategoryTicket.response.status !== 400 || ticketCountAfterInvalidCategory !== ticketCountBeforeInvalidCategory) fail('The support route accepted an undeclared category or persisted a denied ticket');
-  const ticketResponse = await fetchJson(`${base}/api/v2/support/tickets`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-app-token': tenantToken.body.token }, body: JSON.stringify({ category: 'ACCESS_OR_PERMISSIONS', description: 'Disposable tenant-private support test' }) });
+  const supportCreateKey = `support-create-${crypto.randomUUID()}`;
+  const supportCreateBody = { category: 'ACCESS_OR_PERMISSIONS', description: 'Disposable tenant-private support test' };
+  const ticketResponse = await fetchJson(`${base}/api/v2/support/tickets`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-app-token': tenantToken.body.token, 'idempotency-key': supportCreateKey }, body: JSON.stringify(supportCreateBody) });
   if (ticketResponse.response.status !== 201 || ticketResponse.body.ticket?.status !== 'OPEN' || !ticketResponse.body.ticket?.createdAt) fail(`Customer support ticket creation failed its canonical receipt (${ticketResponse.response.status})`);
   const ticketId = ticketResponse.body.ticket?.id;
+  const ticketCountAfterCreate = await prisma.supportTicket.count({ where: { customerAccountId: account.id, homeId: homeOne.id } });
+  const ticketTimelineBeforeRetry = await prisma.nativeSupportTicketTimeline.count({ where: { ticketId } });
+  const ticketRetry = await fetchJson(`${base}/api/v2/support/tickets`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-app-token': tenantToken.body.token, 'idempotency-key': supportCreateKey }, body: JSON.stringify(supportCreateBody) });
+  const ticketConflict = await fetchJson(`${base}/api/v2/support/tickets`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-app-token': tenantToken.body.token, 'idempotency-key': supportCreateKey }, body: JSON.stringify({ ...supportCreateBody, description: `${supportCreateBody.description} changed` }) });
+  if (ticketRetry.response.status !== 201 || ticketRetry.body.ticket?.id !== ticketId
+    || ticketRetry.response.headers.get('idempotent-replay') !== 'true'
+    || ticketConflict.response.status !== 409
+    || await prisma.supportTicket.count({ where: { customerAccountId: account.id, homeId: homeOne.id } }) !== ticketCountAfterCreate
+    || await prisma.nativeSupportTicketTimeline.count({ where: { ticketId } }) !== ticketTimelineBeforeRetry) {
+    fail('Exact support create retry did not reconcile the original receipt, or changed-body key reuse caused additional ticket/timeline effects');
+  }
+  console.log('[stage6:integration] PASS: authenticated support create exact retry returned the original ticket once; changed-body key reuse conflicted with zero extra ticket or timeline rows');
+  await prisma.nativeSupportTicketTimeline.create({ data: { ticketId, homeId: homeOne.id, eventCode: 'INTERNAL_ONLY', actorType: 'EMPLOYEE', actorId: supportEmployee.id, customerVisible: false, safeSummary: 'PRIVATE_INTERNAL_SUPPORT_DETAIL_SENTINEL', purgeAt: new Date(Date.now() + 365 * 24 * 60 * 60 * 1000) } });
+  const ownSupportList = await fetchJson(`${base}/api/v2/support/tickets`, { headers: { 'x-dinodia-app-token': tenantToken.body.token } });
+  const ownSupportDetail = await fetchJson(`${base}/api/v2/support/tickets/${ticketId}`, { headers: { 'x-dinodia-app-token': tenantToken.body.token } });
+  const otherAccountSupportDetail = await fetchJson(`${base}/api/v2/support/tickets/${ticketId}`, { headers: { 'x-dinodia-app-token': propertyToken.body.token } });
+  const otherAccountSupportList = await fetchJson(`${base}/api/v2/support/tickets`, { headers: { 'x-dinodia-app-token': propertyToken.body.token } });
+  if (ownSupportList.response.status !== 200 || !ownSupportList.body.tickets?.some((item) => item.ticketId === ticketId)
+    || JSON.stringify(ownSupportList.body).includes('Disposable tenant-private support test')
+    || ownSupportDetail.response.status !== 200 || ownSupportDetail.body.ticket?.description !== 'Disposable tenant-private support test'
+    || JSON.stringify(ownSupportDetail.body).includes('PRIVATE_INTERNAL_SUPPORT_DETAIL_SENTINEL')
+    || otherAccountSupportDetail.response.status !== 404 || JSON.stringify(otherAccountSupportDetail.body).includes('Disposable tenant-private support test')
+    || otherAccountSupportList.response.status !== 200 || otherAccountSupportList.body.tickets?.some((item) => item.ticketId === ticketId)) {
+    fail(`Customer support list/detail did not preserve exact requester privacy (${JSON.stringify({ ownList: ownSupportList.response.status, ownVisible: ownSupportList.body.tickets?.some((item) => item.ticketId === ticketId), ownDetail: ownSupportDetail.response.status, otherDetail: otherAccountSupportDetail.response.status, otherList: otherAccountSupportList.response.status, otherVisible: otherAccountSupportList.body.tickets?.some((item) => item.ticketId === ticketId) })})`);
+  }
+  console.log('[stage6:integration] PASS: authenticated support list/detail expose only the selected requester’s tickets and customer-visible timeline; another account receives no private ticket data');
   await prisma.supportTicket.update({ where: { id: ticketId }, data: { assignedEmployeeId: supportEmployee.id } });
   const supportRequestCountBeforeDuplicates = await prisma.supportAccessRequest.count({ where: { ticketId } });
   const duplicateSupportScope = await fetchJson(`${base}/api/v2/support/tickets/${ticketId}/access-requests`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-employee-session': supportToken }, body: JSON.stringify({ requestedScope: 'TENANT_SCOPE', targetMembershipId: tenantMembership.id, areaIds: [areaOne.id, areaOne.id], targetIds: [] }) });
@@ -1357,19 +1485,32 @@ async function customerAuthorizationChecks(deliveryEnv) {
   const accessResponse = await fetchJson(`${base}/api/v2/support/tickets/${ticketId}/access-requests`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-employee-session': supportToken }, body: JSON.stringify({ requestedScope: 'TENANT_SCOPE', targetMembershipId: tenantMembership.id, areaIds: [areaOne.id], targetIds: [] }) });
   if (accessResponse.response.status !== 201 || accessResponse.body.accessRequest?.touchesPropertyInfrastructure !== false) fail(`Tenant-private support request was not scoped privately (${accessResponse.response.status})`);
   const requestId = accessResponse.body.accessRequest.id;
+  const tenantApprovalInbox = await fetchJson(`${base}/api/v2/support/access-requests`, { headers: { 'x-dinodia-app-token': tenantToken.body.token } });
+  if (tenantApprovalInbox.response.status !== 200 || !tenantApprovalInbox.body.requests?.some((item) => item.requestId === requestId)
+    || JSON.stringify(tenantApprovalInbox.body).includes('Disposable tenant-private support test')) fail('Tenant support approval inbox omitted its own request or exposed ticket text');
   const implicitSupportDecision = await fetchJson(`${base}/api/v2/support/tickets/${ticketId}/access-requests/${requestId}/approve`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-app-token': tenantToken.body.token }, body: JSON.stringify({}) });
   const stillRequested = await prisma.supportAccessRequest.findUniqueOrThrow({ where: { id: requestId }, select: { status: true } });
   if (implicitSupportDecision.response.status !== 400 || stillRequested.status !== 'REQUESTED') fail('An omitted support decision was interpreted as approval or changed durable state');
-  const approval = await fetchJson(`${base}/api/v2/support/tickets/${ticketId}/access-requests/${requestId}/approve`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-app-token': tenantToken.body.token }, body: JSON.stringify({ approve: true }) });
-  if (approval.response.status !== 200 || !approval.body.oneUseCode) fail(`Tenant support approval did not issue a one-use customer code (${approval.response.status})`);
-  const supportCode = approval.body.oneUseCode;
-  const approvedSupportRow = await prisma.supportAccessRequest.findUnique({ where: { id: requestId }, select: { codeExpiresAt: true, sessionHardStopAt: true } });
-  if (!approvedSupportRow?.codeExpiresAt || approvedSupportRow.codeExpiresAt.getTime() < Date.now() + 9 * 60 * 1000 || !approvedSupportRow.sessionHardStopAt || approvedSupportRow.sessionHardStopAt.getTime() < Date.now() + 29 * 60 * 1000) fail('Support approval did not persist the ten-minute code and thirty-minute hard stop');
+  const missingTenantProof = await fetchJson(`${base}/api/v2/support/tickets/${ticketId}/access-requests/${requestId}/approve`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-app-token': tenantToken.body.token }, body: JSON.stringify({ approve: true, confirmation: 'I approve this support access for me' }) });
+  const afterMissingTenantProof = await prisma.supportAccessRequest.findUniqueOrThrow({ where: { id: requestId }, select: { status: true, codeHash: true } });
+  if (missingTenantProof.response.status !== 400 || afterMissingTenantProof.status !== 'REQUESTED' || afterMissingTenantProof.codeHash !== null) fail('Tenant approval without fresh exact-operation proof changed support authority');
+  const tenantApprovalChallenge = await fetchJson(`${base}/api/v2/security/step-up/challenge`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-app-token': tenantToken.body.token }, body: JSON.stringify({ operationKind: 'support_access_approve', targetIds: [ticketId, requestId], value: 'I approve this support access for me' }) });
+  if (tenantApprovalChallenge.response.status !== 200) fail(`Tenant support approval step-up challenge failed (${tenantApprovalChallenge.response.status})`);
+  const tenantApprovalSignature = crypto.sign(null, stepUpChallengeMessage({ challengeId: tenantApprovalChallenge.body.challengeId, nonce: tenantApprovalChallenge.body.nonce, operationDigest: tenantApprovalChallenge.body.operationDigest }), crypto.createPrivateKey(phone.privateKey)).toString('base64url');
+  const tenantApprovalProof = await fetchJson(`${base}/api/v2/security/step-up/issue`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-app-token': tenantToken.body.token }, body: JSON.stringify({ challengeId: tenantApprovalChallenge.body.challengeId, nonce: tenantApprovalChallenge.body.nonce, deviceSignature: tenantApprovalSignature }) });
+  if (tenantApprovalProof.response.status !== 200) fail(`Tenant support approval step-up proof failed (${tenantApprovalProof.response.status})`);
+  const approval = await fetchJson(`${base}/api/v2/support/tickets/${ticketId}/access-requests/${requestId}/approve`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-app-token': tenantToken.body.token }, body: JSON.stringify({ approve: true, confirmation: 'I approve this support access for me', proof: tenantApprovalProof.body.proof }) });
+  if (approval.response.status !== 200 || approval.body.oneUseCode !== undefined || !nativeV1Contract.validateSupportAccessDecisionReceipt(approval.body)) fail(`Tenant support approval returned a code to the customer or an invalid receipt (${approval.response.status})`);
+  const approvedSupportRow = await prisma.supportAccessRequest.findUniqueOrThrow({ where: { id: requestId }, select: { codeHash: true, codeExpiresAt: true, sessionHardStopAt: true } });
+  if (approvedSupportRow.codeHash !== null || approvedSupportRow.codeExpiresAt !== null || !approvedSupportRow.sessionHardStopAt || approvedSupportRow.sessionHardStopAt.getTime() < Date.now() + 29 * 60 * 1000) fail('Customer approval exposed or prematurely persisted a support code, or omitted the bounded approval hard stop');
   const tenantNotificationsBefore = await fetchJson(`${base}/api/v2/support/notifications`, { headers: { 'x-dinodia-app-token': tenantToken.body.token } });
   if (tenantNotificationsBefore.response.status !== 200 || tenantNotificationsBefore.body.notifications?.length !== 0) fail('Tenant-private support leaked a homeowner notification side channel');
   const issueResponse = await fetchJson(`${base}/api/v2/support/tickets/${ticketId}/access-requests/${requestId}/issue`, { method: 'POST', headers: { 'x-dinodia-employee-session': supportToken } });
-  if (issueResponse.response.status !== 200 || issueResponse.body.code || issueResponse.body.employeeProofEnvelope || !issueResponse.body.supportUrl) fail(`Employee support issue response exposed or omitted bounded handoff (${issueResponse.response.status})`);
-  const redeemBody = await decryptedHubSupportRedemption({ ticketId, code: supportCode });
+  if (issueResponse.response.status !== 200 || !nativeV1Contract.validateSupportAccessIssueReceipt(issueResponse.body) || issueResponse.body.employeeProofEnvelope) fail(`Employee support issue response exposed or omitted the one-time employee-only handoff (${issueResponse.response.status})`);
+  const supportCode = issueResponse.body.oneUseCode;
+  const issuedSupportRow = await prisma.supportAccessRequest.findUniqueOrThrow({ where: { id: requestId }, select: { codeHash: true, codeExpiresAt: true, sessionHardStopAt: true } });
+  if (issuedSupportRow.codeHash !== crypto.createHash('sha256').update(issueResponse.body.oneUseCode).digest('hex') || !issuedSupportRow.codeExpiresAt || issuedSupportRow.codeExpiresAt.getTime() < Date.now() + 9 * 60 * 1000 || issuedSupportRow.codeExpiresAt > issuedSupportRow.sessionHardStopAt) fail('Employee-issued code was not stored as a hash or did not receive a bounded ten-minute expiry');
+  const redeemBody = await decryptedHubSupportRedemption({ ticketId, code: issueResponse.body.oneUseCode });
   if (JSON.stringify(redeemBody).includes('employeeProofPrivateKey') || JSON.stringify(redeemBody).includes('employeeGrant')) fail('Support redemption request exposed decrypted employee proof material');
   const invalidSupportProof = await machineRequest({ base: machineBase, path: '/api/hub-agent/support/v2/redeem', machineSecret, body: { ...redeemBody, homeId: homeTwo.id } });
   if (invalidSupportProof.response.status !== 401) fail(`Support redemption accepted a signature after its home context changed (${invalidSupportProof.response.status})`);
@@ -1395,7 +1536,7 @@ async function customerAuthorizationChecks(deliveryEnv) {
   await prisma.supportAccessRequest.delete({ where: { id: requestId } });
   await prisma.supportTicket.delete({ where: { id: ticketId } });
 
-  const denialTicketResponse = await fetchJson(`${base}/api/v2/support/tickets`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-app-token': tenantToken.body.token }, body: JSON.stringify({ category: 'OTHER', description: 'Disposable support denial test' }) });
+  const denialTicketResponse = await fetchJson(`${base}/api/v2/support/tickets`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-app-token': tenantToken.body.token, 'idempotency-key': `support-denial-${crypto.randomUUID()}` }, body: JSON.stringify({ category: 'OTHER', description: 'Disposable support denial test' }) });
   if (denialTicketResponse.response.status !== 201) fail(`Support denial test ticket was not created (${denialTicketResponse.response.status})`);
   const denialTicketId = denialTicketResponse.body.ticket.id;
   await prisma.supportTicket.update({ where: { id: denialTicketId }, data: { assignedEmployeeId: supportEmployee.id } });
@@ -1419,7 +1560,7 @@ async function customerAuthorizationChecks(deliveryEnv) {
   const tenantDevice = await prisma.nativeDevice.create({ data: { homeId: homeOne.id, hubInstallationId: hubOne.id, osDeviceId: 'harness-tenant-device', originalName: 'Harness tenant light', technicalLabel: 'tenant_device', managementClass: 'TENANT_DEVICE', deviceType: 'light', ownerMembershipId: tenantMembership.id, descriptorRevision: 1, descriptorDigest: tenantDescriptorDigest, lifecycle: 'DISCOVERED' } });
   await prisma.deviceAreaAssignment.create({ data: { deviceId: tenantDevice.id, areaId: areaOne.id, homeId: homeOne.id, source: 'HARNESS', actorType: 'SYSTEM' } });
   await prisma.nativeDevice.update({ where: { id: tenantDevice.id }, data: { lifecycle: 'INSTALLED' } });
-  const propertyTicketResponse = await fetchJson(`${base}/api/v2/support/tickets`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-app-token': tenantToken.body.token }, body: JSON.stringify({ category: 'HUB_OR_CONNECTION', description: 'Disposable property support test' }) });
+  const propertyTicketResponse = await fetchJson(`${base}/api/v2/support/tickets`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-app-token': tenantToken.body.token, 'idempotency-key': `support-property-${crypto.randomUUID()}` }, body: JSON.stringify({ category: 'HUB_OR_CONNECTION', description: 'Disposable property support test' }) });
   if (propertyTicketResponse.response.status !== 201) fail(`Property support ticket creation failed (${propertyTicketResponse.response.status})`);
   const propertyTicketId = propertyTicketResponse.body.ticket.id;
   // The employee was deleted with the tenant-private ticket above; create a
@@ -1433,7 +1574,13 @@ async function customerAuthorizationChecks(deliveryEnv) {
   await prisma.supportTicket.update({ where: { id: propertyTicketId }, data: { assignedEmployeeId: propertySupportEmployee.id } });
   const broadeningTenantRequest = await fetchJson(`${base}/api/v2/support/tickets/${propertyTicketId}/access-requests`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-employee-session': propertySupportToken }, body: JSON.stringify({ requestedScope: 'TENANT_SCOPE', targetMembershipId: tenantMembership.id, areaIds: [areaOne.id], targetIds: [] }) });
   if (broadeningTenantRequest.response.status !== 201) fail(`Tenant approval prerequisite could not be created (${broadeningTenantRequest.response.status})`);
-  const broadeningTenantApproval = await fetchJson(`${base}/api/v2/support/tickets/${propertyTicketId}/access-requests/${broadeningTenantRequest.body.accessRequest.id}/approve`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-app-token': tenantToken.body.token }, body: JSON.stringify({ approve: true }) });
+  const broadeningRequestId = broadeningTenantRequest.body.accessRequest.id;
+  const broadeningChallenge = await fetchJson(`${base}/api/v2/security/step-up/challenge`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-app-token': tenantToken.body.token }, body: JSON.stringify({ operationKind: 'support_access_approve', targetIds: [propertyTicketId, broadeningRequestId], value: 'I approve this support access for me' }) });
+  if (broadeningChallenge.response.status !== 200) fail(`Tenant broadening approval challenge failed (${broadeningChallenge.response.status})`);
+  const broadeningSignature = crypto.sign(null, stepUpChallengeMessage({ challengeId: broadeningChallenge.body.challengeId, nonce: broadeningChallenge.body.nonce, operationDigest: broadeningChallenge.body.operationDigest }), crypto.createPrivateKey(phone.privateKey)).toString('base64url');
+  const broadeningProof = await fetchJson(`${base}/api/v2/security/step-up/issue`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-app-token': tenantToken.body.token }, body: JSON.stringify({ challengeId: broadeningChallenge.body.challengeId, nonce: broadeningChallenge.body.nonce, deviceSignature: broadeningSignature }) });
+  if (broadeningProof.response.status !== 200) fail(`Tenant broadening approval proof failed (${broadeningProof.response.status})`);
+  const broadeningTenantApproval = await fetchJson(`${base}/api/v2/support/tickets/${propertyTicketId}/access-requests/${broadeningRequestId}/approve`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-app-token': tenantToken.body.token }, body: JSON.stringify({ approve: true, confirmation: 'I approve this support access for me', proof: broadeningProof.body.proof }) });
   if (broadeningTenantApproval.response.status !== 200) fail(`Tenant approval prerequisite failed (${broadeningTenantApproval.response.status})`);
   // A tenant-scoped request may include a permanent property device only when
   // the selected area is granted. That access must still notify the homeowner
@@ -1441,18 +1588,23 @@ async function customerAuthorizationChecks(deliveryEnv) {
   // tenant scope and never exposing tenant-private metadata. Use a separate
   // ticket so the partial unique index for one open request per ticket/scope
   // remains part of the test rather than being bypassed.
-  const tenantPropertyTicketResponse = await fetchJson(`${base}/api/v2/support/tickets`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-app-token': tenantToken.body.token }, body: JSON.stringify({ category: 'DEVICE_PROBLEM', description: 'Disposable tenant permanent-device support test' }) });
+  const tenantPropertyTicketResponse = await fetchJson(`${base}/api/v2/support/tickets`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-app-token': tenantToken.body.token, 'idempotency-key': `support-tenant-${crypto.randomUUID()}` }, body: JSON.stringify({ category: 'DEVICE_PROBLEM', description: 'Disposable tenant permanent-device support test' }) });
   if (tenantPropertyTicketResponse.response.status !== 201) fail(`Tenant permanent-device support ticket creation failed (${tenantPropertyTicketResponse.response.status})`);
   const tenantPropertyTicketId = tenantPropertyTicketResponse.body.ticket.id;
   await prisma.supportTicket.update({ where: { id: tenantPropertyTicketId }, data: { assignedEmployeeId: propertySupportEmployee.id } });
   const tenantPropertyDeviceRequest = await fetchJson(`${base}/api/v2/support/tickets/${tenantPropertyTicketId}/access-requests`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-employee-session': propertySupportToken }, body: JSON.stringify({ requestedScope: 'TENANT_SCOPE', targetMembershipId: tenantMembership.id, areaIds: [areaOne.id], targetIds: [propertyDevice.id] }) });
   if (tenantPropertyDeviceRequest.response.status !== 201 || tenantPropertyDeviceRequest.body.accessRequest?.touchesPropertyInfrastructure !== true) fail(`Tenant support targeting a permanent device was not marked as property infrastructure (${tenantPropertyDeviceRequest.response.status}/${tenantPropertyDeviceRequest.body.errorCode || tenantPropertyDeviceRequest.body.error || JSON.stringify(tenantPropertyDeviceRequest.body)})`);
   const tenantPropertyRequestId = tenantPropertyDeviceRequest.body.accessRequest.id;
-  const tenantPropertyApproval = await fetchJson(`${base}/api/v2/support/tickets/${tenantPropertyTicketId}/access-requests/${tenantPropertyRequestId}/approve`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-app-token': tenantToken.body.token }, body: JSON.stringify({ approve: true }) });
-  if (tenantPropertyApproval.response.status !== 200 || !tenantPropertyApproval.body.oneUseCode) fail(`Tenant permanent-device support approval failed (${tenantPropertyApproval.response.status})`);
+  const tenantPropertyChallenge = await fetchJson(`${base}/api/v2/security/step-up/challenge`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-app-token': tenantToken.body.token }, body: JSON.stringify({ operationKind: 'support_access_approve', targetIds: [tenantPropertyTicketId, tenantPropertyRequestId], value: 'I approve this support access for me' }) });
+  if (tenantPropertyChallenge.response.status !== 200) fail(`Tenant permanent-device support approval challenge failed (${tenantPropertyChallenge.response.status})`);
+  const tenantPropertySignature = crypto.sign(null, stepUpChallengeMessage({ challengeId: tenantPropertyChallenge.body.challengeId, nonce: tenantPropertyChallenge.body.nonce, operationDigest: tenantPropertyChallenge.body.operationDigest }), crypto.createPrivateKey(phone.privateKey)).toString('base64url');
+  const tenantPropertyProof = await fetchJson(`${base}/api/v2/security/step-up/issue`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-app-token': tenantToken.body.token }, body: JSON.stringify({ challengeId: tenantPropertyChallenge.body.challengeId, nonce: tenantPropertyChallenge.body.nonce, deviceSignature: tenantPropertySignature }) });
+  if (tenantPropertyProof.response.status !== 200) fail(`Tenant permanent-device support approval proof failed (${tenantPropertyProof.response.status})`);
+  const tenantPropertyApproval = await fetchJson(`${base}/api/v2/support/tickets/${tenantPropertyTicketId}/access-requests/${tenantPropertyRequestId}/approve`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-app-token': tenantToken.body.token }, body: JSON.stringify({ approve: true, confirmation: 'I approve this support access for me', proof: tenantPropertyProof.body.proof }) });
+  if (tenantPropertyApproval.response.status !== 200 || tenantPropertyApproval.body.oneUseCode !== undefined || !nativeV1Contract.validateSupportAccessDecisionReceipt(tenantPropertyApproval.body)) fail(`Tenant permanent-device support approval returned a code or invalid receipt (${tenantPropertyApproval.response.status})`);
   const tenantPropertyIssue = await fetchJson(`${base}/api/v2/support/tickets/${tenantPropertyTicketId}/access-requests/${tenantPropertyRequestId}/issue`, { method: 'POST', headers: { 'x-dinodia-employee-session': propertySupportToken } });
-  if (tenantPropertyIssue.response.status !== 200) fail(`Tenant permanent-device support issue failed (${tenantPropertyIssue.response.status})`);
-  const tenantPropertyRedeemBody = await decryptedHubSupportRedemption({ ticketId: tenantPropertyTicketId, code: tenantPropertyApproval.body.oneUseCode });
+  if (tenantPropertyIssue.response.status !== 200 || !nativeV1Contract.validateSupportAccessIssueReceipt(tenantPropertyIssue.body)) fail(`Tenant permanent-device support issue failed (${tenantPropertyIssue.response.status})`);
+  const tenantPropertyRedeemBody = await decryptedHubSupportRedemption({ ticketId: tenantPropertyTicketId, code: tenantPropertyIssue.body.oneUseCode });
   const tenantPropertyRedeemed = await machineRequest({ base: machineBase, path: '/api/hub-agent/support/v2/redeem', machineSecret, body: tenantPropertyRedeemBody });
   if (tenantPropertyRedeemed.response.status !== 200 || tenantPropertyRedeemed.body.scope !== 'TENANT_SCOPE') fail(`Tenant permanent-device support redemption failed (${tenantPropertyRedeemed.response.status})`);
   const tenantPropertyNotification = await fetchJson(`${base}/api/v2/support/notifications`, { headers: { 'x-dinodia-app-token': propertyToken.body.token } });
@@ -1467,9 +1619,42 @@ async function customerAuthorizationChecks(deliveryEnv) {
       : { bodyType: typeof tenantPropertyNotification.body };
     fail(`Tenant permanent-device notification missing: HTTP ${tenantPropertyNotification.response.status}; safeResponse=${JSON.stringify(safeBody)}; persistedOwnerNotifications=${tenantPropertyNotificationRows.length}; activeOwners=${tenantPropertyActiveOwnerCount}; projected=${tenantPropertyProjection}`);
   }
+  // Closing a ticket with a live support lease must report pending hub
+  // enforcement until the enrolled machine acknowledges the revocation.
+  await prisma.policyAcceptance.upsert({
+    where: { customerAccountId_policyKind_policyVersion: { customerAccountId: account.id, policyKind: 'DINODIA_NATIVE', policyVersion: deliveryEnv.DINODIA_NATIVE_POLICY_VERSION } },
+    create: { customerAccountId: account.id, policyKind: 'DINODIA_NATIVE', policyVersion: deliveryEnv.DINODIA_NATIVE_POLICY_VERSION, acceptedAt: new Date() },
+    update: {},
+  });
+  const accountSupportHeaders = { cookie: `dinodia_customer_session=${encodeURIComponent(rawSession)}`, 'x-dinodia-home-id': homeOne.id };
+  const liveSupportChallenge = await fetchJson(`${base}/api/v2/security/step-up/challenge`, { method: 'POST', headers: { ...accountSupportHeaders, 'content-type': 'application/json' }, body: JSON.stringify({ operationKind: 'support_ticket_close', targetIds: [tenantPropertyTicketId], value: null }) });
+  if (liveSupportChallenge.response.status !== 200) fail(`Live support close challenge failed (${liveSupportChallenge.response.status})`);
+  const liveSupportSignature = crypto.sign(null, stepUpChallengeMessage({ challengeId: liveSupportChallenge.body.challengeId, nonce: liveSupportChallenge.body.nonce, operationDigest: liveSupportChallenge.body.operationDigest }), crypto.createPrivateKey(phone.privateKey)).toString('base64url');
+  const liveSupportProof = await fetchJson(`${base}/api/v2/security/step-up/issue`, { method: 'POST', headers: { ...accountSupportHeaders, 'content-type': 'application/json' }, body: JSON.stringify({ challengeId: liveSupportChallenge.body.challengeId, nonce: liveSupportChallenge.body.nonce, deviceSignature: liveSupportSignature }) });
+  if (liveSupportProof.response.status !== 200) fail(`Live support close proof failed (${liveSupportProof.response.status})`);
+  const liveSupportClose = await fetchJson(`${base}/api/v2/support/tickets/${tenantPropertyTicketId}`, { method: 'POST', headers: { ...accountSupportHeaders, 'content-type': 'application/json' }, body: JSON.stringify({ action: 'close', proof: liveSupportProof.body.proof }) });
+  const liveSupportSession = await prisma.supportSession.findFirst({ where: { accessRequestId: tenantPropertyRequestId }, select: { id: true, status: true, desiredRevokedAt: true } });
+  const pendingSupportDetail = await fetchJson(`${base}/api/v2/support/tickets/${tenantPropertyTicketId}`, { headers: accountSupportHeaders });
+  if (liveSupportClose.response.status !== 200 || liveSupportClose.body.hubEnforcement !== 'PENDING'
+    || pendingSupportDetail.response.status !== 200 || pendingSupportDetail.body.ticket?.hubEnforcement !== 'PENDING'
+    || liveSupportSession?.status !== 'PENDING_HUB_REVOKE' || !liveSupportSession.desiredRevokedAt) {
+    fail(`Closing a ticket with a live lease did not expose pending enforcement truthfully (${liveSupportClose.response.status}/${liveSupportClose.body.hubEnforcement || liveSupportClose.body.error?.code || 'none'}/${liveSupportSession?.status || 'no-session'})`);
+  }
+  const liveSupportHubRevoke = await machineRequest({ base: machineBase, path: '/api/hub-agent/support/v2/revocation', machineSecret, body: { serial: identityOne.serialNumber, identityGeneration: identityOne.identityGeneration, sessionId: liveSupportSession.id, lease: tenantPropertyRedeemed.body.lease } });
+  const acknowledgedSupportDetail = await fetchJson(`${base}/api/v2/support/tickets/${tenantPropertyTicketId}`, { headers: accountSupportHeaders });
+  if (liveSupportHubRevoke.response.status !== 200 || acknowledgedSupportDetail.response.status !== 200
+    || acknowledgedSupportDetail.body.ticket?.hubEnforcement !== 'ACKNOWLEDGED') {
+    fail(`Hub revocation acknowledgement was not reflected in the actual ticket detail (${liveSupportHubRevoke.response.status}/${acknowledgedSupportDetail.body.ticket?.hubEnforcement || 'none'})`);
+  }
+  console.log('[stage2:integration] PASS: support ticket close reports PENDING for an active lease and ACKNOWLEDGED only after the real machine revocation route');
   const propertyRequest = await fetchJson(`${base}/api/v2/support/tickets/${propertyTicketId}/access-requests`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-employee-session': propertySupportToken }, body: JSON.stringify({ requestedScope: 'PROPERTY_SCOPE', areaIds: [], targetIds: [propertyDevice.id] }) });
   if (propertyRequest.response.status !== 201 || propertyRequest.body.accessRequest?.touchesPropertyInfrastructure !== true) fail(`Property support request did not require property scope (${propertyRequest.response.status})`);
   const propertyRequestId = propertyRequest.body.accessRequest.id;
+  const propertyApprovalInbox = await fetchJson(`${base}/api/v2/support/access-requests`, { headers: { 'x-dinodia-app-token': propertyToken.body.token } });
+  const tenantCannotApproveProperty = await fetchJson(`${base}/api/v2/support/access-requests`, { headers: { 'x-dinodia-app-token': tenantToken.body.token } });
+  if (propertyApprovalInbox.response.status !== 200 || !propertyApprovalInbox.body.requests?.some((item) => item.requestId === propertyRequestId)
+    || JSON.stringify(propertyApprovalInbox.body).includes('Disposable property support test')
+    || tenantCannotApproveProperty.body.requests?.some((item) => item.requestId === propertyRequestId)) fail('Property support approval inbox crossed membership privacy or exposed ticket text');
   const propertyNotificationBefore = await fetchJson(`${base}/api/v2/support/notifications`, { headers: { 'x-dinodia-app-token': propertyToken.body.token } });
   if (propertyNotificationBefore.response.status !== 200 || propertyNotificationBefore.body.notifications?.some((item) => item.ticketId === propertyTicketId)) fail('A homeowner was notified before property support was approved and redeemed');
   const propertyChallenge = await fetchJson(`${base}/api/v2/security/step-up/challenge`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-app-token': propertyToken.body.token }, body: JSON.stringify({ operationKind: 'support_access_approve', targetIds: [propertyTicketId, propertyRequestId], value: 'I approve this support access for my property' }) });
@@ -1478,10 +1663,10 @@ async function customerAuthorizationChecks(deliveryEnv) {
   const propertyProof = await fetchJson(`${base}/api/v2/security/step-up/issue`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-app-token': propertyToken.body.token }, body: JSON.stringify({ challengeId: propertyChallenge.body.challengeId, nonce: propertyChallenge.body.nonce, deviceSignature: propertySignature }) });
   if (propertyProof.response.status !== 200) fail(`Property approval step-up proof failed (${propertyProof.response.status})`);
   const propertyApproval = await fetchJson(`${base}/api/v2/support/tickets/${propertyTicketId}/access-requests/${propertyRequestId}/approve`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-app-token': propertyToken.body.token }, body: JSON.stringify({ approve: true, confirmation: 'I approve this support access for my property', proof: propertyProof.body.proof }) });
-  if (propertyApproval.response.status !== 200 || !propertyApproval.body.oneUseCode) fail(`Distinct homeowner property approval failed (${propertyApproval.response.status}/${propertyApproval.body.errorCode || ''})`);
+  if (propertyApproval.response.status !== 200 || propertyApproval.body.oneUseCode !== undefined || !nativeV1Contract.validateSupportAccessDecisionReceipt(propertyApproval.body)) fail(`Distinct homeowner property approval returned a code or invalid receipt (${propertyApproval.response.status}/${propertyApproval.body.errorCode || ''})`);
   const propertyIssue = await fetchJson(`${base}/api/v2/support/tickets/${propertyTicketId}/access-requests/${propertyRequestId}/issue`, { method: 'POST', headers: { 'x-dinodia-employee-session': propertySupportToken } });
-  if (propertyIssue.response.status !== 200) fail(`Property support issue failed (${propertyIssue.response.status})`);
-  const propertyRedeemBody = await decryptedHubSupportRedemption({ ticketId: propertyTicketId, code: propertyApproval.body.oneUseCode });
+  if (propertyIssue.response.status !== 200 || !nativeV1Contract.validateSupportAccessIssueReceipt(propertyIssue.body)) fail(`Property support issue failed (${propertyIssue.response.status})`);
+  const propertyRedeemBody = await decryptedHubSupportRedemption({ ticketId: propertyTicketId, code: propertyIssue.body.oneUseCode });
   const propertyRedeemed = await machineRequest({ base: machineBase, path: '/api/hub-agent/support/v2/redeem', machineSecret, body: propertyRedeemBody });
   if (propertyRedeemed.response.status !== 200 || propertyRedeemed.body.scope !== 'PROPERTY_SCOPE') fail(`Property support redemption failed (${propertyRedeemed.response.status})`);
   const propertyNotification = await fetchJson(`${base}/api/v2/support/notifications`, { headers: { 'x-dinodia-app-token': propertyToken.body.token } });
@@ -1519,18 +1704,25 @@ async function customerAuthorizationChecks(deliveryEnv) {
   // Race customer closure against the real machine-authenticated redemption
   // route. Regardless of which serializable transaction wins, closure must
   // leave no active support session and the one-use request must be revoked.
-  const raceTicketResponse = await fetchJson(`${base}/api/v2/support/tickets`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-app-token': tenantToken.body.token }, body: JSON.stringify({ category: 'OTHER', description: 'Disposable close versus redeem race' }) });
+  const raceTicketResponse = await fetchJson(`${base}/api/v2/support/tickets`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-app-token': tenantToken.body.token, 'idempotency-key': `support-race-${crypto.randomUUID()}` }, body: JSON.stringify({ category: 'OTHER', description: 'Disposable close versus redeem race' }) });
   if (raceTicketResponse.response.status !== 201) fail(`Support race ticket creation failed (${raceTicketResponse.response.status})`);
   const raceTicketId = raceTicketResponse.body.ticket.id;
   await prisma.supportTicket.update({ where: { id: raceTicketId }, data: { assignedEmployeeId: propertySupportEmployee.id } });
   const raceRequestResponse = await fetchJson(`${base}/api/v2/support/tickets/${raceTicketId}/access-requests`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-employee-session': propertySupportToken }, body: JSON.stringify({ requestedScope: 'TENANT_SCOPE', targetMembershipId: tenantMembership.id, areaIds: [areaOne.id], targetIds: [] }) });
   if (raceRequestResponse.response.status !== 201) fail(`Support race request creation failed (${raceRequestResponse.response.status})`);
   const raceRequestId = raceRequestResponse.body.accessRequest.id;
-  const raceApproval = await fetchJson(`${base}/api/v2/support/tickets/${raceTicketId}/access-requests/${raceRequestId}/approve`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-app-token': tenantToken.body.token }, body: JSON.stringify({ approve: true }) });
-  if (raceApproval.response.status !== 200 || !raceApproval.body.oneUseCode) fail(`Support race approval failed (${raceApproval.response.status})`);
+  const raceApprovalInbox = await fetchJson(`${base}/api/v2/support/access-requests`, { headers: { 'x-dinodia-app-token': tenantToken.body.token } });
+  if (raceApprovalInbox.response.status !== 200 || !raceApprovalInbox.body.requests?.some((item) => item.requestId === raceRequestId)) fail('Tenant support race request was absent from the selected-membership approval inbox');
+  const raceApprovalChallenge = await fetchJson(`${base}/api/v2/security/step-up/challenge`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-app-token': tenantToken.body.token }, body: JSON.stringify({ operationKind: 'support_access_approve', targetIds: [raceTicketId, raceRequestId], value: 'I approve this support access for me' }) });
+  if (raceApprovalChallenge.response.status !== 200) fail(`Support race approval step-up challenge failed (${raceApprovalChallenge.response.status})`);
+  const raceApprovalSignature = crypto.sign(null, stepUpChallengeMessage({ challengeId: raceApprovalChallenge.body.challengeId, nonce: raceApprovalChallenge.body.nonce, operationDigest: raceApprovalChallenge.body.operationDigest }), crypto.createPrivateKey(phone.privateKey)).toString('base64url');
+  const raceApprovalProof = await fetchJson(`${base}/api/v2/security/step-up/issue`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-app-token': tenantToken.body.token }, body: JSON.stringify({ challengeId: raceApprovalChallenge.body.challengeId, nonce: raceApprovalChallenge.body.nonce, deviceSignature: raceApprovalSignature }) });
+  if (raceApprovalProof.response.status !== 200) fail(`Support race approval step-up proof failed (${raceApprovalProof.response.status})`);
+  const raceApproval = await fetchJson(`${base}/api/v2/support/tickets/${raceTicketId}/access-requests/${raceRequestId}/approve`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-app-token': tenantToken.body.token }, body: JSON.stringify({ approve: true, confirmation: 'I approve this support access for me', proof: raceApprovalProof.body.proof }) });
+  if (raceApproval.response.status !== 200 || raceApproval.body.oneUseCode !== undefined || !nativeV1Contract.validateSupportAccessDecisionReceipt(raceApproval.body)) fail(`Support race approval returned a code or invalid receipt (${raceApproval.response.status})`);
   const raceIssue = await fetchJson(`${base}/api/v2/support/tickets/${raceTicketId}/access-requests/${raceRequestId}/issue`, { method: 'POST', headers: { 'x-dinodia-employee-session': propertySupportToken } });
-  if (raceIssue.response.status !== 200) fail(`Support race employee handoff failed (${raceIssue.response.status})`);
-  const raceRedeemBody = await decryptedHubSupportRedemption({ ticketId: raceTicketId, code: raceApproval.body.oneUseCode });
+  if (raceIssue.response.status !== 200 || !nativeV1Contract.validateSupportAccessIssueReceipt(raceIssue.body)) fail(`Support race employee handoff failed (${raceIssue.response.status})`);
+  const raceRedeemBody = await decryptedHubSupportRedemption({ ticketId: raceTicketId, code: raceIssue.body.oneUseCode });
   const closeChallenge = await fetchJson(`${base}/api/v2/security/step-up/challenge`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-app-token': tenantToken.body.token }, body: JSON.stringify({ operationKind: 'support_ticket_close', targetIds: [raceTicketId], value: null }) });
   if (closeChallenge.response.status !== 200) fail(`Support close race step-up challenge failed (${closeChallenge.response.status})`);
   const closeSignature = crypto.sign(null, stepUpChallengeMessage({ challengeId: closeChallenge.body.challengeId, nonce: closeChallenge.body.nonce, operationDigest: closeChallenge.body.operationDigest }), crypto.createPrivateKey(phone.privateKey)).toString('base64url');
@@ -1563,23 +1755,36 @@ async function customerAuthorizationChecks(deliveryEnv) {
   // Exercise the real trusted-phone challenge/issue/consume path with a
   // non-device sensitive operation. The signature is the disposable phone's
   // Ed25519 key, standing in for the iOS LocalAuthentication-gated assertion.
-  const stepUpTicket = await fetchJson(`${base}/api/v2/support/tickets`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-app-token': tenantToken.body.token }, body: JSON.stringify({ category: 'OTHER', description: 'Disposable step-up close test' }) });
+  const stepUpTicket = await fetchJson(`${base}/api/v2/support/tickets`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-app-token': tenantToken.body.token, 'idempotency-key': `support-stepup-${crypto.randomUUID()}` }, body: JSON.stringify({ category: 'OTHER', description: 'Disposable step-up close test' }) });
   if (stepUpTicket.response.status !== 201) fail(`Step-up ticket creation failed (${stepUpTicket.response.status})`);
   const stepUpTicketId = stepUpTicket.body.ticket.id;
-  const challenge = await fetchJson(`${base}/api/v2/security/step-up/challenge`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-app-token': tenantToken.body.token }, body: JSON.stringify({ operationKind: 'support_ticket_close', targetIds: [stepUpTicketId], value: null }) });
+  const challenge = await fetchJson(`${base}/api/v2/security/step-up/challenge`, { method: 'POST', headers: { ...accountSupportHeaders, 'content-type': 'application/json' }, body: JSON.stringify({ operationKind: 'support_ticket_close', targetIds: [stepUpTicketId], value: null }) });
   if (challenge.response.status !== 200 || !challenge.body.challengeId) fail(`Trusted-phone step-up challenge was not issued (${challenge.response.status})`);
-  const cancelledChallenge = await fetchJson(`${base}/api/v2/security/step-up/challenge`, { method: 'DELETE', headers: { 'content-type': 'application/json', 'x-dinodia-app-token': tenantToken.body.token }, body: JSON.stringify({ challengeId: challenge.body.challengeId }) });
+  const cancelledChallenge = await fetchJson(`${base}/api/v2/security/step-up/challenge`, { method: 'DELETE', headers: { ...accountSupportHeaders, 'content-type': 'application/json' }, body: JSON.stringify({ challengeId: challenge.body.challengeId }) });
   if (cancelledChallenge.response.status !== 200) fail(`Trusted-phone challenge cancellation failed (${cancelledChallenge.response.status})`);
-  const cancelledIssue = await fetchJson(`${base}/api/v2/security/step-up/issue`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-app-token': tenantToken.body.token }, body: JSON.stringify({ challengeId: challenge.body.challengeId, nonce: challenge.body.nonce, deviceSignature: 'A'.repeat(64) }) });
+  const cancelledIssue = await fetchJson(`${base}/api/v2/security/step-up/issue`, { method: 'POST', headers: { ...accountSupportHeaders, 'content-type': 'application/json' }, body: JSON.stringify({ challengeId: challenge.body.challengeId, nonce: challenge.body.nonce, deviceSignature: 'A'.repeat(64) }) });
   if (cancelledIssue.response.status !== 403) fail(`Cancelled trusted-phone challenge was accepted (${cancelledIssue.response.status})`);
-  const liveChallenge = await fetchJson(`${base}/api/v2/security/step-up/challenge`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-app-token': tenantToken.body.token }, body: JSON.stringify({ operationKind: 'support_ticket_close', targetIds: [stepUpTicketId], value: null }) });
+  const liveChallenge = await fetchJson(`${base}/api/v2/security/step-up/challenge`, { method: 'POST', headers: { ...accountSupportHeaders, 'content-type': 'application/json' }, body: JSON.stringify({ operationKind: 'support_ticket_close', targetIds: [stepUpTicketId], value: null }) });
   const phoneSignature = crypto.sign(null, stepUpChallengeMessage({ challengeId: liveChallenge.body.challengeId, nonce: liveChallenge.body.nonce, operationDigest: liveChallenge.body.operationDigest }), crypto.createPrivateKey(phone.privateKey)).toString('base64url');
-  const proof = await fetchJson(`${base}/api/v2/security/step-up/issue`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-app-token': tenantToken.body.token }, body: JSON.stringify({ challengeId: liveChallenge.body.challengeId, nonce: liveChallenge.body.nonce, deviceSignature: phoneSignature }) });
+  const proof = await fetchJson(`${base}/api/v2/security/step-up/issue`, { method: 'POST', headers: { ...accountSupportHeaders, 'content-type': 'application/json' }, body: JSON.stringify({ challengeId: liveChallenge.body.challengeId, nonce: liveChallenge.body.nonce, deviceSignature: phoneSignature }) });
   if (proof.response.status !== 200 || !proof.body.proof) fail(`Trusted-phone step-up proof was not issued (${proof.response.status})`);
-  const closed = await fetchJson(`${base}/api/v2/support/tickets/${stepUpTicketId}`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-app-token': tenantToken.body.token }, body: JSON.stringify({ action: 'close', proof: proof.body.proof }) });
-  if (closed.response.status !== 200 || closed.body.status !== 'CLOSED') fail(`Operation-bound support close was not consumed (${closed.response.status}/${closed.body.errorCode || closed.body.error || 'unknown'})`);
-  const replayClose = await fetchJson(`${base}/api/v2/support/tickets/${stepUpTicketId}`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-app-token': tenantToken.body.token }, body: JSON.stringify({ action: 'close', proof: proof.body.proof }) });
-  if (replayClose.response.status !== 403) fail(`Operation-bound support close replay was accepted (${replayClose.response.status})`);
+  const beforeInvalidClose = await prisma.supportTicket.findUniqueOrThrow({ where: { id: stepUpTicketId }, select: { status: true, closedAt: true, revision: true } });
+  const proofKey = { customerAccountId_nonceHash: { customerAccountId: account.id, nonceHash: sha256(proof.body.proof) } };
+  const unconsumedProofBeforeInvalidClose = await prisma.stepUpAuthorization.findUniqueOrThrow({ where: proofKey, select: { consumedAt: true } });
+  const invalidClose = await fetchJson(`${base}/api/v2/support/tickets/${stepUpTicketId}`, { method: 'POST', headers: { ...accountSupportHeaders, 'content-type': 'application/json' }, body: JSON.stringify({ action: 'close', proof: `${proof.body.proof}wrong` }) });
+  const afterInvalidClose = await prisma.supportTicket.findUniqueOrThrow({ where: { id: stepUpTicketId }, select: { status: true, closedAt: true, revision: true } });
+  const unconsumedProofAfterInvalidClose = await prisma.stepUpAuthorization.findUniqueOrThrow({ where: proofKey, select: { consumedAt: true } });
+  if (invalidClose.response.status !== 403 || JSON.stringify(beforeInvalidClose) !== JSON.stringify(afterInvalidClose)
+    || unconsumedProofBeforeInvalidClose.consumedAt || unconsumedProofAfterInvalidClose.consumedAt) {
+    fail('Wrong support-close proof changed the ticket or consumed the valid proof before the close transaction');
+  }
+  const closed = await fetchJson(`${base}/api/v2/support/tickets/${stepUpTicketId}`, { method: 'POST', headers: { ...accountSupportHeaders, 'content-type': 'application/json' }, body: JSON.stringify({ action: 'close', proof: proof.body.proof }) });
+  const consumedProofAfterClose = await prisma.stepUpAuthorization.findUniqueOrThrow({ where: proofKey, select: { consumedAt: true } });
+  const closedDetail = await fetchJson(`${base}/api/v2/support/tickets/${stepUpTicketId}`, { headers: accountSupportHeaders });
+  if (closed.response.status !== 200 || closed.body.status !== 'CLOSED' || closed.body.hubEnforcement !== 'NOT_REQUIRED'
+    || !consumedProofAfterClose.consumedAt || closedDetail.response.status !== 200 || closedDetail.body.ticket?.hubEnforcement !== 'NOT_REQUIRED') fail(`Operation-bound support close did not consume proof and report its actual no-hub-enforcement outcome (${closed.response.status}/${closed.body.hubEnforcement || closed.body.error?.code || 'unknown'})`);
+  const replayClose = await fetchJson(`${base}/api/v2/support/tickets/${stepUpTicketId}`, { method: 'POST', headers: { ...accountSupportHeaders, 'content-type': 'application/json' }, body: JSON.stringify({ action: 'close', proof: proof.body.proof }) });
+  if (replayClose.response.status !== 409 || replayClose.body.error?.code !== 'REVISION_CONFLICT') fail(`Operation-bound support close replay was not denied as an already-closed stale revision (${replayClose.response.status}/${replayClose.body.error?.code || 'none'})`);
   // The token returned above is the actual Platform-issued app token. Bind the
   // disposable OS instance to the same installation lineage and exercise the
   // OS HTTP authorization path, not just the issuer route.
@@ -2070,7 +2275,1166 @@ async function customerAuthorizationChecks(deliveryEnv) {
   const operatorSession = operatorLogin.session;
   const operatorToken = operatorLogin.token;
   const operatorWork = await prisma.companyOperationalWorkItem.create({ data: { publicReference: `DIN-${sha256(`handoff-${crypto.randomUUID()}`).slice(0, 16).toUpperCase()}`, kind: 'INITIAL_HUB_INSTALLATION', state: 'ASSIGNED', homeId: homeOne.id, hubInstallationId: hubOne.id, certifiedSerialNumber: identityOne.serialNumber, assignedEmployeeId: operatorEmployee.id, createdByEmployeeId: operatorEmployee.id, reason: 'Disposable browser-bound operator handoff test' } });
-  customerFixture = { accountId: account.id, sessionId: session.id, trustedDeviceId: trusted.id, trustedPhonePrivateKey: phone.privateKey, customerSessionSecret: rawSession, offlineAuthorisationId: tenantOffline.body.authorisation.id, revocableTrustedDeviceId: revocableTrustedDevice.id, revocableRawSession, revocablePhonePrivateKey: revocablePhone.privateKey, revocableOfflineAuthorisationId: revocableOffline.body.authorisation.id, propertyAccountId: propertyAccount.id, propertySessionId: propertySession.id, propertyTrustedDeviceId: propertyTrusted.id, managerAccountId: managerAccount.id, managerMembershipId: managerMembership.id, managerSessionId: managerSession.id, managerTrustedDeviceId: managerTrusted.id, homeOneId: homeOne.id, homeTwoId: homeTwo.id, hubOneId: hubOne.id, hubTwoId: hubTwo.id, identityOneId: identityOne.id, identityTwoId: identityTwo.id, tenantDeviceId: tenantDevice.id, machineSecret, tenantMembershipId: tenantMembership.id, ownerMembershipId: ownerMembership.id, propertyMembershipId: propertyMembership.id, areaOneId: areaOne.id, areaOneOsId: areaOne.osAreaId, areaTwoId: areaTwo.id, areaTwoOsId: areaTwo.osAreaId, tenantToken: tenantToken.body.token, ownerToken: ownerToken.body.token, propertyToken: propertyToken.body.token, managerToken: managerToken.body.token, ticketId, stepUpTicketId, identityOneSigningPrivateKey: identityOneSigning.privateKey, identityOneSigningPublicKey: identityOneSigning.publicKey, identityOneEncryptionPrivateKey: identityOneEncryption.privateKey, identityOneEncryptionPublicKey: identityOneEncryption.publicKey, identityOneSerial: identityOne.serialNumber, identityOneGeneration: identityOne.identityGeneration, operatorEmployeeId: operatorEmployee.id, operatorSessionId: operatorSession.id, operatorWorkId: operatorWork.id, operatorToken };
+  customerFixture = { accountId: account.id, loginEmail: email, loginPassword: customerPassword, loginInstallationId: trustedInstallationId, loginPublicKey: phone.publicKey, sessionId: session.id, trustedDeviceId: trusted.id, trustedPhonePrivateKey: phone.privateKey, customerSessionSecret: rawSession, offlineAuthorisationId: tenantOffline.body.authorisation.id, revocableTrustedDeviceId: revocableTrustedDevice.id, revocableRawSession, revocablePhonePrivateKey: revocablePhone.privateKey, revocableOfflineAuthorisationId: revocableOffline.body.authorisation.id, propertyAccountId: propertyAccount.id, propertySessionId: propertySession.id, propertyTrustedDeviceId: propertyTrusted.id, managerAccountId: managerAccount.id, managerMembershipId: managerMembership.id, managerSessionId: managerSession.id, managerTrustedDeviceId: managerTrusted.id, homeOneId: homeOne.id, homeTwoId: homeTwo.id, hubOneId: hubOne.id, hubTwoId: hubTwo.id, identityOneId: identityOne.id, identityTwoId: identityTwo.id, tenantDeviceId: tenantDevice.id, machineSecret, tenantMembershipId: tenantMembership.id, ownerMembershipId: ownerMembership.id, propertyMembershipId: propertyMembership.id, areaOneId: areaOne.id, areaOneOsId: areaOne.osAreaId, areaTwoId: areaTwo.id, areaTwoOsId: areaTwo.osAreaId, tenantToken: tenantToken.body.token, ownerToken: ownerToken.body.token, propertyToken: propertyToken.body.token, managerToken: managerToken.body.token, ticketId, stepUpTicketId, identityOneSigningPrivateKey: identityOneSigning.privateKey, identityOneSigningPublicKey: identityOneSigning.publicKey, identityOneEncryptionPrivateKey: identityOneEncryption.privateKey, identityOneEncryptionPublicKey: identityOneEncryption.publicKey, identityOneSerial: identityOne.serialNumber, identityOneGeneration: identityOne.identityGeneration, operatorEmployeeId: operatorEmployee.id, operatorSessionId: operatorSession.id, operatorWorkId: operatorWork.id, operatorToken };
+}
+
+async function mobileSessionContractChecks() {
+  const base = `http://127.0.0.1:${appPort}`;
+  const fixture = customerFixture;
+  if (!fixture) fail('Mobile session contract checks require the already-seeded disposable two-home identity');
+  const payload = {
+    email: fixture.loginEmail, password: fixture.loginPassword,
+    deviceInstallationId: fixture.loginInstallationId, publicKey: fixture.loginPublicKey,
+    deviceName: 'Disposable mobile contract phone', model: 'integration-test', osFamily: 'test', osVersion: 'test',
+  };
+  const login = await fetchJson(`${base}/api/v2/mobile/session`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload) });
+  const receipt = login.body;
+  const memberships = Array.isArray(receipt.memberships) ? receipt.memberships : [];
+  if (login.response.status !== 200 || !nativeV1Contract.validateMobileCustomerSessionReceipt(receipt)
+    || login.response.headers.has('set-cookie') || Object.hasOwn(receipt, 'token')
+    || new Set(memberships.map((item) => item.homeId)).size !== 2
+    || new Set(memberships.map((item) => item.role)).size !== 2
+    || memberships.find((item) => item.homeId === fixture.homeOneId)?.role !== 'TENANT'
+    || memberships.find((item) => item.homeId === fixture.homeOneId)?.areaIds?.join(',') !== fixture.areaOneId
+    || memberships.find((item) => item.homeId === fixture.homeTwoId)?.role !== 'OWNER') {
+    fail(`Mobile login did not return a cookie-free, contract-valid account-global two-home session (${login.response.status})`);
+  }
+  const authHeaders = { authorization: `Bearer ${receipt.accessToken}` };
+  const inventory = await fetchJson(`${base}/api/v2/trusted-devices`, { headers: authHeaders });
+  const tenantHub = await fetchJson(`${base}/api/v2/hub-sessions`, { method: 'POST', headers: { ...authHeaders, 'content-type': 'application/json' }, body: JSON.stringify({ homeId: fixture.homeOneId }) });
+  const ownerHub = await fetchJson(`${base}/api/v2/hub-sessions`, { method: 'POST', headers: { ...authHeaders, 'content-type': 'application/json' }, body: JSON.stringify({ homeId: fixture.homeTwoId }) });
+  const ambiguous = await fetchJson(`${base}/api/v2/trusted-devices`, { headers: { ...authHeaders, cookie: `dinodia_customer_session=${encodeURIComponent(receipt.refreshToken)}` } });
+  if (inventory.response.status !== 200 || inventory.body.devices?.filter((device) => device.thisDevice).length !== 1
+    || tenantHub.response.status !== 200 || tenantHub.body.homeId !== fixture.homeOneId
+    || ownerHub.response.status !== 403 || Object.hasOwn(ownerHub.body, 'token')
+    || ambiguous.response.status !== 400 || ambiguous.body.error?.code !== 'VALIDATION_FAILED') {
+    fail(`Mobile bearer did not reach the actual account/hub session guards or home policy (${inventory.response.status}/this=${inventory.body.devices?.filter((device) => device.thisDevice).length ?? 'none'}/${tenantHub.response.status}/home=${tenantHub.body.homeId === fixture.homeOneId}/${ownerHub.response.status}/token=${Object.hasOwn(ownerHub.body, 'token')}/${ambiguous.response.status}/code=${ambiguous.body.error?.code ?? 'none'})`);
+  }
+  const selectedMembershipTicket = await fetchJson(`${base}/api/v2/support/tickets`, { method: 'POST', headers: { ...authHeaders, 'content-type': 'application/json', 'x-dinodia-home-id': fixture.homeOneId, 'idempotency-key': `support-select-${crypto.randomUUID()}` }, body: JSON.stringify({ category: 'OTHER', description: 'Disposable selected-membership support listing' }) });
+  const selectedMembershipTicketId = selectedMembershipTicket.body?.ticket?.id;
+  const selectedTenantSupport = await fetchJson(`${base}/api/v2/support/tickets`, { headers: { ...authHeaders, 'x-dinodia-home-id': fixture.homeOneId } });
+  const selectedOwnerSupport = await fetchJson(`${base}/api/v2/support/tickets`, { headers: { ...authHeaders, 'x-dinodia-home-id': fixture.homeTwoId } });
+  const wrongSelectedHomeSupport = await fetchJson(`${base}/api/v2/support/tickets`, { headers: { ...authHeaders, 'x-dinodia-home-id': crypto.randomUUID() } });
+  if (selectedMembershipTicket.response.status !== 201 || !selectedMembershipTicketId
+    || selectedTenantSupport.response.status !== 200
+    || !selectedTenantSupport.body.tickets?.some((item) => item.ticketId === selectedMembershipTicketId && item.homeId === fixture.homeOneId && item.homeMembershipId === fixture.tenantMembershipId)
+    || selectedOwnerSupport.response.status !== 200 || selectedOwnerSupport.body.tickets?.some((item) => item.ticketId === selectedMembershipTicketId)
+    || wrongSelectedHomeSupport.response.status !== 404 || selectedTenantSupport.body.tickets?.some((item) => Object.hasOwn(item, 'osAreaId'))) {
+    fail(`Account-session support did not resolve the explicit selected membership or isolate its ticket list (${JSON.stringify({ create: selectedMembershipTicket.response.status, tenantStatus: selectedTenantSupport.response.status, tenantContains: selectedTenantSupport.body.tickets?.some((item) => item.ticketId === selectedMembershipTicketId), tenantMembershipMatches: selectedTenantSupport.body.tickets?.some((item) => item.ticketId === selectedMembershipTicketId && item.homeMembershipId === fixture.tenantMembershipId), ownerStatus: selectedOwnerSupport.response.status, ownerContains: selectedOwnerSupport.body.tickets?.some((item) => item.ticketId === selectedMembershipTicketId), wrongStatus: wrongSelectedHomeSupport.response.status, tenantCount: selectedTenantSupport.body.tickets?.length ?? null, ownerCount: selectedOwnerSupport.body.tickets?.length ?? null })})`);
+  }
+  const accountScopedTicket = await fetchJson(`${base}/api/v2/support/tickets`, { method: 'POST', headers: { ...authHeaders, 'content-type': 'application/json', 'x-dinodia-home-id': fixture.homeOneId, 'idempotency-key': `support-mobile-${crypto.randomUUID()}` }, body: JSON.stringify({ category: 'OTHER', description: 'Disposable mobile selected-home support path' }) });
+  const accountScopedTicketId = accountScopedTicket.body?.ticket?.id;
+  const accountScopedChallenge = accountScopedTicketId ? await fetchJson(`${base}/api/v2/security/step-up/challenge`, { method: 'POST', headers: { ...authHeaders, 'content-type': 'application/json', 'x-dinodia-home-id': fixture.homeOneId }, body: JSON.stringify({ operationKind: 'support_ticket_close', targetIds: [accountScopedTicketId] }) }) : null;
+  const accountScopedSignature = accountScopedChallenge?.body?.challengeId ? crypto.sign(null, stepUpChallengeMessage({ challengeId: accountScopedChallenge.body.challengeId, nonce: accountScopedChallenge.body.nonce, operationDigest: accountScopedChallenge.body.operationDigest }), crypto.createPrivateKey(fixture.trustedPhonePrivateKey)).toString('base64url') : null;
+  const accountScopedProof = accountScopedChallenge?.response.status === 200 ? await fetchJson(`${base}/api/v2/security/step-up/issue`, { method: 'POST', headers: { ...authHeaders, 'content-type': 'application/json', 'x-dinodia-home-id': fixture.homeOneId }, body: JSON.stringify({ challengeId: accountScopedChallenge.body.challengeId, nonce: accountScopedChallenge.body.nonce, deviceSignature: accountScopedSignature }) }) : null;
+  const accountScopedClosed = accountScopedProof?.response.status === 200 ? await fetchJson(`${base}/api/v2/support/tickets/${accountScopedTicketId}`, { method: 'POST', headers: { ...authHeaders, 'content-type': 'application/json', 'x-dinodia-home-id': fixture.homeOneId }, body: JSON.stringify({ action: 'close', proof: accountScopedProof.body.proof }) }) : null;
+  const accountScopedTicketRow = accountScopedTicketId ? await prisma.supportTicket.findUnique({ where: { id: accountScopedTicketId }, select: { status: true, customerAccountId: true, homeId: true, selectedMembershipId: true } }) : null;
+  if (accountScopedTicket.response.status !== 201 || !accountScopedTicketId
+    || accountScopedChallenge?.response.status !== 200 || accountScopedProof?.response.status !== 200
+    || accountScopedClosed?.response.status !== 200 || accountScopedClosed.body.status !== 'CLOSED'
+    || accountScopedTicketRow?.status !== 'CLOSED' || accountScopedTicketRow.customerAccountId !== fixture.accountId
+    || accountScopedTicketRow.homeId !== fixture.homeOneId || accountScopedTicketRow.selectedMembershipId !== fixture.tenantMembershipId) {
+    fail(`Account-global mobile credentials did not support a selected-home ticket and exact fresh-proof closure (create=${accountScopedTicket.response.status},challenge=${accountScopedChallenge?.response.status ?? 'none'},proof=${accountScopedProof?.response.status ?? 'none'},close=${accountScopedClosed?.response.status ?? 'none'})`);
+  }
+  const sessionBeforeExpiry = await prisma.customerSession.findUniqueOrThrow({ where: { id: receipt.sessionId }, select: { accessTokenHash: true, accessTokenExpiresAt: true, refreshTokenHash: true, sessionFamilyId: true } });
+  await prisma.customerSession.update({ where: { id: receipt.sessionId }, data: { accessTokenExpiresAt: new Date(Date.now() - 1000) } });
+  const expiredAccess = await fetchJson(`${base}/api/v2/trusted-devices`, { headers: authHeaders });
+  const refresh = await fetchJson(`${base}/api/v2/mobile/session`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ refreshToken: receipt.refreshToken }) });
+  const newSession = refresh.body?.sessionId ? await prisma.customerSession.findUnique({ where: { id: refresh.body.sessionId }, select: { id: true, sessionFamilyId: true, refreshTokenHash: true, accessTokenHash: true, revokedAt: true } }) : null;
+  const oldSession = await prisma.customerSession.findUniqueOrThrow({ where: { id: receipt.sessionId }, select: { revokedAt: true, revokeReason: true, accessTokenHash: true } });
+  const refreshedInventory = await fetchJson(`${base}/api/v2/trusted-devices`, { headers: { authorization: `Bearer ${refresh.body?.accessToken ?? ''}` } });
+  if (expiredAccess.response.status !== 401 || expiredAccess.body.error?.code !== 'CUSTOMER_ACCESS_EXPIRED'
+    || refresh.response.status !== 200 || !nativeV1Contract.validateMobileCustomerSessionReceipt(refresh.body)
+    || refresh.response.headers.has('set-cookie') || refresh.body.refreshToken === receipt.refreshToken
+    || !oldSession.revokedAt || oldSession.revokeReason !== 'refresh_token_rotated' || oldSession.accessTokenHash
+    || !newSession || newSession.sessionFamilyId !== sessionBeforeExpiry.sessionFamilyId || !newSession.accessTokenHash
+    || refreshedInventory.response.status !== 200) fail(`Mobile access expiry did not require one cookie-free family rotation to a fresh authorized session (expired=${expiredAccess.response.status}/${expiredAccess.body.error?.code ?? 'none'}; refresh=${refresh.response.status}/${refresh.body.error?.code ?? 'none'}/cookie=${refresh.response.headers.has('set-cookie')}/valid=${nativeV1Contract.validateMobileCustomerSessionReceipt(refresh.body)}/rotated=${refresh.body?.refreshToken !== receipt.refreshToken}; oldRevoked=${Boolean(oldSession.revokedAt)}/${oldSession.revokeReason ?? 'none'}/accessCleared=${!oldSession.accessTokenHash}; new=${Boolean(newSession)}/family=${newSession?.sessionFamilyId === sessionBeforeExpiry.sessionFamilyId}/accessBound=${Boolean(newSession?.accessTokenHash)}; inventory=${refreshedInventory.response.status})`);
+  const oldRefreshReplay = await fetchJson(`${base}/api/v2/mobile/session`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ refreshToken: receipt.refreshToken }) });
+  const familySession = await prisma.customerSession.findUniqueOrThrow({ where: { id: refresh.body.sessionId }, select: { revokedAt: true, revokeReason: true, accessTokenHash: true } });
+  const familyAccessReplay = await fetchJson(`${base}/api/v2/trusted-devices`, { headers: { authorization: `Bearer ${refresh.body.accessToken}` } });
+  if (oldRefreshReplay.response.status !== 401 || !familySession.revokedAt || familySession.revokeReason !== 'refresh_token_reuse'
+    || familySession.accessTokenHash || familyAccessReplay.response.status !== 401) fail('Reused mobile refresh credential did not revoke the current family and its access bearer');
+  console.log('[stage6:integration] PASS: actual mobile login returns account-global memberships without cookies; bearer reaches protected routes, tenant-only hub authority is enforced, expiry rotates one refresh family, and replay revokes its access token');
+}
+
+async function tenantMembershipRemovalChecks() {
+  const base = `http://127.0.0.1:${appPort}`;
+  const fixture = customerFixture;
+  if (!fixture) fail('Tenant access removal checks require the disposable completed two-home fixture');
+
+  async function createTenant(name, homeIds) {
+    const email = `stage6-remove-${name}-${crypto.randomUUID()}@invalid.test`;
+    const username = `remove-${name}-${crypto.randomUUID().slice(0, 12)}`;
+    const account = await prisma.customerAccount.create({ data: {
+      displayName: `Disposable ${name} tenant`, username, usernameNormalized: username,
+      email, emailNormalized: email, emailVerifiedAt: new Date(), passwordHash: hashPassword(`unused-${crypto.randomUUID()}`),
+    } });
+    const memberships = [];
+    for (const homeId of homeIds) memberships.push(await prisma.homeMembership.create({ data: { customerAccountId: account.id, homeId, role: 'TENANT' } }));
+    await prisma.tenantAreaGrant.create({ data: { membershipId: memberships[0].id, areaId: fixture.areaOneId, homeId: fixture.homeOneId } });
+    const phone = keyPair();
+    const device = await prisma.trustedDevice.create({ data: {
+      customerAccountId: account.id, deviceInstallationId: `stage6-remove-phone-${crypto.randomUUID()}`,
+      publicKey: phone.publicKey,
+      publicKeyThumbprint: crypto.createHash('sha256').update(crypto.createPublicKey(phone.publicKey).export({ type: 'spki', format: 'der' })).digest('hex'),
+      deviceName: `Disposable ${name} phone`,
+    } });
+    const rawSession = `dno-disposable-remove-${crypto.randomBytes(48).toString('base64url')}`;
+    const session = await prisma.customerSession.create({ data: {
+      customerAccountId: account.id, trustedDeviceId: device.id, refreshTokenHash: sha256(rawSession),
+      securityVersion: account.securityVersion, trustedDeviceSessionVersion: device.sessionVersion,
+      expiresAt: new Date(Date.now() + 60 * 60 * 1000), absoluteExpiresAt: new Date(Date.now() + 180 * 24 * 60 * 60 * 1000),
+    } });
+    return { account, memberships, phone, device, session, rawSession };
+  }
+
+  async function acceptConfiguredPolicy(identity) {
+    const headers = { cookie: `dinodia_customer_session=${encodeURIComponent(identity.rawSession)}` };
+    const requirements = await fetchJson(`${base}/api/v2/auth/requirements`, { headers });
+    const policy = requirements.body?.policy;
+    if (requirements.response.status !== 200 || !policy?.version || !/^[a-f0-9]{64}$/.test(policy.contentSha256 || '') || requirements.body.accepted !== false) {
+      fail(`Tenant-removal fixture did not receive the server-owned current policy decision (${requirements.response.status}/${requirements.body?.error?.code ?? 'no-code'})`);
+    }
+    const accepted = await fetchJson(`${base}/api/v2/auth/policy/acceptance`, { method: 'POST', headers: { ...headers, 'content-type': 'application/json' },
+      body: JSON.stringify({ version: policy.version, contentSha256: policy.contentSha256, accepted: true }) });
+    if (accepted.response.status !== 200 || accepted.body.policyVersion !== policy.version) fail(`Tenant-removal fixture could not accept the server-current policy (${accepted.response.status}/${accepted.body?.error?.code ?? 'no-code'})`);
+  }
+
+  async function freshProof(identity, homeId, membership, preview, finalConfirmation) {
+    const headers = { cookie: `dinodia_customer_session=${encodeURIComponent(identity.rawSession)}`, 'x-dinodia-home-id': homeId, 'content-type': 'application/json' };
+    const value = { accessRevision: preview.accessRevision, homeManagementRevision: preview.homeManagementRevision,
+      confirmFinalAccountDeletion: finalConfirmation };
+    const challenge = await fetchJson(`${base}/api/v2/security/step-up/challenge`, { method: 'POST', headers,
+      body: JSON.stringify({ operationKind: 'tenant_membership_remove', targetIds: [membership.id, homeId], value }) });
+    if (challenge.response.status !== 200) fail(`Tenant removal step-up challenge failed (${challenge.response.status}/${challenge.body?.error?.code ?? 'none'})`);
+    const signature = crypto.sign(null, stepUpChallengeMessage({ challengeId: challenge.body.challengeId, nonce: challenge.body.nonce,
+      operationDigest: challenge.body.operationDigest }), crypto.createPrivateKey(identity.phone.privateKey)).toString('base64url');
+    const issued = await fetchJson(`${base}/api/v2/security/step-up/issue`, { method: 'POST', headers,
+      body: JSON.stringify({ challengeId: challenge.body.challengeId, nonce: challenge.body.nonce, deviceSignature: signature }) });
+    if (issued.response.status !== 200) fail(`Tenant removal step-up proof failed (${issued.response.status}/${issued.body?.error?.code ?? 'none'})`);
+    return { headers, value, proof: issued.body.proof };
+  }
+
+  const otherHome = await createTenant('two-home', [fixture.homeOneId, fixture.homeTwoId]);
+  await acceptConfiguredPolicy(otherHome);
+  const headers = { cookie: `dinodia_customer_session=${encodeURIComponent(otherHome.rawSession)}`, 'x-dinodia-home-id': fixture.homeOneId, 'content-type': 'application/json' };
+  const preview = await fetchJson(`${base}/api/v2/homes/${fixture.homeOneId}/tenant/access`, { headers });
+  if (preview.response.status !== 200 || preview.body.willDeleteAccount !== false || preview.body.otherRelationshipsRemain !== true
+    || preview.body.homeMembershipId !== otherHome.memberships[0].id) fail(`Tenant removal preview did not preserve the real second-home relationship (${preview.response.status}/${preview.body?.error?.code ?? preview.body?.errorCode ?? 'no-code'})`);
+  const before = {
+    account: await prisma.customerAccount.findUniqueOrThrow({ where: { id: otherHome.account.id }, select: { securityVersion: true, status: true } }),
+    memberships: await prisma.homeMembership.findMany({ where: { customerAccountId: otherHome.account.id }, orderBy: { homeId: 'asc' }, select: { id: true, homeId: true, status: true, accessRevision: true } }),
+    grants: await prisma.tenantAreaGrant.findMany({ where: { membershipId: otherHome.memberships[0].id }, select: { id: true, revokedAt: true } }),
+  };
+  const deniedWrongHome = await fetchJson(`${base}/api/v2/homes/${fixture.homeTwoId}/tenant/access`, { headers });
+  const deniedSnapshot = {
+    account: await prisma.customerAccount.findUniqueOrThrow({ where: { id: otherHome.account.id }, select: { securityVersion: true, status: true } }),
+    memberships: await prisma.homeMembership.findMany({ where: { customerAccountId: otherHome.account.id }, orderBy: { homeId: 'asc' }, select: { id: true, homeId: true, status: true, accessRevision: true } }),
+    grants: await prisma.tenantAreaGrant.findMany({ where: { membershipId: otherHome.memberships[0].id }, select: { id: true, revokedAt: true } }),
+  };
+  if (deniedWrongHome.response.status !== 404 || JSON.stringify(deniedSnapshot) !== JSON.stringify(before)) fail('Wrong-home tenant removal disclosed state or changed account/membership/grant rows');
+  const proof = await freshProof(otherHome, fixture.homeOneId, otherHome.memberships[0], preview.body, false);
+  const idempotencyKey = `tenant-remove-${crypto.randomUUID()}`;
+  const staleBody = { expectedAccessRevision: preview.body.accessRevision + 1,
+    expectedManagementRevision: preview.body.homeManagementRevision,
+    confirmFinalAccountDeletion: false, proof: proof.proof, idempotencyKey };
+  const staleRevision = await fetchJson(`${base}/api/v2/homes/${fixture.homeOneId}/tenant/access`, { method: 'DELETE', headers: proof.headers, body: JSON.stringify(staleBody) });
+  const proofRowAfterDenial = await prisma.stepUpAuthorization.findFirstOrThrow({ where: { customerAccountId: otherHome.account.id, operationKind: 'tenant_membership_remove' }, orderBy: { issuedAt: 'desc' }, select: { consumedAt: true } });
+  if (staleRevision.response.status !== 409 || proofRowAfterDenial.consumedAt || JSON.stringify({
+    account: await prisma.customerAccount.findUniqueOrThrow({ where: { id: otherHome.account.id }, select: { securityVersion: true, status: true } }),
+    memberships: await prisma.homeMembership.findMany({ where: { customerAccountId: otherHome.account.id }, orderBy: { homeId: 'asc' }, select: { id: true, homeId: true, status: true, accessRevision: true } }),
+  }) !== JSON.stringify({ account: before.account, memberships: before.memberships })) fail('Stale-revision tenant removal consumed proof or mutated account/membership authority');
+  const validBody = { expectedAccessRevision: preview.body.accessRevision,
+    expectedManagementRevision: preview.body.homeManagementRevision, confirmFinalAccountDeletion: false,
+    proof: proof.proof, idempotencyKey };
+  const removed = await fetchJson(`${base}/api/v2/homes/${fixture.homeOneId}/tenant/access`, { method: 'DELETE', headers: proof.headers, body: JSON.stringify(validBody) });
+  const removedMembership = await prisma.homeMembership.findUniqueOrThrow({ where: { id: otherHome.memberships[0].id }, select: { status: true, accessRevision: true, removalReason: true } });
+  const preservedMembership = await prisma.homeMembership.findUniqueOrThrow({ where: { id: otherHome.memberships[1].id }, select: { status: true, role: true } });
+  const revokedGrant = await prisma.tenantAreaGrant.findFirstOrThrow({ where: { membershipId: otherHome.memberships[0].id }, select: { revokedAt: true, revokeReason: true } });
+  const removalOutbox = await prisma.nativeDomainOutbox.findFirst({ where: { aggregateType: 'HomeMembership', aggregateId: otherHome.memberships[0].id, eventType: 'TENANT_MEMBERSHIP_REVOKED' }, select: { id: true, payload: true } });
+  const retry = await fetchJson(`${base}/api/v2/homes/${fixture.homeOneId}/tenant/access`, { method: 'DELETE', headers: proof.headers, body: JSON.stringify(validBody) });
+  if (removed.response.status !== 200 || removed.body.accountDeleted !== false || removed.body.otherRelationshipsRemain !== true
+    || removed.body.hubEnforcement !== 'PENDING' || removed.body.nextAction !== 'SELECT_HOME'
+    || removedMembership.status !== 'REMOVED' || removedMembership.accessRevision !== before.memberships[0].accessRevision + 1
+    || removedMembership.removalReason !== 'tenant_self_removal' || preservedMembership.status !== 'ACTIVE' || preservedMembership.role !== 'TENANT'
+    || !revokedGrant.revokedAt || revokedGrant.revokeReason !== 'tenant_self_removal' || !removalOutbox
+    || retry.response.status !== 200 || retry.body.idempotentReplay !== true || retry.body.homeMembershipId !== otherHome.memberships[0].id) {
+    fail(`Actual scoped tenant removal did not revoke only the selected Home and reconcile retry (${JSON.stringify({ status: removed.response.status, error: removed.body?.error?.code, accountDeleted: removed.body?.accountDeleted, removed: removedMembership.status, other: preservedMembership.status, grantRevoked: Boolean(revokedGrant.revokedAt), outbox: Boolean(removalOutbox), retry: retry.response.status })})`);
+  }
+
+  const finalTenant = await createTenant('final', [fixture.homeOneId]);
+  await acceptConfiguredPolicy(finalTenant);
+  const finalHeaders = { cookie: `dinodia_customer_session=${encodeURIComponent(finalTenant.rawSession)}`, 'x-dinodia-home-id': fixture.homeOneId, 'content-type': 'application/json' };
+  const finalPreview = await fetchJson(`${base}/api/v2/homes/${fixture.homeOneId}/tenant/access`, { headers: finalHeaders });
+  if (finalPreview.response.status !== 200 || finalPreview.body.willDeleteAccount !== true || finalPreview.body.otherRelationshipsRemain !== false) fail('Final relationship preview omitted the account-deletion warning');
+  const noConfirmProof = await freshProof(finalTenant, fixture.homeOneId, finalTenant.memberships[0], finalPreview.body, false);
+  const finalKey = `tenant-final-${crypto.randomUUID()}`;
+  const noConfirm = await fetchJson(`${base}/api/v2/homes/${fixture.homeOneId}/tenant/access`, { method: 'DELETE', headers: noConfirmProof.headers,
+    body: JSON.stringify({ confirmFinalAccountDeletion: false, expectedAccessRevision: finalPreview.body.accessRevision,
+      expectedManagementRevision: finalPreview.body.homeManagementRevision, proof: noConfirmProof.proof, idempotencyKey: finalKey }) });
+  const finalStillExists = await prisma.customerAccount.findUnique({ where: { id: finalTenant.account.id }, select: { id: true, securityVersion: true } });
+  const finalMembershipBeforeConsent = await prisma.homeMembership.findUniqueOrThrow({ where: { id: finalTenant.memberships[0].id }, select: { status: true, accessRevision: true } });
+  const noConfirmProofRow = await prisma.stepUpAuthorization.findFirstOrThrow({ where: { customerAccountId: finalTenant.account.id, operationKind: 'tenant_membership_remove' }, orderBy: { issuedAt: 'desc' }, select: { consumedAt: true } });
+  if (noConfirm.response.status !== 409 || noConfirm.body.error?.code !== 'FINAL_RELATIONSHIP_CONFIRMATION_REQUIRED'
+    || !finalStillExists || finalMembershipBeforeConsent.status !== 'ACTIVE' || noConfirmProofRow.consumedAt) fail(`Final account deletion warning did not preserve authority before explicit consent (${JSON.stringify({ status: noConfirm.response.status, code: noConfirm.body.error?.code, accountStillExists: Boolean(finalStillExists), membership: finalMembershipBeforeConsent.status, proofConsumed: Boolean(noConfirmProofRow.consumedAt) })})`);
+  const consentPreview = await fetchJson(`${base}/api/v2/homes/${fixture.homeOneId}/tenant/access`, { headers: finalHeaders });
+  const consentProof = await freshProof(finalTenant, fixture.homeOneId, finalTenant.memberships[0], consentPreview.body, true);
+  const consent = await fetchJson(`${base}/api/v2/homes/${fixture.homeOneId}/tenant/access`, { method: 'DELETE', headers: consentProof.headers,
+    body: JSON.stringify({ confirmFinalAccountDeletion: true, expectedAccessRevision: consentPreview.body.accessRevision,
+      expectedManagementRevision: consentPreview.body.homeManagementRevision, proof: consentProof.proof, idempotencyKey: `tenant-final-confirmed-${crypto.randomUUID()}` }) });
+  const deletedAccount = await prisma.customerAccount.findUnique({ where: { id: finalTenant.account.id }, select: { id: true } });
+  const deletedSessionCount = await prisma.customerSession.count({ where: { customerAccountId: finalTenant.account.id } });
+  const deletedDeviceCount = await prisma.trustedDevice.count({ where: { customerAccountId: finalTenant.account.id } });
+  const remainingProofRows = await prisma.stepUpAuthorization.count({ where: { nonceHash: sha256(consentProof.proof) } });
+  const anonymousReceipt = consent.body?.anonymousReference ? await prisma.deletionSecurityReceipt.findUnique({ where: { anonymousReference: consent.body.anonymousReference }, select: { actionType: true } }) : null;
+  if (consent.response.status !== 200 || consent.body.accountDeleted !== true || consent.body.nextAction !== 'SIGN_IN'
+    || !/^del_[A-Za-z0-9_-]{32}$/.test(consent.body.anonymousReference || '') || deletedAccount || deletedSessionCount !== 0 || deletedDeviceCount !== 0
+    || remainingProofRows !== 0
+    || anonymousReceipt?.actionType !== 'TENANT_ACCESS_REMOVAL_AND_ACCOUNT_DELETION') fail(`Confirmed last-relationship removal did not delete account-scoped authority and retain only the bounded anonymous security receipt (${JSON.stringify({ status: consent.response.status, code: consent.body?.error?.code, accountDeleted: consent.body?.accountDeleted, nextAction: consent.body?.nextAction, referenceShapeValid: /^del_[A-Za-z0-9_-]{32}$/.test(consent.body?.anonymousReference || ''), accountStillExists: Boolean(deletedAccount), remainingSessions: deletedSessionCount, remainingDevices: deletedDeviceCount, receiptType: anonymousReceipt?.actionType ?? null })})`);
+  console.log('[stage6:integration] PASS: actual tenant-access route proves wrong-home/stale-revision zero-effect denial, fresh proof, selected-membership-only removal, other-home preservation, idempotent retry, final-account warning and account-wide cleanup');
+}
+
+async function pendingInvitationRouteChecks(deliveryEnv) {
+  const base = `http://127.0.0.1:${appPort}`;
+  if (!customerFixture) fail('Pending invitation route checks require the disposable two-home owner fixture');
+  sesShouldFail = false;
+  capturedCustomerVerification = null;
+  const email = `stage6-invitee-${crypto.randomUUID()}@invalid.test`;
+  const password = `stage6-invitee-password-${crypto.randomUUID()}`;
+  const username = `invitee-${crypto.randomUUID().slice(0, 12)}`;
+  const registration = await fetchJson(`${base}/api/v2/auth/register`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ displayName: 'Disposable invitation recipient', username, email, password }) });
+  if (registration.response.status !== 202 || !capturedCustomerVerification) fail('Invitation recipient registration did not create a disposable verification challenge');
+  const verified = await fetchJson(`${base}/api/v2/auth/email/verify`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(capturedCustomerVerification) });
+  const phone = keyPair();
+  const installationId = `stage6-invitee-phone-${crypto.randomUUID()}`;
+  const login = await fetchJson(`${base}/api/v2/session`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ email, password, deviceInstallationId: installationId, publicKey: phone.publicKey, deviceName: 'Disposable invitation recipient phone', model: 'integration-test', osFamily: 'test', osVersion: 'test' }) });
+  const jar = {}; updateCookieJar(jar, login.response);
+  const rawSession = cookieValue(jar, 'dinodia_customer_session');
+  const account = await prisma.customerAccount.findUniqueOrThrow({ where: { emailNormalized: email }, select: { id: true, displayName: true } });
+  const inviter = await prisma.homeMembership.findUniqueOrThrow({ where: { id: customerFixture.ownerMembershipId }, select: { id: true, homeId: true } });
+  const areaId = customerFixture.areaTwoId;
+  if (inviter.homeId !== customerFixture.homeTwoId
+    || await prisma.homeMembership.findUnique({ where: { customerAccountId_homeId: { customerAccountId: account.id, homeId: inviter.homeId } }, select: { id: true } })) fail('Invitation fixture is not an unjoined exact Home for the verified recipient');
+  await prisma.policyAcceptance.upsert({
+    where: { customerAccountId_policyKind_policyVersion: { customerAccountId: customerFixture.accountId, policyKind: 'DINODIA_NATIVE', policyVersion: deliveryEnv.DINODIA_NATIVE_POLICY_VERSION } },
+    create: { customerAccountId: customerFixture.accountId, policyKind: 'DINODIA_NATIVE', policyVersion: deliveryEnv.DINODIA_NATIVE_POLICY_VERSION, acceptedAt: new Date() },
+    update: {},
+  });
+  const inviterHeaders = { cookie: `dinodia_customer_session=${encodeURIComponent(customerFixture.customerSessionSecret)}`, 'content-type': 'application/json' };
+  const invitationHome = await prisma.home.findUniqueOrThrow({ where: { id: inviter.homeId }, select: { managementRevision: true } });
+  const invitationAreaCatalog = await fetchJson(`${base}/api/v2/homes/${inviter.homeId}/areas`, { headers: inviterHeaders });
+  if (invitationAreaCatalog.response.status !== 200 || invitationAreaCatalog.body.homeId !== inviter.homeId
+    || invitationAreaCatalog.body.managementRevision !== invitationHome.managementRevision
+    || !invitationAreaCatalog.body.areas?.some((area) => area.id === areaId && area.name)
+    || JSON.stringify(invitationAreaCatalog.body).includes(customerFixture.areaTwoOsId)) {
+    fail(`Owner invitation Area catalogue did not return only public IDs and names for the exact selected Home (${JSON.stringify({ status: invitationAreaCatalog.response.status, correctHome: invitationAreaCatalog.body.homeId === inviter.homeId, revision: invitationAreaCatalog.body.managementRevision === invitationHome.managementRevision, areaVisible: invitationAreaCatalog.body.areas?.some((area) => area.id === areaId && area.name), privateAliasAbsent: !JSON.stringify(invitationAreaCatalog.body).includes(customerFixture.areaTwoOsId) })})`);
+  }
+  console.log('[stage6:integration] PASS: the current owner can load exact-home invitation Areas and management revision without receiving private OS aliases');
+  const selectedHomeHeaders = { ...inviterHeaders, 'x-dinodia-home-id': inviter.homeId };
+  const preferencesBefore = await fetchJson(`${base}/api/v2/homes/${inviter.homeId}/preferences`, { headers: selectedHomeHeaders });
+  const quietHoursDocument = { version: 1, enabled: true, startLocalTime: '22:00', endLocalTime: '07:00', timeZone: 'Europe/London', days: [1, 2, 3, 4, 5, 6, 7] };
+  const preferencesWrite = await fetchJson(`${base}/api/v2/homes/${inviter.homeId}/preferences`, { method: 'PUT', headers: selectedHomeHeaders, body: JSON.stringify({ kind: 'QUIET_HOURS', expectedRevision: 0, document: quietHoursDocument }) });
+  const preferencesAfter = await fetchJson(`${base}/api/v2/homes/${inviter.homeId}/preferences`, { headers: selectedHomeHeaders });
+  const wrongSelectedHomePreferences = await fetchJson(`${base}/api/v2/homes/${inviter.homeId}/preferences`, { headers: { ...inviterHeaders, 'x-dinodia-home-id': customerFixture.homeOneId } });
+  const preferenceRevisionBeforeInvalid = preferencesWrite.body?.revision;
+  const invalidPreferenceWrite = await fetchJson(`${base}/api/v2/homes/${inviter.homeId}/preferences`, { method: 'PUT', headers: selectedHomeHeaders, body: JSON.stringify({ kind: 'QUIET_HOURS', expectedRevision: preferenceRevisionBeforeInvalid, document: { ...quietHoursDocument, timeZone: 'Not/A_Time_Zone' } }) });
+  const preferencesAfterInvalid = await fetchJson(`${base}/api/v2/homes/${inviter.homeId}/preferences`, { headers: selectedHomeHeaders });
+  const savedQuietHours = preferencesAfter.body?.preferences?.find((row) => row.kind === 'QUIET_HOURS');
+  const savedQuietHoursDocument = savedQuietHours?.document;
+  if (preferencesBefore.response.status !== 200 || preferencesWrite.response.status !== 200 || preferencesWrite.body?.revision !== 1
+    || preferencesAfter.response.status !== 200 || savedQuietHours?.revision !== 1
+    || savedQuietHoursDocument?.enabled !== true || savedQuietHoursDocument?.startLocalTime !== quietHoursDocument.startLocalTime
+    || savedQuietHoursDocument?.endLocalTime !== quietHoursDocument.endLocalTime || savedQuietHoursDocument?.timeZone !== quietHoursDocument.timeZone
+    || JSON.stringify([...(savedQuietHoursDocument?.days ?? [])].sort()) !== JSON.stringify(quietHoursDocument.days)
+    || wrongSelectedHomePreferences.response.status !== 404 || wrongSelectedHomePreferences.body?.error?.code !== 'RESOURCE_NOT_FOUND'
+    || Object.keys(wrongSelectedHomePreferences.body ?? {}).some((key) => !['schemaVersion', 'ok', 'error'].includes(key))
+    || invalidPreferenceWrite.response.status !== 400 || preferencesAfterInvalid.body?.preferences?.find((row) => row.kind === 'QUIET_HOURS')?.revision !== 1) {
+    fail(`Selected-home preferences did not save and re-read the current membership document or deny wrong-home/invalid writes without a revision effect (${JSON.stringify({ before: preferencesBefore.response.status, write: preferencesWrite.response.status, writeError: preferencesWrite.body?.error?.code, after: preferencesAfter.response.status, savedRevision: savedQuietHours?.revision, savedQuietHoursDocument, wrongHome: wrongSelectedHomePreferences.response.status, wrongHomeCode: wrongSelectedHomePreferences.body?.error?.code, wrongHomeKeys: Object.keys(wrongSelectedHomePreferences.body ?? {}), invalid: invalidPreferenceWrite.response.status, invalidError: invalidPreferenceWrite.body?.error?.code, afterInvalidRevision: preferencesAfterInvalid.body?.preferences?.find((row) => row.kind === 'QUIET_HOURS')?.revision })})`);
+  }
+  console.log('[stage6:integration] PASS: actual selected-home preferences save and re-read one bounded membership document; wrong-home projection and malformed timezone deny without disclosing or advancing its revision');
+  capturedCustomerInvitation = null;
+  capturedCustomerInvitationTempPassword = null;
+  const invitationIdempotencyKey = `stage6-invite-${crypto.randomUUID()}`;
+  const invitationPayload = { email, areaIds: [areaId], expectedManagementRevision: invitationHome.managementRevision };
+  const emailCountBefore = customerInvitationEmailCount;
+  const issuedInvitation = await fetchJson(`${base}/api/v2/homes/${inviter.homeId}/tenant/invitations`, { method: 'POST', headers: { ...inviterHeaders, 'idempotency-key': invitationIdempotencyKey }, body: JSON.stringify(invitationPayload) });
+  const invitation = issuedInvitation.body?.invitationId ? await prisma.membershipInvitation.findUniqueOrThrow({ where: { id: issuedInvitation.body.invitationId }, select: { id: true, updatedAt: true, targetAccountId: true, targetEmailNormalized: true, role: true, expiresAt: true, temporaryCredentialHash: true, areas: { select: { areaId: true } } } }) : null;
+  const invitationRetry = await fetchJson(`${base}/api/v2/homes/${inviter.homeId}/tenant/invitations`, { method: 'POST', headers: { ...inviterHeaders, 'idempotency-key': invitationIdempotencyKey }, body: JSON.stringify(invitationPayload) });
+  const unauthorizedTenantInvite = await fetchJson(`${base}/api/v2/homes/${customerFixture.homeOneId}/tenant/invitations`, { method: 'POST', headers: { 'content-type': 'application/json', cookie: `dinodia_customer_session=${encodeURIComponent(customerFixture.customerSessionSecret)}`, 'idempotency-key': `stage6-tenant-invite-${crypto.randomUUID()}` }, body: JSON.stringify({ email: `unauthorized-${crypto.randomUUID()}@invalid.test`, areaIds: [customerFixture.areaOneId], expectedManagementRevision: (await prisma.home.findUniqueOrThrow({ where: { id: customerFixture.homeOneId }, select: { managementRevision: true } })).managementRevision }) });
+  const unauthorizedInvitationCount = await prisma.membershipInvitation.count({ where: { targetEmailNormalized: { startsWith: 'unauthorized-' } } });
+  if (issuedInvitation.response.status !== 201 || !nativeV1Contract.validateCustomerMembershipInvitationReceipt(issuedInvitation.body, inviter.homeId, 'TENANT')
+    || invitation?.targetAccountId !== account.id || invitation?.targetEmailNormalized !== email.toLowerCase() || invitation?.role !== 'TENANT'
+    || invitation.temporaryCredentialHash !== null || invitation.areas.map((area) => area.areaId).join(',') !== areaId
+    || Math.abs(invitation.expiresAt.getTime() - Date.now() - 7 * 24 * 60 * 60 * 1000) > 5000
+    || capturedCustomerInvitation !== invitation.id || capturedCustomerInvitationTempPassword !== null
+    || JSON.stringify(issuedInvitation.body).includes(email) || invitationRetry.response.status !== 201 || !invitationRetry.body.idempotentReplay
+    || customerInvitationEmailCount !== emailCountBefore + 1
+    || unauthorizedTenantInvite.response.status !== 403 || unauthorizedInvitationCount !== 0) fail('Owner-issued tenant invitation did not preserve exact Areas, seven-day expiry, existing credentials, idempotent mail submission or role denial');
+  const managerInviteEmail = `stage6-manager-invite-${crypto.randomUUID()}@invalid.test`;
+  const managerInvitePayload = { email: managerInviteEmail, areaIds: [], expectedManagementRevision: invitationHome.managementRevision };
+  const managerInvite = await fetchJson(`${base}/api/v2/homes/${inviter.homeId}/property-managers`, { method: 'POST', headers: { ...inviterHeaders, 'idempotency-key': `stage6-manager-${crypto.randomUUID()}` }, body: JSON.stringify(managerInvitePayload) });
+  const managerInviteReplacement = managerInvite.body?.invitationId ? await fetchJson(`${base}/api/v2/homes/${inviter.homeId}/property-managers`, { method: 'POST', headers: { ...inviterHeaders, 'idempotency-key': `stage6-manager-resend-${crypto.randomUUID()}` }, body: JSON.stringify({ ...managerInvitePayload, resendInvitationId: managerInvite.body.invitationId }) }) : null;
+  const managerInviteRows = managerInvite.body?.invitationId && managerInviteReplacement?.body?.invitationId ? await prisma.membershipInvitation.findMany({ where: { id: { in: [managerInvite.body.invitationId, managerInviteReplacement.body.invitationId] } }, select: { id: true, role: true, state: true, targetEmailNormalized: true, temporaryCredentialHash: true, replacementOfId: true, expiresAt: true }, orderBy: { createdAt: 'asc' } }) : [];
+  if (managerInvite.response.status !== 201 || managerInviteReplacement?.response.status !== 201 || managerInviteRows.length !== 2
+    || managerInviteRows[0].state !== 'REPLACED' || managerInviteRows[1].state !== 'PENDING' || managerInviteRows[1].replacementOfId !== managerInviteRows[0].id
+    || managerInviteRows.some((row) => row.role !== 'PROPERTY_MANAGER' || row.targetEmailNormalized !== managerInviteEmail.toLowerCase() || row.temporaryCredentialHash !== null)
+    || Math.abs(managerInviteRows[1].expiresAt.getTime() - Date.now() - 7 * 24 * 60 * 60 * 1000) > 5000) fail('Manager invitation resend did not immediately replace the prior generation, preserve self-registration credentials and reset the seven-day request-time expiry');
+  capturedCustomerVerification = null;
+  const managerRecipientPassword = `stage6-manager-recipient-${crypto.randomUUID()}`;
+  const managerRecipientUsername = `manager-recipient-${crypto.randomUUID().slice(0, 12)}`;
+  const managerRecipientRegistration = await fetchJson(`${base}/api/v2/auth/register`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ displayName: 'Disposable invited manager', username: managerRecipientUsername, email: managerInviteEmail, password: managerRecipientPassword }) });
+  const managerRecipientVerification = capturedCustomerVerification ? await fetchJson(`${base}/api/v2/auth/email/verify`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(capturedCustomerVerification) }) : null;
+  const managerRecipientPhone = keyPair();
+  const managerRecipientLogin = await fetchJson(`${base}/api/v2/session`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ email: managerInviteEmail, password: managerRecipientPassword, deviceInstallationId: `stage6-manager-recipient-${crypto.randomUUID()}`, publicKey: managerRecipientPhone.publicKey, deviceName: 'Disposable invited manager phone', model: 'integration-test', osFamily: 'test', osVersion: 'test' }) });
+  const managerRecipientJar = {}; updateCookieJar(managerRecipientJar, managerRecipientLogin.response);
+  const managerRecipientHeaders = { cookie: cookieHeader(managerRecipientJar), 'content-type': 'application/json' };
+  const managerRecipientPolicy = await fetchJson(`${base}/api/v2/auth/policy/acceptance`, { method: 'POST', headers: managerRecipientHeaders, body: JSON.stringify({ version: deliveryEnv.DINODIA_NATIVE_POLICY_VERSION, contentSha256: sha256(deliveryEnv.DINODIA_NATIVE_POLICY_TEXT), accepted: true }) });
+  const managerInvitationCurrent = managerInviteReplacement?.body?.invitationId ? await prisma.membershipInvitation.findUniqueOrThrow({ where: { id: managerInviteReplacement.body.invitationId }, select: { id: true, updatedAt: true, state: true } }) : null;
+  const homeBeforeOwnerTransfer = await prisma.home.findUniqueOrThrow({ where: { id: inviter.homeId }, select: { managementRevision: true } });
+  const managerRecipientAccount = await prisma.customerAccount.findUniqueOrThrow({ where: { emailNormalized: managerInviteEmail.toLowerCase() }, select: { id: true } });
+  // Rehearse the valid post-transfer database state in disposable data: the
+  // former owner is now a manager and the recipient is the sole current owner.
+  // The database's deferred invariant intentionally forbids a zero-owner gap.
+  const formerOwnerToManager = await prisma.$transaction(async (tx) => {
+    const recipientMembership = await tx.homeMembership.create({ data: { customerAccountId: managerRecipientAccount.id, homeId: inviter.homeId, role: 'PROPERTY_MANAGER', status: 'ACTIVE' }, select: { id: true } });
+    await tx.homeMembership.update({ where: { id: customerFixture.ownerMembershipId }, data: { role: 'PROPERTY_MANAGER' } });
+    await tx.homeMembership.update({ where: { id: recipientMembership.id }, data: { role: 'OWNER' } });
+    await tx.home.update({ where: { id: inviter.homeId }, data: { managementRevision: { increment: 1 } } });
+    return recipientMembership.id;
+  });
+  const homeAtFormerOwnerDemotion = await prisma.home.findUniqueOrThrow({ where: { id: inviter.homeId }, select: { managementRevision: true } });
+  const formerOwnerInvitationDecision = managerInvitationCurrent && managerRecipientLogin.response.status === 200
+    ? await fetchJson(`${base}/api/v2/invitations/${managerInvitationCurrent.id}/decision`, { method: 'POST', headers: { cookie: cookieHeader(managerRecipientJar), 'content-type': 'application/json' }, body: JSON.stringify({ decision: 'ACCEPT', expectedUpdatedAt: managerInvitationCurrent.updatedAt.toISOString() }) })
+    : null;
+  const managerInvitationAfterDemotion = managerInvitationCurrent ? await prisma.membershipInvitation.findUniqueOrThrow({ where: { id: managerInvitationCurrent.id }, select: { state: true, acceptedAt: true } }) : null;
+  const homeAfterFormerOwnerDecision = await prisma.home.findUniqueOrThrow({ where: { id: inviter.homeId }, select: { managementRevision: true } });
+  await prisma.$transaction(async (tx) => {
+    await tx.homeMembership.update({ where: { id: formerOwnerToManager }, data: { role: 'PROPERTY_MANAGER', status: 'REMOVED', removedAt: new Date(), removalReason: 'disposable_invitation_authority_test' } });
+    await tx.homeMembership.update({ where: { id: customerFixture.ownerMembershipId }, data: { role: 'OWNER' } });
+    await tx.home.update({ where: { id: inviter.homeId }, data: { managementRevision: { increment: 1 } } });
+  });
+  const homeAfterInviterRestore = await prisma.home.findUniqueOrThrow({ where: { id: inviter.homeId }, select: { managementRevision: true } });
+  invitationHome.managementRevision = homeAfterInviterRestore.managementRevision;
+  if (homeAtFormerOwnerDemotion.managementRevision !== homeBeforeOwnerTransfer.managementRevision + 1
+    || managerRecipientRegistration.response.status !== 202 || managerRecipientVerification?.response.status !== 200
+    || managerRecipientLogin.response.status !== 200 || managerRecipientPolicy.response.status !== 200 || !managerInvitationCurrent
+    || formerOwnerInvitationDecision?.response.status !== 409 || formerOwnerInvitationDecision.body?.error?.code !== 'SCOPE_DENIED'
+    || managerInvitationAfterDemotion?.state !== 'PENDING' || managerInvitationAfterDemotion.acceptedAt
+    || homeAfterFormerOwnerDecision.managementRevision !== homeAtFormerOwnerDemotion.managementRevision) {
+    fail('A pending manager-role invitation remained acceptable after ownership transferred away from its original inviter');
+  }
+  console.log('[stage6:integration] PASS: manager invitation acceptance rechecks original inviter OWNER authority after a valid ownership transfer; former-owner acceptance is denied without changing the pending invitation or Home revision');
+  const newTenantEmail = `stage6-new-tenant-${crypto.randomUUID()}@invalid.test`;
+  capturedCustomerInvitation = null;
+  capturedCustomerInvitationTempPassword = null;
+  capturedCustomerVerification = null;
+  const newTenantIssue = await fetchJson(`${base}/api/v2/homes/${inviter.homeId}/tenant/invitations`, { method: 'POST', headers: { ...inviterHeaders, 'idempotency-key': `stage6-new-tenant-${crypto.randomUUID()}` }, body: JSON.stringify({ email: newTenantEmail, areaIds: [areaId], expectedManagementRevision: invitationHome.managementRevision }) });
+  const newTenantInvitation = newTenantIssue.body?.invitationId ? await prisma.membershipInvitation.findUniqueOrThrow({ where: { id: newTenantIssue.body.invitationId }, select: { id: true, targetAccountId: true, temporaryCredentialHash: true } }) : null;
+  const temporaryPassword = capturedCustomerInvitationTempPassword;
+  const wrongTempRegister = await fetchJson(`${base}/api/v2/auth/register`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ displayName: 'Disposable new tenant', username: `wrong-${crypto.randomUUID().slice(0, 10)}`, email: newTenantEmail, password: `wrong-stage6-${crypto.randomUUID()}` }) });
+  const accountAfterWrongTemp = await prisma.customerAccount.findUnique({ where: { emailNormalized: newTenantEmail.toLowerCase() }, select: { id: true } });
+  const wrongTempCreatedVerification = capturedCustomerVerification;
+  capturedCustomerVerification = null;
+  const newTenantUsername = `newtenant-${crypto.randomUUID().slice(0, 12)}`;
+  const wrongLinkedRedeem = temporaryPassword && newTenantInvitation ? await fetchJson(`${base}/api/v2/auth/register`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ invitationId: newTenantInvitation.id, email: newTenantEmail, password: `wrong-stage6-${crypto.randomUUID()}` }) }) : null;
+  const correctTempRegister = temporaryPassword && newTenantInvitation ? await fetchJson(`${base}/api/v2/auth/register`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ invitationId: newTenantInvitation.id, email: newTenantEmail, password: temporaryPassword }) }) : null;
+  const invitationRateBucket = await prisma.authRateLimitBucket.findFirst({ where: { bucketKey: { startsWith: 'customer-invitation-registration:' } }, orderBy: { updatedAt: 'desc' }, select: { bucketKey: true } });
+  if (!invitationRateBucket || invitationRateBucket.bucketKey.length > 160 || invitationRateBucket.bucketKey.includes(newTenantEmail)) {
+    fail('Tenant invitation registration rate-limit identity exceeded its bounded, non-PII storage contract');
+  }
+  const newTenantAccount = correctTempRegister?.response.status === 202 ? await prisma.customerAccount.findUniqueOrThrow({ where: { emailNormalized: newTenantEmail.toLowerCase() }, select: { id: true, usernameNormalized: true, mustChangePassword: true, usernameSelectionRequired: true, emailVerifiedAt: true } }) : null;
+  const boundInvitation = newTenantInvitation ? await prisma.membershipInvitation.findUniqueOrThrow({ where: { id: newTenantInvitation.id }, select: { targetAccountId: true, temporaryCredentialHash: true, state: true } }) : null;
+  const verifiedNewTenant = capturedCustomerVerification ? await fetchJson(`${base}/api/v2/auth/email/verify`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(capturedCustomerVerification) }) : null;
+  const newTenantPhone = keyPair();
+  const newTenantLogin = temporaryPassword ? await fetchJson(`${base}/api/v2/session`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ email: newTenantEmail, password: temporaryPassword, deviceInstallationId: `stage6-new-tenant-${crypto.randomUUID()}`, publicKey: newTenantPhone.publicKey, deviceName: 'Disposable new tenant phone', model: 'integration-test', osFamily: 'test', osVersion: 'test' }) }) : null;
+  const newTenantJar = {}; if (newTenantLogin) updateCookieJar(newTenantJar, newTenantLogin.response);
+  const newTenantRequirements = newTenantLogin?.response.status === 200 ? await fetchJson(`${base}/api/v2/auth/requirements`, { headers: { cookie: cookieHeader(newTenantJar) } }) : null;
+  const replacementPassword = `new-tenant-replaced-${crypto.randomUUID()}`;
+  const mandatoryReplacement = newTenantLogin?.response.status === 200 ? await fetchJson(`${base}/api/v2/auth/password/change`, { method: 'POST', headers: { 'content-type': 'application/json', cookie: cookieHeader(newTenantJar) }, body: JSON.stringify({ currentPassword: temporaryPassword, newPassword: replacementPassword }) }) : null;
+  if (mandatoryReplacement) updateCookieJar(newTenantJar, mandatoryReplacement.response);
+  const usernameRequirements = mandatoryReplacement?.response.status === 200 ? await fetchJson(`${base}/api/v2/auth/requirements`, { headers: { cookie: cookieHeader(newTenantJar) } }) : null;
+  const pendingBeforeUsername = mandatoryReplacement?.response.status === 200 ? await fetchJson(`${base}/api/v2/me/pending-relationships`, { headers: { cookie: cookieHeader(newTenantJar) } }) : null;
+  const usernameSelection = newTenantAccount && mandatoryReplacement?.response.status === 200 ? await fetchJson(`${base}/api/v2/me/username`, { method: 'PATCH', headers: { 'content-type': 'application/json', cookie: cookieHeader(newTenantJar) }, body: JSON.stringify({ username: newTenantUsername }) }) : null;
+  const selectedTenantAccount = newTenantAccount ? await prisma.customerAccount.findUniqueOrThrow({ where: { id: newTenantAccount.id }, select: { usernameNormalized: true, usernameSelectionRequired: true } }) : null;
+  const tenantPolicyVersion = deliveryEnv.DINODIA_NATIVE_POLICY_VERSION;
+  const tenantPolicyHash = sha256(deliveryEnv.DINODIA_NATIVE_POLICY_TEXT);
+  const tenantPolicyAcceptance = usernameSelection?.response.status === 200 ? await fetchJson(`${base}/api/v2/auth/policy/acceptance`, { method: 'POST', headers: { 'content-type': 'application/json', cookie: cookieHeader(newTenantJar) }, body: JSON.stringify({ version: tenantPolicyVersion, contentSha256: tenantPolicyHash, accepted: true }) }) : null;
+  const tenantPending = tenantPolicyAcceptance?.response.status === 200 ? await fetchJson(`${base}/api/v2/me/pending-relationships`, { headers: { cookie: cookieHeader(newTenantJar) } }) : null;
+  const currentInviteForAcceptance = newTenantInvitation ? await prisma.membershipInvitation.findUniqueOrThrow({ where: { id: newTenantInvitation.id }, select: { updatedAt: true } }) : null;
+  const newTenantMembershipBeforeAccept = newTenantAccount ? await prisma.homeMembership.findUnique({ where: { customerAccountId_homeId: { customerAccountId: newTenantAccount.id, homeId: inviter.homeId } }, select: { id: true } }) : null;
+  if (wrongLinkedRedeem?.response.status >= 500 || correctTempRegister?.response.status >= 500) {
+    console.log(`[stage6:integration] tenant registration safe runtime codes: wrong=${wrongLinkedRedeem?.response.headers.get('x-dinodia-stage6-test-error') ?? 'none'} correct=${correctTempRegister?.response.headers.get('x-dinodia-stage6-test-error') ?? 'none'}`);
+  }
+  const acceptedNewTenantInvitation = tenantPending?.response.status === 200 && currentInviteForAcceptance ? await fetchJson(`${base}/api/v2/invitations/${newTenantInvitation.id}/decision`, { method: 'POST', headers: { 'content-type': 'application/json', cookie: cookieHeader(newTenantJar), 'idempotency-key': `stage6-new-tenant-accept-${crypto.randomUUID()}` }, body: JSON.stringify({ decision: 'ACCEPT', expectedUpdatedAt: currentInviteForAcceptance.updatedAt.toISOString() }) }) : null;
+  const newTenantMembershipAfterAccept = newTenantAccount ? await prisma.homeMembership.findUnique({ where: { customerAccountId_homeId: { customerAccountId: newTenantAccount.id, homeId: inviter.homeId } }, select: { id: true, status: true, role: true, tenantAreaGrants: { where: { revokedAt: null }, select: { areaId: true } } } }) : null;
+  if (newTenantIssue.response.status !== 201 || !newTenantInvitation?.temporaryCredentialHash || newTenantInvitation.targetAccountId
+    || !temporaryPassword || !/^[A-Za-z0-9_-]{24,160}$/.test(temporaryPassword) || capturedCustomerInvitation !== newTenantInvitation.id
+    || JSON.stringify(newTenantIssue.body).includes(temporaryPassword) || JSON.stringify(newTenantIssue.body).includes(newTenantEmail)
+    || wrongTempRegister.response.status !== 202 || accountAfterWrongTemp || wrongTempCreatedVerification
+    || wrongLinkedRedeem?.response.status !== 202 || correctTempRegister?.response.status !== 202 || !newTenantAccount?.mustChangePassword || !newTenantAccount.usernameSelectionRequired || !newTenantAccount.usernameNormalized.startsWith('setup-')
+    || newTenantAccount.emailVerifiedAt || boundInvitation?.targetAccountId !== newTenantAccount.id || boundInvitation.temporaryCredentialHash !== null || boundInvitation.state !== 'PENDING'
+    || verifiedNewTenant?.response.status !== 200 || newTenantLogin?.response.status !== 200 || newTenantRequirements?.response.status !== 200 || newTenantRequirements.body.nextAction !== 'CHANGE_PASSWORD'
+    || mandatoryReplacement?.response.status !== 200 || usernameRequirements?.body?.nextAction !== 'CHOOSE_USERNAME' || pendingBeforeUsername?.response.status !== 403
+    || usernameSelection?.response.status !== 200 || selectedTenantAccount?.usernameNormalized !== newTenantUsername.toLowerCase() || selectedTenantAccount.usernameSelectionRequired
+    || tenantPolicyAcceptance?.response.status !== 200 || tenantPending?.body?.pendingRelationships?.[0]?.allowedActions?.includes('ACCEPT') !== true
+    || acceptedNewTenantInvitation?.response.status !== 200 || newTenantMembershipBeforeAccept || newTenantMembershipAfterAccept?.status !== 'ACTIVE'
+    || newTenantMembershipAfterAccept?.role !== 'TENANT' || newTenantMembershipAfterAccept.tenantAreaGrants.length !== 1 || newTenantMembershipAfterAccept.tenantAreaGrants[0].areaId !== areaId) fail(`New tenant invitation did not complete the linked temporary-password, password-replacement, username-selection and explicit-accept journey (${JSON.stringify({ issue: newTenantIssue.response.status, invitation: Boolean(newTenantInvitation), wrongGenericRegistration: wrongTempRegister.response.status, wrongLinkedRedeem: wrongLinkedRedeem?.response.status, wrongLinkedErrorCode: wrongLinkedRedeem?.body?.error?.code || wrongLinkedRedeem?.body?.errorCode || null, registration: correctTempRegister?.response.status, registrationErrorCode: correctTempRegister?.body?.error?.code || correctTempRegister?.body?.errorCode || null, placeholder: newTenantAccount?.usernameNormalized?.startsWith('setup-'), forcedPasswordChange: newTenantAccount?.mustChangePassword, usernameRequired: newTenantAccount?.usernameSelectionRequired, verification: verifiedNewTenant?.response.status, login: newTenantLogin?.response.status, initialAction: newTenantRequirements?.body?.nextAction, replacement: mandatoryReplacement?.response.status, usernameAction: usernameRequirements?.body?.nextAction, pendingBeforeUsername: pendingBeforeUsername?.response.status, usernameSelection: usernameSelection?.response.status, policy: tenantPolicyAcceptance?.response.status, pendingAction: tenantPending?.body?.pendingRelationships?.[0]?.allowedActions, invitationAccept: acceptedNewTenantInvitation?.response.status, membershipBeforeAccept: Boolean(newTenantMembershipBeforeAccept), membershipAfterAccept: newTenantMembershipAfterAccept?.status, grantCount: newTenantMembershipAfterAccept?.tenantAreaGrants.length })})`);
+  console.log('[stage6:integration] PASS: new tenant uses the linked one-time credential, verifies the invited email, replaces the password, chooses a unique username, accepts policy, sees only safe pending metadata and gains exactly the invited Area only after explicit acceptance');
+  const headers = { cookie: `dinodia_customer_session=${encodeURIComponent(rawSession)}` };
+  const currentPolicyVersion = deliveryEnv.DINODIA_NATIVE_POLICY_VERSION;
+  const currentPolicyText = deliveryEnv.DINODIA_NATIVE_POLICY_TEXT;
+  const currentPolicyHash = sha256(currentPolicyText);
+  const requirementsBeforePolicy = await fetchJson(`${base}/api/v2/auth/requirements`, { headers });
+  const protectedBeforePolicy = await fetchJson(`${base}/api/v2/me/pending-relationships`, { headers });
+  const policyBeforeCount = await prisma.policyAcceptance.count({ where: { customerAccountId: account.id, policyKind: 'DINODIA_NATIVE', policyVersion: currentPolicyVersion } });
+  const wrongPolicyHash = await fetchJson(`${base}/api/v2/auth/policy/acceptance`, { method: 'POST', headers: { ...headers, 'content-type': 'application/json' }, body: JSON.stringify({ version: currentPolicyVersion, contentSha256: 'a'.repeat(64), accepted: true }) });
+  const policyAfterWrongHash = await prisma.policyAcceptance.count({ where: { customerAccountId: account.id, policyKind: 'DINODIA_NATIVE', policyVersion: currentPolicyVersion } });
+  const acceptPolicy = await fetchJson(`${base}/api/v2/auth/policy/acceptance`, { method: 'POST', headers: { ...headers, 'content-type': 'application/json' }, body: JSON.stringify({ version: currentPolicyVersion, contentSha256: currentPolicyHash, accepted: true }) });
+  const replayPolicy = await fetchJson(`${base}/api/v2/auth/policy/acceptance`, { method: 'POST', headers: { ...headers, 'content-type': 'application/json' }, body: JSON.stringify({ version: currentPolicyVersion, contentSha256: currentPolicyHash, accepted: true }) });
+  const requirementsAfterPolicy = await fetchJson(`${base}/api/v2/auth/requirements`, { headers });
+  const policyAcceptanceCount = await prisma.policyAcceptance.count({ where: { customerAccountId: account.id, policyKind: 'DINODIA_NATIVE', policyVersion: currentPolicyVersion } });
+  if (requirementsBeforePolicy.response.status !== 200 || requirementsBeforePolicy.body.nextAction !== 'ACCEPT_POLICY'
+    || requirementsBeforePolicy.body.policy?.version !== currentPolicyVersion || requirementsBeforePolicy.body.policy?.contentSha256 !== currentPolicyHash
+    || protectedBeforePolicy.response.status !== 403 || protectedBeforePolicy.body.error?.code !== 'UPDATE_REQUIRED'
+    || wrongPolicyHash.response.status !== 409 || wrongPolicyHash.body.error?.code !== 'UPDATE_REQUIRED'
+    || policyAfterWrongHash !== policyBeforeCount || acceptPolicy.response.status !== 200 || acceptPolicy.body.idempotentReplay
+    || replayPolicy.response.status !== 200 || !replayPolicy.body.idempotentReplay || requirementsAfterPolicy.body.nextAction !== 'CONTINUE'
+    || policyAcceptanceCount !== 1) fail('Account-global current-policy review/acceptance did not bind exact server-owned content or idempotently gate continuation');
+  console.log('[stage6:integration] PASS: account-global policy requirement gates protected reads, serves only configured version/hash, denies mismatched content without acceptance, and records explicit acceptance once');
+  const initialHome = await prisma.home.findUniqueOrThrow({ where: { id: inviter.homeId }, select: { managementRevision: true } });
+  const pending = await fetchJson(`${base}/api/v2/me/pending-relationships`, { headers });
+  const anonymous = await fetchJson(`${base}/api/v2/me/pending-relationships`);
+  const row = pending.body?.pendingRelationships?.find((candidate) => candidate.id === invitation.id);
+  if (verified.response.status !== 200 || login.response.status !== 200 || !nativeV1Contract.validateCustomerPendingRelationshipsProjection(pending.body)
+    || !row || row.type !== 'INVITATION' || row.allowedActions.join(',') !== 'ACCEPT,DECLINE' || row.decisionRevision !== invitation.updatedAt.toISOString()
+    || ['addressLine1','streetAddress','homeId','deviceId','areaIds','targetEmail','targetAccountId'].some((key) => Object.hasOwn(row, key))
+    || anonymous.response.status !== 401 || Object.hasOwn(anonymous.body, 'pendingRelationships')) fail('Actual account pending projection failed its safe invitation shape or anonymous denial');
+
+  const wrongRevision = await fetchJson(`${base}/api/v2/invitations/${invitation.id}/decision`, { method: 'POST', headers: { ...headers, 'content-type': 'application/json' }, body: JSON.stringify({ decision: 'ACCEPT', expectedUpdatedAt: new Date(invitation.updatedAt.getTime() + 1000).toISOString() }) });
+  const afterWrongRevision = await Promise.all([
+    prisma.membershipInvitation.findUniqueOrThrow({ where: { id: invitation.id }, select: { state: true } }),
+    prisma.homeMembership.findUnique({ where: { customerAccountId_homeId: { customerAccountId: account.id, homeId: inviter.homeId } }, select: { id: true } }),
+    prisma.home.findUniqueOrThrow({ where: { id: inviter.homeId }, select: { managementRevision: true } }),
+    prisma.auditEvent.count({ where: { targetId: invitation.id, action: 'membership_invitation_accepted' } }),
+  ]);
+  if (wrongRevision.response.status !== 409 || afterWrongRevision[0].state !== 'PENDING' || afterWrongRevision[1]
+    || afterWrongRevision[2].managementRevision !== initialHome.managementRevision || afterWrongRevision[3] !== 0) fail('Stale invitation decision changed membership, grant authority, Home revision or audit state');
+  const accept = await fetchJson(`${base}/api/v2/invitations/${invitation.id}/decision`, { method: 'POST', headers: { ...headers, 'content-type': 'application/json' }, body: JSON.stringify({ decision: 'ACCEPT', expectedUpdatedAt: invitation.updatedAt.toISOString() }) });
+  const afterAccept = await Promise.all([
+    prisma.membershipInvitation.findUniqueOrThrow({ where: { id: invitation.id }, select: { state: true } }),
+    prisma.homeMembership.findUniqueOrThrow({ where: { customerAccountId_homeId: { customerAccountId: account.id, homeId: inviter.homeId } }, select: { id: true, role: true, status: true, tenantAreaGrants: { where: { revokedAt: null }, select: { areaId: true } } } }),
+    prisma.home.findUniqueOrThrow({ where: { id: inviter.homeId }, select: { managementRevision: true } }),
+    prisma.auditEvent.count({ where: { targetId: invitation.id, action: 'membership_invitation_accepted' } }),
+  ]);
+  const retry = await fetchJson(`${base}/api/v2/invitations/${invitation.id}/decision`, { method: 'POST', headers: { ...headers, 'content-type': 'application/json' }, body: JSON.stringify({ decision: 'ACCEPT', expectedUpdatedAt: invitation.updatedAt.toISOString() }) });
+  const conflictingDecision = await fetchJson(`${base}/api/v2/invitations/${invitation.id}/decision`, { method: 'POST', headers: { ...headers, 'content-type': 'application/json' }, body: JSON.stringify({ decision: 'DECLINE', expectedUpdatedAt: invitation.updatedAt.toISOString() }) });
+  const afterReplay = await Promise.all([
+    prisma.homeMembership.findUniqueOrThrow({ where: { customerAccountId_homeId: { customerAccountId: account.id, homeId: inviter.homeId } }, select: { id: true, tenantAreaGrants: { where: { revokedAt: null }, select: { areaId: true } } } }),
+    prisma.home.findUniqueOrThrow({ where: { id: inviter.homeId }, select: { managementRevision: true } }),
+    prisma.auditEvent.count({ where: { targetId: invitation.id, action: 'membership_invitation_accepted' } }),
+  ]);
+  if (accept.response.status !== 200 || !nativeV1Contract.validateCustomerInvitationDecisionReceipt(accept.body, invitation.id)
+    || accept.body.idempotentReplay || afterAccept[0].state !== 'ACCEPTED' || afterAccept[1].role !== 'TENANT' || afterAccept[1].status !== 'ACTIVE'
+    || afterAccept[1].tenantAreaGrants.map((grant) => grant.areaId).join(',') !== areaId || afterAccept[2].managementRevision !== initialHome.managementRevision + 1 || afterAccept[3] !== 1
+    || retry.response.status !== 200 || !retry.body.idempotentReplay || conflictingDecision.response.status !== 410
+    || afterReplay[0].tenantAreaGrants.length !== 1 || afterReplay[1].managementRevision !== initialHome.managementRevision + 1 || afterReplay[2] !== 1) {
+    fail(`Invitation acceptance did not commit one exact tenant grant or safely reconcile retries (${accept.response.status}/${retry.response.status}/${conflictingDecision.response.status})`);
+  }
+  const recipientOnly = await fetchJson(`${base}/api/v2/invitations/${invitation.id}/decision`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ decision: 'ACCEPT', expectedUpdatedAt: invitation.updatedAt.toISOString() }) });
+  if (recipientOnly.response.status !== 401) fail('Invitation decision route admitted an anonymous caller');
+
+  // Exercise the customer claim adapter against an actual disposable Home,
+  // reservation, session and server-owned policy version. This deliberately
+  // remains a pending, ownerless claim; it is not Production onboarding.
+  const claimReferenceValue = `dno_home_${crypto.randomBytes(32).toString('base64url')}`;
+  const claimantHeaders = { cookie: `dinodia_customer_session=${encodeURIComponent(customerFixture.customerSessionSecret)}` };
+  const initialPolicyAcceptance = await fetchJson(`${base}/api/v2/auth/policy/acceptance`, { method: 'POST', headers: { ...claimantHeaders, 'content-type': 'application/json' }, body: JSON.stringify({ version: deliveryEnv.DINODIA_NATIVE_POLICY_VERSION, contentSha256: sha256(deliveryEnv.DINODIA_NATIVE_POLICY_TEXT), accepted: true }) });
+  if (initialPolicyAcceptance.response.status !== 200) fail('Disposable claimant could not accept the current account-wide policy through its actual route');
+  const claimHome = await prisma.home.create({ data: { lifecycle: 'CLAIMABLE', installationStatus: 'DRAFT' } });
+  const claimSigning = keyPair();
+  const claimEncryption = x25519KeyPair();
+  const claimIdentity = await prisma.hubManufacturingIdentity.create({ data: {
+    serialNumber: `stage6-claim-${crypto.randomUUID()}`,
+    signingPublicKey: claimSigning.publicKey,
+    encryptionPublicKey: claimEncryption.publicKey,
+    signingKeyFingerprint: publicKeyFingerprint(claimSigning.publicKey),
+    encryptionKeyFingerprint: publicKeyFingerprint(claimEncryption.publicKey),
+  } });
+  const claimHub = await prisma.hubInstallation.create({ data: {
+    homeId: claimHome.id, manufacturingIdentityId: claimIdentity.id,
+    serialNumberSnapshot: claimIdentity.serialNumber, state: 'PAIRING', lifecycleStatus: 'ACTIVE',
+  } });
+  await prisma.home.update({ where: { id: claimHome.id }, data: { activeHubInstallationId: claimHub.id } });
+  const claimReference = await prisma.homeClaimReference.create({ data: {
+    homeId: claimHome.id, hubInstallationId: claimHub.id, purpose: 'INITIAL_OWNER',
+    companyQrReferenceHash: claimReferenceHash(claimReferenceValue, env.CLAIM_REFERENCE_PEPPER), resolverGeneration: 1,
+  } });
+  const unauthorizedResolve = await fetchJson(`${base}/api/v2/home-claims/resolve`, { method: 'POST', headers: { 'content-type': 'application/json', 'idempotency-key': `claim-anon-${crypto.randomUUID()}` }, body: JSON.stringify({ reference: claimReferenceValue }) });
+  const resolveKey = `claim-resolve-${crypto.randomUUID()}`;
+  const resolve = await fetchJson(`${base}/api/v2/home-claims/resolve`, { method: 'POST', headers: { ...claimantHeaders, 'content-type': 'application/json', 'idempotency-key': resolveKey }, body: JSON.stringify({ reference: claimReferenceValue }) });
+  const resolveRetry = await fetchJson(`${base}/api/v2/home-claims/resolve`, { method: 'POST', headers: { ...claimantHeaders, 'content-type': 'application/json', 'idempotency-key': resolveKey }, body: JSON.stringify({ reference: claimReferenceValue }) });
+  const claimId = resolve.body?.claimId;
+  const claimStatusUrl = `${base}/api/v2/home-claims/${claimId}/status`;
+  const pendingWithClaim = await fetchJson(`${base}/api/v2/me/pending-relationships`, { headers: claimantHeaders });
+  const wrongClaimantStatus = await fetchJson(claimStatusUrl, { headers });
+  const claimantStatus = await fetchJson(claimStatusUrl, { headers: claimantHeaders });
+  const pendingClaimRow = pendingWithClaim.body?.pendingRelationships?.find((candidate) => candidate.id === claimId);
+  const claimantAccount = await prisma.customerAccount.findUniqueOrThrow({ where: { id: customerFixture.accountId }, select: { displayName: true, username: true } });
+  let revision = claimantStatus.body?.revision;
+  async function submitClaimStep(step, mutation, key = `claim-step-${step}-${crypto.randomUUID()}`) {
+    const response = await fetchJson(`${base}/api/v2/home-claims/${claimId}/setup`, { method: 'POST', headers: { ...claimantHeaders, 'content-type': 'application/json', 'idempotency-key': key }, body: JSON.stringify({ expectedRevision: revision, mutation, step }) });
+    if (response.response.status === 200) revision = response.body.revision;
+    return response;
+  }
+  const changedProfile = { displayName: `${claimantAccount.displayName} Setup`, username: `claim-${crypto.randomUUID().slice(0, 12)}` };
+  const profile = await submitClaimStep('PROFILE', changedProfile);
+  const afterProfile = await prisma.homeClaimReservation.findUniqueOrThrow({ where: { id: claimId }, select: { expiresAt: true, setupRevision: true } });
+  const profileRetry = await submitClaimStep('PROFILE', changedProfile, `claim-profile-retry-${crypto.randomUUID()}`);
+  const afterProfileRetry = await prisma.homeClaimReservation.findUniqueOrThrow({ where: { id: claimId }, select: { expiresAt: true, setupRevision: true } });
+  const addressPayload = { addressLine1: '81 Disposable Claim Lane', addressLine2: '', city: 'London', region: '', postcode: `N${crypto.randomInt(1, 9)} ${crypto.randomInt(1, 9)}AA`, country: 'GB', timezone: 'Europe/London' };
+  const addressSave = await submitClaimStep('ADDRESS', addressPayload);
+  const address = await fetchJson(`${base}/api/v2/home-claims/${claimId}/address`, { headers: claimantHeaders });
+  const confirmation = await submitClaimStep('ADDRESS_CONFIRMATION', { addressRevision: address.body.addressRevision, addressDigest: address.body.addressDigest });
+  const preCompletion = await Promise.all([
+    prisma.homeClaimReservation.findUniqueOrThrow({ where: { id: claimId }, select: { state: true, expiresAt: true, setupRevision: true, claimReference: { select: { state: true, claimedAccountId: true, consumedAt: true } } } }),
+    prisma.home.findUniqueOrThrow({ where: { id: claimHome.id }, select: { lifecycle: true, managementRevision: true } }),
+    prisma.homeMembership.count({ where: { customerAccountId: customerFixture.accountId, status: 'ACTIVE' } }),
+    prisma.policyAcceptance.count({ where: { customerAccountId: customerFixture.accountId, policyKind: 'DINODIA_NATIVE', policyVersion: deliveryEnv.DINODIA_NATIVE_POLICY_VERSION } }),
+  ]);
+  // Simulate a newly published server policy after setup and verify the
+  // account gate blocks completion without changing claim/Home authority.
+  await prisma.policyAcceptance.deleteMany({ where: { customerAccountId: customerFixture.accountId, policyKind: 'DINODIA_NATIVE', policyVersion: deliveryEnv.DINODIA_NATIVE_POLICY_VERSION } });
+  const preAcceptanceSnapshot = await prisma.policyAcceptance.count({ where: { customerAccountId: customerFixture.accountId, policyKind: 'DINODIA_NATIVE', policyVersion: deliveryEnv.DINODIA_NATIVE_POLICY_VERSION } });
+  const prematureComplete = await fetchJson(`${base}/api/v2/home-claims/${claimId}/complete`, { method: 'POST', headers: { ...claimantHeaders, 'content-type': 'application/json' }, body: JSON.stringify({ expectedRevision: revision, idempotencyKey: `claim-complete-${crypto.randomUUID()}` }) });
+  const afterPremature = await Promise.all([
+    prisma.homeClaimReservation.findUniqueOrThrow({ where: { id: claimId }, select: { state: true, expiresAt: true, setupRevision: true, claimReference: { select: { state: true, claimedAccountId: true, consumedAt: true } } } }),
+    prisma.home.findUniqueOrThrow({ where: { id: claimHome.id }, select: { lifecycle: true, managementRevision: true } }),
+    prisma.homeMembership.count({ where: { customerAccountId: customerFixture.accountId, status: 'ACTIVE' } }),
+    prisma.policyAcceptance.count({ where: { customerAccountId: customerFixture.accountId, policyKind: 'DINODIA_NATIVE', policyVersion: deliveryEnv.DINODIA_NATIVE_POLICY_VERSION } }),
+  ]);
+  const currentPolicy = deliveryEnv.DINODIA_NATIVE_POLICY_VERSION;
+  const restorePolicyAcceptance = await fetchJson(`${base}/api/v2/auth/policy/acceptance`, { method: 'POST', headers: { ...claimantHeaders, 'content-type': 'application/json' }, body: JSON.stringify({ version: currentPolicy, contentSha256: sha256(deliveryEnv.DINODIA_NATIVE_POLICY_TEXT), accepted: true }) });
+  const policy = await submitClaimStep('POLICY', { policyVersion: currentPolicy, contentSha256: sha256(deliveryEnv.DINODIA_NATIVE_POLICY_TEXT), accepted: true });
+  const completeKey = `claim-complete-${crypto.randomUUID()}`;
+  const completeBody = JSON.stringify({ expectedRevision: revision, idempotencyKey: completeKey });
+  const completed = await fetchJson(`${base}/api/v2/home-claims/${claimId}/complete`, { method: 'POST', headers: { ...claimantHeaders, 'content-type': 'application/json' }, body: completeBody });
+  const completedRetry = await fetchJson(`${base}/api/v2/home-claims/${claimId}/complete`, { method: 'POST', headers: { ...claimantHeaders, 'content-type': 'application/json' }, body: completeBody });
+  const finalClaim = await Promise.all([
+    prisma.homeClaimReservation.findUniqueOrThrow({ where: { id: claimId }, select: { state: true, claimReference: { select: { state: true, claimedAccountId: true, consumedAt: true } } } }),
+    prisma.home.findUniqueOrThrow({ where: { id: claimHome.id }, select: { lifecycle: true } }),
+    prisma.homeMembership.count({ where: { homeId: claimHome.id, status: 'ACTIVE', role: 'OWNER' } }),
+    prisma.homeMembership.count({ where: { customerAccountId: customerFixture.accountId, status: 'ACTIVE' } }),
+  ]);
+  const claimChecks = {
+    anonymousDenied: unauthorizedResolve.response.status === 401,
+    resolveAccepted: resolve.response.status === 200,
+    resolveReceiptValid: nativeV1Contract.validateCustomerHomeClaimResolveReceipt(resolve.body),
+    resolveRetryStable: resolveRetry.response.status === 200 && resolveRetry.body.claimId === claimId && resolveRetry.body.expiresAt === resolve.body.expiresAt,
+    pendingProjectionSafe: nativeV1Contract.validateCustomerPendingRelationshipsProjection(pendingWithClaim.body),
+    pendingSetupShape: pendingClaimRow?.type === 'HOME_SETUP' && pendingClaimRow.postcode === null && pendingClaimRow.allowedActions.join(',') === 'RESUME_SETUP',
+    wrongClaimantHidden: wrongClaimantStatus.response.status === 404,
+    claimantStatusValid: claimantStatus.response.status === 200 && nativeV1Contract.validateCustomerHomeClaimSetupStatus(claimantStatus.body),
+    profileAndNoopRetry: profile.response.status === 200 && profileRetry.response.status === 200 && afterProfileRetry.setupRevision === afterProfile.setupRevision && afterProfileRetry.expiresAt.getTime() === afterProfile.expiresAt.getTime(),
+    addressAndConfirmation: addressSave.response.status === 200 && address.response.status === 200 && confirmation.response.status === 200,
+    prematurePolicyDeniedWithoutEffects: prematureComplete.response.status === 403 && prematureComplete.body.error?.code === 'UPDATE_REQUIRED'
+      && JSON.stringify(afterPremature.slice(0, 3)) === JSON.stringify(preCompletion.slice(0, 3)) && afterPremature[3] === preAcceptanceSnapshot,
+    currentPolicyAccepted: restorePolicyAcceptance.response.status === 200 && policy.response.status === 200,
+    completionPendingAndIdempotent: completed.response.status === 200 && completed.body.state === 'PENDING_INSTALLATION'
+      && completedRetry.response.status === 200 && completedRetry.body.idempotentReplay,
+    stillOwnerlessAndUnconsumed: finalClaim[0].state === 'CONVERTED_TO_PENDING_INSTALLATION' && finalClaim[0].claimReference.state === 'PENDING_INSTALLATION'
+      && finalClaim[0].claimReference.claimedAccountId === customerFixture.accountId && finalClaim[0].claimReference.consumedAt === null
+      && finalClaim[1].lifecycle === 'PENDING_INSTALLATION' && finalClaim[2] === 0 && finalClaim[3] === preCompletion[2],
+  };
+  if (Object.values(claimChecks).some((passed) => !passed)) {
+    fail(`Actual customer claim flow failed checks ${JSON.stringify(Object.entries(claimChecks).filter(([, passed]) => !passed).map(([name]) => name))}; evidence ${JSON.stringify({premature: {status: prematureComplete.response.status, body: prematureComplete.body, before: preCompletion, after: afterPremature}, currentPolicyConfigured: Boolean(currentPolicy), policyStatus: policy.response.status, completion: completed.body})}`);
+  }
+
+  // A previously completed installation uses the ordinary claim journey but
+  // does not reopen installer work. The guarded customer activation creates
+  // one owner exactly once after retained-address confirmation and current
+  // account policy; all data here is disposable and loopback-only.
+  const completedHomeNow = new Date();
+  const completedHome = await prisma.home.create({ data: {
+    addressLine1: '18 Disposable Completed Lane', city: 'London', postcode: 'N1 1AA', country: 'GB', timezone: 'Europe/London',
+    addressStatus: 'VERIFIED', lifecycle: 'CLAIMABLE', installationStatus: 'COMPLETE', installationCompletedAt: completedHomeNow,
+  } });
+  const completedSigning = keyPair(); const completedEncryption = x25519KeyPair();
+  const completedIdentity = await prisma.hubManufacturingIdentity.create({ data: {
+    serialNumber: `stage6-completed-claim-${crypto.randomUUID()}`, signingPublicKey: completedSigning.publicKey,
+    encryptionPublicKey: completedEncryption.publicKey, signingKeyFingerprint: publicKeyFingerprint(completedSigning.publicKey),
+    encryptionKeyFingerprint: publicKeyFingerprint(completedEncryption.publicKey),
+  } });
+  const completedHub = await prisma.hubInstallation.create({ data: {
+    homeId: completedHome.id, manufacturingIdentityId: completedIdentity.id, serialNumberSnapshot: completedIdentity.serialNumber,
+    state: 'ACTIVE', lifecycleStatus: 'ACTIVE', cloudUrl: 'https://completed-claim.disposable.invalid',
+    cloudUrlVerifiedAt: completedHomeNow, remoteVerificationAt: completedHomeNow,
+  } });
+  await prisma.home.update({ where: { id: completedHome.id }, data: { activeHubInstallationId: completedHub.id } });
+  await prisma.area.create({ data: { homeId: completedHome.id, osAreaId: 'area-living-room', originalName: 'Living Room', status: 'ACTIVE' } });
+  const completedReferenceValue = `dno_home_${crypto.randomBytes(32).toString('base64url')}`;
+  await prisma.homeClaimReference.create({ data: {
+    homeId: completedHome.id, hubInstallationId: completedHub.id, purpose: 'INITIAL_OWNER', state: 'AVAILABLE', generation: 1,
+    companyQrReferenceHash: claimReferenceHash(completedReferenceValue, deliveryEnv.CLAIM_REFERENCE_PEPPER), resolverGeneration: 1,
+  } });
+  const completedResolve = await fetchJson(`${base}/api/v2/home-claims/resolve`, { method: 'POST', headers: { ...headers, 'content-type': 'application/json', 'idempotency-key': `completed-claim-${crypto.randomUUID()}` }, body: JSON.stringify({ reference: completedReferenceValue }) });
+  const completedClaimId = completedResolve.body?.claimId;
+  const completedStatus = completedClaimId ? await fetchJson(`${base}/api/v2/home-claims/${completedClaimId}/status`, { headers }) : null;
+  let completedRevision = completedStatus?.body?.revision;
+  const completedProfile = await fetchJson(`${base}/api/v2/home-claims/${completedClaimId}/setup`, { method: 'POST', headers: { ...headers, 'content-type': 'application/json', 'idempotency-key': `completed-profile-${crypto.randomUUID()}` }, body: JSON.stringify({ expectedRevision: completedRevision, step: 'PROFILE', mutation: { displayName: 'Disposable Completed Home Claimant', username: `completed-${crypto.randomUUID().slice(0, 10)}` } }) });
+  if (completedProfile.response.status === 200) completedRevision = completedProfile.body.revision;
+  const retainedAddress = await fetchJson(`${base}/api/v2/home-claims/${completedClaimId}/address`, { headers });
+  const retainedConfirmation = await fetchJson(`${base}/api/v2/home-claims/${completedClaimId}/setup`, { method: 'POST', headers: { ...headers, 'content-type': 'application/json', 'idempotency-key': `completed-address-${crypto.randomUUID()}` }, body: JSON.stringify({ expectedRevision: completedRevision, step: 'ADDRESS_CONFIRMATION', mutation: { addressRevision: retainedAddress.body?.addressRevision, addressDigest: retainedAddress.body?.addressDigest } }) });
+  if (retainedConfirmation.response.status === 200) completedRevision = retainedConfirmation.body.revision;
+  const completedPolicyStep = await fetchJson(`${base}/api/v2/home-claims/${completedClaimId}/setup`, { method: 'POST', headers: { ...headers, 'content-type': 'application/json', 'idempotency-key': `completed-policy-${crypto.randomUUID()}` }, body: JSON.stringify({ expectedRevision: completedRevision, step: 'POLICY', mutation: { policyVersion: currentPolicyVersion, contentSha256: currentPolicyHash, accepted: true } }) });
+  if (completedPolicyStep.response.status === 200) completedRevision = completedPolicyStep.body.revision;
+  const completedBody = JSON.stringify({ expectedRevision: completedRevision, idempotencyKey: `completed-owner-${crypto.randomUUID()}` });
+  const completedActivation = await fetchJson(`${base}/api/v2/home-claims/${completedClaimId}/complete`, { method: 'POST', headers: { ...headers, 'content-type': 'application/json' }, body: completedBody });
+  const completedActivationRetry = await fetchJson(`${base}/api/v2/home-claims/${completedClaimId}/complete`, { method: 'POST', headers: { ...headers, 'content-type': 'application/json' }, body: completedBody });
+  const completedAuthority = await Promise.all([
+    prisma.homeMembership.findMany({ where: { homeId: completedHome.id, status: 'ACTIVE' }, select: { customerAccountId: true, role: true } }),
+    prisma.home.findUniqueOrThrow({ where: { id: completedHome.id }, select: { lifecycle: true, installationStatus: true } }),
+    prisma.homeClaimReference.findFirstOrThrow({ where: { homeId: completedHome.id }, select: { state: true, claimedAccountId: true, consumedAt: true } }),
+    prisma.nativeDomainOutbox.count({ where: { idempotencyKey: { startsWith: 'claim-activated:' }, homeId: completedHome.id } }),
+    prisma.homeMembership.findUnique({ where: { customerAccountId_homeId: { customerAccountId: account.id, homeId: inviter.homeId } }, select: { role: true, status: true } }),
+  ]);
+  if (completedResolve.response.status !== 200 || completedStatus?.response.status !== 200
+    || retainedAddress.response.status !== 200 || retainedConfirmation.response.status !== 200 || completedPolicyStep.response.status !== 200
+    || completedActivation.response.status !== 200 || completedActivation.body.state !== 'ACTIVE'
+    || completedActivationRetry.response.status !== 200 || !completedActivationRetry.body.idempotentReplay
+    || completedAuthority[0].length !== 1 || completedAuthority[0][0].customerAccountId !== account.id || completedAuthority[0][0].role !== 'OWNER'
+    || completedAuthority[1].lifecycle !== 'ACTIVE' || completedAuthority[1].installationStatus !== 'COMPLETE'
+    || completedAuthority[2].state !== 'CONSUMED' || completedAuthority[2].claimedAccountId !== account.id || !completedAuthority[2].consumedAt
+    || completedAuthority[3] !== 1 || completedAuthority[4]?.role !== 'TENANT' || completedAuthority[4]?.status !== 'ACTIVE') {
+    fail(`Claiming an already-completed installation failed guarded exactly-once owner activation (${JSON.stringify({ resolve: completedResolve.response.status, status: completedStatus?.response.status, address: retainedAddress.response.status, confirm: retainedConfirmation.response.status, policy: completedPolicyStep.response.status, activate: completedActivation.response.status, activateState: completedActivation.body?.state, retry: completedActivationRetry.response.status })})`);
+  }
+  console.log('[stage6:integration] PASS: a verified account claimed an already-completed installation through the normal QR flow; retained-address confirmation created exactly one owner/outbox activation, replay was idempotent, and the claimant retained its unrelated tenant membership');
+  await prisma.nativeDomainOutbox.deleteMany({ where: { homeId: completedHome.id } });
+  await prisma.homeDocument.deleteMany({ where: { homeId: completedHome.id } });
+  await prisma.home.update({ where: { id: completedHome.id }, data: { lifecycle: 'CLAIM_RESERVED' } });
+  await prisma.homeMembership.deleteMany({ where: { homeId: completedHome.id } });
+  await prisma.pendingHomeSetup.deleteMany({ where: { reservation: { claimReference: { homeId: completedHome.id } } } });
+  await prisma.homeClaimReservation.deleteMany({ where: { claimReference: { homeId: completedHome.id } } });
+  await prisma.homeClaimReference.deleteMany({ where: { homeId: completedHome.id } });
+  await prisma.area.deleteMany({ where: { homeId: completedHome.id } });
+  await prisma.hubInstallation.delete({ where: { id: completedHub.id } });
+  await prisma.home.delete({ where: { id: completedHome.id } });
+  await prisma.hubManufacturingIdentity.delete({ where: { id: completedIdentity.id } });
+  await prisma.pendingHomeSetup.deleteMany({ where: { reservationId: claimId } });
+  await prisma.homeClaimReservation.deleteMany({ where: { id: claimId } });
+  await prisma.homeClaimReference.delete({ where: { id: claimReference.id } });
+  await prisma.hubInstallation.delete({ where: { id: claimHub.id } });
+  await prisma.home.delete({ where: { id: claimHome.id } });
+  await prisma.hubManufacturingIdentity.delete({ where: { id: claimIdentity.id } });
+  console.log('[stage6:integration] PASS: pending projection/invitation decision is safe and idempotent; actual authenticated QR claim setup revalidates holder, current policy and address revision, rejects completion before policy acceptance without effects, and remains ownerless/unconsumed until installation activation');
+
+  // Room QR uses the pre-existing AreaQrCredential/AreaAccessRequest owners.
+  // This is an actual loopback route journey: a verified tenant requests one
+  // original Area, can cancel/retry immediately, and an owner approves only
+  // that Area. No Production account or household Home is used.
+  const roomArea = await prisma.area.create({ data: { homeId: inviter.homeId, osAreaId: `stage6-room-${crypto.randomUUID()}`, originalName: 'Study', status: 'ACTIVE' } });
+  const roomReference = `dno_room_${crypto.randomBytes(32).toString('base64url')}`;
+  const roomQr = await prisma.areaQrCredential.create({ data: { areaId: roomArea.id, resolverHash: sha256(roomReference) }, select: { id: true, generation: true } });
+  const roomPreview = await fetchJson(`${base}/api/public/areas/scan`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ reference: roomReference }) });
+  const ownerMembership = await prisma.homeMembership.findUniqueOrThrow({ where: { id: inviter.id }, select: { customerAccountId: true } });
+  const roomOwnerAccount = await prisma.customerAccount.findUniqueOrThrow({ where: { id: ownerMembership.customerAccountId }, select: { id: true, securityVersion: true } });
+  const roomOwnerPhone = keyPair();
+  const roomOwnerThumbprint = crypto.createHash('sha256').update(crypto.createPublicKey(roomOwnerPhone.publicKey).export({ type: 'spki', format: 'der' })).digest('hex');
+  const roomOwnerTrusted = await prisma.trustedDevice.create({ data: { customerAccountId: roomOwnerAccount.id, deviceInstallationId: `stage6-room-owner-${crypto.randomUUID()}`, publicKey: roomOwnerPhone.publicKey, publicKeyThumbprint: roomOwnerThumbprint, deviceName: 'Disposable Room owner phone' }, select: { id: true, sessionVersion: true } });
+  const roomOwnerRawSession = `dno-customer-session-${crypto.randomBytes(32).toString('base64url')}`;
+  const roomOwnerNow = new Date();
+  await prisma.customerSession.create({ data: { customerAccountId: roomOwnerAccount.id, trustedDeviceId: roomOwnerTrusted.id, refreshTokenHash: sha256(roomOwnerRawSession), securityVersion: roomOwnerAccount.securityVersion, trustedDeviceSessionVersion: roomOwnerTrusted.sessionVersion, issuedAt: roomOwnerNow, lastUsedAt: roomOwnerNow, expiresAt: new Date(roomOwnerNow.getTime() + 30 * 24 * 60 * 60 * 1000), absoluteExpiresAt: new Date(roomOwnerNow.getTime() + 180 * 24 * 60 * 60 * 1000) } });
+  await prisma.policyAcceptance.upsert({ where: { customerAccountId_policyKind_policyVersion: { customerAccountId: roomOwnerAccount.id, policyKind: 'DINODIA_NATIVE', policyVersion: currentPolicyVersion } }, create: { customerAccountId: roomOwnerAccount.id, policyKind: 'DINODIA_NATIVE', policyVersion: currentPolicyVersion }, update: {} });
+  const roomOwnerHeaders = { cookie: `dinodia_customer_session=${encodeURIComponent(roomOwnerRawSession)}` };
+  const roomRequesterHeaders = { ...headers, 'content-type': 'application/json' };
+  const wrongGeneration = await fetchJson(`${base}/api/public/areas/request-access`, { method: 'POST', headers: roomRequesterHeaders, body: JSON.stringify({ reference: roomReference, expectedGeneration: roomQr.generation + 1, idempotencyKey: `room-wrong-gen-${crypto.randomUUID()}` }) });
+  const wrongGenerationCount = await prisma.areaAccessRequest.count({ where: { areaId: roomArea.id } });
+  const roomRequestKey = `room-request-${crypto.randomUUID()}`;
+  const roomRequestBody = JSON.stringify({ reference: roomReference, expectedGeneration: roomQr.generation, idempotencyKey: roomRequestKey });
+  const roomRequest = await fetchJson(`${base}/api/public/areas/request-access`, { method: 'POST', headers: roomRequesterHeaders, body: roomRequestBody });
+  if (roomRequest.response.status !== 201 || typeof roomRequest.body?.requestId !== 'string') fail(`Initial authenticated Room request did not create one bounded request (status=${roomRequest.response.status},code=${roomRequest.body?.error?.code ?? 'none'})`);
+  const roomRequestRetry = await fetchJson(`${base}/api/public/areas/request-access`, { method: 'POST', headers: roomRequesterHeaders, body: roomRequestBody });
+  const [roomRequestCoalesce, roomRequestConcurrent] = await Promise.all([
+    fetchJson(`${base}/api/public/areas/request-access`, { method: 'POST', headers: roomRequesterHeaders, body: JSON.stringify({ reference: roomReference, expectedGeneration: roomQr.generation, idempotencyKey: `room-coalesce-${crypto.randomUUID()}` }) }),
+    fetchJson(`${base}/api/public/areas/request-access`, { method: 'POST', headers: roomRequesterHeaders, body: JSON.stringify({ reference: roomReference, expectedGeneration: roomQr.generation, idempotencyKey: `room-concurrent-${crypto.randomUUID()}` }) }),
+  ]);
+  const roomPendingCountAfterConcurrency = await prisma.areaAccessRequest.count({ where: { areaId: roomArea.id, status: 'PENDING' } });
+  const roomPending = await fetchJson(`${base}/api/v2/me/pending-relationships`, { headers });
+  const roomPendingRow = roomPending.body?.pendingRelationships?.find((item) => item.id === roomRequest.body?.requestId);
+  const roomStatus = await fetchJson(`${base}/api/v2/room-access-requests/${roomRequest.body?.requestId}`, { headers });
+  const wrongRoomStatus = await fetchJson(`${base}/api/v2/room-access-requests/${roomRequest.body?.requestId}`, { headers: claimantHeaders });
+  const beforeRoomCancel = await prisma.areaAccessRequest.findUniqueOrThrow({ where: { id: roomRequest.body.requestId }, select: { status: true, updatedAt: true } });
+  const roomCancelBody = JSON.stringify({ expectedRevision: beforeRoomCancel.updatedAt.toISOString(), idempotencyKey: `room-cancel-${crypto.randomUUID()}` });
+  const roomCancel = await fetchJson(`${base}/api/v2/room-access-requests/${roomRequest.body.requestId}/cancel`, { method: 'POST', headers: roomRequesterHeaders, body: roomCancelBody });
+  const roomCancelRetry = await fetchJson(`${base}/api/v2/room-access-requests/${roomRequest.body.requestId}/cancel`, { method: 'POST', headers: roomRequesterHeaders, body: roomCancelBody });
+  const afterRoomCancel = await Promise.all([
+    prisma.areaAccessRequest.findUniqueOrThrow({ where: { id: roomRequest.body.requestId }, select: { status: true } }),
+    prisma.homeMembership.findUniqueOrThrow({ where: { customerAccountId_homeId: { customerAccountId: account.id, homeId: inviter.homeId } }, select: { tenantAreaGrants: { where: { revokedAt: null }, select: { areaId: true } } } }),
+  ]);
+  const roomFreshRequest = await fetchJson(`${base}/api/public/areas/request-access`, { method: 'POST', headers: roomRequesterHeaders, body: JSON.stringify({ reference: roomReference, expectedGeneration: roomQr.generation, idempotencyKey: `room-resubmit-${crypto.randomUUID()}` }) });
+  const wrongHomeQueue = await fetchJson(`${base}/api/v2/homes/${customerFixture.homeOneId}/area-access-requests`, { headers: roomOwnerHeaders });
+  const roomQueue = await fetchJson(`${base}/api/v2/homes/${inviter.homeId}/area-access-requests`, { headers: roomOwnerHeaders });
+  const roomQueueRows = roomQueue.body?.requests ?? [];
+  const queuedRoom = roomQueueRows.find((item) => item.requestId === roomFreshRequest.body?.requestId);
+  const managementRevisionBeforeRoomDecision = (await prisma.home.findUniqueOrThrow({ where: { id: inviter.homeId }, select: { managementRevision: true } })).managementRevision;
+  const roomDecisionKey = `room-approve-${crypto.randomUUID()}`;
+  const roomDecisionBody = JSON.stringify({ requestId: roomFreshRequest.body?.requestId, decision: 'APPROVE', expectedRevision: roomFreshRequest.body?.revision, idempotencyKey: roomDecisionKey });
+  const roomDecision = await fetchJson(`${base}/api/v2/homes/${inviter.homeId}/area-access-requests`, { method: 'POST', headers: { ...roomOwnerHeaders, 'content-type': 'application/json' }, body: roomDecisionBody });
+  const roomDecisionRetry = await fetchJson(`${base}/api/v2/homes/${inviter.homeId}/area-access-requests`, { method: 'POST', headers: { ...roomOwnerHeaders, 'content-type': 'application/json' }, body: roomDecisionBody });
+  const afterRoomDecision = await Promise.all([
+    prisma.areaAccessRequest.findUniqueOrThrow({ where: { id: roomFreshRequest.body.requestId }, select: { status: true, approvedByMembershipId: true } }),
+    prisma.homeMembership.findUniqueOrThrow({ where: { customerAccountId_homeId: { customerAccountId: account.id, homeId: inviter.homeId } }, select: { id: true, role: true, tenantAreaGrants: { where: { revokedAt: null }, select: { areaId: true, homeId: true, policyRevision: true } } } }),
+    prisma.home.findUniqueOrThrow({ where: { id: inviter.homeId }, select: { managementRevision: true } }),
+    prisma.auditEvent.count({ where: { targetId: roomFreshRequest.body.requestId, action: 'room_access_approved' } }),
+  ]);
+  const roomRequesterCurrent = await prisma.customerAccount.findUniqueOrThrow({ where: { id: account.id }, select: { displayName: true } });
+  const activeRoomGrants = afterRoomDecision[1].tenantAreaGrants;
+  const unauthRoomDecision = await fetchJson(`${base}/api/v2/homes/${inviter.homeId}/area-access-requests`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: roomDecisionBody });
+  const roomResultChecks = {
+    previewBounded: roomPreview.response.status === 200 && roomPreview.body.state === 'AVAILABLE' && roomPreview.body.areaLabel === 'Study'
+      && !['homeId','postcode','addressLine1','requesterAccountId','deviceIds'].some((key) => Object.hasOwn(roomPreview.body, key)),
+    staleGenerationDeniedWithoutRows: wrongGeneration.response.status === 409 && wrongGenerationCount === 0,
+    exactRequestAndRetry: roomRequest.response.status === 201 && roomRequestRetry.response.status === 200 && roomRequestRetry.body.requestId === roomRequest.body.requestId && roomRequestRetry.body.idempotentReplay === true,
+    concurrentStyleCoalescing: [roomRequestCoalesce, roomRequestConcurrent].every((result) => result.response.status === 200 && result.body.requestId === roomRequest.body.requestId && result.body.coalesced === true)
+      && roomPendingCountAfterConcurrency === 1,
+    pendingAndRequesterOnlyStatus: roomPendingRow?.type === 'ROOM_ACCESS_REQUEST' && roomPendingRow.allowedActions.join(',') === 'VIEW_STATUS,CANCEL'
+      && roomStatus.response.status === 200 && roomStatus.body.state === 'PENDING' && wrongRoomStatus.response.status === 404,
+    cancelNoGrantAndExactRetry: roomCancel.response.status === 200 && roomCancel.body.state === 'CANCELLED' && roomCancelRetry.response.status === 200
+      && roomCancelRetry.body.idempotentReplay === true && afterRoomCancel[0].status === 'CANCELLED'
+      && afterRoomCancel[1].tenantAreaGrants.every((grant) => grant.areaId !== roomArea.id),
+    immediateFreshRetry: roomFreshRequest.response.status === 201 && roomFreshRequest.body.requestId !== roomRequest.body.requestId,
+    queueOwnerOnly: wrongHomeQueue.response.status === 404 && roomQueue.response.status === 200 && queuedRoom?.areaLabel === 'Study'
+      && queuedRoom.requesterLabel === (roomRequesterCurrent.displayName || 'Verified Dinodia customer'),
+    exactAreaApprovalAndRetry: roomDecision.response.status === 200 && roomDecision.body.state === 'APPROVED'
+      && roomDecisionRetry.response.status === 200 && roomDecisionRetry.body.idempotentReplay === true
+      && afterRoomDecision[0].status === 'APPROVED' && afterRoomDecision[0].approvedByMembershipId === inviter.id
+      && afterRoomDecision[1].role === 'TENANT' && activeRoomGrants.some((grant) => grant.areaId === roomArea.id && grant.homeId === inviter.homeId)
+      && activeRoomGrants.some((grant) => grant.areaId === areaId) && afterRoomDecision[2].managementRevision === managementRevisionBeforeRoomDecision + 1
+      && afterRoomDecision[3] === 1,
+    anonymousDecisionDenied: unauthRoomDecision.response.status === 401,
+  };
+  if (Object.values(roomResultChecks).some((passed) => !passed)) fail(`Actual Room QR journey failed checks ${JSON.stringify(Object.entries(roomResultChecks).filter(([, passed]) => !passed).map(([name]) => name))}; safe diagnostics ${JSON.stringify({ scan: roomPreview.response.status, stale: wrongGeneration.response.status, request: roomRequest.response.status, retry: roomRequestRetry.response.status, retryReplay: roomRequestRetry.body?.idempotentReplay === true, coalesce: roomRequestCoalesce.response.status, coalesceFlag: roomRequestCoalesce.body?.coalesced === true, concurrent: roomRequestConcurrent.response.status, concurrentFlag: roomRequestConcurrent.body?.coalesced === true, singlePending: roomPendingCountAfterConcurrency === 1, cancel: roomCancel.response.status, resubmit: roomFreshRequest.response.status, queue: roomQueue.response.status, queueHasRequest: Boolean(queuedRoom), queueLabelMatches: queuedRoom?.requesterLabel === (roomRequesterCurrent.displayName || 'Verified Dinodia customer'), queueLabel: queuedRoom?.requesterLabel, expectedBoundedLabel: roomRequesterCurrent.displayName || 'Verified Dinodia customer', decision: roomDecision.response.status, decisionRetry: roomDecisionRetry.response.status, anonymous: unauthRoomDecision.response.status })}`);
+  console.log('[stage6:integration] PASS: actual Room QR route enforces current QR generation, coalesces idempotent requests, exposes only bounded pending/status data, permits immediate post-cancel resubmission, and grants exactly the approved Area once');
+  await prisma.areaAccessRequest.deleteMany({ where: { areaId: roomArea.id } });
+  await prisma.tenantAreaGrant.deleteMany({ where: { areaId: roomArea.id } });
+  await prisma.areaQrCredential.deleteMany({ where: { areaId: roomArea.id } });
+  await prisma.area.delete({ where: { id: roomArea.id } });
+  await prisma.customerSession.deleteMany({ where: { trustedDeviceId: roomOwnerTrusted.id } });
+  await prisma.trustedDevice.delete({ where: { id: roomOwnerTrusted.id } });
+
+}
+
+async function customerAuthenticationLifecycleChecks(deliveryEnv) {
+  const base = `http://127.0.0.1:${appPort}`;
+  sesShouldFail = false;
+  capturedCustomerVerification = null;
+  let email = `customer-auth-${crypto.randomUUID()}@invalid.test`;
+  const username = `customer-auth-${crypto.randomUUID().slice(0, 12)}`;
+  const password = `customer-auth-password-${crypto.randomUUID()}`;
+  const registrationBody = { displayName: 'Disposable customer', username, email, password };
+  const registration = await fetchJson(`${base}/api/v2/auth/register`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(registrationBody) });
+  if (registration.response.status !== 202 || registration.body.ok !== true || registration.body.state !== 'PENDING' || !registration.body.challengeId || !capturedCustomerVerification || capturedCustomerAuthPath !== '/app/auth' || registration.body.expiresAt == null) fail(`Real customer registration did not create a generic pending V2 associated-domain email challenge (${registration.response.status})`);
+  const account = await prisma.customerAccount.findUniqueOrThrow({ where: { emailNormalized: email }, select: { id: true, emailVerifiedAt: true, status: true } });
+  const deliveryRow = await prisma.authChallenge.findUniqueOrThrow({ where: { id: registration.body.challengeId }, select: { deliveryStatus: true, consumedAt: true, expiresAt: true } });
+  if (account.emailVerifiedAt || account.status !== 'ACTIVE' || deliveryRow.deliveryStatus !== 'ACCEPTED' || deliveryRow.consumedAt) fail('Registration marked an unverified account as verified or confused SES acceptance with verification');
+  const challengePending = await fetchJson(`${base}/api/v2/auth/challenges/${registration.body.challengeId}`);
+  if (challengePending.response.status !== 200 || challengePending.body.state !== 'PENDING') fail('The verification polling route did not report the real pending challenge state');
+  const duplicate = await fetchJson(`${base}/api/v2/auth/register`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ ...registrationBody, username: `${username}-duplicate` }) });
+  const duplicateAccountCount = await prisma.customerAccount.count({ where: { emailNormalized: email } });
+  if (duplicate.response.status !== 202 || Object.keys(duplicate.body).sort().join(',') !== Object.keys(registration.body).sort().join(',') || duplicateAccountCount !== 1) fail('Duplicate email registration leaked existence or created a second account');
+  const loginPhone = keyPair();
+  const installId = `customer-auth-install-${crypto.randomUUID()}`;
+  const loginPayload = { email, password, deviceInstallationId: installId, publicKey: loginPhone.publicKey, deviceName: 'Disposable customer phone', model: 'integration-test', osFamily: 'test', osVersion: 'test' };
+  const unverifiedLogin = await fetchJson(`${base}/api/v2/session`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(loginPayload) });
+  if (unverifiedLogin.response.status !== 401 || await prisma.customerSession.count({ where: { customerAccountId: account.id } })) fail('Unverified registration received an authenticated customer session');
+  const verified = await fetchJson(`${base}/api/v2/auth/email/verify`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(capturedCustomerVerification) });
+  const verifiedAccount = await prisma.customerAccount.findUniqueOrThrow({ where: { id: account.id }, select: { emailVerifiedAt: true } });
+  const verifiedPoll = await fetchJson(`${base}/api/v2/auth/challenges/${registration.body.challengeId}`);
+  const verificationReplay = await fetchJson(`${base}/api/v2/auth/email/verify`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(capturedCustomerVerification) });
+  if (verified.response.status !== 200 || verified.body.state !== 'VERIFIED' || !verifiedAccount.emailVerifiedAt || verifiedPoll.body.state !== 'VERIFIED' || verificationReplay.response.status !== 409) fail('Actual emailed verification did not verify exactly once or allow an unverified account to sign in only afterward');
+  const login = await fetchJson(`${base}/api/v2/session`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(loginPayload) });
+  const loginJar = {};
+  updateCookieJar(loginJar, login.response);
+  let rawSession = cookieValue(loginJar, 'dinodia_customer_session');
+  const authHeaders = { cookie: `dinodia_customer_session=${encodeURIComponent(rawSession)}` };
+  const policyRequirements = await fetchJson(`${base}/api/v2/auth/requirements`, { headers: authHeaders });
+  const protectedBeforePolicy = await fetchJson(`${base}/api/v2/trusted-devices`, { headers: authHeaders });
+  const acceptPolicy = await fetchJson(`${base}/api/v2/auth/policy/acceptance`, { method: 'POST', headers: { ...authHeaders, 'content-type': 'application/json' }, body: JSON.stringify({ version: deliveryEnv.DINODIA_NATIVE_POLICY_VERSION, contentSha256: sha256(deliveryEnv.DINODIA_NATIVE_POLICY_TEXT), accepted: true }) });
+  if (policyRequirements.response.status !== 200 || policyRequirements.body.nextAction !== 'ACCEPT_POLICY'
+    || protectedBeforePolicy.response.status !== 403 || protectedBeforePolicy.body.error?.code !== 'UPDATE_REQUIRED'
+    || acceptPolicy.response.status !== 200 || acceptPolicy.body.idempotentReplay) fail('Newly verified account did not encounter the account-global policy gate before protected account data and then accept the exact current policy');
+  let accountSession = await prisma.customerSession.findUniqueOrThrow({ where: { refreshTokenHash: sha256(rawSession) }, select: { id: true, revokedAt: true, expiresAt: true, absoluteExpiresAt: true } });
+  if (login.response.status !== 200 || !rawSession || accountSession.expiresAt.getTime() > accountSession.absoluteExpiresAt.getTime()) fail('Verified customer did not receive a bounded account-global session');
+
+  const secondPhone = keyPair();
+  const secondInstallationId = `customer-auth-second-phone-${crypto.randomUUID()}`;
+  const secondLogin = await fetchJson(`${base}/api/v2/session`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ ...loginPayload, deviceInstallationId: secondInstallationId, publicKey: secondPhone.publicKey, deviceName: 'Disposable second phone' }) });
+  const secondJar = {};
+  updateCookieJar(secondJar, secondLogin.response);
+  const secondRawSession = cookieValue(secondJar, 'dinodia_customer_session');
+  const trustedDevices = await fetchJson(`${base}/api/v2/trusted-devices`, { headers: { cookie: `dinodia_customer_session=${encodeURIComponent(rawSession)}` } });
+  const anonymousTrustedDevices = await fetchJson(`${base}/api/v2/trusted-devices`);
+  const listedDevices = trustedDevices.body?.devices;
+  if (trustedDevices.response.status !== 200 || !Array.isArray(listedDevices) || listedDevices.length !== 2
+    || listedDevices.filter((device) => device.thisDevice).length !== 1
+    || listedDevices.some((device) => 'publicKey' in device || 'deviceInstallationId' in device || 'refreshTokenHash' in device)
+    || anonymousTrustedDevices.response.status !== 401) fail('Account-global trusted-device inventory exposed credentials, omitted either phone, or allowed anonymous access');
+  console.log('[stage6:integration] PASS: account-global trusted-device inventory identifies only the signed-in account phones without returning key, installation, or session secrets');
+  await prisma.customerAccount.update({ where: { id: account.id }, data: { mustChangePassword: true } });
+  const passwordGateRestore = await fetchJson(`${base}/api/v2/session`, { headers: { cookie: `dinodia_customer_session=${encodeURIComponent(rawSession)}` } });
+  updateCookieJar(loginJar, passwordGateRestore.response);
+  rawSession = cookieValue(loginJar, 'dinodia_customer_session');
+  const requirementsBefore = await fetchJson(`${base}/api/v2/auth/requirements`, { headers: { cookie: `dinodia_customer_session=${encodeURIComponent(rawSession)}` } });
+  const mandatoryPassword = `customer-auth-mandatory-${crypto.randomUUID()}`;
+  const changed = await fetchJson(`${base}/api/v2/auth/password/change`, { method: 'POST', headers: { 'content-type': 'application/json', cookie: `dinodia_customer_session=${encodeURIComponent(rawSession)}` }, body: JSON.stringify({ currentPassword: password, newPassword: mandatoryPassword }) });
+  const newRawSession = cookieValue(changed.jar || (() => { const jar = {}; updateCookieJar(jar, changed.response); return jar; })(), 'dinodia_customer_session');
+  const changedAccount = await prisma.customerAccount.findUniqueOrThrow({ where: { id: account.id }, select: { mustChangePassword: true, securityVersion: true } });
+  const secondPhoneSession = await prisma.customerSession.findUniqueOrThrow({ where: { refreshTokenHash: sha256(secondRawSession) }, select: { revokedAt: true, revokeReason: true } });
+  const requirementsAfter = await fetchJson(`${base}/api/v2/auth/requirements`, { headers: { cookie: `dinodia_customer_session=${encodeURIComponent(newRawSession)}` } });
+  const oldSessionRestore = await fetchJson(`${base}/api/v2/session`, { headers: { cookie: `dinodia_customer_session=${encodeURIComponent(rawSession)}` } });
+  const replayedChangeSession = await fetchJson(`${base}/api/v2/auth/requirements`, { headers: { cookie: `dinodia_customer_session=${encodeURIComponent(newRawSession)}` } });
+  const changedSessionRow = newRawSession ? await prisma.customerSession.findUnique({ where: { refreshTokenHash: sha256(newRawSession) }, select: { id: true, revokedAt: true, expiresAt: true, absoluteExpiresAt: true, securityVersion: true, trustedDeviceSessionVersion: true, trustedDevice: { select: { revokedAt: true, sessionVersion: true } }, customerAccount: { select: { status: true, securityVersion: true } } } }) : null;
+  if (secondLogin.response.status !== 200 || passwordGateRestore.response.status !== 200 || passwordGateRestore.body.memberships?.length !== 0 || requirementsBefore.response.status !== 200 || requirementsBefore.body.nextAction !== 'CHANGE_PASSWORD'
+    || changed.response.status !== 200 || changed.body.nextAction !== 'CONTINUE' || !newRawSession || newRawSession === rawSession
+    || changedAccount.mustChangePassword || secondPhoneSession.revokeReason !== 'password_changed' || !secondPhoneSession.revokedAt
+    || oldSessionRestore.response.status !== 401 || requirementsAfter.response.status !== 200 || requirementsAfter.body.nextAction !== 'CONTINUE'
+    || replayedChangeSession.response.status !== 401 || !changedSessionRow?.revokedAt) fail(`Mandatory password replacement mismatch (second=${secondLogin.response.status}, before=${requirementsBefore.response.status}/${requirementsBefore.body?.nextAction || requirementsBefore.body?.error?.code || 'none'}, change=${changed.response.status}/${changed.body?.error?.code || changed.body?.error?.message || 'ok'}, cookie=${Boolean(newRawSession)}, row=${Boolean(changedSessionRow)}, rowRevoked=${Boolean(changedSessionRow?.revokedAt)}, rowSecurity=${changedSessionRow?.securityVersion ?? 'none'}/${changedSessionRow?.customerAccount.securityVersion ?? 'none'}, rowDeviceVersion=${changedSessionRow?.trustedDeviceSessionVersion ?? 'none'}/${changedSessionRow?.trustedDevice.sessionVersion ?? 'none'}, deviceRevoked=${Boolean(changedSessionRow?.trustedDevice.revokedAt)}, accountMustChange=${changedAccount.mustChangePassword}, otherPhone=${secondPhoneSession.revokeReason || (secondPhoneSession.revokedAt ? 'revoked' : 'active')}, oldRestore=${oldSessionRestore.response.status}, after=${requirementsAfter.response.status}/${requirementsAfter.body?.nextAction || requirementsAfter.body?.error?.code || 'none'}, replayAfter=${replayedChangeSession.response.status})`);
+  rawSession = newRawSession;
+  accountSession = await prisma.customerSession.findUniqueOrThrow({ where: { refreshTokenHash: sha256(rawSession) }, select: { id: true, revokedAt: true, expiresAt: true, absoluteExpiresAt: true } });
+  loginPayload.password = mandatoryPassword;
+  console.log('[stage6:integration] PASS: mandatory password change is server-gated, rotates the completing phone cookie, and revokes other phone sessions');
+
+
+  // Use a fresh, active phone session for the independent password-reset
+  // revocation assertion. The prior section deliberately replays its retired
+  // refresh cookie, which correctly revokes that family as reuse.
+  const resetLogin = await fetchJson(`${base}/api/v2/session`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(loginPayload) });
+  const resetJar = {};
+  updateCookieJar(resetJar, resetLogin.response);
+  rawSession = cookieValue(resetJar, 'dinodia_customer_session');
+  accountSession = rawSession ? await prisma.customerSession.findUniqueOrThrow({ where: { refreshTokenHash: sha256(rawSession) }, select: { id: true, revokedAt: true, expiresAt: true, absoluteExpiresAt: true } }) : accountSession;
+  if (resetLogin.response.status !== 200 || !rawSession || accountSession.revokedAt) fail('Could not establish the fresh disposable session required to independently verify password-reset revocation');
+  const resetCompanionPhone = keyPair();
+  const resetCompanionInstallationId = `customer-auth-reset-companion-${crypto.randomUUID()}`;
+  const resetCompanionLogin = await fetchJson(`${base}/api/v2/session`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ ...loginPayload, deviceInstallationId: resetCompanionInstallationId, publicKey: resetCompanionPhone.publicKey, deviceName: 'Disposable reset companion' }) });
+  const resetCompanionSession = cookieValue((() => { const jar = {}; updateCookieJar(jar, resetCompanionLogin.response); return jar; })(), 'dinodia_customer_session');
+  const resetCompanionDevice = await prisma.trustedDevice.findUniqueOrThrow({ where: { customerAccountId_deviceInstallationId: { customerAccountId: account.id, deviceInstallationId: resetCompanionInstallationId } }, select: { id: true, revokedAt: true, sessionVersion: true } });
+  if (resetCompanionLogin.response.status !== 200 || !resetCompanionSession || resetCompanionDevice.revokedAt) fail('Could not establish the second active disposable installation required to prove reset revocation');
+
+  capturedCustomerReset = null;
+  const forgotten = await fetchJson(`${base}/api/v2/auth/password/forgot`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ identifier: email }) });
+  if (forgotten.response.status !== 202 || !capturedCustomerReset || capturedCustomerAuthPath !== '/app/auth' || forgotten.body.state !== 'PENDING') fail('Forgot-password did not issue an emailed, bounded V2 associated-domain reset challenge');
+  const resetChallenge = await prisma.authChallenge.findUniqueOrThrow({ where: { id: forgotten.body.challengeId }, select: { customerAccountId: true, targetEmail: true, deliveryStatus: true, expiresAt: true } });
+  const unknownForgotten = await fetchJson(`${base}/api/v2/auth/password/forgot`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ identifier: `nobody-${crypto.randomUUID()}@invalid.test` }) });
+  if (resetChallenge.customerAccountId !== account.id || resetChallenge.targetEmail !== email || resetChallenge.deliveryStatus !== 'ACCEPTED' || unknownForgotten.response.status !== forgotten.response.status || Object.keys(unknownForgotten.body).sort().join(',') !== Object.keys(forgotten.body).sort().join(',')) fail('Password-recovery response exposed account existence or did not record provider acceptance truthfully');
+
+  const passwordBeforeReset = loginPayload.password;
+  const newPassword = `customer-auth-reset-${crypto.randomUUID()}`;
+  const reset = await fetchJson(`${base}/api/v2/auth/password/reset`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ ...capturedCustomerReset, challengeId: forgotten.body.challengeId, password: newPassword, deviceInstallationId: loginPayload.deviceInstallationId, publicKey: loginPayload.publicKey, deviceName: loginPayload.deviceName, model: loginPayload.model, osFamily: loginPayload.osFamily, osVersion: loginPayload.osVersion }) });
+  const resetCompletionJar = {};
+  updateCookieJar(resetCompletionJar, reset.response);
+  let resetCurrentCookie = cookieValue(resetCompletionJar, 'dinodia_customer_session');
+  const resetCurrentSession = resetCurrentCookie ? await prisma.customerSession.findUnique({ where: { refreshTokenHash: sha256(resetCurrentCookie) }, select: { id: true, customerAccountId: true, trustedDeviceId: true, revokedAt: true, absoluteExpiresAt: true } }) : null;
+  const revokedSession = await prisma.customerSession.findUniqueOrThrow({ where: { id: accountSession.id }, select: { revokedAt: true, revokeReason: true } });
+  const revokedCompanionSession = await prisma.customerSession.findUniqueOrThrow({ where: { refreshTokenHash: sha256(resetCompanionSession) }, select: { revokedAt: true, revokeReason: true } });
+  const revokedCompanionDevice = await prisma.trustedDevice.findUniqueOrThrow({ where: { id: resetCompanionDevice.id }, select: { revokedAt: true, sessionVersion: true } });
+  const retainedCurrentDevice = await prisma.trustedDevice.findUniqueOrThrow({ where: { customerAccountId_deviceInstallationId: { customerAccountId: account.id, deviceInstallationId: loginPayload.deviceInstallationId } }, select: { id: true, revokedAt: true } });
+  const expiredCookieRestore = await fetchJson(`${base}/api/v2/session`, { headers: { cookie: `dinodia_customer_session=${encodeURIComponent(rawSession)}` } });
+  const replayedReset = await fetchJson(`${base}/api/v2/auth/password/reset`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ ...capturedCustomerReset, challengeId: forgotten.body.challengeId, password: `another-${crypto.randomUUID()}` }) });
+  const oldPasswordLogin = await fetchJson(`${base}/api/v2/session`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ ...loginPayload, password: passwordBeforeReset }) });
+  const newPasswordLogin = await fetchJson(`${base}/api/v2/session`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ ...loginPayload, password: newPassword }) });
+  const resetRequirements = resetCurrentCookie ? await fetchJson(`${base}/api/v2/auth/requirements`, { headers: { cookie: `dinodia_customer_session=${encodeURIComponent(resetCurrentCookie)}` } }) : null;
+  if (reset.response.status !== 200 || !resetCurrentSession || resetCurrentSession.revokedAt || resetCurrentSession.customerAccountId !== account.id || resetCurrentSession.trustedDeviceId !== retainedCurrentDevice.id || !resetCurrentCookie || !retainedCurrentDevice.id || retainedCurrentDevice.revokedAt || !revokedSession.revokedAt || revokedSession.revokeReason !== 'password_reset' || !revokedCompanionSession.revokedAt || revokedCompanionSession.revokeReason !== 'password_reset' || !revokedCompanionDevice.revokedAt || revokedCompanionDevice.sessionVersion <= resetCompanionDevice.sessionVersion || expiredCookieRestore.response.status !== 401 || replayedReset.response.status !== 409 || oldPasswordLogin.response.status !== 401 || newPasswordLogin.response.status !== 200 || resetRequirements?.response.status !== 200 || resetRequirements.body.nextAction !== 'CONTINUE') fail(`Password reset mismatch (reset=${reset.response.status}/${reset.body?.error?.code || reset.body?.state || 'none'}, current=${Boolean(resetCurrentSession && !resetCurrentSession.revokedAt)}, other=${revokedCompanionSession.revokeReason || (revokedCompanionSession.revokedAt ? 'revoked' : 'active')}, restore=${expiredCookieRestore.response.status}, replay=${replayedReset.response.status}, oldLogin=${oldPasswordLogin.response.status}, newLogin=${newPasswordLogin.response.status})`);
+
+  const ordinaryPassword = `customer-auth-stepup-${crypto.randomUUID()}`;
+  const unprovedPasswordBefore = await prisma.customerAccount.findUniqueOrThrow({ where: { id: account.id }, select: { passwordHash: true, securityVersion: true } });
+  const unprovedAuthorizationCount = await prisma.stepUpAuthorization.count({ where: { customerAccountId: account.id, operationKind: 'customer_password_change' } });
+  const unprovedChange = await fetchJson(`${base}/api/v2/auth/password/change`, { method: 'POST', headers: { 'content-type': 'application/json', cookie: `dinodia_customer_session=${encodeURIComponent(resetCurrentCookie)}` }, body: JSON.stringify({ currentPassword: newPassword, newPassword: ordinaryPassword, proof: `dno-unissued-${crypto.randomBytes(32).toString('base64url')}` }) });
+  const unprovedPasswordAfter = await prisma.customerAccount.findUniqueOrThrow({ where: { id: account.id }, select: { passwordHash: true, securityVersion: true } });
+  const unprovedAuthorizationAfter = await prisma.stepUpAuthorization.count({ where: { customerAccountId: account.id, operationKind: 'customer_password_change' } });
+  if (unprovedChange.response.status !== 403 || unprovedPasswordAfter.passwordHash !== unprovedPasswordBefore.passwordHash
+    || unprovedPasswordAfter.securityVersion !== unprovedPasswordBefore.securityVersion || unprovedAuthorizationAfter !== unprovedAuthorizationCount) {
+    fail(`Ordinary password change without issued proof had effects (${unprovedChange.response.status})`);
+  }
+  const ordinaryValue = { newPasswordDigest: sha256(ordinaryPassword) };
+  const ordinaryChallenge = await fetchJson(`${base}/api/v2/auth/security/step-up/challenge`, { method: 'POST', headers: { 'content-type': 'application/json', cookie: `dinodia_customer_session=${encodeURIComponent(resetCurrentCookie)}` }, body: JSON.stringify({ operationKind: 'customer_password_change', targetIds: [account.id], value: ordinaryValue }) });
+  const ordinarySignature = ordinaryChallenge.body?.challengeId && ordinaryChallenge.body?.nonce && ordinaryChallenge.body?.operationDigest
+    ? crypto.sign(null, stepUpChallengeMessage({ challengeId: ordinaryChallenge.body.challengeId, nonce: ordinaryChallenge.body.nonce, operationDigest: ordinaryChallenge.body.operationDigest }), crypto.createPrivateKey(loginPhone.privateKey)).toString('base64url')
+    : '';
+  const ordinaryProof = await fetchJson(`${base}/api/v2/auth/security/step-up/issue`, { method: 'POST', headers: { 'content-type': 'application/json', cookie: `dinodia_customer_session=${encodeURIComponent(resetCurrentCookie)}` }, body: JSON.stringify({ challengeId: ordinaryChallenge.body?.challengeId, nonce: ordinaryChallenge.body?.nonce, deviceSignature: ordinarySignature }) });
+  const mismatchedChange = await fetchJson(`${base}/api/v2/auth/password/change`, { method: 'POST', headers: { 'content-type': 'application/json', cookie: `dinodia_customer_session=${encodeURIComponent(resetCurrentCookie)}` }, body: JSON.stringify({ currentPassword: newPassword, newPassword: `${ordinaryPassword}-different`, proof: ordinaryProof.body?.proof }) });
+  const beforeApprovedChange = await prisma.customerAccount.findUniqueOrThrow({ where: { id: account.id }, select: { passwordHash: true, securityVersion: true } });
+  const approvedChange = await fetchJson(`${base}/api/v2/auth/password/change`, { method: 'POST', headers: { 'content-type': 'application/json', cookie: `dinodia_customer_session=${encodeURIComponent(resetCurrentCookie)}` }, body: JSON.stringify({ currentPassword: newPassword, newPassword: ordinaryPassword, proof: ordinaryProof.body?.proof }) });
+  const ordinaryJar = {}; updateCookieJar(ordinaryJar, approvedChange.response);
+  resetCurrentCookie = cookieValue(ordinaryJar, 'dinodia_customer_session');
+  const afterApprovedChange = await prisma.customerAccount.findUniqueOrThrow({ where: { id: account.id }, select: { passwordHash: true, securityVersion: true } });
+  const ordinaryProofRow = await prisma.stepUpAuthorization.findFirstOrThrow({ where: { customerAccountId: account.id, operationKind: 'customer_password_change' }, select: { consumedAt: true } });
+  if (ordinaryChallenge.response.status !== 200 || ordinaryProof.response.status !== 200 || mismatchedChange.response.status !== 403
+    || beforeApprovedChange.passwordHash !== unprovedPasswordBefore.passwordHash || beforeApprovedChange.securityVersion !== unprovedPasswordBefore.securityVersion
+    || approvedChange.response.status !== 200 || !resetCurrentCookie || afterApprovedChange.securityVersion !== beforeApprovedChange.securityVersion + 1 || !ordinaryProofRow.consumedAt) {
+    fail(`Operation-bound password change failed (challenge=${ordinaryChallenge.response.status}, proof=${ordinaryProof.response.status}, mismatch=${mismatchedChange.response.status}, change=${approvedChange.response.status})`);
+  }
+  const replayedPasswordProof = await fetchJson(`${base}/api/v2/auth/password/change`, { method: 'POST', headers: { 'content-type': 'application/json', cookie: `dinodia_customer_session=${encodeURIComponent(resetCurrentCookie)}` }, body: JSON.stringify({ currentPassword: ordinaryPassword, newPassword: ordinaryPassword, proof: ordinaryProof.body.proof }) });
+  if (replayedPasswordProof.response.status !== 403 || (await prisma.customerAccount.findUniqueOrThrow({ where: { id: account.id }, select: { securityVersion: true } })).securityVersion !== afterApprovedChange.securityVersion) fail('A consumed password-change proof replay changed account authority');
+
+  const accountProfileBefore = await fetchJson(`${base}/api/v2/me/profile`, { headers: { cookie: `dinodia_customer_session=${encodeURIComponent(resetCurrentCookie)}` } });
+  const requestedProfile = { displayName: 'Disposable Profile Updated', username: `${username}-profile`, usernameNormalized: `${username}-profile`.toLowerCase(), phoneNumber: '+44 20 7000 0000', profileRevision: accountProfileBefore.body?.profileRevision };
+  const profileChallenge = await fetchJson(`${base}/api/v2/auth/security/step-up/challenge`, { method: 'POST', headers: { 'content-type': 'application/json', cookie: `dinodia_customer_session=${encodeURIComponent(resetCurrentCookie)}` }, body: JSON.stringify({ operationKind: 'customer_profile_change', targetIds: [account.id], value: { displayName: requestedProfile.displayName, usernameNormalized: requestedProfile.usernameNormalized, phoneNumber: requestedProfile.phoneNumber, profileRevision: requestedProfile.profileRevision } }) });
+  const profileSignature = profileChallenge.body?.challengeId && profileChallenge.body?.nonce && profileChallenge.body?.operationDigest
+    ? crypto.sign(null, stepUpChallengeMessage({ challengeId: profileChallenge.body.challengeId, nonce: profileChallenge.body.nonce, operationDigest: profileChallenge.body.operationDigest }), crypto.createPrivateKey(loginPhone.privateKey)).toString('base64url') : '';
+  const profileProof = await fetchJson(`${base}/api/v2/auth/security/step-up/issue`, { method: 'POST', headers: { 'content-type': 'application/json', cookie: `dinodia_customer_session=${encodeURIComponent(resetCurrentCookie)}` }, body: JSON.stringify({ challengeId: profileChallenge.body?.challengeId, nonce: profileChallenge.body?.nonce, deviceSignature: profileSignature }) });
+  const mismatchedProfile = await fetchJson(`${base}/api/v2/me/profile`, { method: 'PATCH', headers: { 'content-type': 'application/json', cookie: `dinodia_customer_session=${encodeURIComponent(resetCurrentCookie)}` }, body: JSON.stringify({ displayName: requestedProfile.displayName, username: `${username}-other`, phoneNumber: requestedProfile.phoneNumber, expectedProfileRevision: requestedProfile.profileRevision, proof: profileProof.body?.proof }) });
+  const profileAfterMismatch = await prisma.customerAccount.findUniqueOrThrow({ where: { id: account.id }, select: { displayName: true, username: true, phoneNumber: true } });
+  const profileProofBeforeUse = profileProof.body?.proof ? await prisma.stepUpAuthorization.findUnique({ where: { customerAccountId_nonceHash: { customerAccountId: account.id, nonceHash: sha256(profileProof.body.proof) } }, select: { consumedAt: true } }) : null;
+  const approvedProfile = await fetchJson(`${base}/api/v2/me/profile`, { method: 'PATCH', headers: { 'content-type': 'application/json', cookie: `dinodia_customer_session=${encodeURIComponent(resetCurrentCookie)}` }, body: JSON.stringify({ displayName: requestedProfile.displayName, username: `${username}-profile`, phoneNumber: requestedProfile.phoneNumber, expectedProfileRevision: requestedProfile.profileRevision, proof: profileProof.body?.proof }) });
+  const replayedProfile = await fetchJson(`${base}/api/v2/me/profile`, { method: 'PATCH', headers: { 'content-type': 'application/json', cookie: `dinodia_customer_session=${encodeURIComponent(resetCurrentCookie)}` }, body: JSON.stringify({ displayName: requestedProfile.displayName, username: `${username}-profile`, phoneNumber: requestedProfile.phoneNumber, expectedProfileRevision: requestedProfile.profileRevision, proof: profileProof.body?.proof }) });
+  const profileAfterReplay = await prisma.customerAccount.findUniqueOrThrow({ where: { id: account.id }, select: { displayName: true, username: true, phoneNumber: true } });
+  const profileProofAfterUse = profileProof.body?.proof ? await prisma.stepUpAuthorization.findUnique({ where: { customerAccountId_nonceHash: { customerAccountId: account.id, nonceHash: sha256(profileProof.body.proof) } }, select: { consumedAt: true } }) : null;
+  if (accountProfileBefore.response.status !== 200 || profileChallenge.response.status !== 200 || profileProof.response.status !== 200
+    || mismatchedProfile.response.status !== 403 || profileAfterMismatch.displayName !== registrationBody.displayName || profileAfterMismatch.username !== username || profileAfterMismatch.phoneNumber !== null
+    || profileProofBeforeUse?.consumedAt || approvedProfile.response.status !== 200 || approvedProfile.body?.username !== `${username}-profile`
+    || approvedProfile.body?.phoneNumber !== requestedProfile.phoneNumber || !profileProofAfterUse?.consumedAt
+    || ![403, 409].includes(replayedProfile.response.status) || profileAfterReplay.username !== `${username}-profile`) {
+    fail(`Operation-bound profile change failed (read=${accountProfileBefore.response.status}, challenge=${profileChallenge.response.status}, proof=${profileProof.response.status}, mismatch=${mismatchedProfile.response.status}, update=${approvedProfile.response.status}, replay=${replayedProfile.response.status})`);
+  }
+  console.log('[stage6:integration] PASS: profile changes require a fresh trusted-phone proof bound to exact values and current profile revision; mismatch preserves the proof, one update consumes it, and replay is denied');
+  loginPayload.password = ordinaryPassword;
+  // This disposable integration account has already exercised several login
+  // denials. Reset only its test-database admission bucket so this independent
+  // mobile-session/email-change scenario reaches the real routes.
+  await prisma.authRateLimitBucket.deleteMany({ where: { bucketKey: `customer-login:${sha256(email)}` } });
+  const mobileEmailSession = await fetchJson(`${base}/api/v2/mobile/session`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(loginPayload) });
+  const mobileEmailBearer = mobileEmailSession.body?.accessToken;
+  const mobileEmailHeaders = { authorization: `Bearer ${mobileEmailBearer}` };
+  const apnsToken = crypto.randomBytes(32).toString('hex');
+  const apnsRegistration = await fetchJson(`${base}/api/v2/me/push-registration`, { method: 'PUT', headers: { ...mobileEmailHeaders, 'content-type': 'application/json' }, body: JSON.stringify({ deviceToken: apnsToken, environment: 'DEVELOPMENT' }) });
+  const apnsDeviceId = mobileEmailSession.body?.trustedDeviceId;
+  const apnsDevice = apnsDeviceId ? await prisma.trustedDevice.findUnique({ where: { id: apnsDeviceId }, select: { apnsTokenCiphertext: true, apnsTokenDigest: true, apnsEnvironment: true, apnsTokenRevision: true, pushEnabledAt: true } }) : null;
+  const apnsDuplicate = await fetchJson(`${base}/api/v2/me/push-registration`, { method: 'PUT', headers: { ...mobileEmailHeaders, 'content-type': 'application/json' }, body: JSON.stringify({ deviceToken: apnsToken.toUpperCase(), environment: 'DEVELOPMENT' }) });
+  const apnsRotatedToken = crypto.randomBytes(32).toString('hex');
+  const apnsRotation = await fetchJson(`${base}/api/v2/me/push-registration`, { method: 'PUT', headers: { ...mobileEmailHeaders, 'content-type': 'application/json' }, body: JSON.stringify({ deviceToken: apnsRotatedToken, environment: 'PRODUCTION' }) });
+  const apnsRotatedDevice = apnsDeviceId ? await prisma.trustedDevice.findUnique({ where: { id: apnsDeviceId }, select: { apnsTokenCiphertext: true, apnsTokenDigest: true, apnsEnvironment: true, apnsTokenRevision: true, pushEnabledAt: true } }) : null;
+  const apnsDisabled = await fetchJson(`${base}/api/v2/me/push-registration`, { method: 'DELETE', headers: mobileEmailHeaders });
+  const apnsDisabledReplay = await fetchJson(`${base}/api/v2/me/push-registration`, { method: 'DELETE', headers: mobileEmailHeaders });
+  const apnsAfterDisable = apnsDeviceId ? await prisma.trustedDevice.findUnique({ where: { id: apnsDeviceId }, select: { apnsTokenCiphertext: true, apnsTokenDigest: true, apnsEnvironment: true, apnsTokenRevision: true, pushEnabledAt: true, pushRevokedAt: true } }) : null;
+  const apnsMalformed = await fetchJson(`${base}/api/v2/me/push-registration`, { method: 'PUT', headers: { ...mobileEmailHeaders, 'content-type': 'application/json' }, body: JSON.stringify({ deviceToken: 'not-an-apns-token', environment: 'DEVELOPMENT' }) });
+  if (apnsRegistration.response.status !== 200 || apnsRegistration.body?.state !== 'ENABLED' || apnsRegistration.body?.idempotentReplay !== false
+    || !apnsDevice?.apnsTokenCiphertext || !apnsDevice.apnsTokenDigest || apnsDevice.apnsEnvironment !== 'DEVELOPMENT' || !apnsDevice.pushEnabledAt
+    || apnsDevice.apnsTokenCiphertext.includes(apnsToken) || JSON.stringify(apnsRegistration.body).includes(apnsToken)
+    || apnsDuplicate.response.status !== 200 || apnsDuplicate.body?.idempotentReplay !== true || apnsDuplicate.body?.revision !== apnsRegistration.body?.revision
+    || apnsRotation.response.status !== 200 || apnsRotation.body?.idempotentReplay !== false || apnsRotation.body?.revision !== Number(apnsRegistration.body?.revision) + 1
+    || !apnsRotatedDevice?.apnsTokenCiphertext || apnsRotatedDevice.apnsTokenDigest === apnsDevice?.apnsTokenDigest || apnsRotatedDevice.apnsEnvironment !== 'PRODUCTION'
+    || apnsDisabled.response.status !== 200 || apnsDisabled.body?.state !== 'DISABLED' || !apnsAfterDisable?.pushRevokedAt
+    || apnsAfterDisable.apnsTokenCiphertext !== null || apnsAfterDisable.apnsTokenDigest !== null || apnsAfterDisable.apnsEnvironment !== null
+    || apnsDisabledReplay.response.status !== 200 || apnsDisabledReplay.body?.idempotentReplay !== true
+    || apnsMalformed.response.status !== 400 || !apnsAfterDisable || apnsAfterDisable.apnsTokenRevision !== apnsRotation.body?.revision + 1) {
+    fail(`Trusted-installation APNs registration/rotation/revocation contract failed (register=${apnsRegistration.response.status}, duplicate=${apnsDuplicate.response.status}/${apnsDuplicate.body?.idempotentReplay}, rotation=${apnsRotation.response.status}, disable=${apnsDisabled.response.status}/${apnsDisabledReplay.response.status}, malformed=${apnsMalformed.response.status})`);
+  }
+  console.log('[stage6:integration] PASS: actual APNs token registration is encrypted and installation-bound, duplicate refresh is idempotent, rotation advances revision, malformed tokens deny, and explicit disable erases token material');
+  const emailProfile = await fetchJson(`${base}/api/v2/me/profile`, { headers: mobileEmailHeaders });
+  const newEmail = `customer-email-change-${crypto.randomUUID()}@invalid.test`;
+  const emailChangeValue = { emailNormalized: newEmail, profileRevision: emailProfile.body?.profileRevision };
+  const emailChangeChallenge = await fetchJson(`${base}/api/v2/auth/security/step-up/challenge`, { method: 'POST', headers: { ...mobileEmailHeaders, 'content-type': 'application/json' }, body: JSON.stringify({ operationKind: 'customer_email_change', targetIds: [account.id], value: emailChangeValue }) });
+  const emailChangeSignature = emailChangeChallenge.body?.challengeId && emailChangeChallenge.body?.nonce && emailChangeChallenge.body?.operationDigest
+    ? crypto.sign(null, stepUpChallengeMessage({ challengeId: emailChangeChallenge.body.challengeId, nonce: emailChangeChallenge.body.nonce, operationDigest: emailChangeChallenge.body.operationDigest }), crypto.createPrivateKey(loginPhone.privateKey)).toString('base64url') : '';
+  const emailChangeProof = await fetchJson(`${base}/api/v2/auth/security/step-up/issue`, { method: 'POST', headers: { ...mobileEmailHeaders, 'content-type': 'application/json' }, body: JSON.stringify({ challengeId: emailChangeChallenge.body?.challengeId, nonce: emailChangeChallenge.body?.nonce, deviceSignature: emailChangeSignature }) });
+  const emailChangeUnbound = await fetchJson(`${base}/api/v2/me/email-change`, { method: 'POST', headers: { ...mobileEmailHeaders, 'content-type': 'application/json' }, body: JSON.stringify({ email: `${newEmail}.different`, expectedProfileRevision: emailProfile.body?.profileRevision, proof: emailChangeProof.body?.proof }) });
+  const accountBeforeEmailConfirmation = await prisma.customerAccount.findUniqueOrThrow({ where: { id: account.id }, select: { emailNormalized: true, pendingEmailNormalized: true } });
+  const otherEmailPhone = keyPair();
+  const otherEmailInstall = `email-change-other-${crypto.randomUUID()}`;
+  await prisma.authRateLimitBucket.deleteMany({ where: { bucketKey: `customer-login:${sha256(email)}` } });
+  const otherEmailLogin = await fetchJson(`${base}/api/v2/session`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ ...loginPayload, deviceInstallationId: otherEmailInstall, publicKey: otherEmailPhone.publicKey, deviceName: 'Disposable email-change other phone' }) });
+  const otherEmailDevice = await prisma.trustedDevice.findUnique({ where: { customerAccountId_deviceInstallationId: { customerAccountId: account.id, deviceInstallationId: otherEmailInstall } }, select: { id: true, revokedAt: true } });
+  capturedCustomerEmailChange = null;
+  const emailChangeRequested = await fetchJson(`${base}/api/v2/me/email-change`, { method: 'POST', headers: { ...mobileEmailHeaders, 'content-type': 'application/json' }, body: JSON.stringify({ email: newEmail, expectedProfileRevision: emailProfile.body?.profileRevision, proof: emailChangeProof.body?.proof }) });
+  const emailChangeChallengeRow = emailChangeRequested.body?.challengeId ? await prisma.authChallenge.findUnique({ where: { id: emailChangeRequested.body.challengeId }, select: { purpose: true, targetEmail: true, deliveryStatus: true, consumedAt: true, revokedAt: true } }) : null;
+  const emailBeforeVerification = await prisma.customerAccount.findUniqueOrThrow({ where: { id: account.id }, select: { emailNormalized: true, pendingEmailNormalized: true } });
+  const anonymousEmailConfirmation = capturedCustomerEmailChange ? await fetchJson(`${base}/api/v2/auth/email/verify`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(capturedCustomerEmailChange) }) : null;
+  const emailChallengeBeforeConfirm = emailChangeRequested.body?.challengeId ? await prisma.authChallenge.findUnique({ where: { id: emailChangeRequested.body.challengeId }, select: { consumedAt: true, revokedAt: true } }) : null;
+  const emailChangeConfirmed = capturedCustomerEmailChange ? await fetchJson(`${base}/api/v2/auth/email/verify`, { method: 'POST', headers: { ...mobileEmailHeaders, 'content-type': 'application/json' }, body: JSON.stringify(capturedCustomerEmailChange) }) : null;
+  const emailChangedAccount = await prisma.customerAccount.findUniqueOrThrow({ where: { id: account.id }, select: { emailNormalized: true, pendingEmailNormalized: true, emailVerifiedAt: true, securityVersion: true } });
+  const newMobileSession = emailChangeConfirmed?.body?.refreshToken ? await prisma.customerSession.findUnique({ where: { refreshTokenHash: sha256(emailChangeConfirmed.body.refreshToken) }, select: { id: true, revokedAt: true, securityVersion: true, trustedDeviceId: true } }) : null;
+  const otherEmailDeviceAfter = otherEmailDevice ? await prisma.trustedDevice.findUnique({ where: { id: otherEmailDevice.id }, select: { revokedAt: true } }) : null;
+  if (mobileEmailSession.response.status !== 200 || !mobileEmailBearer || emailProfile.response.status !== 200
+    || emailChangeChallenge.response.status !== 200 || emailChangeProof.response.status !== 200
+    || emailChangeUnbound.response.status !== 403 || accountBeforeEmailConfirmation.pendingEmailNormalized !== null
+    || otherEmailLogin.response.status !== 200 || !otherEmailDevice || otherEmailDevice.revokedAt
+    || emailChangeRequested.response.status !== 202 || !capturedCustomerEmailChange || !emailChangeChallengeRow
+    || emailChangeChallengeRow.purpose !== 'CUSTOMER_EMAIL_CHANGE' || emailChangeChallengeRow.targetEmail !== newEmail
+    || emailChangeChallengeRow.deliveryStatus !== 'ACCEPTED' || emailChangeChallengeRow.consumedAt || emailChangeChallengeRow.revokedAt
+    || emailBeforeVerification.emailNormalized !== email || emailBeforeVerification.pendingEmailNormalized !== newEmail
+    || anonymousEmailConfirmation?.response.status !== 401 || emailChallengeBeforeConfirm?.consumedAt
+    || emailChangeConfirmed?.response.status !== 200 || emailChangeConfirmed.body?.user?.email !== newEmail
+    || emailChangedAccount.emailNormalized !== newEmail || emailChangedAccount.pendingEmailNormalized !== null || !emailChangedAccount.emailVerifiedAt
+    || emailChangeConfirmed.body?.refreshToken === mobileEmailSession.body?.refreshToken || !newMobileSession || newMobileSession.revokedAt
+    || !otherEmailDeviceAfter?.revokedAt) {
+    fail(`Authenticated email change failed safely (mobile=${mobileEmailSession.response.status}, profile=${emailProfile.response.status}, challenge=${emailChangeChallenge.response.status}, proof=${emailChangeProof.response.status}, mismatch=${emailChangeUnbound.response.status}/${emailChangeUnbound.body?.error?.code}, request=${emailChangeRequested.response.status}/${emailChangeRequested.body?.error?.code}, other=${otherEmailLogin.response.status}, anonymous=${anonymousEmailConfirmation?.response.status}, confirm=${emailChangeConfirmed?.response.status}/${emailChangeConfirmed?.body?.error?.code}, old=${emailBeforeVerification.emailNormalized}, pending=${emailBeforeVerification.pendingEmailNormalized}, new=${emailChangedAccount.emailNormalized}, otherRevoked=${Boolean(otherEmailDeviceAfter?.revokedAt)})`);
+  }
+  email = newEmail;
+  loginPayload.email = newEmail;
+  resetCurrentCookie = emailChangeConfirmed.body.refreshToken;
+  console.log('[stage6:integration] PASS: verified email change keeps the old address active while pending, requires exact fresh phone proof and the same signed-in installation, rotates mobile credentials, revokes other phones, and denies anonymous confirmation');
+  console.log('[stage6:integration] PASS: ordinary password changes require fresh account-bound exact-value proof; missing/mismatched/replayed proof has no password or authority effect');
+  console.log('[stage6:integration] PASS: actual disposable registration, SES verification/recovery, password reset keeps the completing phone, revokes other phone/session authority, rejects replay, and allows only the new credential');
+
+  // Account security remains available from the Home chooser. It does not
+  // borrow a tenant/home bearer; proof scope is the current account session,
+  // signing phone, operation and exact target. A wrong target is denied
+  // without consuming proof or mutating the intended phone.
+  loginPayload.password = ordinaryPassword;
+  const resetTargetPhone = keyPair();
+  const resetTargetInstallationId = `customer-auth-reset-target-${crypto.randomUUID()}`;
+  const resetTargetLogin = await fetchJson(`${base}/api/v2/session`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ ...loginPayload, deviceInstallationId: resetTargetInstallationId, publicKey: resetTargetPhone.publicKey, deviceName: 'Disposable removal target' }) });
+  const resetTargetRawSession = cookieValue((() => { const jar = {}; updateCookieJar(jar, resetTargetLogin.response); return jar; })(), 'dinodia_customer_session');
+  if (resetTargetLogin.response.status !== 200 || !resetTargetRawSession) fail(`Could not establish the fresh disposable account-security removal target (${resetTargetLogin.response.status}/${resetTargetLogin.body?.error?.code || 'no-session'})`);
+  const resetTargetDevice = await prisma.trustedDevice.findUniqueOrThrow({ where: { customerAccountId_deviceInstallationId: { customerAccountId: account.id, deviceInstallationId: resetTargetInstallationId } }, select: { id: true, revokedAt: true, sessionVersion: true } });
+  const accountCookieHeaders = { cookie: `dinodia_customer_session=${encodeURIComponent(resetCurrentCookie)}` };
+  const accountRemovalChallenge = await fetchJson(`${base}/api/v2/auth/security/step-up/challenge`, { method: 'POST', headers: { ...accountCookieHeaders, 'content-type': 'application/json' }, body: JSON.stringify({ operationKind: 'trusted_device_remove', targetIds: [resetTargetDevice.id] }) });
+  const accountProofSignature = accountRemovalChallenge.body?.challengeId && accountRemovalChallenge.body?.nonce && accountRemovalChallenge.body?.operationDigest
+    ? crypto.sign(null, stepUpChallengeMessage({ challengeId: accountRemovalChallenge.body.challengeId, nonce: accountRemovalChallenge.body.nonce, operationDigest: accountRemovalChallenge.body.operationDigest }), crypto.createPrivateKey(loginPhone.privateKey)).toString('base64url')
+    : '';
+  const accountRemovalProof = await fetchJson(`${base}/api/v2/auth/security/step-up/issue`, { method: 'POST', headers: { ...accountCookieHeaders, 'content-type': 'application/json' }, body: JSON.stringify({ challengeId: accountRemovalChallenge.body?.challengeId, nonce: accountRemovalChallenge.body?.nonce, deviceSignature: accountProofSignature }) });
+  const wrongTargetRemoval = await fetchJson(`${base}/api/v2/trusted-devices/${crypto.randomUUID()}`, { method: 'DELETE', headers: { ...accountCookieHeaders, 'content-type': 'application/json' }, body: JSON.stringify({ proof: accountRemovalProof.body?.proof }) });
+  const targetBeforeRemoval = await prisma.trustedDevice.findUniqueOrThrow({ where: { id: resetTargetDevice.id }, select: { revokedAt: true, sessionVersion: true } });
+  if (resetTargetLogin.response.status !== 200 || !resetTargetRawSession || resetTargetDevice.revokedAt
+    || accountRemovalChallenge.response.status !== 200 || accountRemovalProof.response.status !== 200
+    || wrongTargetRemoval.response.status !== 404 || targetBeforeRemoval.revokedAt) fail(`Account-global Trusted Device proof mismatch (targetLogin=${resetTargetLogin.response.status}, challenge=${accountRemovalChallenge.response.status}/${accountRemovalChallenge.body?.error?.code || 'ok'}, issue=${accountRemovalProof.response.status}/${accountRemovalProof.body?.error?.code || 'ok'}, wrongTarget=${wrongTargetRemoval.response.status}, revokedBefore=${Boolean(targetBeforeRemoval.revokedAt)})`);
+  const accountRemoval = await fetchJson(`${base}/api/v2/trusted-devices/${resetTargetDevice.id}`, { method: 'DELETE', headers: { ...accountCookieHeaders, 'content-type': 'application/json' }, body: JSON.stringify({ proof: accountRemovalProof.body.proof }) });
+  const targetAfterRemoval = await prisma.trustedDevice.findUniqueOrThrow({ where: { id: resetTargetDevice.id }, select: { revokedAt: true, sessionVersion: true } });
+  const targetSessionAfterRemoval = await prisma.customerSession.findUniqueOrThrow({ where: { refreshTokenHash: sha256(resetTargetRawSession) }, select: { revokedAt: true, revokeReason: true } });
+  const accountRemovalReplay = await fetchJson(`${base}/api/v2/trusted-devices/${resetTargetDevice.id}`, { method: 'DELETE', headers: { ...accountCookieHeaders, 'content-type': 'application/json' }, body: JSON.stringify({ proof: accountRemovalProof.body.proof }) });
+  if (accountRemoval.response.status !== 200 || accountRemoval.body.accountWide !== true || !targetAfterRemoval.revokedAt
+    || targetAfterRemoval.sessionVersion <= targetBeforeRemoval.sessionVersion || !targetSessionAfterRemoval.revokedAt
+    || targetSessionAfterRemoval.revokeReason !== 'trusted_device_removed' || accountRemovalReplay.response.status !== 404) fail('Account-global Trusted Device removal failed to revoke exactly the target phone or permitted replay');
+  console.log('[stage6:integration] PASS: cookie-authenticated account-wide Trusted Device removal is Home-independent, denies wrong-target proof with zero target effects, revokes the exact phone/session once, and denies replay');
+
+  const currentDevice = await prisma.trustedDevice.findUniqueOrThrow({ where: { customerAccountId_deviceInstallationId: { customerAccountId: account.id, deviceInstallationId: installId } }, select: { id: true, revokedAt: true, sessionVersion: true } });
+  const currentBefore = await prisma.customerSession.count({ where: { trustedDeviceId: currentDevice.id, revokedAt: null } });
+  const selfRemovalChallenge = await fetchJson(`${base}/api/v2/auth/security/step-up/challenge`, { method: 'POST', headers: { ...accountCookieHeaders, 'content-type': 'application/json' }, body: JSON.stringify({ operationKind: 'trusted_device_remove', targetIds: [currentDevice.id] }) });
+  const selfRemovalSignature = selfRemovalChallenge.body?.challengeId && selfRemovalChallenge.body?.nonce && selfRemovalChallenge.body?.operationDigest
+    ? crypto.sign(null, stepUpChallengeMessage({ challengeId: selfRemovalChallenge.body.challengeId, nonce: selfRemovalChallenge.body.nonce, operationDigest: selfRemovalChallenge.body.operationDigest }), crypto.createPrivateKey(loginPhone.privateKey)).toString('base64url') : '';
+  const selfRemovalProof = await fetchJson(`${base}/api/v2/auth/security/step-up/issue`, { method: 'POST', headers: { ...accountCookieHeaders, 'content-type': 'application/json' }, body: JSON.stringify({ challengeId: selfRemovalChallenge.body?.challengeId, nonce: selfRemovalChallenge.body?.nonce, deviceSignature: selfRemovalSignature }) });
+  const selfRemoval = await fetchJson(`${base}/api/v2/trusted-devices/${currentDevice.id}`, { method: 'DELETE', headers: { ...accountCookieHeaders, 'content-type': 'application/json' }, body: JSON.stringify({ proof: selfRemovalProof.body?.proof }) });
+  const currentAfter = await prisma.trustedDevice.findUniqueOrThrow({ where: { id: currentDevice.id }, select: { revokedAt: true, sessionVersion: true } });
+  const currentSessionsAfter = await prisma.customerSession.count({ where: { trustedDeviceId: currentDevice.id, revokedAt: null } });
+  const oldCurrentCookie = await fetchJson(`${base}/api/v2/trusted-devices`, { headers: accountCookieHeaders });
+  if (selfRemovalChallenge.response.status !== 200 || selfRemovalProof.response.status !== 200 || selfRemoval.response.status !== 200
+    || !currentAfter.revokedAt || currentAfter.sessionVersion <= currentDevice.sessionVersion || currentSessionsAfter !== 0
+    || currentBefore === 0 || oldCurrentCookie.response.status !== 401) fail('Current trusted-phone removal did not revoke the current installation and its sessions');
+
+  const webResetPhone = keyPair();
+  const webResetInstallationId = `customer-auth-web-reset-${crypto.randomUUID()}`;
+  // The earlier login, refresh, reset and proof cases intentionally share one
+  // test account. Isolate this independent web-reset case's login admission
+  // bucket in the throwaway database; production rate-limit behavior remains
+  // covered by its maintained security checks.
+  await prisma.authRateLimitBucket.deleteMany({ where: { bucketKey: `customer-login:${sha256(email)}` } });
+  const webResetLogin = await fetchJson(`${base}/api/v2/session`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ ...loginPayload, deviceInstallationId: webResetInstallationId, publicKey: webResetPhone.publicKey, deviceName: 'Disposable web-reset revocation target' }) });
+  const webResetChallenge = await fetchJson(`${base}/api/v2/auth/password/forgot`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ identifier: email }) });
+  const activeBeforeWebReset = await prisma.trustedDevice.count({ where: { customerAccountId: account.id, revokedAt: null } });
+  const webReset = await fetchJson(`${base}/api/v2/auth/password/reset`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ ...capturedCustomerReset, challengeId: webResetChallenge.body?.challengeId, password: `customer-auth-web-reset-${crypto.randomUUID()}` }) });
+  const activeAfterWebReset = await prisma.trustedDevice.count({ where: { customerAccountId: account.id, revokedAt: null } });
+  const activeSessionsAfterWebReset = await prisma.customerSession.count({ where: { customerAccountId: account.id, revokedAt: null } });
+  if (webResetLogin.response.status !== 200 || webResetChallenge.response.status !== 202 || activeBeforeWebReset !== 1 || webReset.response.status !== 200
+    || webReset.body.nextAction !== 'SIGN_IN' || activeAfterWebReset !== 0 || activeSessionsAfterWebReset !== 0) fail(`Web password reset revocation proof failed (login=${webResetLogin.response.status}, challenge=${webResetChallenge.response.status}, reset=${webReset.response.status}/${webReset.body?.error?.code || webReset.body?.nextAction || 'unknown'}, devices=${activeBeforeWebReset}->${activeAfterWebReset}, sessions=${activeSessionsAfterWebReset})`);
+  console.log('[stage6:integration] PASS: current-phone proof removal signs out its session; web password reset revokes every trusted installation and session');
+
+  const queuedChallenge = await fetchJson(`${base}/api/v2/auth/password/forgot`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ identifier: email }) });
+  if (queuedChallenge.response.status !== 202) fail('Queued expiry test could not issue its disposable challenge');
+  const queuedId = queuedChallenge.body.challengeId;
+  const queuedExpiry = new Date(Date.now() + 3000);
+  await prisma.authChallenge.update({ where: { id: queuedId }, data: { expiresAt: queuedExpiry } });
+  let signalLocked; let releaseLocked;
+  const isLocked = new Promise((resolve) => { signalLocked = resolve; });
+  const allowUnlock = new Promise((resolve) => { releaseLocked = resolve; });
+  const rowLock = prisma.$transaction(async (tx) => {
+    await tx.$queryRawUnsafe('SELECT "id" FROM "AuthChallenge" WHERE "id" = $1::uuid FOR UPDATE', queuedId);
+    signalLocked(); await allowUnlock;
+  }, { timeout: 10_000 });
+  await isLocked;
+  const queuedReset = fetchJson(`${base}/api/v2/auth/password/reset`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ ...capturedCustomerReset, challengeId: queuedId, password: `customer-auth-expired-reset-${crypto.randomUUID()}` }) });
+  let observedWait = false;
+  for (let attempt = 0; attempt < 30; attempt += 1) {
+    const waits = await prisma.$queryRawUnsafe("SELECT count(*)::int AS count FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE '%AuthChallenge%'");
+    if (waits.some((row) => row.count > 0)) { observedWait = true; break; }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  await new Promise((resolve) => setTimeout(resolve, Math.max(0, queuedExpiry.getTime() + 250 - Date.now())));
+  releaseLocked(); await rowLock;
+  const queuedResetResult = await queuedReset;
+  const queuedChallengeRow = await prisma.authChallenge.findUniqueOrThrow({ where: { id: queuedId }, select: { expiresAt: true, consumedAt: true, revokedAt: true } });
+  if (!observedWait || queuedResetResult.response.status !== 410 || queuedChallengeRow.consumedAt
+    || !queuedChallengeRow.revokedAt || queuedChallengeRow.expiresAt.getTime() !== queuedExpiry.getTime()) fail(`Reset queued beyond expiry was accepted or not measured (wait=${observedWait}, status=${queuedResetResult.response.status}, consumed=${Boolean(queuedChallengeRow.consumedAt)})`);
+  console.log('[stage6:integration] PASS: actual password-reset request waiting on its challenge lock is denied after expiry with no credential/session/device authority mutation');
+
+  sesShouldFail = true;
+  capturedCustomerVerification = null;
+  const failedEmail = `customer-mail-fail-${crypto.randomUUID()}@invalid.test`;
+  const failedRegistration = await fetchJson(`${base}/api/v2/auth/register`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ displayName: 'Delivery retry', username: `delivery-${crypto.randomUUID().slice(0, 10)}`, email: failedEmail, password: `delivery-password-${crypto.randomUUID()}` }) });
+  const failedDelivery = await prisma.authChallenge.findUniqueOrThrow({ where: { id: failedRegistration.body.challengeId }, select: { deliveryStatus: true, revokedAt: true } });
+  const failedState = await fetchJson(`${base}/api/v2/auth/challenges/${failedRegistration.body.challengeId}`);
+  sesShouldFail = false;
+  const resend = await fetchJson(`${base}/api/v2/auth/email/resend`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ email: failedEmail, challengeId: failedRegistration.body.challengeId }) });
+  const resent = await prisma.authChallenge.findUniqueOrThrow({ where: { id: resend.body.challengeId }, select: { deliveryStatus: true } });
+  if (failedRegistration.response.status !== 202 || failedDelivery.deliveryStatus !== 'FAILED' || !failedDelivery.revokedAt || failedState.body.state !== 'PENDING' || resend.response.status !== 202 || !capturedCustomerVerification || resent.deliveryStatus !== 'ACCEPTED') fail('Email failure was falsely shown as verified/delivered or could not recover through a bounded resend');
+  console.log('[stage6:integration] PASS: SES failure is stored as FAILED, remains a non-enumerating retry state, and resend issues one new provider-accepted challenge');
+  sesShouldFail = false;
+
+  // Public Get Help is a standalone, email-verified path. It must not create
+  // account/home authority, and replay must reconcile the exact same ticket.
+  const publicEmail = `public-help-${crypto.randomUUID()}@invalid.test`;
+  const publicBody = { replyEmail: publicEmail, category: 'ACCOUNT_OR_SIGN_IN', description: 'Disposable public Get Help integration request' };
+  capturedPublicSupportCode = null;
+  const publicTicketCountBefore = await prisma.supportTicket.count();
+  const publicChallenge = await fetchJson(`${base}/api/public/support/email-challenges`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(publicBody) });
+  const publicChallengeRow = publicChallenge.body.challengeId ? await prisma.authChallenge.findUnique({ where: { id: publicChallenge.body.challengeId }, select: { customerAccountId: true, targetEmail: true, purpose: true, deliveryStatus: true, consumedAt: true, revokedAt: true } }) : null;
+  if (publicChallenge.response.status !== 202 || publicChallenge.body.emailSubmission !== 'ACCEPTED'
+    || !capturedPublicSupportCode || !publicChallengeRow || publicChallengeRow.customerAccountId !== null
+    || publicChallengeRow.targetEmail !== publicEmail || publicChallengeRow.purpose !== 'PUBLIC_SUPPORT_TICKET'
+    || publicChallengeRow.deliveryStatus !== 'ACCEPTED' || publicChallengeRow.consumedAt || publicChallengeRow.revokedAt) {
+    fail(`Public Get Help did not create a standalone, provider-accepted email challenge (${publicChallenge.response.status}/${publicChallenge.body?.emailSubmission || 'none'})`);
+  }
+  const wrongPublicCode = capturedPublicSupportCode === '000000' ? '000001' : '000000';
+  const badPublicVerify = await fetchJson(`${base}/api/public/support/email-challenges/${publicChallenge.body.challengeId}/verify`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ code: wrongPublicCode, category: publicBody.category, description: publicBody.description }) });
+  const countAfterBadPublicVerify = await prisma.supportTicket.count();
+  const publicChallengeAfterBad = await prisma.authChallenge.findUniqueOrThrow({ where: { id: publicChallenge.body.challengeId }, select: { attemptCount: true, consumedAt: true, targetEmail: true } });
+  if (badPublicVerify.response.status !== 409 || countAfterBadPublicVerify !== publicTicketCountBefore
+    || publicChallengeAfterBad.attemptCount !== 1 || publicChallengeAfterBad.consumedAt || publicChallengeAfterBad.targetEmail !== publicEmail) {
+    fail('Invalid public support email code disclosed or created a ticket or mutated unrelated authority');
+  }
+  const publicVerifyBody = { code: capturedPublicSupportCode, category: publicBody.category, description: publicBody.description };
+  const validPublicVerify = await fetchJson(`${base}/api/public/support/email-challenges/${publicChallenge.body.challengeId}/verify`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(publicVerifyBody) });
+  const publicReference = validPublicVerify.body.publicReference;
+  const publicTicket = publicReference ? await prisma.supportTicket.findUnique({ where: { publicReference }, select: {
+    customerAccountId: true, homeId: true, selectedMembershipId: true, requesterEmailHash: true,
+    category: true, description: true, timeline: { select: { eventCode: true, safeSummary: true, safeMetadata: true } },
+  } }) : null;
+  const publicTicketCountAfter = await prisma.supportTicket.count();
+  const publicChallengeAfter = await prisma.authChallenge.findUniqueOrThrow({ where: { id: publicChallenge.body.challengeId }, select: { consumedAt: true, targetEmail: true } });
+  const publicReplay = await fetchJson(`${base}/api/public/support/email-challenges/${publicChallenge.body.challengeId}/verify`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(publicVerifyBody) });
+  const publicConflict = await fetchJson(`${base}/api/public/support/email-challenges/${publicChallenge.body.challengeId}/verify`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ ...publicVerifyBody, description: `${publicBody.description} changed` }) });
+  if (validPublicVerify.response.status !== 201 || !/^DNO-[A-Z0-9]{16}$/.test(publicReference || '')
+    || !publicTicket || publicTicket.customerAccountId !== null || publicTicket.homeId !== null || publicTicket.selectedMembershipId !== null
+    || !publicTicket.requesterEmailHash || publicTicket.category !== publicBody.category || publicTicket.description !== publicBody.description
+    || publicTicket.timeline.length !== 1 || publicTicket.timeline[0].eventCode !== 'PUBLIC_CREATED'
+    || publicTicketCountAfter !== publicTicketCountBefore + 1 || !publicChallengeAfter.consumedAt || publicChallengeAfter.targetEmail !== null
+    || publicReplay.response.status !== 200 || publicReplay.body.publicReference !== publicReference || publicReplay.body.idempotentReplay !== true
+    || publicConflict.response.status !== 409 || await prisma.supportTicket.count() !== publicTicketCountAfter) {
+    fail('Public Get Help did not verify the reply address, create one standalone ticket and reconcile only an identical retry');
+  }
+  console.log('[stage6:integration] PASS: public Get Help email proof creates one standalone non-enumerating ticket; wrong code has zero ticket effect, exact retry reconciles and changed-body reuse conflicts');
+
+  sesShouldFail = true;
+  capturedPublicSupportCode = null;
+  const failedPublicChallenge = await fetchJson(`${base}/api/public/support/email-challenges`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ ...publicBody, replyEmail: `public-help-fail-${crypto.randomUUID()}@invalid.test` }) });
+  const failedPublicRow = failedPublicChallenge.body.challengeId ? await prisma.authChallenge.findUnique({ where: { id: failedPublicChallenge.body.challengeId }, select: { deliveryStatus: true, targetEmail: true, revokedAt: true } }) : null;
+  const failedPublicVerify = failedPublicChallenge.body.challengeId ? await fetchJson(`${base}/api/public/support/email-challenges/${failedPublicChallenge.body.challengeId}/verify`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ code: '123456', category: publicBody.category, description: publicBody.description }) }) : null;
+  sesShouldFail = false;
+  if (failedPublicChallenge.response.status !== 202 || failedPublicChallenge.body.emailSubmission !== 'FAILED'
+    || !failedPublicRow || failedPublicRow.deliveryStatus !== 'FAILED' || failedPublicRow.targetEmail !== null || !failedPublicRow.revokedAt
+    || failedPublicVerify?.response.status !== 409 || await prisma.supportTicket.count() !== publicTicketCountAfter) {
+    fail('Public Get Help provider failure was represented as delivery success or retained usable verification authority');
+  }
+  console.log('[stage6:integration] PASS: public Get Help reports SES failure without creating a ticket or leaving a usable code');
 }
 
 async function installationBootstrapChecks() {
@@ -3140,13 +4504,23 @@ try {
   await startFakeSes();
   const sesEndpoint = `http://127.0.0.1:${sesPort}`;
   assertLoopbackTestEndpoint(sesEndpoint);
-  const deliveryEnv = { ...env, V2_ENVIRONMENT: 'test', COMPANY_PORTAL_INITIAL_CXO_EMAIL: 'niveditgupta@dinodiasmartliving.com', AWS_REGION: 'eu-north-1', SES_FROM_EMAIL: 'no-reply@dinodiasmartliving.com', AWS_ACCESS_KEY_ID: 'stage1-test-access-key', AWS_SECRET_ACCESS_KEY: 'stage1-test-secret', SES_TEST_ENDPOINT: sesEndpoint };
+  const disposablePolicyText = 'Disposable test-only customer policy for the Stage 6 integration harness. It is not Production legal copy.';
+  const deliveryEnv = { ...env, V2_ENVIRONMENT: 'test', COMPANY_PORTAL_INITIAL_CXO_EMAIL: 'niveditgupta@dinodiasmartliving.com', AWS_REGION: 'eu-north-1', SES_FROM_EMAIL: 'no-reply@dinodiasmartliving.com', AWS_ACCESS_KEY_ID: 'stage1-test-access-key', AWS_SECRET_ACCESS_KEY: 'stage1-test-secret', SES_TEST_ENDPOINT: sesEndpoint,
+    DINODIA_NATIVE_POLICY_TITLE: 'Disposable Stage 6 policy fixture', DINODIA_NATIVE_POLICY_TEXT: disposablePolicyText, DINODIA_NATIVE_POLICY_CONTENT_SHA256: sha256(disposablePolicyText) };
   await startPlatform(deliveryEnv);
   await bootstrapDeliveryChecks(deliveryEnv);
+  await customerAuthenticationLifecycleChecks(deliveryEnv);
   await customerAuthorizationChecks(deliveryEnv);
-  await installationBootstrapChecks();
-  await osChecks();
-  await operatorMutationChecks();
+  if (process.env.STAGE6_TENANT_REMOVAL_ONLY === '1') {
+    await tenantMembershipRemovalChecks();
+  } else {
+    await pendingInvitationRouteChecks(deliveryEnv);
+    await mobileSessionContractChecks();
+    await installationBootstrapChecks();
+    await osChecks();
+    await operatorMutationChecks();
+    await tenantMembershipRemovalChecks();
+  }
   const childTargets = verifyChildOutboundTargets();
   console.log(`[stage1:integration] PASS: live Platform routes, locked Dinodia OS HTTP, browser isolation, authenticated native WebSocket command authorization and denial exercised against disposable PostgreSQL; parent=${[...outboundTargets].sort().join(',')}; children=${childTargets.join(',')}`);
 } finally {

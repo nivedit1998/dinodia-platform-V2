@@ -27,8 +27,16 @@ export async function POST(request: Request) {
     const employeeProofSignature = String(hub.body.employeeProofSignature ?? '').trim();
     if (!ticketId || !/^[0-9a-f-]{36}$/i.test(requestId) || !Number.isInteger(identityGeneration) || identityGeneration < 1 || !code || !employeeId || !homeId || !/^[A-Za-z0-9_-]{32,128}$/.test(nonce) || !Number.isSafeInteger(proofExpiresAt) || !/^[a-f0-9]{64}$/.test(requestBodyDigest) || !/^[A-Za-z0-9_-]{80,256}$/.test(employeeProofSignature)) throw new Stage1AuthError(401, 'support_credentials_required', 'A support ticket, request, one-use support code and hub employee proof are required');
     if (serial !== hub.installation.serialNumberSnapshot || identityGeneration !== Number(hub.identity.identityGeneration)) throw new Stage1AuthError(401, 'support_identity_generation_mismatch', 'The support proof is bound to a different hub identity or generation');
-    const now = new Date();
     const result = await serializableTransaction(async (tx) => {
+      // Serialize redemption with customer ticket closure using the same lock
+      // order (ticket, then request). Without these locks, the two serializable
+      // transactions can both pass their initial reads and exhaust retries on
+      // the one-session-per-request constraint, surfacing an internal 500.
+      await tx.$queryRaw`SELECT "id" FROM "SupportTicket" WHERE "id" = ${ticketId}::uuid FOR UPDATE`;
+      await tx.$queryRaw`SELECT "id" FROM "SupportAccessRequest" WHERE "id" = ${requestId}::uuid AND "ticketId" = ${ticketId}::uuid FOR UPDATE`;
+      // Request start time is not authority: a legitimate request may have
+      // waited on either lock across code, handoff or hard-stop expiry.
+      const now = new Date();
       const row = await tx.supportAccessRequest.findFirst({ where: { id: requestId, ticketId, hubInstallationId: hub.installation.id, status: 'ISSUED', codeHash: sha256(code), employeeHandoffEnvelope: { not: null } }, select: { id: true, ticketId: true, requestedByEmployeeId: true, homeId: true, hubInstallationId: true, requestedScope: true, targetMembershipId: true, targetUserId: true, canonicalAreaIds: true, codeExpiresAt: true, employeeHandoffExpiresAt: true, employeeHandoffConsumedAt: true, sessionHardStopAt: true, codeConsumedAt: true, employeeProofPublicKey: true } });
       if (!row || row.codeConsumedAt || row.employeeHandoffConsumedAt || !row.codeExpiresAt || row.codeExpiresAt <= now || !row.employeeHandoffExpiresAt || row.employeeHandoffExpiresAt <= now || !row.sessionHardStopAt || row.sessionHardStopAt <= now) throw new Stage1AuthError(401, 'support_code_invalid', 'The support code and Company Portal handoff are invalid or expired');
       if (employeeId !== row.requestedByEmployeeId || homeId !== row.homeId || proofExpiresAt <= Math.floor(now.getTime() / 1000) || proofExpiresAt > Math.floor(row.employeeHandoffExpiresAt.getTime() / 1000)) throw new Stage1AuthError(401, 'support_proof_context_invalid', 'The employee proof is invalid, expired or bound to another request');

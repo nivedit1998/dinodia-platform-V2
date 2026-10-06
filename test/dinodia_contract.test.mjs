@@ -34,8 +34,79 @@ const privateFixture = JSON.parse(fs.readFileSync(path.join(root, 'fixtures/inva
 const source = fs.readFileSync(path.join(process.cwd(), 'src/lib/contracts/dinodiaV1.ts'), 'utf8');
 const compiled = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText;
 const module = { exports: {} };
-new Function('module','exports',compiled)(module,module.exports);
+new Function('module','exports','require',compiled)(module,module.exports,require);
 const native = module.exports;
+test('customer requirements and policy acceptance bind the exact server-owned text hash', () => {
+  const text = 'A sufficiently long disposable policy text used only by this contract unit test.';
+  const contentSha256 = crypto.createHash('sha256').update(text).digest('hex');
+  const projection = { version: 'policy-test-v1', title: 'Test policy', text, contentSha256 };
+  assert.equal(native.validateCustomerRequirementsReceipt({ schemaVersion: 'dinodia.v1', ok: true, nextAction: 'ACCEPT_POLICY', accepted: false, policy: projection }), true);
+  assert.equal(native.validateCustomerRequirementsReceipt({ schemaVersion: 'dinodia.v1', ok: true, nextAction: 'POLICY_UNAVAILABLE', accepted: false, policy: null }), true);
+  assert.equal(native.validateCustomerRequirementsReceipt({ schemaVersion: 'dinodia.v1', ok: true, nextAction: 'CONTINUE', accepted: false, policy: projection }), false);
+  assert.equal(native.validateCustomerRequirementsReceipt({ schemaVersion: 'dinodia.v1', ok: true, nextAction: 'ACCEPT_POLICY', accepted: false, policy: { ...projection, contentSha256: 'a'.repeat(64) } }), false);
+  assert.equal(native.validateCustomerPolicyAcceptanceReceipt({ schemaVersion: 'dinodia.v1', ok: true, policyVersion: projection.version, contentSha256, idempotentReplay: false }), true);
+  assert.equal(native.validateCustomerPolicyAcceptanceReceipt({ schemaVersion: 'dinodia.v1', ok: true, policyVersion: projection.version, contentSha256, idempotentReplay: false, currentPolicy: true }), false);
+});
+test('invited tenant cannot choose a username until the invitation credential, email and server gate are satisfied', () => {
+  const invitationId = '55555555-5555-4555-8555-555555555555';
+  const request = { invitationId, email: 'tenant@example.invalid', password: 'one-time-password-123' };
+  assert.equal(native.validateInvitedTenantRegistrationRequest(request), true);
+  assert.equal(native.validateInvitedTenantRegistrationRequest({ ...request, username: 'chosen-too-early' }), false);
+  assert.equal(native.validateInvitedTenantRegistrationRequest({ ...request, email: 'Tenant@example.invalid' }), false);
+  assert.equal(native.validateInvitedTenantRegistrationRequest({ ...request, invitationId: 'not-a-uuid' }), false);
+  assert.equal(native.validateInvitedTenantRegistrationRequest({ ...request, password: 'short' }), false);
+  const username = { username: 'tenant.new' };
+  assert.equal(native.validateInvitedTenantUsernameRequest(username), true);
+  assert.equal(native.validateInvitedTenantUsernameRequest({ ...username, accountId: 'caller-authority' }), false);
+  const receipt = { schemaVersion: 'dinodia.v1', ok: true, username: 'tenant.new', usernameNormalized: 'tenant.new', nextAction: 'CONTINUE' };
+  assert.equal(native.validateInvitedTenantUsernameReceipt(receipt, username.username), true);
+  assert.equal(native.validateInvitedTenantUsernameReceipt({ ...receipt, usernameNormalized: 'someone-else' }, username.username), false);
+  assert.equal(ajv.compile({ $ref: `${contract.$id}#/$defs/invitedTenantRegistrationRequest` })(request), true);
+  assert.equal(ajv.compile({ $ref: `${contract.$id}#/$defs/invitedTenantUsernameRequest` })(username), true);
+});
+test('customer profile contract is account-only and profile updates require a bounded exact proof', () => {
+  const receipt = { schemaVersion: 'dinodia.v1', ok: true, accountId: 'account:fixture', displayName: 'Fixture Customer', username: 'fixture-customer', phoneNumber: null, email: 'customer@example.invalid', emailVerified: true, profileRevision: '2026-10-05T10:00:00.000Z' };
+  const request = { displayName: 'Fixture Customer', username: 'fixture-customer', phoneNumber: null, expectedProfileRevision: receipt.profileRevision, proof: `dno-step-up-${'p'.repeat(48)}` };
+  for (const [name, value] of [['customerProfileReceipt', receipt], ['customerProfileUpdateRequest', request]]) {
+    const validate = ajv.compile({ $ref: `${contract.$id}#/$defs/${name}` });
+    assert.equal(validate(value), true, `${name}: ${JSON.stringify(validate.errors)}`);
+  }
+  assert.equal(native.validateCustomerProfileReceipt(receipt), true);
+  assert.equal(native.validateCustomerProfileReceipt({ ...receipt, homeId: 'must-not-be-profile-authority' }), false);
+  assert.equal(native.validateCustomerProfileUpdateRequest(request), true);
+  assert.equal(native.validateCustomerProfileUpdateRequest({ ...request, address: 'must-remain-read-only' }), false);
+  assert.equal(native.validateCustomerProfileUpdateRequest({ ...request, phoneNumber: 'not a phone' }), false);
+  const challenge = { operationKind: 'customer_profile_change', targetIds: [receipt.accountId], value: { displayName: request.displayName, usernameNormalized: request.username, phoneNumber: null, profileRevision: request.expectedProfileRevision } };
+  assert.equal(native.validateStepUpChallengeRequest(challenge), true);
+  assert.equal(native.validateStepUpChallengeRequest({ ...challenge, value: { ...challenge.value, profileRevision: 'not-a-timestamp' } }), true, 'generic challenge contract leaves operation-specific values to its actual authority route');
+});
+test('tenant removal binds selected-home revisions, explicit last-relationship warning, and anonymous deletion receipt', () => {
+  const request = JSON.parse(fs.readFileSync(path.join(root, 'fixtures/tenant-membership-removal-request.json'), 'utf8'));
+  const preview = JSON.parse(fs.readFileSync(path.join(root, 'fixtures/tenant-membership-removal-final-warning.json'), 'utf8'));
+  const receipt = JSON.parse(fs.readFileSync(path.join(root, 'fixtures/tenant-membership-removal-other-home-preserved.json'), 'utf8'));
+  assert.equal(native.validateTenantMembershipRemovalRequest(request), true);
+  assert.equal(native.validateTenantMembershipRemovalRequest({ ...request, homeMembershipId: 'caller-selected' }), false);
+  assert.equal(native.validateTenantMembershipRemovalPreview(preview), true);
+  assert.equal(native.validateTenantMembershipRemovalPreview({ ...preview, willDeleteAccount: false }), false);
+  assert.equal(native.validateTenantMembershipRemovalReceipt(receipt), true);
+  assert.equal(native.validateTenantMembershipRemovalReceipt({ ...receipt, accountDeleted: true }), false);
+});
+test('customer email change request is exact, proof-bound and cannot claim verification before confirmation', () => {
+  const profileRevision = '2026-10-05T10:00:00.000Z';
+  const request = { email: 'new-customer@example.invalid', expectedProfileRevision: profileRevision, proof: `dno-step-up-${'e'.repeat(48)}` };
+  const receipt = { schemaVersion: 'dinodia.v1', ok: true, state: 'PENDING', challengeId: 'challenge:email-change', expiresAt: '2026-10-05T10:10:00.000Z', emailSubmission: 'ACCEPTED' };
+  for (const [name, value] of [['customerEmailChangeRequest', request], ['customerEmailChangeReceipt', receipt]]) {
+    const validate = ajv.compile({ $ref: `${contract.$id}#/$defs/${name}` });
+    assert.equal(validate(value), true, `${name}: ${JSON.stringify(validate.errors)}`);
+  }
+  assert.equal(native.validateCustomerEmailChangeRequest(request), true);
+  assert.equal(native.validateCustomerEmailChangeRequest({ ...request, homeId: 'not-authority' }), false);
+  assert.equal(native.validateCustomerEmailChangeRequest({ ...request, email: 'not-an-email' }), false);
+  assert.equal(native.validateCustomerEmailChangeRequest({ ...request, expectedProfileRevision: '2026-02-31T10:00:00Z' }), false);
+  assert.equal(native.validateCustomerEmailChangeReceipt(receipt), true);
+  assert.equal(native.validateCustomerEmailChangeReceipt({ ...receipt, state: 'VERIFIED' }), false);
+  assert.equal(native.validateCustomerEmailChangeReceipt({ ...receipt, emailSubmission: 'DELIVERED' }), false);
+});
 const lanEndpointSource = fs.readFileSync(path.join(process.cwd(), 'src/lib/lanEndpoint.ts'), 'utf8');
 const lanEndpointCompiled = ts.transpileModule(lanEndpointSource, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText;
 const lanEndpointModule = { exports: {} };
@@ -393,9 +464,11 @@ test('active Native V2 security routes validate their canonical request and resp
   schema('supportTicketCloseRequest', closeRequest);
   assert.equal(native.validateSupportTicketCloseRequest(closeRequest), true);
   assert.equal(native.validateSupportTicketCloseRequest({ action: 'close', proof: 'proof', privateNote: 'extra' }), false);
-  const closeReceipt = { ok: true, ticketId: 'ticket:1', status: 'CLOSED', message: 'Support access revoked — waiting for hub confirmation' };
+  const closeReceipt = { ok: true, ticketId: 'ticket:1', status: 'CLOSED', message: 'Support request closed; no hub access required enforcement', hubEnforcement: 'NOT_REQUIRED' };
   schema('supportTicketCloseReceipt', closeReceipt);
   assert.equal(native.validateSupportTicketCloseReceipt(closeReceipt), true);
+  assert.equal(native.validateSupportTicketCloseReceipt({ ...closeReceipt, hubEnforcement: 'PENDING' }), true);
+  assert.equal(native.validateSupportTicketCloseReceipt({ ...closeReceipt, hubEnforcement: 'MAYBE' }), false);
 });
 test('support create boundaries enforce the seven-category and exact scoped-request DTOs', () => {
   const schema = (name, value) => {
@@ -435,9 +508,14 @@ test('support decision contract requires an explicit choice and keeps denial rec
   schema('supportAccessDecisionReceipt', denied);
   assert.equal(native.validateSupportAccessDecisionReceipt(denied), true);
   assert.equal(native.validateSupportAccessDecisionReceipt({ ...denied, oneUseCode: 'must-not-exist' }), false);
-  const approved = { ok: true, requestId: 'request:1', status: 'APPROVED', oneUseCode: 'DNO-S-one-use-only', codeExpiresAt: '2026-09-29T10:10:00Z' };
+  const approved = { ok: true, requestId: 'request:1', status: 'APPROVED' };
   schema('supportAccessDecisionReceipt', approved);
   assert.equal(native.validateSupportAccessDecisionReceipt(approved), true);
+  assert.equal(native.validateSupportAccessDecisionReceipt({ ...approved, oneUseCode: 'never-return-this-to-the-customer' }), false);
+  const issued = { ok: true, requestId: 'request:1', status: 'ISSUED', oneUseCode: `DNO-S-${'A'.repeat(24)}`, supportUrl: 'https://dinodia-example.local/support-access', codeExpiresAt: '2026-09-29T10:10:00Z' };
+  schema('supportAccessIssueReceipt', issued);
+  assert.equal(native.validateSupportAccessIssueReceipt(issued), true);
+  assert.equal(native.validateSupportAccessIssueReceipt({ ...issued, supportUrl: 'https://attacker.example/support-access?code=secret' }), false);
 });
 test('support revocation DTOs match the customer step-up route and reject caller-supplied authority', () => {
   const requestSchema = ajv.compile({ $ref: `${contract.$id}#/$defs/supportAccessRevokeRequest` });

@@ -86,7 +86,7 @@ test('every Native V2 route method has an explicit role-profile and AC cross-ref
   const indexed = new Set();
   for (const row of acRouteMatrix.routes) {
     assert.ok(Array.isArray(row.acceptanceCriteria) && row.acceptanceCriteria.length > 0, `AC cross-reference missing for ${row.file}`);
-    for (const criterion of row.acceptanceCriteria) assert.match(criterion, /^AC-02\.(?:[1-9]|[1-3][0-9]|4[0-5])$/, `invalid AC reference ${criterion} in ${row.file}`);
+    for (const criterion of row.acceptanceCriteria) assert.match(criterion, /^AC-(?:02\.(?:[1-9]|[1-3][0-9]|4[0-5])|06\.(?:[1-9]|[1-2][0-9]|3[0-5]))$/, `invalid AC reference ${criterion} in ${row.file}`);
     for (const method of row.methods) {
       const profile = typeof row.principalProfile === 'string' ? row.principalProfile : row.principalProfile?.[method];
       assert.ok(profile, `principal profile missing for ${method} ${routePath(row.file)}`);
@@ -113,6 +113,34 @@ test('property-support revoke OpenAPI binds the approving customer and exact ste
   const indexed = coverage.routes.find((row) => row.file === 'src/app/api/v2/support/tickets/[ticketId]/access-requests/[requestId]/revoke/route.ts');
   assert.equal(indexed?.principalProfile, 'customer_membership');
   assert.equal(indexed?.boundary, 'customer_step_up_stage1_projection');
+});
+
+test('support approval never returns the one-use code; only the assigned-employee issue response may carry it', () => {
+  const approve = openApi.paths['/api/v2/support/tickets/{ticketId}/access-requests/{requestId}/approve'].post;
+  const issue = openApi.paths['/api/v2/support/tickets/{ticketId}/access-requests/{requestId}/issue'].post;
+  assert.equal(approve.responses['200'].content['application/json'].schema.$ref, './contract.json#/$defs/supportAccessDecisionReceipt');
+  assert.equal(issue.responses['200'].content['application/json'].schema.$ref, './contract.json#/$defs/supportAccessIssueReceipt');
+  assert.equal(issue.parameters.some((parameter) => parameter.$ref === '#/components/parameters/IdempotencyKey'), false, 'one-time plaintext cannot be replayed for re-disclosure');
+  const customerRoute = fs.readFileSync(path.join(root, 'src/app/api/v2/support/tickets/[ticketId]/access-requests/[requestId]/approve/route.ts'), 'utf8');
+  const employeeRoute = fs.readFileSync(path.join(root, 'src/app/api/v2/support/tickets/[ticketId]/access-requests/[requestId]/issue/route.ts'), 'utf8');
+  assert.doesNotMatch(customerRoute, /oneUseCode/);
+  assert.match(employeeRoute, /requireEmployeeRecentAuth/);
+  assert.match(employeeRoute, /requestedByEmployeeId:\s*employee\.id/);
+  assert.match(employeeRoute, /status:\s*'ISSUED',\s*codeHash/);
+  assert.match(employeeRoute, /validateSupportAccessIssueReceipt\(receipt\)/);
+});
+
+test('support approval inbox has an explicit selected-membership privacy contract', () => {
+  const route = '/api/v2/support/access-requests';
+  assert.ok(openApi.paths[route]?.get);
+  assert.equal(openApi.paths[route].get.responses['200'].content['application/json'].schema.$ref, './contract.json#/$defs/supportAccessApprovalProjection');
+  const indexed = coverage.routes.find((row) => row.file === 'src/app/api/v2/support/access-requests/route.ts');
+  assert.equal(indexed?.principalProfile, 'customer_membership');
+  assert.equal(indexed?.boundary, 'customer_session_native_projection');
+  const source = fs.readFileSync(path.join(root, 'src/app/api/v2/support/access-requests/route.ts'), 'utf8');
+  assert.match(source, /customer\.role === 'TENANT'[\s\S]*?targetMembershipId === customer\.membershipId/);
+  assert.match(source, /customer\.role === 'OWNER' \|\| customer\.role === 'PROPERTY_MANAGER'/);
+  assert.doesNotMatch(source, /description|safeDiagnostics|targetIds/);
 });
 
 test('all active Native V2 non-Alexa routes preserve the canonical Native V1 error adapter', () => {

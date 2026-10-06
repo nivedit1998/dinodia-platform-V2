@@ -2,8 +2,11 @@ import type { Prisma, MemberPreferenceKind } from '@prisma/client';
 import { boundedJson, canonicalPublicId } from './nativeSchemaValidation';
 
 export class NativePreferenceError extends Error {
-  constructor(readonly code: 'PREFERENCE_INVALID' | 'MEMBERSHIP_FORBIDDEN' | 'REVISION_CONFLICT') { super(code); }
+  constructor(readonly code: 'PREFERENCE_INVALID' | 'MEMBERSHIP_FORBIDDEN' | 'REVISION_CONFLICT' | 'PREFERENCE_FORBIDDEN') { super(code); }
 }
+
+const ownerFamilies = ['hub_availability', 'permanent_device_outages', 'new_permanent_devices', 'tenant_access_requests', 'installation_updates', 'automation_activity'] as const;
+const tenantFamilies = ['hub_availability', 'permanent_device_outages_in_authorized_areas', 'own_tenant_device_outages', 'new_permanent_devices_in_authorized_areas', 'automation_failure_or_skipped_run', 'access_request_decisions'] as const;
 
 function exactKeys(value: Record<string, unknown>, keys: readonly string[]) {
   return Object.keys(value).length === keys.length && keys.every((key) => Object.hasOwn(value, key));
@@ -41,12 +44,57 @@ function documentValid(kind: MemberPreferenceKind, value: unknown): value is Rec
     try { new Intl.DateTimeFormat('en', { timeZone: document.timeZone }); } catch { return false; }
     return true;
   }
+  if (kind === 'NOTIFICATION_PREFERENCES') {
+    return exactKeys(document, ['version', 'enabledFamilies']) && Array.isArray(document.enabledFamilies)
+      && document.enabledFamilies.length <= 6 && document.enabledFamilies.every((family) => typeof family === 'string')
+      && new Set(document.enabledFamilies).size === document.enabledFamilies.length;
+  }
+  if (kind === 'MANAGER_NOTIFICATION_ASSIGNMENT') {
+    return exactKeys(document, ['version', 'assignments']) && Array.isArray(document.assignments)
+      && document.assignments.length <= 100 && document.assignments.every((raw) => {
+        if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return false;
+        const assignment = raw as Record<string, unknown>;
+        return exactKeys(assignment, ['membershipId', 'enabledFamilies']) && canonicalPublicId(assignment.membershipId)
+          && Array.isArray(assignment.enabledFamilies) && assignment.enabledFamilies.length <= 6
+          && assignment.enabledFamilies.every((family) => typeof family === 'string')
+          && new Set(assignment.enabledFamilies).size === assignment.enabledFamilies.length;
+      }) && new Set((document.assignments as Array<Record<string, unknown>>).map((item) => item.membershipId)).size === (document.assignments as unknown[]).length;
+  }
   return false;
 }
 
 async function assertReferencesVisible(db: Prisma.TransactionClient, input: {
-  homeId: string; membershipId: string; role: string; grantedAreaIds: readonly string[]; document: Record<string, unknown>;
+  homeId: string; membershipId: string; role: string; kind: MemberPreferenceKind; grantedAreaIds: readonly string[]; document: Record<string, unknown>;
 }) {
+  if (input.role === 'TENANT' && input.document) {
+    const enabled = input.document.enabledFamilies as unknown;
+    if (Array.isArray(enabled) && enabled.some((family) => typeof family !== 'string' || !tenantFamilies.includes(family as typeof tenantFamilies[number]))) {
+      throw new NativePreferenceError('PREFERENCE_INVALID');
+    }
+  } else if (input.role !== 'TENANT' && input.document) {
+    const enabled = input.document.enabledFamilies as unknown;
+    if (Array.isArray(enabled) && enabled.some((family) => typeof family !== 'string' || !ownerFamilies.includes(family as typeof ownerFamilies[number]))) {
+      throw new NativePreferenceError('PREFERENCE_INVALID');
+    }
+  }
+  if (input.document && 'assignments' in input.document) {
+    if (input.role !== 'OWNER') throw new NativePreferenceError('PREFERENCE_FORBIDDEN');
+    const assignments = input.document.assignments as Array<{ membershipId: string; enabledFamilies: string[] }>;
+    if (assignments.some((assignment) => assignment.enabledFamilies.some((family) => !ownerFamilies.includes(family as typeof ownerFamilies[number])))) throw new NativePreferenceError('PREFERENCE_INVALID');
+    if (assignments.length) {
+      const managers = await db.homeMembership.findMany({ where: { id: { in: assignments.map((assignment) => assignment.membershipId) }, homeId: input.homeId, role: 'PROPERTY_MANAGER', status: 'ACTIVE' }, select: { id: true } });
+      if (managers.length !== assignments.length) throw new NativePreferenceError('PREFERENCE_INVALID');
+    }
+  }
+  if (input.kind === 'NOTIFICATION_PREFERENCES' && input.role === 'PROPERTY_MANAGER') {
+    const owner = await db.homeMembership.findFirst({ where: { homeId: input.homeId, role: 'OWNER', status: 'ACTIVE' }, select: { id: true } });
+    const assignment = owner && await db.memberPreferenceDocument.findUnique({ where: { membershipId_kind: { membershipId: owner.id, kind: 'MANAGER_NOTIFICATION_ASSIGNMENT' } }, select: { document: true } });
+    const managerAssignments = assignment?.document && typeof assignment.document === 'object' && 'assignments' in assignment.document
+      ? (assignment.document as { assignments: Array<{ membershipId: string; enabledFamilies: string[] }> }).assignments : [];
+    const permitted = managerAssignments.find((item) => item.membershipId === input.membershipId)?.enabledFamilies ?? [];
+    const requested = input.document.enabledFamilies as string[];
+    if (requested.some((family) => !permitted.includes(family))) throw new NativePreferenceError('PREFERENCE_FORBIDDEN');
+  }
   const areaIds = 'areaIds' in input.document ? input.document.areaIds as string[] : [];
   const deviceIds = 'deviceIds' in input.document
     ? input.document.deviceIds as string[]
@@ -85,7 +133,8 @@ export async function compareAndSetMemberPreference(db: Prisma.TransactionClient
     select: { id: true, homeId: true, role: true, tenantAreaGrants: { where: { revokedAt: null }, select: { areaId: true } } },
   });
   if (!membership) throw new NativePreferenceError('MEMBERSHIP_FORBIDDEN');
-  await assertReferencesVisible(db, { homeId: membership.homeId, membershipId: membership.id, role: membership.role, grantedAreaIds: membership.tenantAreaGrants.map((grant) => grant.areaId), document: input.document });
+  if (input.kind === 'MANAGER_NOTIFICATION_ASSIGNMENT' && membership.role !== 'OWNER') throw new NativePreferenceError('PREFERENCE_FORBIDDEN');
+  await assertReferencesVisible(db, { homeId: membership.homeId, membershipId: membership.id, role: membership.role, grantedAreaIds: membership.tenantAreaGrants.map((grant) => grant.areaId), document: input.document, kind: input.kind });
   const current = await db.memberPreferenceDocument.findUnique({ where: { membershipId_kind: { membershipId: membership.id, kind: input.kind } }, select: { id: true, revision: true } });
   if (!current) {
     if (input.expectedRevision !== 0) throw new NativePreferenceError('REVISION_CONFLICT');

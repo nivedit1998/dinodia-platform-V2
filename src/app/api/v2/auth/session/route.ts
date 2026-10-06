@@ -10,6 +10,17 @@ import { enforcePersistentRateLimit } from '@/lib/rateLimit';
 
 export const dynamic = 'force-dynamic';
 
+const SESSION_INACTIVITY_MS = 30 * 24 * 60 * 60 * 1000;
+const SESSION_ABSOLUTE_MS = 180 * 24 * 60 * 60 * 1000;
+
+function sessionCookie(raw: string, absoluteExpiresAt: Date, now: Date): string {
+  // The browser cookie may live through the absolute ceiling so successful
+  // account activity can move the server-side 30-day idle deadline. The
+  // server rejects an idle-expired token even while the cookie remains stored.
+  const maxAge = Math.max(0, Math.floor((absoluteExpiresAt.getTime() - now.getTime()) / 1000));
+  return `dinodia_customer_session=${encodeURIComponent(raw)}; HttpOnly; SameSite=Strict; Secure; Path=/; Max-Age=${maxAge}`;
+}
+
 /**
  * Restore the account-global Native V1 context. This endpoint deliberately
  * returns memberships, not an implicitly selected home or a hub bearer. The
@@ -21,39 +32,82 @@ export async function GET(request: Request) {
     const rawSession = cookieToken(request, 'dinodia_customer_session');
     if (!rawSession) throw new Stage1AuthError(401, 'customer_session_required', 'A customer session is required');
     const now = new Date();
-    const session = await prisma.customerSession.findUnique({
-      where: { refreshTokenHash: sha256(rawSession) },
-      select: { id: true, customerAccountId: true, trustedDeviceId: true, trustedDeviceSessionVersion: true, securityVersion: true, revokedAt: true, expiresAt: true },
-    });
-    if (!session || session.revokedAt || session.expiresAt <= now) throw new Stage1AuthError(401, 'customer_session_invalid', 'The customer session is invalid');
-    const [account, trusted, memberships] = await Promise.all([
-      prisma.customerAccount.findUnique({ where: { id: session.customerAccountId }, select: { id: true, status: true, securityVersion: true } }),
-      prisma.trustedDevice.findUnique({ where: { id: session.trustedDeviceId }, select: { id: true, customerAccountId: true, revokedAt: true, sessionVersion: true } }),
-      prisma.homeMembership.findMany({
-        where: { customerAccountId: session.customerAccountId, status: 'ACTIVE' },
-        orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
-        select: {
-          id: true,
-          homeId: true,
-          role: true,
-          accessRevision: true,
-          tenantAreaGrants: { where: { revokedAt: null, area: { status: 'ACTIVE' } }, select: { areaId: true, homeId: true } },
-        },
-      }),
-    ]);
-    if (!account || account.status !== 'ACTIVE' || account.securityVersion !== session.securityVersion || !trusted || trusted.customerAccountId !== account.id || trusted.revokedAt || trusted.sessionVersion !== session.trustedDeviceSessionVersion) {
-      throw new Stage1AuthError(401, 'customer_session_invalid', 'The customer session is no longer active');
+    const tokenHash = sha256(rawSession);
+    const refreshCandidate = await prisma.customerSession.findUnique({ where: { refreshTokenHash: tokenHash }, select: { sessionFamilyId: true } });
+    if (!refreshCandidate) throw new Stage1AuthError(401, 'customer_session_invalid', 'The customer session is invalid');
+    await enforcePersistentRateLimit(`customer-session-refresh:${refreshCandidate.sessionFamilyId}`, 120, 60 * 60 * 1000);
+    const rotated = await prisma.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT "id" FROM "CustomerSession" WHERE "refreshTokenHash" = ${tokenHash} FOR UPDATE`;
+      const previous = await tx.customerSession.findUnique({ where: { refreshTokenHash: tokenHash }, select: {
+        id: true, customerAccountId: true, trustedDeviceId: true, trustedDeviceSessionVersion: true,
+        securityVersion: true, revokedAt: true, revokeReason: true, expiresAt: true, absoluteExpiresAt: true,
+        sessionFamilyId: true,
+      } });
+      if (!previous) return { error: 'invalid' as const };
+      if (previous.revokedAt) {
+        if (previous.revokeReason === 'refresh_token_rotated') {
+          await tx.customerSession.updateMany({
+            where: { sessionFamilyId: previous.sessionFamilyId, revokedAt: null },
+            data: { revokedAt: now, revokeReason: 'refresh_token_reuse', accessTokenHash: null, accessTokenExpiresAt: null },
+          });
+          return { error: 'reused' as const };
+        }
+        return { error: 'invalid' as const };
+      }
+      if (previous.expiresAt <= now || previous.absoluteExpiresAt <= now) return { error: 'expired' as const };
+      const [account, trusted] = await Promise.all([
+        tx.customerAccount.findUnique({ where: { id: previous.customerAccountId }, select: { id: true, status: true, securityVersion: true, mustChangePassword: true } }),
+        tx.trustedDevice.findUnique({ where: { id: previous.trustedDeviceId }, select: { id: true, customerAccountId: true, revokedAt: true, sessionVersion: true } }),
+      ]);
+      if (!account || account.status !== 'ACTIVE' || account.securityVersion !== previous.securityVersion
+        || !trusted || trusted.customerAccountId !== account.id || trusted.revokedAt
+        || trusted.sessionVersion !== previous.trustedDeviceSessionVersion) return { error: 'invalid' as const };
+      const expiresAt = new Date(Math.min(now.getTime() + SESSION_INACTIVITY_MS, previous.absoluteExpiresAt.getTime()));
+      const nextRaw = `dno-customer-session-${randomSecret(32)}`;
+      await tx.customerSession.update({ where: { id: previous.id }, data: { revokedAt: now, revokeReason: 'refresh_token_rotated', lastUsedAt: now, accessTokenHash: null, accessTokenExpiresAt: null } });
+      const next = await tx.customerSession.create({ data: {
+        customerAccountId: previous.customerAccountId,
+        trustedDeviceId: previous.trustedDeviceId,
+        sessionFamilyId: previous.sessionFamilyId,
+        refreshTokenHash: sha256(nextRaw),
+        securityVersion: previous.securityVersion,
+        trustedDeviceSessionVersion: previous.trustedDeviceSessionVersion,
+        issuedAt: now,
+        expiresAt,
+        absoluteExpiresAt: previous.absoluteExpiresAt,
+        lastUsedAt: now,
+      }, select: { id: true, expiresAt: true, absoluteExpiresAt: true } });
+      await tx.trustedDevice.update({ where: { id: trusted.id }, data: { lastUsedAt: now } });
+      await tx.auditEvent.create({ data: { actorType: 'CUSTOMER', actorId: account.id, category: 'SECURITY', action: 'customer_session_refreshed', targetType: 'CustomerSession', targetId: next.id, metadata: { outcome: 'rotated', previousSessionId: previous.id }, purgeAt: new Date(now.getTime() + 365 * 24 * 60 * 60 * 1000) } });
+      return { session: next, raw: nextRaw, accountId: account.id, trustedDeviceId: trusted.id, requiresPasswordChange: account.mustChangePassword };
+    }, { isolationLevel: 'Serializable' });
+    if ('error' in rotated) {
+      if (rotated.error === 'expired') throw new Stage1AuthError(401, 'customer_session_invalid', 'The customer session has expired');
+      if (rotated.error === 'reused') throw new Stage1AuthError(401, 'customer_session_invalid', 'The customer session is no longer active');
+      throw new Stage1AuthError(401, 'customer_session_invalid', 'The customer session is invalid');
     }
+    const session = { id: rotated.session.id, customerAccountId: rotated.accountId, trustedDeviceId: rotated.trustedDeviceId, expiresAt: rotated.session.expiresAt, absoluteExpiresAt: rotated.session.absoluteExpiresAt };
+    const memberships = rotated.requiresPasswordChange ? [] : await prisma.homeMembership.findMany({
+      where: { customerAccountId: session.customerAccountId, status: 'ACTIVE' },
+      orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
+      select: {
+        id: true,
+        homeId: true,
+        role: true,
+        accessRevision: true,
+        tenantAreaGrants: { where: { revokedAt: null, area: { status: 'ACTIVE' } }, select: { areaId: true, homeId: true } },
+      },
+    });
     const accountContext = {
       schemaVersion: 'dinodia.v1',
-      accountId: account.id,
+      accountId: session.customerAccountId,
       // These opaque identifiers let the app bind per-action step-up proofs
       // after cookie-backed session restoration. Neither value authenticates
       // a request; the HttpOnly session cookie remains the authority.
       sessionId: session.id,
-      trustedDeviceId: trusted.id,
+      trustedDeviceId: session.trustedDeviceId,
       memberships: memberships.map((membership) => ({
-        accountId: account.id,
+        accountId: session.customerAccountId,
         homeId: membership.homeId,
         homeMembershipId: membership.id,
         role: membership.role,
@@ -67,7 +121,7 @@ export async function GET(request: Request) {
       throw new Stage1AuthError(500, 'native_v1_contract_invalid', 'The account session response failed contract validation');
     }
     const response = NextResponse.json(accountContext, { headers: { 'Cache-Control': 'no-store', Pragma: 'no-cache' } });
-    await prisma.customerSession.updateMany({ where: { id: session.id, revokedAt: null, expiresAt: { gt: now } }, data: { lastUsedAt: now } });
+    response.headers.append('Set-Cookie', sessionCookie(rotated.raw, session.absoluteExpiresAt, now));
     return response;
   } catch (error) { return nativeV1ErrorResponse(error); }
 }
@@ -98,17 +152,28 @@ export async function POST(request: Request) {
     const thumbprint = crypto.createHash('sha256').update(crypto.createPublicKey(publicKey).export({ type: 'spki', format: 'der' })).digest('hex');
     const rawSession = `dno-customer-session-${randomSecret(32)}`;
     const session = await prisma.$transaction(async (tx) => {
-      const trusted = await tx.trustedDevice.upsert({
-        where: { customerAccountId_deviceInstallationId: { customerAccountId: account.id, deviceInstallationId } },
-        create: { customerAccountId: account.id, deviceInstallationId, publicKey, publicKeyThumbprint: thumbprint, deviceName, model: boundedContractText(input.model, 160) || null, osFamily: boundedContractText(input.osFamily, 80) || null, osVersion: boundedContractText(input.osVersion, 80) || null },
-        // Ordinary password login cannot silently re-enrol a removed phone or
-        // replace the key already bound to an installation identity.
-        update: { deviceName, lastUsedAt: new Date(), sessionVersion: { increment: 1 } },
-        select: { id: true, sessionVersion: true, revokedAt: true, publicKeyThumbprint: true },
-      });
+      const existing = await tx.trustedDevice.findUnique({ where: { customerAccountId_deviceInstallationId: { customerAccountId: account.id, deviceInstallationId } }, select: { id: true, sessionVersion: true, revokedAt: true, publicKeyThumbprint: true } });
+      if (existing?.revokedAt) throw new Stage1AuthError(403, 'trusted_device_revoked', 'This trusted device was removed; use the approved re-enrolment process');
+      if (existing && !constantTimeEqual(existing.publicKeyThumbprint, thumbprint)) throw new Stage1AuthError(409, 'trusted_device_identity_changed', 'This installation ID is already bound to another signing key');
+      const trusted = existing
+        ? await tx.trustedDevice.update({
+          where: { id: existing.id },
+          // Ordinary sign-in refreshes this device's use time only. It does not
+          // rotate its revocation generation or silently invalidate its other
+          // account sessions. Re-enrolment/key changes have a separate flow.
+          data: { deviceName, model: boundedContractText(input.model, 160) || null, osFamily: boundedContractText(input.osFamily, 80) || null, osVersion: boundedContractText(input.osVersion, 80) || null, lastUsedAt: new Date() },
+          select: { id: true, sessionVersion: true, revokedAt: true, publicKeyThumbprint: true },
+        })
+        : await tx.trustedDevice.create({
+          data: { customerAccountId: account.id, deviceInstallationId, publicKey, publicKeyThumbprint: thumbprint, deviceName, model: boundedContractText(input.model, 160) || null, osFamily: boundedContractText(input.osFamily, 80) || null, osVersion: boundedContractText(input.osVersion, 80) || null },
+          select: { id: true, sessionVersion: true, revokedAt: true, publicKeyThumbprint: true },
+        });
       if (trusted.revokedAt) throw new Stage1AuthError(403, 'trusted_device_revoked', 'This trusted device was removed; use the approved re-enrolment process');
       if (!constantTimeEqual(trusted.publicKeyThumbprint, thumbprint)) throw new Stage1AuthError(409, 'trusted_device_identity_changed', 'This installation ID is already bound to another signing key');
-      const created = await tx.customerSession.create({ data: { customerAccountId: account.id, trustedDeviceId: trusted.id, refreshTokenHash: sha256(rawSession), securityVersion: account.securityVersion, trustedDeviceSessionVersion: trusted.sessionVersion, expiresAt: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000) }, select: { id: true, expiresAt: true } });
+      const issuedAt = new Date();
+      const absoluteExpiresAt = new Date(issuedAt.getTime() + SESSION_ABSOLUTE_MS);
+      const expiresAt = new Date(Math.min(issuedAt.getTime() + SESSION_INACTIVITY_MS, absoluteExpiresAt.getTime()));
+      const created = await tx.customerSession.create({ data: { customerAccountId: account.id, trustedDeviceId: trusted.id, sessionFamilyId: crypto.randomUUID(), refreshTokenHash: sha256(rawSession), securityVersion: account.securityVersion, trustedDeviceSessionVersion: trusted.sessionVersion, issuedAt, expiresAt, absoluteExpiresAt }, select: { id: true, expiresAt: true, absoluteExpiresAt: true } });
       await tx.auditEvent.create({ data: { actorType: 'CUSTOMER', actorId: account.id, category: 'SECURITY', action: 'customer_login_succeeded', targetType: 'CustomerSession', targetId: created.id, metadata: { trustedDeviceId: trusted.id, outcome: 'succeeded' }, purgeAt: new Date(Date.now() + 365 * 24 * 60 * 60 * 1000) } });
       return { ...created, trustedDeviceId: trusted.id };
     });
@@ -117,7 +182,7 @@ export async function POST(request: Request) {
       throw new Stage1AuthError(500, 'native_v1_contract_invalid', 'The customer session receipt failed contract validation');
     }
     const response = NextResponse.json(receipt, { headers: { 'Cache-Control': 'no-store', Pragma: 'no-cache' } });
-    response.headers.append('Set-Cookie', `dinodia_customer_session=${encodeURIComponent(rawSession)}; HttpOnly; SameSite=Strict; Secure; Path=/; Max-Age=${30 * 24 * 60 * 60}`);
+    response.headers.append('Set-Cookie', sessionCookie(rawSession, session.absoluteExpiresAt, new Date()));
     return response;
   } catch (error) { return nativeV1ErrorResponse(error); }
 }
@@ -126,7 +191,16 @@ export async function DELETE(request: Request) {
   try {
     const rawSession = request.headers.get('x-dinodia-session') || cookieToken(request, 'dinodia_customer_session');
     if (!rawSession) throw new Stage1AuthError(401, 'customer_session_required', 'A customer session is required');
-    await prisma.customerSession.updateMany({ where: { refreshTokenHash: sha256(rawSession), revokedAt: null }, data: { revokedAt: new Date(), revokeReason: 'customer_logout' } });
+    await prisma.$transaction(async (tx) => {
+      const session = await tx.customerSession.findUnique({ where: { refreshTokenHash: sha256(rawSession) }, select: { id: true, trustedDeviceId: true } });
+      if (!session) return;
+      const now = new Date();
+      await tx.customerSession.updateMany({ where: { id: session.id, revokedAt: null }, data: { revokedAt: now, revokeReason: 'customer_logout', accessTokenHash: null, accessTokenExpiresAt: null } });
+      await tx.trustedDevice.updateMany({ where: { id: session.trustedDeviceId, apnsTokenDigest: { not: null } }, data: {
+        apnsTokenCiphertext: null, apnsTokenDigest: null, apnsEnvironment: null, apnsKeyVersion: null,
+        apnsTokenRevision: { increment: 1 }, pushEnabledAt: null, pushRevokedAt: now, lastDeliveryHealth: 'DISABLED',
+      } });
+    });
     const receipt = { ok: true as const };
     if (!validateCustomerSessionLogoutReceipt(receipt)) throw new Stage1AuthError(500, 'native_v1_contract_invalid', 'The customer logout receipt failed contract validation');
     const response = NextResponse.json(receipt, { headers: { 'Cache-Control': 'no-store' } });

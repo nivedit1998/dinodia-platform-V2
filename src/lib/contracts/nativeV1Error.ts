@@ -6,6 +6,7 @@ type BoundedFailure = { status?: unknown; code?: unknown; message?: unknown };
 const CODE_BY_STAGE1_ERROR: Record<string, string> = {
   customer_session_required: 'AUTH_REQUIRED',
   customer_session_invalid: 'TOKEN_EXPIRED',
+  customer_access_token_expired: 'CUSTOMER_ACCESS_EXPIRED',
   customer_credentials_invalid: 'AUTH_REQUIRED',
   app_token_invalid: 'AUTH_REQUIRED',
   membership_invalid: 'TOKEN_EXPIRED',
@@ -15,6 +16,14 @@ const CODE_BY_STAGE1_ERROR: Record<string, string> = {
   recent_authentication_required: 'STEP_UP_REQUIRED',
   area_policy_stale: 'UPDATE_REQUIRED',
   policy_stale: 'UPDATE_REQUIRED',
+  claim_policy_required: 'UPDATE_REQUIRED',
+  claim_policy_stale: 'UPDATE_REQUIRED',
+  claim_address_confirmation_required: 'REVISION_CONFLICT',
+  claim_reservation_expired: 'RESOURCE_NOT_FOUND',
+  claim_unavailable: 'RESOURCE_NOT_FOUND',
+  policy_unavailable: 'FEATURE_NOT_ENABLED',
+  customer_policy_unavailable: 'FEATURE_NOT_ENABLED',
+  customer_policy_acceptance_required: 'UPDATE_REQUIRED',
   trusted_device_revoked: 'AUTH_REQUIRED',
   trusted_device_identity_changed: 'SCOPE_DENIED',
   employee_role_denied: 'SCOPE_DENIED',
@@ -26,9 +35,10 @@ const CODE_BY_STAGE1_ERROR: Record<string, string> = {
 };
 
 const DINODIA_V1_CODES = new Set([
-  'AUTH_REQUIRED', 'TOKEN_EXPIRED', 'STEP_UP_REQUIRED', 'STEP_UP_FAILED', 'SCOPE_DENIED',
+  'AUTH_REQUIRED', 'TOKEN_EXPIRED', 'CUSTOMER_ACCESS_EXPIRED', 'STEP_UP_REQUIRED', 'STEP_UP_FAILED', 'SCOPE_DENIED',
+  'EMAIL_VERIFICATION_REQUIRED', 'ROOM_ACCESS_HOME_NOT_READY',
   'HOME_MISMATCH', 'AREA_DENIED', 'NOT_DEVICE_OWNER', 'PERMANENT_DEVICE_IMMUTABLE',
-  'RESOURCE_NOT_FOUND', 'REVISION_CONFLICT', 'CATALOG_REVISION_MISMATCH', 'CONTROL_REMOVED',
+  'RESOURCE_NOT_FOUND', 'REVISION_CONFLICT', 'FINAL_RELATIONSHIP_CONFIRMATION_REQUIRED', 'CATALOG_REVISION_MISMATCH', 'CONTROL_REMOVED',
   'VALIDATION_FAILED', 'DEVICE_OFFLINE', 'CONTROL_UNAVAILABLE', 'COMMAND_UNCERTAIN',
   'HUB_UNAVAILABLE', 'UNSUPPORTED_CAPABILITY', 'UPDATE_REQUIRED', 'RATE_LIMITED',
   'PAIRING_NOT_ADVERTISED', 'PAIRING_EXPIRED', 'PAIRING_USED', 'HARDWARE_IDENTITY_INVALID',
@@ -69,8 +79,9 @@ export function nativeV1ErrorResponse(error: unknown): NextResponse {
     : String(failure.message ?? 'The request could not be completed').trim().slice(0, 240);
   const requestId = crypto.randomUUID();
   const retryable = code === 'HUB_UNAVAILABLE' || code === 'RATE_LIMITED' || code === 'INTERNAL_ERROR';
+  const headers: Record<string, string> = { 'Cache-Control': 'no-store', Pragma: 'no-cache' };
   return NextResponse.json({ error: { code, message, requestId, retryable } }, {
     status,
-    headers: { 'Cache-Control': 'no-store', Pragma: 'no-cache' },
+    headers,
   });
 }

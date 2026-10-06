@@ -1,0 +1,23 @@
+import crypto from 'node:crypto';
+
+export const STAGE6_CUSTOMER_MIGRATIONS = Object.freeze([
+  '20261005120000_stage6_customer_refresh_families',
+  '20261005130000_stage6_mobile_access_credentials',
+  '20261006100000_stage6_apns_registration_and_notification_preferences',
+  '20261006120000_stage6_invited_tenant_username_setup',
+]);
+
+export function migrationBundleIdentity(names, checksums) {
+  const migrations = [...new Set(names)].sort().map((name) => {
+    const sha256 = checksums.get(name);
+    if (!sha256 || !/^[a-f0-9]{64}$/.test(sha256)) throw new Error(`missing reviewed checksum for migration ${name}`);
+    return { name, sha256 };
+  });
+  if (!migrations.length) throw new Error('migration bundle cannot be empty');
+  return { migrations, sha256: crypto.createHash('sha256').update(JSON.stringify(migrations)).digest('hex') };
+}
+
+export function unexpectedPendingMigrations(pendingNames, allowedNames) {
+  const allowed = new Set(allowedNames);
+  return [...new Set(pendingNames)].filter((name) => !allowed.has(name)).sort();
+}
