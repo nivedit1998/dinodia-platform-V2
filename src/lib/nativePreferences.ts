@@ -36,7 +36,10 @@ function documentValid(kind: MemberPreferenceKind, value: unknown): value is Rec
       const legacy = exactKeys(tile, ['deviceId', 'size']);
       const ordered = exactKeys(tile, ['deviceId', 'size', 'position', 'label']);
       if ((!legacy && !ordered) || !canonicalPublicId(tile.deviceId) || ids.has(tile.deviceId)) return false;
-      if (!['COMPACT', 'STANDARD', 'LARGE'].includes(String(tile.size))) return false;
+      // Keep the Stage 7 three-value vocabulary readable while accepting the
+      // four-size dashboard contract. COMPACT/STANDARD remain legacy aliases;
+      // clients map them to SMALL/MEDIUM without rewriting until saved.
+      if (!['COMPACT', 'STANDARD', 'LARGE', 'MINI', 'SMALL', 'MEDIUM'].includes(String(tile.size))) return false;
       if (ordered && (!Number.isSafeInteger(tile.position) || Number(tile.position) < 0 || Number(tile.position) >= 500
         || typeof tile.label !== 'string' || tile.label.length < 1 || tile.label.length > 40 || tile.label.trim() !== tile.label)) return false;
       ids.add(tile.deviceId);

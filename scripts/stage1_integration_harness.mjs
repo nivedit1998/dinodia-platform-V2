@@ -3040,7 +3040,15 @@ async function pendingInvitationRouteChecks(deliveryEnv) {
   const anonymousDashboardContext = await fetchJson(`${base}/api/v2/homes/${inviter.homeId}/tenant-device-context`, { headers: { 'x-dinodia-home-id': inviter.homeId } });
   const dashboardLayout = { version: 1, tiles: [{ deviceId: dashboardDevices[0].id, size: 'STANDARD', position: 0, label: 'My light' }], labelColours: { Lights: '#f2c94c' } };
   const layoutWrite = await fetchJson(`${base}/api/v2/homes/${inviter.homeId}/preferences`, { method: 'PUT', headers: { ...tenantDashboardHeaders, 'content-type': 'application/json' }, body: JSON.stringify({ kind: 'DASHBOARD_LAYOUT', expectedRevision: 0, document: dashboardLayout }) });
-  const layoutWrongOwnerWrite = await fetchJson(`${base}/api/v2/homes/${inviter.homeId}/preferences`, { method: 'PUT', headers: { ...tenantDashboardHeaders, 'content-type': 'application/json' }, body: JSON.stringify({ kind: 'DASHBOARD_LAYOUT', expectedRevision: 1, document: { ...dashboardLayout, tiles: [{ ...dashboardLayout.tiles[0], deviceId: dashboardDevices[1].id }] } }) });
+  const layoutFourSizeWrites = [];
+  for (const [index, size] of ['MINI', 'SMALL', 'MEDIUM', 'LARGE'].entries()) {
+    layoutFourSizeWrites.push(await fetchJson(`${base}/api/v2/homes/${inviter.homeId}/preferences`, {
+      method: 'PUT', headers: { ...tenantDashboardHeaders, 'content-type': 'application/json' },
+      body: JSON.stringify({ kind: 'DASHBOARD_LAYOUT', expectedRevision: index + 1,
+        document: { ...dashboardLayout, tiles: [{ ...dashboardLayout.tiles[0], size }] } }),
+    }));
+  }
+  const layoutWrongOwnerWrite = await fetchJson(`${base}/api/v2/homes/${inviter.homeId}/preferences`, { method: 'PUT', headers: { ...tenantDashboardHeaders, 'content-type': 'application/json' }, body: JSON.stringify({ kind: 'DASHBOARD_LAYOUT', expectedRevision: 5, document: { ...dashboardLayout, tiles: [{ ...dashboardLayout.tiles[0], deviceId: dashboardDevices[1].id }] } }) });
   const renameKey = crypto.randomUUID();
   const renameBody = { action: 'rename', expectedInventoryRevision: dashboardDevices[0].inventoryRevision, overrideName: 'My bedside light' };
   const renameHeaders = { ...tenantDashboardHeaders, 'content-type': 'application/json', 'idempotency-key': renameKey };
@@ -3072,7 +3080,8 @@ async function pendingInvitationRouteChecks(deliveryEnv) {
     || ['state', 'controls', 'onlineState', 'lastSeenAt', 'originalName'].some((key) => Object.hasOwn(tenantDashboard.body?.deviceOverrides?.[0] ?? {}, key))
     || wrongSelectedTenantHome.response.status !== 404 || foreignHomeTenantContext.response.status !== 404
     || ownerDashboardContext.response.status !== 404 || anonymousDashboardContext.response.status !== 401
-    || layoutWrite.response.status !== 200 || layoutWrongOwnerWrite.response.status !== 400
+    || layoutWrite.response.status !== 200 || layoutFourSizeWrites.some((result) => result.response.status !== 200)
+    || layoutWrongOwnerWrite.response.status !== 400
     || ownDeviceRename.response.status !== 200 || ownDeviceRenameRetry.response.status !== 200 || ownDeviceRenameRetry.body?.inventoryRevision !== ownDeviceRename.body?.inventoryRevision
     || renameKeyConflict.response.status !== 409 || otherTenantDeviceMutation.response.status !== 404 || permanentDeviceMutation.response.status !== 404
     || deniedAreaMove.response.status !== 403 || ownDeviceMove.response.status !== 200 || ownDeviceMove.body?.hubEnforcement !== 'PENDING'
@@ -3081,10 +3090,10 @@ async function pendingInvitationRouteChecks(deliveryEnv) {
     || ownerDeviceAfterMutations?.customerLabel !== 'My Lights' || ownerDeviceAfterMutations?.inventoryRevision !== dashboardDevices[0].inventoryRevision + 3
     || ownerDeviceAfterMutations?.assignments?.length !== 1 || ownerDeviceAfterMutations.assignments[0].areaId !== grantedMoveArea.id
     || ownerDeviceAfterMutations?.technicalLabel !== 'tenant_device' || ownerDeviceAfterMutations?.ownerMembershipId !== newTenantMembershipAfterAccept.id
-    || tenantDashboardAfterWrite.response.status !== 200 || dashboardLayoutRow?.revision !== 1
+    || tenantDashboardAfterWrite.response.status !== 200 || dashboardLayoutRow?.revision !== 5
     || dashboardLayoutRow?.document?.tiles?.[0]?.deviceId !== dashboardDevices[0].id
     || dashboardLayoutRow?.document?.labelColours?.Lights !== '#f2c94c') {
-    fail(`Actual tenant dashboard context/layout/device-presentation routes did not enforce selected membership, private-device isolation, exact retries and the OS/cloud authority split (${JSON.stringify({ context: tenantDashboard.response.status, ownDeviceVisible: tenantDashboardIds.includes(dashboardDevices[0].id), otherTenantDeviceHidden: !tenantDashboardIds.includes(dashboardDevices[1].id), propertyDeviceReadOnly: propertyDashboardDevice?.canManage === false, ownDeviceManageable: ownDashboardDevice?.canManage === true, wrongSelectedHome: wrongSelectedTenantHome.response.status, otherHome: foreignHomeTenantContext.response.status, owner: ownerDashboardContext.response.status, anonymous: anonymousDashboardContext.response.status, layoutWrite: layoutWrite.response.status, foreignLayoutWrite: layoutWrongOwnerWrite.response.status, rename: ownDeviceRename.response.status, renameRetry: ownDeviceRenameRetry.response.status, keyConflict: renameKeyConflict.response.status, otherTenantMutation: otherTenantDeviceMutation.response.status, propertyMutation: permanentDeviceMutation.response.status, relabel: relabelOwnDevice.response.status, privateDeviceRevision: ownerDeviceAfterMutations?.inventoryRevision, layoutRevision: dashboardLayoutRow?.revision })})`);
+    fail(`Actual tenant dashboard context/layout/device-presentation routes did not enforce selected membership, private-device isolation, exact retries and the OS/cloud authority split (${JSON.stringify({ context: tenantDashboard.response.status, ownDeviceVisible: tenantDashboardIds.includes(dashboardDevices[0].id), otherTenantDeviceHidden: !tenantDashboardIds.includes(dashboardDevices[1].id), propertyDeviceReadOnly: propertyDashboardDevice?.canManage === false, ownDeviceManageable: ownDashboardDevice?.canManage === true, wrongSelectedHome: wrongSelectedTenantHome.response.status, otherHome: foreignHomeTenantContext.response.status, owner: ownerDashboardContext.response.status, anonymous: anonymousDashboardContext.response.status, layoutWrite: layoutWrite.response.status, layoutFourSizeStatuses: layoutFourSizeWrites.map((result) => result.response.status), foreignLayoutWrite: layoutWrongOwnerWrite.response.status, rename: ownDeviceRename.response.status, renameRetry: ownDeviceRenameRetry.response.status, keyConflict: renameKeyConflict.response.status, otherTenantMutation: otherTenantDeviceMutation.response.status, propertyMutation: permanentDeviceMutation.response.status, relabel: relabelOwnDevice.response.status, privateDeviceRevision: ownerDeviceAfterMutations?.inventoryRevision, layoutRevision: dashboardLayoutRow?.revision })})`);
   }
   const removalChallengeValue = { operation: 'remove_tenant_device', descriptorRevision: ownDashboardDevice.descriptorRevision };
   const removalChallenge = await fetchJson(`${base}/api/v2/security/step-up/challenge`, { method: 'POST', headers: { ...tenantDashboardHeaders, 'content-type': 'application/json' }, body: JSON.stringify({ operationKind: 'tenant_device_remove', targetIds: [ownDashboardDevice.osDeviceId], value: removalChallengeValue }) });
