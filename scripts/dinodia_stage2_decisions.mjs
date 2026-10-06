@@ -511,6 +511,30 @@ function executeSemanticFixture(path, value, adapters) {
       "scoped tenant removal must preserve another home and truthfully report pending hub enforcement");
       return result("accepted", { protectedEffects: 0 });
     }
+    case "tenant-device-dashboard.json": {
+      assert(schema("tenantDeviceContext", value) && value.ok && value.schemaVersion === "dinodia.v1",
+        "tenant dashboard projection must match the canonical bounded wire contract");
+      const membershipId = value.membership.membershipId;
+      const grantedAreas = new Set(value.areaAccess.map((item) => item.areaId));
+      const visibleDevices = new Set(value.deviceOverrides.map((item) => item.id));
+      assert(value.membership.role === "tenant" && value.membership.status === "active" &&
+        value.home.id === value.membership.homeId && value.areaOverrides.every((item) => grantedAreas.has(item.areaId)) &&
+        value.deviceOverrides.every((item) => item.areaIds.every((areaId) => grantedAreas.has(areaId)) &&
+          (item.managementClass === "tenant_device"
+            ? item.ownerMembershipId === membershipId && item.canManage && item.canRename && item.canRelabel
+            : item.managementClass === "property_device" && item.ownerMembershipId === null && !item.canManage && !item.canRename && !item.canRelabel && !item.canMove && !item.canRemove)) &&
+        value.layout.document.tiles.every((tile) => visibleDevices.has(tile.deviceId)) &&
+        value.deviceOverrides.every((item) => !["state", "controls", "onlineState", "lastSeenAt", "originalName", "technicalLabel"].some((key) => Object.hasOwn(item, key))),
+      "tenant projection must bind selected membership and grants, hide another tenant's devices and omit OS state/descriptor data");
+      return result("accepted", { visibleDevices: visibleDevices.size, privateStateFields: 0, ownerManagerPrivateDeviceEffects: 0 });
+    }
+    case "tenant-device-removal-pending.json": {
+      assert(schema("tenantDeviceRemovalRequest", value.request) && schema("tenantDeviceRemovalReceipt", value.receipt) &&
+        value.receipt.state === "REMOVAL_PENDING" && value.receipt.hubEnforcement === "PENDING" &&
+        value.receipt.inventoryRevision === value.request.expectedInventoryRevision + 1,
+      "tenant removal must first revoke cloud visibility, bind current revisions and remain pending until the hub confirms physical enforcement");
+      return result("accepted", { allowedCases: 1, exactProofRequired: true, prematureEnforcementClaims: 0 });
+    }
     case "customer-recovery-lifecycle.json":
       assert(value.cases.length >= 2 && value.cases.every((item) => item.accountExistsDisclosed === false && item.sessionIssued === false) &&
         value.cases[0].responseClass === value.cases[1].responseClass,

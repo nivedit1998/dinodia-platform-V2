@@ -161,6 +161,24 @@ export async function POST(request: Request) {
         throw new Stage1AuthError(409, 'REVISION_CONFLICT', 'Refresh the selected Home before confirming access removal');
       }
     }
+    if (operationKind === 'tenant_device_remove') {
+      if (customer.role !== 'TENANT' || targetIds.length !== 1 || !value || typeof value !== 'object' || Array.isArray(value)) {
+        throw new Stage1AuthError(403, 'tenant_device_owner_required', 'Only the selected owner-tenant can confirm removal of a privately owned device');
+      }
+      const removalValue = value as Record<string, unknown>;
+      if (Object.keys(removalValue).sort().join(',') !== 'descriptorRevision,operation'
+        || removalValue.operation !== 'remove_tenant_device'
+        || !Number.isSafeInteger(removalValue.descriptorRevision) || Number(removalValue.descriptorRevision) < 1) {
+        throw new Stage1AuthError(400, 'step_up_fields_invalid', 'Confirm removal of the exact current private device descriptor');
+      }
+      const device = await prisma.nativeDevice.findFirst({ where: {
+        osDeviceId: targetIds[0], homeId: customer.homeId, hubInstallationId: customer.hubInstallationId,
+        managementClass: 'TENANT_DEVICE', ownerMembershipId: customer.membershipId, lifecycle: 'INSTALLED',
+        descriptorRevision: Number(removalValue.descriptorRevision),
+        assignments: { some: { validUntil: null, areaId: { in: customer.areaIds }, area: { status: 'ACTIVE' } } },
+      }, select: { id: true } });
+      if (!device) throw new Stage1AuthError(409, 'REVISION_CONFLICT', 'The device or its selected Area access changed. Refresh before confirming removal.');
+    }
     if (operationKind === 'support_ticket_close') {
       if (targetIds.length !== 1) throw new Stage1AuthError(400, 'step_up_target_invalid', 'A single selected-home support request is required');
       const ticket = await prisma.supportTicket.findFirst({ where: {

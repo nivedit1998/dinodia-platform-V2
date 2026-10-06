@@ -67,6 +67,8 @@ for (const fixture of [
   'out-of-order-events.json',
   'transfer-lifecycle.json',
   'trusted-device-revocation.json',
+  'tenant-device-dashboard.json',
+  'tenant-device-removal-pending.json',
   'notification-lifecycle.json',
   'updater-maintenance-status-unprovisioned.json',
   'invalid/updater-maintenance-status-exposes-authority.json',

@@ -2984,6 +2984,143 @@ async function pendingInvitationRouteChecks(deliveryEnv) {
     || tenantPolicyAcceptance?.response.status !== 200 || tenantPending?.body?.pendingRelationships?.[0]?.allowedActions?.includes('ACCEPT') !== true
     || acceptedNewTenantInvitation?.response.status !== 200 || newTenantMembershipBeforeAccept || newTenantMembershipAfterAccept?.status !== 'ACTIVE'
     || newTenantMembershipAfterAccept?.role !== 'TENANT' || newTenantMembershipAfterAccept.tenantAreaGrants.length !== 1 || newTenantMembershipAfterAccept.tenantAreaGrants[0].areaId !== areaId) fail(`New tenant invitation did not complete the mobile temporary-password, password-replacement, username-selection and explicit-accept journey (${JSON.stringify({ issue: newTenantIssue.response.status, invitation: Boolean(newTenantInvitation), wrongGenericRegistration: wrongTempRegister.response.status, wrongLinkedRedeem: wrongLinkedRedeem?.response.status, login: newTenantLogin?.response.status, loginError: newTenantLogin?.body?.error?.code ?? null, accessShape: /^dno-customer-access-[A-Za-z0-9_-]{32,}$/.test(newTenantLogin?.body?.accessToken ?? ''), refreshShape: /^dno-customer-session-[A-Za-z0-9_-]{32,}$/.test(newTenantLogin?.body?.refreshToken ?? ''), accountPlaceholder: newTenantAccount?.usernameNormalized?.startsWith('setup-'), accountVerified: Boolean(newTenantAccount?.emailVerifiedAt), accountMustChangePassword: newTenantAccount?.mustChangePassword, accountUsernameRequired: newTenantAccount?.usernameSelectionRequired, invitationBound: boundInvitation?.targetAccountId === newTenantAccount?.id, invitationSecretCleared: boundInvitation?.temporaryCredentialHash === null, initialAction: newTenantRequirements?.body?.nextAction, replacement: mandatoryReplacement?.response.status, replacementError: mandatoryReplacement?.body?.error?.code ?? null, replacementAccessShape: /^dno-customer-access-[A-Za-z0-9_-]{32,}$/.test(mandatoryReplacement?.body?.accessToken ?? ''), usernameAction: usernameRequirements?.body?.nextAction, pendingBeforeUsername: pendingBeforeUsername?.response.status, usernameSelection: usernameSelection?.response.status, usernameMatches: selectedTenantAccount?.usernameNormalized === newTenantUsername.toLowerCase(), usernameStillRequired: selectedTenantAccount?.usernameSelectionRequired, policy: tenantPolicyAcceptance?.response.status, pendingAction: tenantPending?.body?.pendingRelationships?.[0]?.allowedActions, invitationAccept: acceptedNewTenantInvitation?.response.status, membershipBeforeAccept: Boolean(newTenantMembershipBeforeAccept), membershipAfterAccept: newTenantMembershipAfterAccept?.status, grantCount: newTenantMembershipAfterAccept?.tenantAreaGrants.length, grantedAreaMatches: newTenantMembershipAfterAccept?.tenantAreaGrants?.[0]?.areaId === areaId })})`);
+  // Stage 7: exercise the real tenant projection and preference write through
+  // loopback using the newly invited, policy-current disposable mobile account.
+  const selectedHome = await prisma.home.findUniqueOrThrow({ where: { id: inviter.homeId }, select: { activeHubInstallationId: true } });
+  if (!selectedHome.activeHubInstallationId) fail('Stage 7 tenant dashboard fixture requires the disposable Home hub');
+  const foreignSuffix = crypto.randomUUID();
+  const foreignAccount = await prisma.customerAccount.create({ data: {
+    displayName: 'Other disposable tenant', username: `stage7-other-${foreignSuffix.slice(0, 12)}`,
+    usernameNormalized: `stage7-other-${foreignSuffix.slice(0, 12)}`,
+    email: `stage7-other-${foreignSuffix}@invalid.test`, emailNormalized: `stage7-other-${foreignSuffix}@invalid.test`,
+    passwordHash: 'disposable-integration-only', emailVerifiedAt: new Date(),
+  } });
+  const foreignMembership = await prisma.homeMembership.create({ data: { customerAccountId: foreignAccount.id, homeId: inviter.homeId, role: 'TENANT', status: 'ACTIVE' } });
+  await prisma.tenantAreaGrant.create({ data: { membershipId: foreignMembership.id, areaId, homeId: inviter.homeId } });
+  const grantedMoveArea = await prisma.area.create({ data: { homeId: inviter.homeId, osAreaId: `stage7-move-${crypto.randomUUID()}`, originalName: 'Permitted second Area', status: 'ACTIVE' } });
+  const deniedMoveArea = await prisma.area.create({ data: { homeId: inviter.homeId, osAreaId: `stage7-deny-${crypto.randomUUID()}`, originalName: 'Unassigned Area', status: 'ACTIVE' } });
+  await prisma.tenantAreaGrant.create({ data: { membershipId: newTenantMembershipAfterAccept.id, areaId: grantedMoveArea.id, homeId: inviter.homeId } });
+  const bedroomAreas = await Promise.all(['Bedroom One', 'Bedroom Two', 'Bedroom Hidden'].map((originalName, index) => prisma.area.create({ data: {
+    homeId: inviter.homeId, osAreaId: `stage7-bedroom-${index}-${crypto.randomUUID()}`, originalName, overrideName: '  Bedroom  ', status: 'ACTIVE',
+  } })));
+  const officeAreas = await Promise.all(['Office left', 'Office right'].map((originalName, index) => prisma.area.create({ data: {
+    homeId: inviter.homeId, osAreaId: `stage7-office-${index}-${crypto.randomUUID()}`, originalName, overrideName: index === 0 ? 'Home Office' : ' home   office ', status: 'ACTIVE',
+  } })));
+  await prisma.tenantAreaGrant.createMany({ data: [
+    ...bedroomAreas.slice(0, 2).map((area) => ({ membershipId: newTenantMembershipAfterAccept.id, areaId: area.id, homeId: inviter.homeId })),
+    ...officeAreas.map((area) => ({ membershipId: newTenantMembershipAfterAccept.id, areaId: area.id, homeId: inviter.homeId })),
+    { membershipId: foreignMembership.id, areaId: bedroomAreas[0].id, homeId: inviter.homeId },
+  ] });
+  const dashboardDevices = await Promise.all([
+    prisma.nativeDevice.create({ data: { homeId: inviter.homeId, hubInstallationId: selectedHome.activeHubInstallationId,
+      osDeviceId: `stage7-own-${crypto.randomUUID()}`, originalName: 'Disposable private light', technicalLabel: 'tenant_device',
+      managementClass: 'TENANT_DEVICE', ownerMembershipId: newTenantMembershipAfterAccept.id, deviceType: 'light',
+      descriptorDigest: sha256(`stage7-own-${crypto.randomUUID()}`), lifecycle: 'INSTALLED', installedAt: new Date(),
+      assignments: { create: { areaId, homeId: inviter.homeId, source: 'STAGE7_HARNESS', actorType: 'SYSTEM' } } } }),
+    prisma.nativeDevice.create({ data: { homeId: inviter.homeId, hubInstallationId: selectedHome.activeHubInstallationId,
+      osDeviceId: `stage7-other-${crypto.randomUUID()}`, originalName: 'Other tenant private lamp', technicalLabel: 'tenant_device',
+      managementClass: 'TENANT_DEVICE', ownerMembershipId: foreignMembership.id, deviceType: 'light',
+      descriptorDigest: sha256(`stage7-other-${crypto.randomUUID()}`), lifecycle: 'INSTALLED', installedAt: new Date(),
+      assignments: { create: { areaId, homeId: inviter.homeId, source: 'STAGE7_HARNESS', actorType: 'SYSTEM' } } } }),
+    prisma.nativeDevice.create({ data: { homeId: inviter.homeId, hubInstallationId: selectedHome.activeHubInstallationId,
+      osDeviceId: `stage7-property-${crypto.randomUUID()}`, originalName: 'Permanent property light', technicalLabel: 'property_device',
+      managementClass: 'PROPERTY_DEVICE', deviceType: 'light', descriptorDigest: sha256(`stage7-property-${crypto.randomUUID()}`),
+      lifecycle: 'INSTALLED', installedAt: new Date(),
+      assignments: { create: { areaId, homeId: inviter.homeId, source: 'STAGE7_HARNESS', actorType: 'SYSTEM' } } } }),
+  ]);
+  const tenantDashboardHeaders = { ...newTenantAuthHeaders(), 'x-dinodia-home-id': inviter.homeId };
+  const tenantDashboard = await fetchJson(`${base}/api/v2/homes/${inviter.homeId}/tenant-device-context`, { headers: tenantDashboardHeaders });
+  const tenantDashboardIds = (tenantDashboard.body?.deviceOverrides ?? []).map((item) => item.id);
+  const tenantAreaGroups = tenantDashboard.body?.areaGroups ?? [];
+  const propertyDashboardDevice = tenantDashboard.body?.deviceOverrides?.find((item) => item.id === dashboardDevices[2].id);
+  const ownDashboardDevice = tenantDashboard.body?.deviceOverrides?.find((item) => item.id === dashboardDevices[0].id);
+  const wrongSelectedTenantHome = await fetchJson(`${base}/api/v2/homes/${inviter.homeId}/tenant-device-context`, { headers: { ...tenantDashboardHeaders, 'x-dinodia-home-id': customerFixture.homeOneId } });
+  const foreignHomeTenantContext = await fetchJson(`${base}/api/v2/homes/${customerFixture.homeOneId}/tenant-device-context`, { headers: { ...tenantDashboardHeaders, 'x-dinodia-home-id': customerFixture.homeOneId } });
+  const ownerDashboardContext = await fetchJson(`${base}/api/v2/homes/${inviter.homeId}/tenant-device-context`, { headers: { cookie: `dinodia_customer_session=${encodeURIComponent(customerFixture.customerSessionSecret)}`, 'x-dinodia-home-id': inviter.homeId } });
+  const anonymousDashboardContext = await fetchJson(`${base}/api/v2/homes/${inviter.homeId}/tenant-device-context`, { headers: { 'x-dinodia-home-id': inviter.homeId } });
+  const dashboardLayout = { version: 1, tiles: [{ deviceId: dashboardDevices[0].id, size: 'STANDARD', position: 0, label: 'My light' }], labelColours: { Lights: '#f2c94c' } };
+  const layoutWrite = await fetchJson(`${base}/api/v2/homes/${inviter.homeId}/preferences`, { method: 'PUT', headers: { ...tenantDashboardHeaders, 'content-type': 'application/json' }, body: JSON.stringify({ kind: 'DASHBOARD_LAYOUT', expectedRevision: 0, document: dashboardLayout }) });
+  const layoutWrongOwnerWrite = await fetchJson(`${base}/api/v2/homes/${inviter.homeId}/preferences`, { method: 'PUT', headers: { ...tenantDashboardHeaders, 'content-type': 'application/json' }, body: JSON.stringify({ kind: 'DASHBOARD_LAYOUT', expectedRevision: 1, document: { ...dashboardLayout, tiles: [{ ...dashboardLayout.tiles[0], deviceId: dashboardDevices[1].id }] } }) });
+  const renameKey = crypto.randomUUID();
+  const renameBody = { action: 'rename', expectedInventoryRevision: dashboardDevices[0].inventoryRevision, overrideName: 'My bedside light' };
+  const renameHeaders = { ...tenantDashboardHeaders, 'content-type': 'application/json', 'idempotency-key': renameKey };
+  const ownDeviceRename = await fetchJson(`${base}/api/v2/homes/${inviter.homeId}/tenant-devices/${dashboardDevices[0].id}`, { method: 'PATCH', headers: renameHeaders, body: JSON.stringify(renameBody) });
+  const ownDeviceRenameRetry = await fetchJson(`${base}/api/v2/homes/${inviter.homeId}/tenant-devices/${dashboardDevices[0].id}`, { method: 'PATCH', headers: renameHeaders, body: JSON.stringify(renameBody) });
+  const renameKeyConflict = await fetchJson(`${base}/api/v2/homes/${inviter.homeId}/tenant-devices/${dashboardDevices[0].id}`, { method: 'PATCH', headers: renameHeaders, body: JSON.stringify({ ...renameBody, overrideName: 'Different operation' }) });
+  const deniedAreaMove = await fetchJson(`${base}/api/v2/homes/${inviter.homeId}/tenant-devices/${dashboardDevices[0].id}`, { method: 'PATCH', headers: { ...tenantDashboardHeaders, 'content-type': 'application/json', 'idempotency-key': crypto.randomUUID() }, body: JSON.stringify({ action: 'move', expectedInventoryRevision: dashboardDevices[0].inventoryRevision + 1, areaId: deniedMoveArea.id }) });
+  const moveKey = crypto.randomUUID();
+  const moveBody = { action: 'move', expectedInventoryRevision: dashboardDevices[0].inventoryRevision + 1, areaId: grantedMoveArea.id };
+  const ownDeviceMove = await fetchJson(`${base}/api/v2/homes/${inviter.homeId}/tenant-devices/${dashboardDevices[0].id}`, { method: 'PATCH', headers: { ...tenantDashboardHeaders, 'content-type': 'application/json', 'idempotency-key': moveKey }, body: JSON.stringify(moveBody) });
+  const ownDeviceMoveRetry = await fetchJson(`${base}/api/v2/homes/${inviter.homeId}/tenant-devices/${dashboardDevices[0].id}`, { method: 'PATCH', headers: { ...tenantDashboardHeaders, 'content-type': 'application/json', 'idempotency-key': moveKey }, body: JSON.stringify(moveBody) });
+  const otherTenantDeviceMutation = await fetchJson(`${base}/api/v2/homes/${inviter.homeId}/tenant-devices/${dashboardDevices[1].id}`, { method: 'PATCH', headers: { ...tenantDashboardHeaders, 'content-type': 'application/json', 'idempotency-key': crypto.randomUUID() }, body: JSON.stringify({ action: 'rename', expectedInventoryRevision: dashboardDevices[1].inventoryRevision, overrideName: 'Not mine' }) });
+  const permanentDeviceMutation = await fetchJson(`${base}/api/v2/homes/${inviter.homeId}/tenant-devices/${dashboardDevices[2].id}`, { method: 'PATCH', headers: { ...tenantDashboardHeaders, 'content-type': 'application/json', 'idempotency-key': crypto.randomUUID() }, body: JSON.stringify({ action: 'rename', expectedInventoryRevision: dashboardDevices[2].inventoryRevision, overrideName: 'Property device' }) });
+  const relabelOwnDevice = await fetchJson(`${base}/api/v2/homes/${inviter.homeId}/tenant-devices/${dashboardDevices[0].id}`, { method: 'PATCH', headers: { ...tenantDashboardHeaders, 'content-type': 'application/json', 'idempotency-key': crypto.randomUUID() }, body: JSON.stringify({ action: 'relabel', expectedInventoryRevision: dashboardDevices[0].inventoryRevision + 2, customerLabel: 'My Lights' }) });
+  const ownerDeviceAfterMutations = await prisma.nativeDevice.findUnique({ where: { id: dashboardDevices[0].id }, select: { overrideName: true, customerLabel: true, inventoryRevision: true, technicalLabel: true, ownerMembershipId: true, assignments: { where: { validUntil: null }, select: { areaId: true } } } });
+  const tenantDashboardAfterWrite = await fetchJson(`${base}/api/v2/homes/${inviter.homeId}/tenant-device-context`, { headers: tenantDashboardHeaders });
+  const dashboardLayoutRow = tenantDashboardAfterWrite.body?.layout;
+  if (tenantDashboard.response.status !== 200 || tenantDashboard.body?.membership?.membershipId !== newTenantMembershipAfterAccept.id
+    || tenantDashboard.body?.membership?.homeId !== inviter.homeId
+    || !tenantDashboard.body?.revision?.streamId || tenantDashboard.body?.revision?.sequence < 0
+    || tenantAreaGroups.length !== 1 || tenantAreaGroups[0]?.name.trim().toLowerCase() !== 'home office'
+    || JSON.stringify([...tenantAreaGroups[0].areaIds].sort()) !== JSON.stringify(officeAreas.map((area) => area.id).sort())
+    || tenantAreaGroups.some((group) => /bedroom/i.test(group.name))
+    || bedroomAreas.slice(0, 2).some((area) => !tenantDashboard.body?.areaOverrides?.some((row) => row.areaId === area.id))
+    || tenantDashboard.body?.areaOverrides?.some((row) => row.areaId === bedroomAreas[2].id)
+    || !tenantDashboardIds.includes(dashboardDevices[0].id) || tenantDashboardIds.includes(dashboardDevices[1].id)
+    || !propertyDashboardDevice || propertyDashboardDevice.canManage !== false || propertyDashboardDevice.ownerMembershipId !== null
+    || !ownDashboardDevice || ownDashboardDevice.canManage !== true || ownDashboardDevice.ownerMembershipId !== newTenantMembershipAfterAccept.id
+    || ['state', 'controls', 'onlineState', 'lastSeenAt', 'originalName'].some((key) => Object.hasOwn(tenantDashboard.body?.deviceOverrides?.[0] ?? {}, key))
+    || wrongSelectedTenantHome.response.status !== 404 || foreignHomeTenantContext.response.status !== 404
+    || ownerDashboardContext.response.status !== 404 || anonymousDashboardContext.response.status !== 401
+    || layoutWrite.response.status !== 200 || layoutWrongOwnerWrite.response.status !== 400
+    || ownDeviceRename.response.status !== 200 || ownDeviceRenameRetry.response.status !== 200 || ownDeviceRenameRetry.body?.inventoryRevision !== ownDeviceRename.body?.inventoryRevision
+    || renameKeyConflict.response.status !== 409 || otherTenantDeviceMutation.response.status !== 404 || permanentDeviceMutation.response.status !== 404
+    || deniedAreaMove.response.status !== 403 || ownDeviceMove.response.status !== 200 || ownDeviceMove.body?.hubEnforcement !== 'PENDING'
+    || ownDeviceMoveRetry.response.status !== 200 || ownDeviceMoveRetry.body?.inventoryRevision !== ownDeviceMove.body?.inventoryRevision
+    || relabelOwnDevice.response.status !== 200 || ownerDeviceAfterMutations?.overrideName !== 'My bedside light'
+    || ownerDeviceAfterMutations?.customerLabel !== 'My Lights' || ownerDeviceAfterMutations?.inventoryRevision !== dashboardDevices[0].inventoryRevision + 3
+    || ownerDeviceAfterMutations?.assignments?.length !== 1 || ownerDeviceAfterMutations.assignments[0].areaId !== grantedMoveArea.id
+    || ownerDeviceAfterMutations?.technicalLabel !== 'tenant_device' || ownerDeviceAfterMutations?.ownerMembershipId !== newTenantMembershipAfterAccept.id
+    || tenantDashboardAfterWrite.response.status !== 200 || dashboardLayoutRow?.revision !== 1
+    || dashboardLayoutRow?.document?.tiles?.[0]?.deviceId !== dashboardDevices[0].id
+    || dashboardLayoutRow?.document?.labelColours?.Lights !== '#f2c94c') {
+    fail(`Actual tenant dashboard context/layout/device-presentation routes did not enforce selected membership, private-device isolation, exact retries and the OS/cloud authority split (${JSON.stringify({ context: tenantDashboard.response.status, ownDeviceVisible: tenantDashboardIds.includes(dashboardDevices[0].id), otherTenantDeviceHidden: !tenantDashboardIds.includes(dashboardDevices[1].id), propertyDeviceReadOnly: propertyDashboardDevice?.canManage === false, ownDeviceManageable: ownDashboardDevice?.canManage === true, wrongSelectedHome: wrongSelectedTenantHome.response.status, otherHome: foreignHomeTenantContext.response.status, owner: ownerDashboardContext.response.status, anonymous: anonymousDashboardContext.response.status, layoutWrite: layoutWrite.response.status, foreignLayoutWrite: layoutWrongOwnerWrite.response.status, rename: ownDeviceRename.response.status, renameRetry: ownDeviceRenameRetry.response.status, keyConflict: renameKeyConflict.response.status, otherTenantMutation: otherTenantDeviceMutation.response.status, propertyMutation: permanentDeviceMutation.response.status, relabel: relabelOwnDevice.response.status, privateDeviceRevision: ownerDeviceAfterMutations?.inventoryRevision, layoutRevision: dashboardLayoutRow?.revision })})`);
+  }
+  const removalChallengeValue = { operation: 'remove_tenant_device', descriptorRevision: ownDashboardDevice.descriptorRevision };
+  const removalChallenge = await fetchJson(`${base}/api/v2/security/step-up/challenge`, { method: 'POST', headers: { ...tenantDashboardHeaders, 'content-type': 'application/json' }, body: JSON.stringify({ operationKind: 'tenant_device_remove', targetIds: [ownDashboardDevice.osDeviceId], value: removalChallengeValue }) });
+  if (removalChallenge.response.status !== 200 || !removalChallenge.body.challengeId) fail(`Exact own-device removal step-up was not issued (${removalChallenge.response.status})`);
+  const removalSignature = crypto.sign(null, stepUpChallengeMessage({ challengeId: removalChallenge.body.challengeId, nonce: removalChallenge.body.nonce, operationDigest: removalChallenge.body.operationDigest }), crypto.createPrivateKey(newTenantPhone.privateKey)).toString('base64url');
+  const removalProof = await fetchJson(`${base}/api/v2/security/step-up/issue`, { method: 'POST', headers: { ...tenantDashboardHeaders, 'content-type': 'application/json' }, body: JSON.stringify({ challengeId: removalChallenge.body.challengeId, nonce: removalChallenge.body.nonce, deviceSignature: removalSignature }) });
+  if (removalProof.response.status !== 200 || typeof removalProof.body.proof !== 'string') fail(`Exact own-device removal proof was not issued (${removalProof.response.status})`);
+  const proofRowKey = { customerAccountId_nonceHash: { customerAccountId: newTenantAccount.id, nonceHash: sha256(removalProof.body.proof) } };
+  const removalBefore = await prisma.nativeDevice.findUniqueOrThrow({ where: { id: dashboardDevices[0].id }, select: { lifecycle: true, inventoryRevision: true, ownerMembershipId: true, managementClass: true } });
+  const removalHomeRevisionBefore = await prisma.home.findUniqueOrThrow({ where: { id: inviter.homeId }, select: { managementRevision: true } });
+  const removalProofBefore = await prisma.stepUpAuthorization.findUniqueOrThrow({ where: proofRowKey, select: { consumedAt: true } });
+  const removalKey = crypto.randomUUID();
+  const removalBody = { expectedDescriptorRevision: ownDashboardDevice.descriptorRevision, expectedInventoryRevision: removalBefore.inventoryRevision, proof: removalProof.body.proof };
+  const removalHeaders = { ...tenantDashboardHeaders, 'content-type': 'application/json', 'idempotency-key': removalKey };
+  const wrongOwnerRemoval = await fetchJson(`${base}/api/v2/homes/${inviter.homeId}/tenant-devices/${dashboardDevices[1].id}/remove`, { method: 'POST', headers: removalHeaders, body: JSON.stringify(removalBody) });
+  const permanentRemoval = await fetchJson(`${base}/api/v2/homes/${inviter.homeId}/tenant-devices/${dashboardDevices[2].id}/remove`, { method: 'POST', headers: { ...removalHeaders, 'idempotency-key': crypto.randomUUID() }, body: JSON.stringify(removalBody) });
+  const noProofRemoval = await fetchJson(`${base}/api/v2/homes/${inviter.homeId}/tenant-devices/${dashboardDevices[0].id}/remove`, { method: 'POST', headers: { ...removalHeaders, 'idempotency-key': crypto.randomUUID() }, body: JSON.stringify({ expectedDescriptorRevision: removalBody.expectedDescriptorRevision, expectedInventoryRevision: removalBody.expectedInventoryRevision }) });
+  const removalAfterDenials = await prisma.nativeDevice.findUniqueOrThrow({ where: { id: dashboardDevices[0].id }, select: { lifecycle: true, inventoryRevision: true, ownerMembershipId: true, managementClass: true } });
+  const removalHomeRevisionAfterDenials = await prisma.home.findUniqueOrThrow({ where: { id: inviter.homeId }, select: { managementRevision: true } });
+  const removalProofAfterDenials = await prisma.stepUpAuthorization.findUniqueOrThrow({ where: proofRowKey, select: { consumedAt: true } });
+  const ownRemoval = await fetchJson(`${base}/api/v2/homes/${inviter.homeId}/tenant-devices/${dashboardDevices[0].id}/remove`, { method: 'POST', headers: removalHeaders, body: JSON.stringify(removalBody) });
+  const ownRemovalRetry = await fetchJson(`${base}/api/v2/homes/${inviter.homeId}/tenant-devices/${dashboardDevices[0].id}/remove`, { method: 'POST', headers: removalHeaders, body: JSON.stringify(removalBody) });
+  const ownDeviceAfterRemoval = await prisma.nativeDevice.findUniqueOrThrow({ where: { id: dashboardDevices[0].id }, select: { lifecycle: true, inventoryRevision: true, ownerMembershipId: true, managementClass: true } });
+  const removalProofAfterSuccess = await prisma.stepUpAuthorization.findUniqueOrThrow({ where: proofRowKey, select: { consumedAt: true } });
+  if (wrongOwnerRemoval.response.status !== 409 || permanentRemoval.response.status !== 409 || noProofRemoval.response.status !== 400
+    || JSON.stringify(removalBefore) !== JSON.stringify(removalAfterDenials)
+    || removalHomeRevisionBefore.managementRevision !== removalHomeRevisionAfterDenials.managementRevision
+    || removalProofBefore.consumedAt || removalProofAfterDenials.consumedAt
+    || ownRemoval.response.status !== 202 || ownRemoval.body?.state !== 'REMOVAL_PENDING' || ownRemoval.body?.hubEnforcement !== 'PENDING'
+    || ownRemovalRetry.response.status !== 202 || ownRemovalRetry.body?.inventoryRevision !== ownRemoval.body?.inventoryRevision
+    || ownDeviceAfterRemoval.lifecycle !== 'REMOVAL_PENDING' || ownDeviceAfterRemoval.inventoryRevision !== removalBefore.inventoryRevision + 1
+    || ownDeviceAfterRemoval.ownerMembershipId !== newTenantMembershipAfterAccept.id || ownDeviceAfterRemoval.managementClass !== 'TENANT_DEVICE'
+    || !removalProofAfterSuccess.consumedAt) {
+    fail(`Actual tenant-owned removal did not enforce fresh proof, ownership, zero-effect denial, pending hub cleanup and exact retry (${JSON.stringify({ wrongOwner: wrongOwnerRemoval.response.status, permanent: permanentRemoval.response.status, missingProof: noProofRemoval.response.status, allowed: ownRemoval.response.status, retry: ownRemovalRetry.response.status, lifecycle: ownDeviceAfterRemoval.lifecycle })})`);
+  }
+  console.log('[stage7:integration] PASS: actual tenant context/layout and owned-device rename/relabel/move/remove routes preserve selected-membership privacy; denied wrong-owner/permanent/missing-proof removal has zero Home/device/proof effects; authorized removal consumes exact proof once and remains pending until hub enforcement; exact retry does not repeat effects');
   console.log('[stage6:integration] PASS: actual mobile sign-in accepts the recipient-only one-time credential (proving email possession), returns V2 access/refresh credentials, gates password replacement and username choice, then grants exactly the invited Area only after explicit acceptance');
   const headers = { cookie: `dinodia_customer_session=${encodeURIComponent(rawSession)}` };
   const currentPolicyVersion = deliveryEnv.DINODIA_NATIVE_POLICY_VERSION;

@@ -21,13 +21,24 @@ function documentValid(kind: MemberPreferenceKind, value: unknown): value is Rec
   const document = value as Record<string, unknown>;
   if (document.version !== 1) return false;
   if (kind === 'DASHBOARD_LAYOUT') {
-    if (!exactKeys(document, ['version', 'tiles']) || !Array.isArray(document.tiles) || document.tiles.length > 500) return false;
+    if ((!exactKeys(document, ['version', 'tiles']) && !exactKeys(document, ['version', 'tiles', 'labelColours']))
+      || !Array.isArray(document.tiles) || document.tiles.length > 500) return false;
+    if ('labelColours' in document) {
+      if (!document.labelColours || typeof document.labelColours !== 'object' || Array.isArray(document.labelColours)) return false;
+      const colours = document.labelColours as Record<string, unknown>;
+      if (Object.keys(colours).length > 64 || Object.entries(colours).some(([label, colour]) =>
+        label.length < 1 || label.length > 40 || label.trim() !== label || typeof colour !== 'string' || !/^#[0-9a-fA-F]{6}$/.test(colour))) return false;
+    }
     const ids = new Set<string>();
     return document.tiles.every((raw) => {
       if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return false;
       const tile = raw as Record<string, unknown>;
-      if (!exactKeys(tile, ['deviceId', 'size']) || !canonicalPublicId(tile.deviceId) || ids.has(tile.deviceId)) return false;
+      const legacy = exactKeys(tile, ['deviceId', 'size']);
+      const ordered = exactKeys(tile, ['deviceId', 'size', 'position', 'label']);
+      if ((!legacy && !ordered) || !canonicalPublicId(tile.deviceId) || ids.has(tile.deviceId)) return false;
       if (!['COMPACT', 'STANDARD', 'LARGE'].includes(String(tile.size))) return false;
+      if (ordered && (!Number.isSafeInteger(tile.position) || Number(tile.position) < 0 || Number(tile.position) >= 500
+        || typeof tile.label !== 'string' || tile.label.length < 1 || tile.label.length > 40 || tile.label.trim() !== tile.label)) return false;
       ids.add(tile.deviceId);
       return true;
     });
