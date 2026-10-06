@@ -94,15 +94,21 @@ test('readiness accepts the exact Stage 3 head plus only reviewed additive Stage
   const migration = (name) => ({ migration_name: name, checksum: COMPATIBLE_ADDITIVE_MIGRATIONS[name] });
   const stage4 = [migration('20261004050000_stage4_customer_lan_tls_identity'), ...stage3];
   const stage5 = [migration('20261005100000_stage5_incident_source_kind'), migration('20261005070000_stage5_hub_incident_deadline'), migration('20261004150000_stage5_hub_sync_v2'), ...stage4];
-  const stage6 = [migration('20261006120000_stage6_invited_tenant_username_setup'), migration('20261006100000_stage6_apns_registration_and_notification_preferences'), migration('20261005130000_stage6_mobile_access_credentials'), migration('20261005120000_stage6_customer_refresh_families'), ...stage5];
+  const ownershipTransfer = migration('20261006150000_stage6_ownership_transfer_claim');
+  const prospectiveRoomAccess = migration('20261006170000_stage6_prospective_room_access');
+  const invitedTenantUsername = migration('20261006120000_stage6_invited_tenant_username_setup');
+  const apnsRegistration = migration('20261006100000_stage6_apns_registration_and_notification_preferences');
+  const mobileAccess = migration('20261005130000_stage6_mobile_access_credentials');
+  const refreshFamilies = migration('20261005120000_stage6_customer_refresh_families');
+  const stage6 = [prospectiveRoomAccess, ownershipTransfer, invitedTenantUsername, apnsRegistration, mobileAccess, refreshFamilies, ...stage5];
   assert.equal(isSchemaReady(stage3, REQUIRED_MODEL_COUNT, stage3Checksum), true);
   assert.equal(isSchemaReady(stage4, REQUIRED_MODEL_COUNT, stage3Checksum), true, 'the app rollback remains ready after the additive migration');
   assert.equal(isSchemaReady(stage5, REQUIRED_MODEL_COUNT + 1, stage3Checksum), true, 'the Stage 5 app and Stage 4 rollback remain ready on the additive Stage 5 schema');
-  assert.equal(isSchemaReady(stage6, REQUIRED_MODEL_COUNT + 1, stage3Checksum), true, 'the Stage 6 app and compatible rollback remain ready on all reviewed additive Stage 6 schema');
-  assert.equal(isSchemaReady([stage6[0], ...stage5], REQUIRED_MODEL_COUNT + 1, stage3Checksum), true, 'the invited-tenant username column remains compatible with the prior Stage 5 app');
-  assert.equal(isSchemaReady([stage6[0], ...stage5], REQUIRED_MODEL_COUNT + 1, stage3Checksum), true, 'the isolated username setup column is an additive compatible migration');
-  assert.equal(isSchemaReady([stage6[1], ...stage5], REQUIRED_MODEL_COUNT + 1, stage3Checksum), false, 'APNs registration requires the mobile access and refresh-family migrations');
-  assert.equal(isSchemaReady([{ ...stage6[0], checksum: '0'.repeat(64) }, ...stage6.slice(1)], REQUIRED_MODEL_COUNT + 1, stage3Checksum), false, 'an unreviewed Stage 6 migration checksum is not schema-ready');
+  assert.equal(isSchemaReady(stage6, REQUIRED_MODEL_COUNT + 2, stage3Checksum), true, 'the Stage 6 app and compatible rollback remain ready on all reviewed additive Stage 6 schema');
+  assert.equal(isSchemaReady([ownershipTransfer, ...stage5], REQUIRED_MODEL_COUNT + 1, stage3Checksum), true, 'ownership transfer adds nullable data and remains compatible with the prior Stage 5 app');
+  assert.equal(isSchemaReady([invitedTenantUsername, ...stage5], REQUIRED_MODEL_COUNT + 1, stage3Checksum), true, 'the invited-tenant username migration remains compatible with the prior Stage 5 app');
+  assert.equal(isSchemaReady([apnsRegistration, ...stage5], REQUIRED_MODEL_COUNT + 1, stage3Checksum), false, 'APNs registration requires the mobile access and refresh-family migrations');
+  assert.equal(isSchemaReady([{ ...stage6[0], checksum: '0'.repeat(64) }, ...stage6.slice(1)], REQUIRED_MODEL_COUNT + 2, stage3Checksum), false, 'an unreviewed Stage 6 migration checksum is not schema-ready');
   assert.equal(isSchemaReady([{ ...stage5[0], checksum: '0'.repeat(64) }, ...stage5.slice(1)], REQUIRED_MODEL_COUNT + 1, stage3Checksum), false, 'an unreviewed Stage 5 follow-on checksum is not schema-ready');
   assert.equal(isSchemaReady([stage5[0], stage5[1], stage5[2], ...stage3], REQUIRED_MODEL_COUNT + 1, stage3Checksum), false, 'Stage 5 cannot be accepted without its Stage 4 prerequisite');
   assert.equal(isSchemaReady([{ migration_name: 'unreviewed_migration', checksum: 'c'.repeat(64) }, ...stage4], REQUIRED_MODEL_COUNT, stage3Checksum), false);
@@ -110,7 +116,7 @@ test('readiness accepts the exact Stage 3 head plus only reviewed additive Stage
   assert.equal(isSchemaReady([{ ...stage5[2], checksum: '0'.repeat(64) }, ...stage5.slice(3)], REQUIRED_MODEL_COUNT + 1, stage3Checksum), false);
   assert.equal(isSchemaReady(stage4, REQUIRED_MODEL_COUNT + 1, stage3Checksum), false);
   assert.equal(isSchemaReady(stage5, REQUIRED_MODEL_COUNT, stage3Checksum), false);
-  assert.equal(isSchemaReady(stage6, REQUIRED_MODEL_COUNT, stage3Checksum), false, 'Stage 6 additive columns do not change the approved table count');
+  assert.equal(isSchemaReady(stage6, REQUIRED_MODEL_COUNT + 1, stage3Checksum), false, 'the prospective Room attempt table is included in the Stage 6 migration/table-count contract');
   assert.equal(isSchemaReady(stage4, REQUIRED_MODEL_COUNT, '0'.repeat(64)), false);
 });
 
@@ -125,10 +131,10 @@ test('foundation and Stage 1 schema is exactly native and bounded', () => {
     'NativeDomainOutbox', 'NativeNotificationDeliveryReceipt', 'NativeDeviceOutageIncident',
     'NativeSupportTicketTimeline', 'ExceptionalOwnershipTransfer', 'NativeTenantDeviceRecovery',
   ];
-  assert.equal(modelNames.length, 66);
+  assert.equal(modelNames.length, 67);
   assert.equal(modelNames.filter((name) => name === 'HubSyncReceipt').length, 1);
   assert.deepEqual(modelNames.filter((name) => stage3Models.includes(name)).sort(), [...stage3Models].sort());
-  assert.equal(modelNames.length - stage3Models.length, 45, 'Stage 1/foundation and Stage 5 receipt tables remain intact; Stage 3 is additive');
+  assert.equal(modelNames.length - stage3Models.length, 46, 'Stage 1/foundation, Stage 5 receipt and Stage 6 private Room verification tables remain intact; Stage 3 is additive');
   assert.doesNotMatch(schema, /HaConnection|HomeAssistant|SupportRequest|AlexaRefreshToken/);
   assert.match(schema, /model HomeMembership/);
   assert.match(schema, /model TenantAreaGrant/);

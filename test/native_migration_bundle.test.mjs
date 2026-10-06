@@ -8,7 +8,7 @@ test('Stage 6 migration bundle identity is stable, ordered and requires every re
   const second = migrationBundleIdentity([...STAGE6_CUSTOMER_MIGRATIONS].reverse(), checksums);
   assert.deepEqual(first, second);
   assert.deepEqual(first.migrations.map(({ name }) => name), [...STAGE6_CUSTOMER_MIGRATIONS].sort());
-  assert.equal(first.migrations.length, 4);
+  assert.equal(first.migrations.length, 6);
   assert.throws(() => migrationBundleIdentity(STAGE6_CUSTOMER_MIGRATIONS, new Map()), /missing reviewed checksum/);
 });
 

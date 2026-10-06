@@ -47,6 +47,105 @@ test('customer requirements and policy acceptance bind the exact server-owned te
   assert.equal(native.validateCustomerPolicyAcceptanceReceipt({ schemaVersion: 'dinodia.v1', ok: true, policyVersion: projection.version, contentSha256, idempotentReplay: false }), true);
   assert.equal(native.validateCustomerPolicyAcceptanceReceipt({ schemaVersion: 'dinodia.v1', ok: true, policyVersion: projection.version, contentSha256, idempotentReplay: false, currentPolicy: true }), false);
 });
+
+test('prospective Room email receipts distinguish private verification from an already verified pending request', () => {
+  const schema = ajv.getSchema(`${contract.$id}#/$defs/publicRoomAccessEmailChallengeReceipt`);
+  assert.ok(schema);
+  const verifyEmail = {
+    schemaVersion: 'dinodia.v1', ok: true, state: 'VERIFY_EMAIL',
+    requestId: '11111111-1111-4111-8111-111111111111',
+    challengeId: '22222222-2222-4222-8222-222222222222',
+    expiresAt: '2026-10-06T12:10:00Z', emailSubmission: 'ACCEPTED', idempotentReplay: false,
+  };
+  const pending = {
+    schemaVersion: 'dinodia.v1', ok: true, state: 'PENDING',
+    requestId: '33333333-3333-4333-8333-333333333333',
+    expiresAt: '2026-10-13T12:00:00Z', revision: '2026-10-06T12:00:00Z',
+    emailSubmission: 'NOT_REQUIRED', idempotentReplay: true,
+  };
+  for (const receipt of [verifyEmail, pending]) {
+    assert.equal(schema(receipt), true, JSON.stringify(schema.errors));
+    assert.equal(native.validatePublicRoomAccessEmailChallengeReceipt(receipt), true);
+  }
+  for (const invalid of [
+    { ...verifyEmail, challengeId: undefined },
+    { ...pending, revision: undefined },
+    { ...pending, challengeId: '44444444-4444-4444-8444-444444444444' },
+    { ...pending, emailSubmission: 'ACCEPTED' },
+    { ...verifyEmail, revision: '2026-10-06T12:00:00Z' },
+  ]) {
+    assert.equal(schema(invalid), false, `JSON Schema rejects contradictory receipt: ${JSON.stringify(invalid)}`);
+    assert.equal(native.validatePublicRoomAccessEmailChallengeReceipt(invalid), false);
+  }
+});
+
+test('Room approval receipt can remain membership-free until the invited recipient explicitly accepts', () => {
+  const requestId = crypto.randomUUID();
+  const invited = { schemaVersion: 'dinodia.v1', ok: true, requestId, state: 'APPROVED', membershipId: null, idempotentReplay: false };
+  const existingCustomer = { ...invited, membershipId: crypto.randomUUID() };
+  assert.equal(native.validateCustomerRoomAccessDecisionReceipt(invited, requestId), true);
+  assert.equal(native.validateCustomerRoomAccessDecisionReceipt(existingCustomer, requestId), true);
+  assert.equal(native.validateCustomerRoomAccessDecisionReceipt({ ...invited, state: 'REJECTED', membershipId: crypto.randomUUID() }, requestId), false);
+});
+
+test('ownership-transfer HTTP contract binds one current owner workflow and recipient-bound presentations', () => {
+  const fixture = JSON.parse(fs.readFileSync(path.join(root, 'fixtures/ownership-transfer-api.json'), 'utf8'));
+  const homeId = fixture.status.homeId;
+  for (const [name, value] of Object.entries(fixture.schemaCases)) {
+    if (name === 'ownershipTransferLabelResolveRequest') continue;
+    const validate = ajv.getSchema(`${contract.$id}#/$defs/${name}`);
+    assert.ok(validate, `schema exists for ${name}`);
+    assert.equal(validate(value), true, `${name}: ${JSON.stringify(validate.errors)}`);
+  }
+  const resolveRequestSchema = ajv.getSchema(`${contract.$id}#/$defs/ownershipTransferResolveRequest`);
+  assert.equal(resolveRequestSchema(fixture.schemaCases.ownershipTransferLabelResolveRequest), true, JSON.stringify(resolveRequestSchema.errors));
+  assert.equal(native.validateOwnershipTransferStatus(fixture.status, homeId), true);
+  assert.equal(native.validateOwnershipTransferStatus({ ...fixture.status, homeId: fixture.otherHomeId }, homeId), false);
+  assert.equal(native.validateOwnershipTransferStatus({ ...fixture.status, recipientEmail: 'leak@example.test' }, homeId), false);
+  assert.equal(native.validateOwnershipTransferStartRequest(fixture.schemaCases.ownershipTransferStartRequest), true);
+  assert.equal(native.validateOwnershipTransferStartRequest({ ...fixture.schemaCases.ownershipTransferStartRequest, proof: {} }), false);
+  assert.equal(native.validateOwnershipTransferCancelRequest(fixture.schemaCases.ownershipTransferCancelRequest), true);
+  assert.equal(native.validateOwnershipTransferResolveRequest(fixture.schemaCases.ownershipTransferResolveRequest), true);
+  assert.equal(native.validateOwnershipTransferResolveRequest(fixture.schemaCases.ownershipTransferLabelResolveRequest), true);
+  assert.equal(native.validateOwnershipTransferResolveRequest({ reference: 'DNO-HOME-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA', idempotencyKey: 'transfer-resolve-without-proof' }), false);
+  assert.equal(native.validateOwnershipTransferResolveRequest({ ...fixture.schemaCases.ownershipTransferResolveRequest, injectedRole: 'OWNER' }), false);
+  assert.equal(native.validateOwnershipTransferStartReceipt(fixture.schemaCases.ownershipTransferStartReceipt), true);
+  assert.equal(native.validateOwnershipTransferCancelReceipt(fixture.schemaCases.ownershipTransferCancelReceipt), true);
+  assert.equal(native.validateOwnershipTransferResolveReceipt(fixture.schemaCases.ownershipTransferResolveReceipt), true);
+});
+test('permanent-label Home claims require a strict signed hub resolver proof while Portal QR claims do not', () => {
+  const claimRequest = ajv.compile({ $ref: `${contract.$id}#/$defs/customerHomeClaimResolveRequest` });
+  const qr = { reference: `dno_home_${'Q'.repeat(48)}` };
+  const proof = { version: 1, serial: 'din-home-001', identityGeneration: 2,
+    challengeId: '11111111-2222-4333-8444-555555555555', challenge: 'A'.repeat(32), resolverGeneration: 3,
+    expiresAt: '2026-10-06T12:00:00Z', timestamp: '1791288000000', nonce: 'N'.repeat(24), bodyHash: 'a'.repeat(64), hubSignature: 'S'.repeat(64) };
+  const permanent = { reference: `DNO-HOME-${'L'.repeat(40)}`, resolverProof: proof };
+  assert.equal(claimRequest(qr), true, JSON.stringify(claimRequest.errors));
+  assert.equal(claimRequest(permanent), true, JSON.stringify(claimRequest.errors));
+  assert.equal(native.validateCustomerHomeClaimResolveRequest(qr), true);
+  assert.equal(native.validateCustomerHomeClaimResolveRequest(permanent), true);
+  assert.equal(claimRequest({ ...permanent, resolverProof: { ...proof, identityGeneration: 0 } }), false);
+  assert.equal(native.validateCustomerHomeClaimResolveRequest({ ...permanent, resolverProof: { ...proof, hubSignature: 'not-a-signature' } }), false);
+  assert.equal(claimRequest({ reference: permanent.reference }), false, 'a permanent label without live hub proof is not a claim credential');
+  assert.equal(claimRequest({ ...qr, resolverProof: proof }), false, 'a QR cannot smuggle an unrelated resolver proof');
+});
+test('permanent-label LAN endpoint projection is strict, fresh and contains only the verified hub identity', () => {
+  const now = Date.parse('2026-10-06T12:00:00.000Z');
+  const lanEndpoint = { state: 'verified_lan', origin: 'https://dinodia-0123456789abcdefabcd.local:8123',
+    publicHubId: '0123456789abcdefabcd', certificateGeneration: 2,
+    currentSpkiPin: 'sha256/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=',
+    currentNotBefore: '2026-10-05T00:00:00.000Z', currentNotAfter: '2026-10-07T00:00:00.000Z',
+    reportedAt: '2026-10-06T11:59:00.000Z', validUntil: '2026-10-06T12:06:00.000Z' };
+  const schema = ajv.compile({ $ref: `${contract.$id}#/$defs/customerHomeClaimLanEndpointReceipt` });
+  const receipt = { schemaVersion: 'dinodia.v1', ok: true, lanEndpoint };
+  assert.equal(schema(receipt), true, JSON.stringify(schema.errors));
+  assert.equal(native.validateCustomerHomeClaimLanEndpointRequest({ reference: `DNO-HOME-${'A'.repeat(40)}` }), true);
+  assert.equal(native.validateCustomerHomeClaimLanEndpointRequest({ reference: `DNO-HOME-${'A'.repeat(40)}`, homeId: 'caller-controlled' }), false);
+  assert.equal(native.validateCustomerHomeClaimLanEndpointReceipt(receipt, now), true);
+  assert.equal(native.validateCustomerHomeClaimLanEndpointReceipt({ ...receipt, homeId: 'leaked-home' }, now), false);
+  assert.equal(native.validateCustomerHomeClaimLanEndpointReceipt({ ...receipt, lanEndpoint: { ...lanEndpoint, validUntil: '2026-10-06T11:59:59.000Z' } }, now), false);
+  assert.equal(native.validateCustomerHomeClaimLanEndpointReceipt({ ...receipt, lanEndpoint: { ...lanEndpoint, origin: 'http://dinodia-0123456789abcdefabcd.local:80' } }, now), false);
+});
 test('invited tenant cannot choose a username until the invitation credential, email and server gate are satisfied', () => {
   const invitationId = '55555555-5555-4555-8555-555555555555';
   const request = { invitationId, email: 'tenant@example.invalid', password: 'one-time-password-123' };

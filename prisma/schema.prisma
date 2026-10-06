@@ -375,26 +375,26 @@ enum AuditCategory {
 }
 
 model CustomerAccount {
-  id                     String         @id @default(uuid()) @db.Uuid
-  displayName            String         @db.VarChar(160)
-  username               String         @db.VarChar(80)
-  usernameNormalized     String         @unique @db.VarChar(80)
-  email                  String         @db.VarChar(320)
-  emailNormalized        String         @unique @db.VarChar(320)
-  emailVerifiedAt        DateTime?
-  pendingEmail           String?        @db.VarChar(320)
-  pendingEmailNormalized String?        @db.VarChar(320)
-  phoneNumber            String?        @db.VarChar(40)
-  passwordHash           String         @db.VarChar(255)
-  mustChangePassword     Boolean        @default(false)
-  usernameSelectionRequired Boolean     @default(false)
-  passwordChangedAt      DateTime?
-  status                 CustomerStatus @default(ACTIVE)
-  securityVersion        Int            @default(1)
-  lastUsedHomeId         String?        @db.Uuid
-  deletedAt              DateTime?
-  createdAt              DateTime       @default(now())
-  updatedAt              DateTime       @updatedAt
+  id                        String         @id @default(uuid()) @db.Uuid
+  displayName               String         @db.VarChar(160)
+  username                  String         @db.VarChar(80)
+  usernameNormalized        String         @unique @db.VarChar(80)
+  email                     String         @db.VarChar(320)
+  emailNormalized           String         @unique @db.VarChar(320)
+  emailVerifiedAt           DateTime?
+  pendingEmail              String?        @db.VarChar(320)
+  pendingEmailNormalized    String?        @db.VarChar(320)
+  phoneNumber               String?        @db.VarChar(40)
+  passwordHash              String         @db.VarChar(255)
+  mustChangePassword        Boolean        @default(false)
+  usernameSelectionRequired Boolean        @default(false)
+  passwordChangedAt         DateTime?
+  status                    CustomerStatus @default(ACTIVE)
+  securityVersion           Int            @default(1)
+  lastUsedHomeId            String?        @db.Uuid
+  deletedAt                 DateTime?
+  createdAt                 DateTime       @default(now())
+  updatedAt                 DateTime       @updatedAt
 
   lastUsedHome           Home?                               @relation("CustomerLastUsedHome", fields: [lastUsedHomeId], references: [id], onDelete: SetNull)
   memberships            HomeMembership[]
@@ -527,6 +527,7 @@ model AuthChallenge {
   customerAccountId   String?   @db.Uuid
   purpose             String    @db.VarChar(80)
   targetEmail         String?   @db.VarChar(320)
+  targetResourceId    String?   @db.Uuid
   tokenHash           String    @unique @db.VarChar(128)
   expiresAt           DateTime
   approvedAt          DateTime?
@@ -541,6 +542,7 @@ model AuthChallenge {
   customerAccount CustomerAccount? @relation(fields: [customerAccountId], references: [id], onDelete: Cascade)
 
   @@index([customerAccountId, purpose, expiresAt])
+  @@index([targetResourceId, purpose, expiresAt])
 }
 
 model StepUpAuthorization {
@@ -621,6 +623,7 @@ model Home {
   areaSourceAlias            AreaSourceAlias[]
   nativeDeviceSourceAlias    NativeDeviceSourceAlias[]
   nativeAutomationExecutions NativeAutomationExecution[]
+  roomAccessEmailAttempts    RoomAccessEmailAttempt[]
 
   @@index([lifecycle, installationStatus])
   @@index([postcode])
@@ -685,6 +688,7 @@ model Area {
   temperatureSamples        NativeTemperatureSample[]
   automationActions         NativeAutomationAction[]
   alexaEndpoints            AlexaNativeEndpointProjection[]
+  roomAccessEmailAttempts   RoomAccessEmailAttempt[]
 
   @@unique([homeId, osAreaId])
   @@unique([id, homeId])
@@ -1038,10 +1042,11 @@ model MembershipInvitation {
   createdAt               DateTime        @default(now())
   updatedAt               DateTime        @updatedAt
 
-  home          Home                       @relation(fields: [homeId], references: [id], onDelete: Cascade)
-  inviter       HomeMembership             @relation("InvitationInviter", fields: [inviterMembershipId], references: [id], onDelete: Restrict)
-  targetAccount CustomerAccount?           @relation("InvitationTarget", fields: [targetAccountId], references: [id], onDelete: SetNull)
-  areas         MembershipInvitationArea[]
+  home              Home                       @relation(fields: [homeId], references: [id], onDelete: Cascade)
+  inviter           HomeMembership             @relation("InvitationInviter", fields: [inviterMembershipId], references: [id], onDelete: Restrict)
+  targetAccount     CustomerAccount?           @relation("InvitationTarget", fields: [targetAccountId], references: [id], onDelete: SetNull)
+  areas             MembershipInvitationArea[]
+  roomAccessRequest AreaAccessRequest?
 
   @@unique([id, homeId])
   @@index([targetEmailNormalized, state, expiresAt])
@@ -1072,8 +1077,9 @@ model AreaQrCredential {
   replacedAt                DateTime?
   disabledAt                DateTime?
 
-  area           Area                @relation(fields: [areaId], references: [id], onDelete: Cascade)
+  area           Area                     @relation(fields: [areaId], references: [id], onDelete: Cascade)
   accessRequests AreaAccessRequest[]
+  emailAttempts  RoomAccessEmailAttempt[]
 
   @@unique([areaId, generation])
   @@unique([id, areaId])
@@ -1081,51 +1087,94 @@ model AreaQrCredential {
 }
 
 model AreaAccessRequest {
-  id                     String                  @id @default(uuid()) @db.Uuid
-  areaQrCredentialId     String                  @db.Uuid
-  areaId                 String                  @db.Uuid
-  homeId                 String                  @db.Uuid
-  requesterAccountId     String                  @db.Uuid
-  status                 AreaAccessRequestStatus @default(PENDING)
-  expiresAt              DateTime
-  approvedByMembershipId String?                 @db.Uuid
-  decidedAt              DateTime?
-  cancelledAt            DateTime?
-  createdAt              DateTime                @default(now())
-  updatedAt              DateTime                @updatedAt
+  id                       String                  @id @default(uuid()) @db.Uuid
+  areaQrCredentialId       String                  @db.Uuid
+  areaId                   String                  @db.Uuid
+  homeId                   String                  @db.Uuid
+  requesterAccountId       String?                 @db.Uuid
+  requesterEmailNormalized String?                 @db.VarChar(320)
+  requesterEmailHash       String?                 @db.VarChar(128)
+  emailVerifiedAt          DateTime?
+  onboardingInvitationId   String?                 @unique @db.Uuid
+  onboardingEmailStatus    String                  @default("NOT_REQUIRED") @db.VarChar(24)
+  status                   AreaAccessRequestStatus @default(PENDING)
+  expiresAt                DateTime
+  approvedByMembershipId   String?                 @db.Uuid
+  decidedAt                DateTime?
+  cancelledAt              DateTime?
+  createdAt                DateTime                @default(now())
+  updatedAt                DateTime                @updatedAt
 
-  qrCredential AreaQrCredential @relation(fields: [areaQrCredentialId], references: [id], onDelete: Restrict)
-  area         Area             @relation(fields: [areaId], references: [id], onDelete: Restrict)
-  requester    CustomerAccount  @relation(fields: [requesterAccountId], references: [id], onDelete: Cascade)
+  qrCredential            AreaQrCredential        @relation(fields: [areaQrCredentialId], references: [id], onDelete: Restrict)
+  area                    Area                    @relation(fields: [areaId], references: [id], onDelete: Restrict)
+  requester               CustomerAccount?        @relation(fields: [requesterAccountId], references: [id], onDelete: Cascade)
+  onboardingInvitation    MembershipInvitation?   @relation(fields: [onboardingInvitationId], references: [id], onDelete: SetNull)
+  prospectiveEmailAttempt RoomAccessEmailAttempt?
 
   @@unique([id, areaId, homeId])
   @@index([requesterAccountId, status, expiresAt])
+  @@index([requesterEmailHash, areaId, status, expiresAt])
   @@index([areaId, status, expiresAt])
   @@index([areaQrCredentialId, status])
 }
 
+// Pre-verification Room QR attempts are not access requests and are never
+// returned in homeowner/manager projections. Verification creates the
+// separate owner-visible AreaAccessRequest exactly once.
+model RoomAccessEmailAttempt {
+  id                       String    @id @default(uuid()) @db.Uuid
+  areaQrCredentialId       String    @db.Uuid
+  areaId                   String    @db.Uuid
+  homeId                   String    @db.Uuid
+  qrGeneration             Int
+  requesterEmailNormalized String?   @db.VarChar(320)
+  requesterEmailHash       String    @db.VarChar(128)
+  idempotencyKeyHash       String    @unique @db.VarChar(128)
+  requestHash              String    @db.VarChar(128)
+  state                    String    @default("PENDING") @db.VarChar(16)
+  expiresAt                DateTime
+  verifiedAt               DateTime?
+  areaAccessRequestId      String?   @unique @db.Uuid
+  coalescedIntoId          String?   @db.Uuid
+  createdAt                DateTime  @default(now())
+  updatedAt                DateTime  @updatedAt
+
+  qrCredential      AreaQrCredential         @relation(fields: [areaQrCredentialId, areaId], references: [id, areaId], onDelete: Restrict)
+  area              Area                     @relation(fields: [areaId, homeId], references: [id, homeId], onDelete: Restrict)
+  home              Home                     @relation(fields: [homeId], references: [id], onDelete: Restrict)
+  areaAccessRequest AreaAccessRequest?       @relation(fields: [areaAccessRequestId], references: [id], onDelete: SetNull)
+  coalescedInto     RoomAccessEmailAttempt?  @relation("RoomAccessAttemptCoalescing", fields: [coalescedIntoId], references: [id], onDelete: SetNull)
+  coalescedAttempts RoomAccessEmailAttempt[] @relation("RoomAccessAttemptCoalescing")
+
+  @@index([requesterEmailHash, areaId, state, expiresAt])
+  @@index([homeId, state, expiresAt])
+}
+
 model HomeClaimReference {
-  id                        String       @id @default(uuid()) @db.Uuid
-  homeId                    String       @db.Uuid
-  hubInstallationId         String       @db.Uuid
-  purpose                   ClaimPurpose
-  generation                Int          @default(1)
-  state                     ClaimState   @default(AVAILABLE)
-  companyQrReferenceHash    String       @db.VarChar(128)
-  transferCodeHash          String?      @db.VarChar(128)
-  resolverGeneration        Int
-  outgoingOwnerMembershipId String?      @db.Uuid
-  claimedAccountId          String?      @db.Uuid
-  issuedAt                  DateTime     @default(now())
-  reservedAt                DateTime?
-  consumedAt                DateTime?
-  cancelledAt               DateTime?
-  replacedAt                DateTime?
-  revokedAt                 DateTime?
-  invalidatedAt             DateTime?
-  auditReference            String?      @db.VarChar(160)
-  createdAt                 DateTime     @default(now())
-  updatedAt                 DateTime     @updatedAt
+  id                          String       @id @default(uuid()) @db.Uuid
+  homeId                      String       @db.Uuid
+  hubInstallationId           String       @db.Uuid
+  purpose                     ClaimPurpose
+  generation                  Int          @default(1)
+  state                       ClaimState   @default(AVAILABLE)
+  companyQrReferenceHash      String       @db.VarChar(128)
+  transferCodeHash            String?      @db.VarChar(128)
+  transferRecipientEmailHash  String?      @db.VarChar(128)
+  transferRecipientEmail      String?      @db.VarChar(320)
+  transferEmailDeliveryStatus String?      @db.VarChar(24)
+  resolverGeneration          Int
+  outgoingOwnerMembershipId   String?      @db.Uuid
+  claimedAccountId            String?      @db.Uuid
+  issuedAt                    DateTime     @default(now())
+  reservedAt                  DateTime?
+  consumedAt                  DateTime?
+  cancelledAt                 DateTime?
+  replacedAt                  DateTime?
+  revokedAt                   DateTime?
+  invalidatedAt               DateTime?
+  auditReference              String?      @db.VarChar(160)
+  createdAt                   DateTime     @default(now())
+  updatedAt                   DateTime     @updatedAt
 
   home                 Home                           @relation(fields: [homeId], references: [id], onDelete: Restrict)
   hubInstallation      HubInstallation                @relation(fields: [hubInstallationId], references: [id], onDelete: Restrict)

@@ -53,7 +53,11 @@ let customerInvitationEmailCount = 0;
 let capturedCustomerVerification;
 let capturedCustomerEmailChange;
 let capturedCustomerReset;
+let capturedOwnershipTransfer;
+let ownershipTransferEmailCount = 0;
 let capturedPublicSupportCode;
+let capturedRoomAccessCode;
+let roomAccessVerificationEmailCount = 0;
 let capturedCustomerAuthPath;
 let customerFixture;
 let fakePhysicalCommandCount = 0;
@@ -423,13 +427,17 @@ async function startFakeSes() {
         const verification = body.match(/#verify-email=([A-Za-z0-9_-]{40,64})&challenge=([0-9a-f-]{36})/i);
         const emailChange = body.match(/#change-email=([A-Za-z0-9_-]{40,64})&challenge=([0-9a-f-]{36})/i);
         const reset = body.match(/#reset-password=([A-Za-z0-9_-]{40,64})&challenge=([0-9a-f-]{36})/i);
+        const ownershipTransfer = body.match(/#ownership-transfer=(dno_transfer_[0-9a-f-]{36}_[A-Za-z0-9_-]{40,64})&challenge=([0-9a-f-]{36})/i);
         const customerAuthPath = body.match(/https:\/\/dinodia-platform-v2\.vercel\.app(\/app\/auth)#(?:verify-email|change-email|reset-password)=/i);
         if (customerAuthPath) capturedCustomerAuthPath = customerAuthPath[1];
         if (verification) capturedCustomerVerification = { token: verification[1], challengeId: verification[2] };
         if (emailChange) capturedCustomerEmailChange = { token: emailChange[1], challengeId: emailChange[2] };
         if (reset) capturedCustomerReset = { token: reset[1], challengeId: reset[2] };
+        if (ownershipTransfer) { capturedOwnershipTransfer = { reference: ownershipTransfer[1], challengeId: ownershipTransfer[2] }; ownershipTransferEmailCount += 1; }
         const publicSupportCode = body.match(/one-time support verification code is (\d{6})/i);
         if (publicSupportCode) capturedPublicSupportCode = publicSupportCode[1];
+        const roomAccessCode = body.match(/one-time Room QR email verification code is (\d{6})/i);
+        if (roomAccessCode) { capturedRoomAccessCode = roomAccessCode[1]; roomAccessVerificationEmailCount += 1; }
       }
       response.statusCode = sesShouldFail ? 500 : 200;
       response.setHeader('content-type', 'application/json');
@@ -451,11 +459,23 @@ function assertLoopbackTestEndpoint(value) {
 }
 
 async function stopPlatform() {
-  if (!platformProcess) return;
-  platformProcess.kill('SIGTERM');
-  await sleep(500);
-  if (!platformProcess.killed) platformProcess.kill('SIGKILL');
-  platformProcess = undefined;
+  const child = platformProcess;
+  if (!child) return;
+  if (child.exitCode === null && !child.killed) child.kill('SIGTERM');
+  const exited = () => child.exitCode !== null || child.signalCode !== null;
+  const waitForExit = async (timeoutMs) => {
+    if (exited()) return true;
+    return Promise.race([
+      new Promise((resolve) => child.once('exit', () => resolve(true))),
+      sleep(timeoutMs).then(() => false),
+    ]);
+  };
+  if (!await waitForExit(3000) && !exited()) {
+    child.kill('SIGKILL');
+    await waitForExit(3000);
+  }
+  if (!exited()) fail('Disposable Platform server did not stop before the next environment was started');
+  if (platformProcess === child) platformProcess = undefined;
 }
 
 async function startPlatform(runEnv) {
@@ -468,6 +488,12 @@ async function startPlatform(runEnv) {
       pending = `${pending}${chunk.toString('utf8')}`.slice(-4096);
       const lines = pending.split(/\r?\n/);
       pending = lines.pop() ?? '';
+      for (const line of lines) {
+        if (line.includes('[stage6:ownership-transfer] email submission was not accepted')) {
+          const safeCode = line.match(/\bcode:\s*['"]?([A-Za-z0-9_-]{1,64})['"]?/)?.[1];
+          if (safeCode) console.log(`[stage6:integration] ownership-transfer email handoff returned bounded code=${safeCode}`);
+        }
+      }
     });
   }
   await waitFor(async () => { try { return (await fetch(`http://127.0.0.1:${appPort}/api/health`)).status === 200; } catch { return false; } }, 'Platform server');
@@ -713,13 +739,13 @@ async function customerAuthorizationChecks(deliveryEnv) {
   const hubTwo = await prisma.hubInstallation.create({ data: { homeId: homeTwo.id, manufacturingIdentityId: identityTwo.id, serialNumberSnapshot: identityTwo.serialNumber, state: 'ACTIVE', lifecycleStatus: 'ACTIVE', cloudUrl: 'https://dinodia-harness-two.dinodiasmartliving.com', reservedHostname: 'dinodia-harness-two.dinodiasmartliving.com', cloudUrlVerifiedAt: verifiedAt, remoteChallengeAt: verifiedAt, remoteVerificationAt: verifiedAt } });
   await prisma.home.update({ where: { id: homeOne.id }, data: { activeHubInstallationId: hubOne.id } });
   await prisma.home.update({ where: { id: homeTwo.id }, data: { activeHubInstallationId: hubTwo.id } });
-  const claimReferenceValue = `harness-permanent-label-${crypto.randomUUID()}`;
+  const claimReferenceValue = `DNO-HOME-${crypto.randomBytes(32).toString('base64url')}`;
   const claimReferenceHashValue = claimReferenceHash(claimReferenceValue, env.CLAIM_REFERENCE_PEPPER);
   const claimIdentitySigning = keyPair();
   const claimIdentityEncryption = x25519KeyPair();
   const claimIdentity = await prisma.hubManufacturingIdentity.create({ data: { serialNumber: `harness-claim-${crypto.randomUUID()}`, signingPublicKey: claimIdentitySigning.publicKey, encryptionPublicKey: claimIdentityEncryption.publicKey, signingKeyFingerprint: publicKeyFingerprint(claimIdentitySigning.publicKey), encryptionKeyFingerprint: publicKeyFingerprint(claimIdentityEncryption.publicKey) } });
   const claimHome = await prisma.home.create({ data: { lifecycle: 'INSTALLING', installationStatus: 'DRAFT' } });
-  const claimHub = await prisma.hubInstallation.create({ data: { homeId: claimHome.id, manufacturingIdentityId: claimIdentity.id, serialNumberSnapshot: claimIdentity.serialNumber, state: 'PAIRING', lifecycleStatus: 'ACTIVE', permanentResolverHash: claimReferenceHashValue, permanentResolverGeneration: 1, permanentResolverStatus: 'ACTIVE' } });
+  const claimHub = await prisma.hubInstallation.create({ data: { homeId: claimHome.id, manufacturingIdentityId: claimIdentity.id, serialNumberSnapshot: claimIdentity.serialNumber, state: 'PAIRING', lifecycleStatus: 'ACTIVE', permanentResolverHash: claimReferenceHashValue, permanentResolverGeneration: 1, permanentResolverStatus: 'ACTIVE', publicHubId: crypto.randomBytes(10).toString('hex'), lanTlsReportedAt: verifiedAt, lanTlsState: 'CURRENT', lanTlsIdentityGeneration: claimIdentity.identityGeneration, lanTlsCertificateGeneration: 1, lanTlsCurrentSpkiPin: `sha256/${Buffer.alloc(32).toString('base64')}`, lanTlsCurrentNotBefore: new Date(verifiedAt.getTime() - 60_000), lanTlsCurrentNotAfter: new Date(verifiedAt.getTime() + 86_400_000) } });
   await prisma.home.update({ where: { id: claimHome.id }, data: { activeHubInstallationId: claimHub.id } });
   const claimReference = await prisma.homeClaimReference.create({ data: { homeId: claimHome.id, hubInstallationId: claimHub.id, purpose: 'INITIAL_OWNER', companyQrReferenceHash: claimReferenceHashValue, resolverGeneration: 1 } });
   const claimMachineSecret = `harness-claim-machine-${crypto.randomUUID()}`;
@@ -937,6 +963,24 @@ async function customerAuthorizationChecks(deliveryEnv) {
   // Next routes. Delivery is observed by token-state, acknowledgement is a
   // separate durable write, and activation is a third exact-version write.
   const machineBase = `http://127.0.0.1:${appPort}`;
+  const unauthenticatedLanEndpoint = await fetchJson(`${base}/api/v2/home-claims/lan-endpoint`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ reference: claimReferenceValue }) });
+  const currentLanEndpoint = await fetchJson(`${base}/api/v2/home-claims/lan-endpoint`, { method: 'POST', headers: { 'content-type': 'application/json', cookie: `dinodia_customer_session=${encodeURIComponent(rawSession)}` }, body: JSON.stringify({ reference: claimReferenceValue }) });
+  const unavailableLanEndpoint = await fetchJson(`${base}/api/v2/home-claims/lan-endpoint`, { method: 'POST', headers: { 'content-type': 'application/json', cookie: `dinodia_customer_session=${encodeURIComponent(rawSession)}` }, body: JSON.stringify({ reference: `DNO-HOME-${crypto.randomBytes(32).toString('base64url')}` }) });
+  const safeLanEndpoint = currentLanEndpoint.body?.lanEndpoint;
+  if (unauthenticatedLanEndpoint.response.status !== 401 || currentLanEndpoint.response.status !== 200
+    || currentLanEndpoint.body?.schemaVersion !== 'dinodia.v1' || currentLanEndpoint.body?.ok !== true
+    || Object.keys(currentLanEndpoint.body).sort().join(',') !== 'lanEndpoint,ok,schemaVersion'
+    || safeLanEndpoint?.origin !== `https://dinodia-${claimHub.publicHubId}.local:8123`
+    || safeLanEndpoint?.publicHubId !== claimHub.publicHubId || Object.hasOwn(safeLanEndpoint || {}, 'homeId')
+    || unavailableLanEndpoint.response.status !== 404 || JSON.stringify(unavailableLanEndpoint.body).includes(claimHome.id)) {
+    fail(`Permanent-label endpoint authority was not authenticated, fresh and data-minimal (${unauthenticatedLanEndpoint.response.status}/${currentLanEndpoint.response.status}/${unavailableLanEndpoint.response.status})`);
+  }
+  const staleLanReportedAt = claimHub.lanTlsReportedAt;
+  await prisma.hubInstallation.update({ where: { id: claimHub.id }, data: { lanTlsReportedAt: new Date(Date.now() - 421_000) } });
+  const staleLanEndpoint = await fetchJson(`${base}/api/v2/home-claims/lan-endpoint`, { method: 'POST', headers: { 'content-type': 'application/json', cookie: `dinodia_customer_session=${encodeURIComponent(rawSession)}` }, body: JSON.stringify({ reference: claimReferenceValue }) });
+  await prisma.hubInstallation.update({ where: { id: claimHub.id }, data: { lanTlsReportedAt: staleLanReportedAt } });
+  if (staleLanEndpoint.response.status !== 404 || JSON.stringify(staleLanEndpoint.body).includes(claimHome.id)) fail('Stale hub LAN identity exposed a claim endpoint or Home data');
+  console.log('[stage6:integration] PASS: actual authenticated permanent-label endpoint returns only fresh, current pinned hub identity; anonymous, unknown-label and stale-report requests deny without Home disclosure');
   const createSupportProofOfPossession = createRequire(import.meta.url)(path.join(osRoot, 'src/auth/supportProofOfPossession.js')).createSupportProofOfPossession;
   async function decryptedHubSupportRedemption({ ticketId, code }) {
     const deliveredProof = await machineRequest({ base: machineBase, path: '/api/hub-agent/support/v2/proof', machineSecret, body: { serial: identityOne.serialNumber, identityGeneration: identityOne.identityGeneration, ticketId } });
@@ -982,20 +1026,42 @@ async function customerAuthorizationChecks(deliveryEnv) {
   const resolverBodyHash = sha256(JSON.stringify(resolverProof));
   const resolverSignature = crypto.sign(null, Buffer.from(canonicalHubRequest({ method: 'POST', path: '/api/hub-agent/v2/claim/resolver/challenge', timestamp: resolverTimestamp, nonce: resolverNonce, bodyHash: resolverBodyHash }), 'utf8'), crypto.createPrivateKey(claimIdentitySigning.privateKey)).toString('base64url');
   const resolved = await fetchJson(`${machineBase}/api/internal/stage1/claim`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-stage1-contract-secret': env.STAGE1_CONTRACT_SECRET }, body: JSON.stringify({ action: 'resolve', ...resolverProof, timestamp: resolverTimestamp, nonce: resolverNonce, bodyHash: resolverBodyHash, hubSignature: resolverSignature }) });
-  if (resolved.response.status !== 200 || resolved.body.homeId !== claimHome.id) fail(`Permanent-label signed resolver proof was not accepted (${resolved.response.status})`);
+  if (resolved.response.status !== 200 || resolved.body.homeId !== claimHome.id) fail(`Permanent-label signed resolver proof was not accepted (${resolved.response.status}/${resolved.body?.error?.code || resolved.body?.errorCode || 'no-code'})`);
   const resolverReplay = await fetchJson(`${machineBase}/api/internal/stage1/claim`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-stage1-contract-secret': env.STAGE1_CONTRACT_SECRET }, body: JSON.stringify({ action: 'resolve', ...resolverProof, timestamp: resolverTimestamp, nonce: resolverNonce, bodyHash: resolverBodyHash, hubSignature: resolverSignature }) });
   if (![401, 409].includes(resolverReplay.response.status)) fail(`Permanent-label resolver replay was accepted (${resolverReplay.response.status})`);
-  const winnerAccount = await prisma.customerAccount.create({ data: { displayName: 'Claim winner', username: `claim-winner-${crypto.randomUUID()}`, usernameNormalized: `claim-winner-${crypto.randomUUID()}`, email: `claim-winner-${crypto.randomUUID()}@invalid.test`, emailNormalized: `claim-winner-${crypto.randomUUID()}@invalid.test`, emailVerifiedAt: now, passwordHash: 'harness-only-password-hash' } });
-  const loserAccount = await prisma.customerAccount.create({ data: { displayName: 'Claim loser', username: `claim-loser-${crypto.randomUUID()}`, usernameNormalized: `claim-loser-${crypto.randomUUID()}`, email: `claim-loser-${crypto.randomUUID()}@invalid.test`, emailNormalized: `claim-loser-${crypto.randomUUID()}@invalid.test`, emailVerifiedAt: now, passwordHash: 'harness-only-password-hash' } });
-  const concurrentClaims = await Promise.all([winnerAccount, loserAccount].map((candidate) => fetchJson(`${machineBase}/api/internal/stage1/claim`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-stage1-contract-secret': env.STAGE1_CONTRACT_SECRET }, body: JSON.stringify({ action: 'redeem', reference: claimReferenceValue, customerAccountId: candidate.id }) })));
+  const createPermanentLabelProof = async () => {
+    const challenge = await machineRequest({ base: machineBase, path: '/api/hub-agent/v2/claim/resolver/challenge', machineSecret: claimMachineSecret,
+      body: { serial: claimIdentity.serialNumber, identityGeneration: claimIdentity.identityGeneration, reference: claimReferenceValue } });
+    if (challenge.response.status !== 200) fail(`Customer permanent-label claim did not receive a fresh hub challenge (${challenge.response.status}/${challenge.body?.error?.code || 'no-code'})`);
+    const signed = { version: 1, serial: claimIdentity.serialNumber, identityGeneration: claimIdentity.identityGeneration,
+      challengeId: challenge.body.challengeId, challenge: challenge.body.challenge, resolverGeneration: challenge.body.resolverGeneration,
+      expiresAt: challenge.body.expiresAt };
+    const timestamp = String(Date.now());
+    const nonce = `harness-customer-resolver-${crypto.randomUUID()}`;
+    const bodyHash = sha256(JSON.stringify(signed));
+    const hubSignature = crypto.sign(null, Buffer.from(canonicalHubRequest({ method: 'POST', path: '/api/hub-agent/v2/claim/resolver/challenge', timestamp, nonce, bodyHash }), 'utf8'), crypto.createPrivateKey(claimIdentitySigning.privateKey)).toString('base64url');
+    return { ...signed, timestamp, nonce, bodyHash, hubSignature };
+  };
+  const customerClaimRequests = await Promise.all([
+    { accountId: account.id, rawSession, proof: await createPermanentLabelProof(), key: `label-claim-${crypto.randomUUID()}` },
+    { accountId: propertyAccount.id, rawSession: propertyRawSession, proof: await createPermanentLabelProof(), key: `label-claim-${crypto.randomUUID()}` },
+  ].map(async (candidate) => ({ accountId: candidate.accountId, ...(await fetchJson(`${base}/api/v2/home-claims/resolve`, {
+    method: 'POST', headers: { 'content-type': 'application/json', cookie: `dinodia_customer_session=${encodeURIComponent(candidate.rawSession)}`, 'idempotency-key': candidate.key },
+    body: JSON.stringify({ reference: claimReferenceValue, resolverProof: candidate.proof }),
+  })) })));
+  const concurrentClaims = customerClaimRequests;
   const claimSuccesses = concurrentClaims.filter((entry) => entry.response.status === 200);
   const claimLosers = concurrentClaims.filter((entry) => entry.response.status === 409);
-  if (claimSuccesses.length !== 1 || claimLosers.length !== 1 || JSON.stringify(claimLosers[0].body).includes(claimHome.id)) fail(`Claim reservation was not first-wins and private (${concurrentClaims.map((entry) => entry.response.status).join('/')})`);
-  const winningAccountId = concurrentClaims[0].response.status === 200 ? winnerAccount.id : loserAccount.id;
-  const losingAccountId = concurrentClaims[0].response.status === 200 ? loserAccount.id : winnerAccount.id;
-  const reservationId = claimSuccesses[0].body.reservationId;
+  if (claimSuccesses.length !== 1 || claimLosers.length !== 1 || JSON.stringify(claimLosers[0].body).includes(claimHome.id)) fail(`Two real verified accounts using fresh permanent-label proofs were not first-wins/private (${concurrentClaims.map((entry) => `${entry.response.status}/${entry.body?.error?.code || 'ok'}`).join('/')})`);
+  const winningAccountId = claimSuccesses[0].accountId;
+  const losingAccountId = claimLosers[0].accountId;
+  const reservationId = claimSuccesses[0].body.claimId;
   const claimHeaders = { 'content-type': 'application/json', 'x-stage1-contract-secret': env.STAGE1_CONTRACT_SECRET };
-  const claimAction = (body, extraHeaders = {}) => fetchJson(`${machineBase}/api/internal/stage1/claim`, { method: 'POST', headers: { ...claimHeaders, ...extraHeaders }, body: JSON.stringify(body) });
+  const claimAction = async (body, extraHeaders = {}) => {
+    const resolvedBody = body.action === 'redeem' && body.reference === claimReferenceValue && !body.resolverProof
+      ? { ...body, resolverProof: await createPermanentLabelProof() } : body;
+    return fetchJson(`${machineBase}/api/internal/stage1/claim`, { method: 'POST', headers: { ...claimHeaders, ...extraHeaders }, body: JSON.stringify(resolvedBody) });
+  };
   const snapshotClaimSetup = async (targetReservationId, targetAccountId, targetHomeId) => {
     const [reservation, pendingSetup, home, customerAccount, policyAcceptances, sessions, trustedDevices] = await Promise.all([
       prisma.homeClaimReservation.findUniqueOrThrow({ where: { id: targetReservationId }, select: { state: true, expiresAt: true, setupRevision: true, lastQualifyingMutationAt: true, updatedAt: true, claimReference: { select: { state: true, claimedAccountId: true, consumedAt: true } } } }),
@@ -1014,9 +1080,12 @@ async function customerAuthorizationChecks(deliveryEnv) {
     const claimReferenceLocked = new Promise((resolve) => { signalLocked = resolve; });
     const claimReferenceHold = new Promise((resolve) => { releaseLock = resolve; });
     const expiresAt = new Date(Date.now() + 1200);
+    // Commit the soon-to-expire reservation before taking the reference lock.
+    // Otherwise the route can queue on this fixture UPDATE itself and never
+    // reach the real serialization lock whose post-wait clock we are testing.
+    await prisma.homeClaimReservation.update({ where: { id: targetReservationId }, data: { createdAt: new Date(Date.now() - 2000), expiresAt } });
     const lockTransaction = prisma.$transaction(async (tx) => {
       await tx.$queryRaw`SELECT "id" FROM "HomeClaimReference" WHERE "id" = ${claimReference.id}::uuid FOR UPDATE`;
-      await tx.homeClaimReservation.update({ where: { id: targetReservationId }, data: { createdAt: new Date(Date.now() - 2000), expiresAt } });
       signalLocked();
       await claimReferenceHold;
     });
@@ -1029,10 +1098,11 @@ async function customerAuthorizationChecks(deliveryEnv) {
       await sleep(25);
     }
     if (!requestWaitingForLock) {
+      const lockWaits = await prisma.$queryRaw`SELECT wait_event, left(query, 180) AS query_shape FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock'`;
       releaseLock();
       await lockTransaction;
-      await routePromise;
-      fail(`${label} did not reach the real claim-reference lock`);
+      const completed = await routePromise;
+      fail(`${label} did not reach the real claim-reference lock (route=${completed.response.status}/${completed.body?.errorCode || completed.body?.error?.code || 'ok'}; lockWaits=${JSON.stringify(lockWaits.map(({ wait_event, query_shape }) => ({ wait_event, query_shape: String(query_shape).replace(/\s+/g, ' ').slice(0, 120) })))})`);
     }
     const remaining = expiresAt.getTime() - Date.now();
     if (remaining > 0) await sleep(remaining + 30);
@@ -1044,7 +1114,7 @@ async function customerAuthorizationChecks(deliveryEnv) {
   const claimHolderThumbprint = crypto.createHash('sha256').update(crypto.createPublicKey(claimHolderPhone.publicKey).export({ type: 'spki', format: 'der' })).digest('hex');
   const claimHolderTrusted = await prisma.trustedDevice.create({ data: { customerAccountId: winningAccountId, deviceInstallationId: `claim-holder-${crypto.randomUUID()}`, publicKey: claimHolderPhone.publicKey, publicKeyThumbprint: claimHolderThumbprint, deviceName: 'Disposable claim holder phone' } });
   await prisma.customerSession.create({ data: { customerAccountId: winningAccountId, trustedDeviceId: claimHolderTrusted.id, refreshTokenHash: sha256(`claim-holder-session-${crypto.randomUUID()}`), securityVersion: 1, trustedDeviceSessionVersion: 1, expiresAt: new Date(Date.now() + 3600000) } });
-  const repeatedClaim = await fetchJson(`${machineBase}/api/internal/stage1/claim`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-stage1-contract-secret': env.STAGE1_CONTRACT_SECRET }, body: JSON.stringify({ action: 'redeem', reference: claimReferenceValue, customerAccountId: winningAccountId }) });
+  const repeatedClaim = await claimAction({ action: 'redeem', reference: claimReferenceValue, customerAccountId: winningAccountId });
   if (repeatedClaim.response.status !== 200 || repeatedClaim.body.reservationId !== reservationId || repeatedClaim.body.expiresAt !== claimSuccesses[0].body.expiresAt) fail('Claim polling/idempotent replay changed the reservation deadline');
   const initialProfile = { displayName: 'Claim winner updated', username: `claim-updated-${crypto.randomUUID()}` };
   const mutation = await claimAction({ action: 'mutate', reservationId, customerAccountId: winningAccountId, step: 'PROFILE', mutation: initialProfile });
@@ -1099,34 +1169,44 @@ async function customerAuthorizationChecks(deliveryEnv) {
   const afterExpiredMutation = await snapshotClaimSetup(reservationId, winningAccountId, claimHome.id);
   if (expiredMutation.response.status !== 409 || JSON.stringify(afterExpiredMutation) !== JSON.stringify(beforeExpiredMutation)) fail('A setup mutation revived or changed an expired reservation');
   console.log('[stage3:integration] PASS: invalid PROFILE validation and a request queued across exact claim expiry preserve all account/setup/claim rows and authority');
-  const expiredClaim = await fetchJson(`${machineBase}/api/internal/stage1/claim`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-stage1-contract-secret': env.STAGE1_CONTRACT_SECRET }, body: JSON.stringify({ action: 'redeem', reference: claimReferenceValue, customerAccountId: losingAccountId }) });
+  const expiredClaim = await claimAction({ action: 'redeem', reference: claimReferenceValue, customerAccountId: losingAccountId });
   if (expiredClaim.response.status !== 409) fail(`Expired claim did not return the bounded restart error (${expiredClaim.response.status})`);
-  const deletedWinner = await prisma.customerAccount.findUnique({ where: { id: winningAccountId }, select: { id: true } });
+  const survivingWinner = await prisma.customerAccount.findUnique({ where: { id: winningAccountId }, select: { id: true } });
+  const winnerRelationships = await prisma.homeMembership.findMany({ where: { customerAccountId: winningAccountId, status: 'ACTIVE' }, orderBy: { id: 'asc' }, select: { id: true, homeId: true, role: true } });
+  const winnerSessions = await prisma.customerSession.count({ where: { customerAccountId: winningAccountId, revokedAt: null } });
+  const winnerDevices = await prisma.trustedDevice.count({ where: { customerAccountId: winningAccountId, revokedAt: null } });
+  const expiredReservation = await prisma.homeClaimReservation.findUnique({ where: { id: reservationId }, select: { state: true } });
+  const expiredDraft = await prisma.pendingHomeSetup.findUnique({ where: { reservationId }, select: { id: true } });
   const resetClaim = await prisma.homeClaimReference.findUnique({ where: { id: claimReference.id }, select: { state: true } });
   const resetHome = await prisma.home.findUnique({ where: { id: claimHome.id }, select: { lifecycle: true } });
-  if (deletedWinner || resetClaim?.state !== 'AVAILABLE' || resetHome?.lifecycle !== 'CLAIMABLE') fail('Expired claim cleanup did not commit before returning its error');
-  if (!(await prisma.customerAccount.findUnique({ where: { id: losingAccountId }, select: { id: true } })) || await prisma.trustedDevice.count({ where: { id: claimHolderTrusted.id } }) || await prisma.customerSession.count({ where: { customerAccountId: winningAccountId } })) fail('Expired holder cleanup deleted the unrelated scanner or retained the holder session/trusted device');
-  const secondHolder = await fetchJson(`${machineBase}/api/internal/stage1/claim`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-stage1-contract-secret': env.STAGE1_CONTRACT_SECRET }, body: JSON.stringify({ action: 'redeem', reference: claimReferenceValue, customerAccountId: losingAccountId }) });
+  if (!survivingWinner || !winnerRelationships.length || !winnerSessions || !winnerDevices || expiredReservation?.state !== 'EXPIRED' || expiredDraft
+    || resetClaim?.state !== 'AVAILABLE' || resetHome?.lifecycle !== 'CLAIMABLE') fail('Expired claim cleanup did not release its draft while preserving the holder account’s valid membership/session/device');
+  if (!(await prisma.customerAccount.findUnique({ where: { id: losingAccountId }, select: { id: true } })) || await prisma.trustedDevice.count({ where: { id: claimHolderTrusted.id } }) === 0) fail('Expiry deleted the unrelated scanner or failed to preserve the holder’s valid authority');
+  const secondHolder = await claimAction({ action: 'redeem', reference: claimReferenceValue, customerAccountId: losingAccountId });
   if (secondHolder.response.status !== 200) fail('Unrelated survivor could not reserve after prior holder cleanup');
   await prisma.homeClaimReservation.update({ where: { id: secondHolder.body.reservationId }, data: { createdAt: new Date(Date.now() - 2000), expiresAt: new Date(Date.now() - 1000) } });
-  const secondExpiry = await fetchJson(`${machineBase}/api/internal/stage1/claim`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-stage1-contract-secret': env.STAGE1_CONTRACT_SECRET }, body: JSON.stringify({ action: 'redeem', reference: claimReferenceValue, customerAccountId: account.id }) });
-  if (secondExpiry.response.status !== 409 || await prisma.customerAccount.findUnique({ where: { id: losingAccountId }, select: { id: true } })) fail('Second expiry did not clean only its actual holder');
+  const secondExpiry = await claimAction({ action: 'redeem', reference: claimReferenceValue, customerAccountId: account.id });
+  const survivingSecondHolderMemberships = await prisma.homeMembership.count({ where: { customerAccountId: losingAccountId, status: 'ACTIVE' } });
+  const survivingSecondHolderSessions = await prisma.customerSession.count({ where: { customerAccountId: losingAccountId, revokedAt: null } });
+  const survivingSecondHolderDevices = await prisma.trustedDevice.count({ where: { customerAccountId: losingAccountId, revokedAt: null } });
+  if (secondExpiry.response.status !== 409 || !await prisma.customerAccount.findUnique({ where: { id: losingAccountId }, select: { id: true } })
+    || !survivingSecondHolderMemberships || !survivingSecondHolderSessions || !survivingSecondHolderDevices) fail('Second expiry did not preserve the holder’s unrelated valid property relationships and account authority');
   if (!(await prisma.customerAccount.findUnique({ where: { id: account.id }, select: { id: true } })) || !(await prisma.homeMembership.findUnique({ where: { id: tenantMembership.id }, select: { id: true } })) || !(await prisma.trustedDevice.findUnique({ where: { id: trusted.id }, select: { id: true } })) || !(await prisma.customerSession.findFirst({ where: { customerAccountId: account.id, revokedAt: null }, select: { id: true } }))) fail('A different verified scanner lost account, membership, trusted device or session during holder expiry');
   // A verified account with another active property relationship survives the
   // same expiry transaction. This is the settled account-preservation rule.
-  const preservedReservation = await fetchJson(`${machineBase}/api/internal/stage1/claim`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-stage1-contract-secret': env.STAGE1_CONTRACT_SECRET }, body: JSON.stringify({ action: 'redeem', reference: claimReferenceValue, customerAccountId: propertyAccount.id }) });
+  const preservedReservation = await claimAction({ action: 'redeem', reference: claimReferenceValue, customerAccountId: propertyAccount.id });
   if (preservedReservation.response.status !== 200) fail(`Account-preserving claim reservation could not be created (${preservedReservation.response.status})`);
   const preservedCreatedAt = new Date(Date.now() - 2000);
   const preservedExpiresAt = new Date(Date.now() - 1000);
   await prisma.homeClaimReservation.update({ where: { id: preservedReservation.body.reservationId }, data: { createdAt: preservedCreatedAt, expiresAt: preservedExpiresAt } });
-  const preservedExpired = await fetchJson(`${machineBase}/api/internal/stage1/claim`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-stage1-contract-secret': env.STAGE1_CONTRACT_SECRET }, body: JSON.stringify({ action: 'redeem', reference: claimReferenceValue, customerAccountId: propertyAccount.id }) });
+  const preservedExpired = await claimAction({ action: 'redeem', reference: claimReferenceValue, customerAccountId: propertyAccount.id });
   if (preservedExpired.response.status !== 409) fail(`Account-preserving claim expiry returned the wrong status (${preservedExpired.response.status})`);
   if (!(await prisma.customerAccount.findUnique({ where: { id: propertyAccount.id }, select: { id: true } }))) fail('Claim expiry deleted an account with another active property relationship');
   // The shared native-operations dispatcher must perform the same cleanup,
   // not a feature-specific schedule. This uses the real authenticated cron
   // route with an already-expired durable reservation.
   const scheduledAccount = await prisma.customerAccount.create({ data: { displayName: 'Scheduled claim expiry', username: `claim-scheduled-${crypto.randomUUID()}`, usernameNormalized: `claim-scheduled-${crypto.randomUUID()}`, email: `claim-scheduled-${crypto.randomUUID()}@invalid.test`, emailNormalized: `claim-scheduled-${crypto.randomUUID()}@invalid.test`, emailVerifiedAt: now, passwordHash: 'harness-only-password-hash' } });
-  const scheduledReservation = await fetchJson(`${machineBase}/api/internal/stage1/claim`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-stage1-contract-secret': env.STAGE1_CONTRACT_SECRET }, body: JSON.stringify({ action: 'redeem', reference: claimReferenceValue, customerAccountId: scheduledAccount.id }) });
+  const scheduledReservation = await claimAction({ action: 'redeem', reference: claimReferenceValue, customerAccountId: scheduledAccount.id });
   if (scheduledReservation.response.status !== 200) fail(`Scheduled claim reservation could not be created (${scheduledReservation.response.status})`);
   await prisma.homeClaimReservation.update({ where: { id: scheduledReservation.body.reservationId }, data: { createdAt: new Date(Date.now() - 2000), expiresAt: new Date(Date.now() - 1000) } });
   const scheduledRuns = await Promise.all([0, 1].map(() => fetchJson(`${machineBase}/api/cron/native-operations`, { method: 'POST', headers: { authorization: `Bearer ${env.CRON_SECRET}` } })));
@@ -1155,7 +1235,11 @@ async function customerAuthorizationChecks(deliveryEnv) {
   const redeemRaceAccount = await prisma.customerAccount.create({ data: { displayName: 'Redeem lock boundary', username: `redeem-lock-${crypto.randomUUID()}`, usernameNormalized: `redeem-lock-${crypto.randomUUID()}`, email: `redeem-lock-${crypto.randomUUID()}@invalid.test`, emailNormalized: `redeem-lock-${crypto.randomUUID()}@invalid.test`, emailVerifiedAt: now, passwordHash: 'harness-only-password-hash' } });
   const redeemRaceClaim = await claimAction({ action: 'redeem', reference: claimReferenceValue, customerAccountId: redeemRaceAccount.id });
   if (redeemRaceClaim.response.status !== 200) fail('Could not create disposable reservation for queued redemption boundary');
-  const queuedRedemption = await queueClaimRoutePastExpiry(redeemRaceClaim.body.reservationId, () => claimAction({ action: 'redeem', reference: claimReferenceValue, customerAccountId: redeemRaceAccount.id }), 'Claim redemption');
+  // Issue the real hub challenge before the lock holder starts: challenge
+  // issuance itself checks the HomeClaimReference foreign key and would wait
+  // on the fixture lock before the actual redemption route reached it.
+  const queuedRedemptionProof = await createPermanentLabelProof();
+  const queuedRedemption = await queueClaimRoutePastExpiry(redeemRaceClaim.body.reservationId, () => claimAction({ action: 'redeem', reference: claimReferenceValue, customerAccountId: redeemRaceAccount.id, resolverProof: queuedRedemptionProof }), 'Claim redemption');
   const [redeemRaceReservation, redeemRaceReference, redeemRaceHome, redeemRaceDraft, redeemRaceSurvivor] = await Promise.all([
     prisma.homeClaimReservation.findUnique({ where: { id: redeemRaceClaim.body.reservationId }, select: { state: true } }),
     prisma.homeClaimReference.findUnique({ where: { id: claimReference.id }, select: { state: true, consumedAt: true } }),
@@ -1337,7 +1421,6 @@ async function customerAuthorizationChecks(deliveryEnv) {
   await prisma.customerAccount.delete({ where: { id: pendingAccount.id } });
   await prisma.employeeSession.deleteMany({ where: { employeeId: staff.id } });
   await prisma.companyEmployeeAccount.delete({ where: { id: staff.id } });
-  await prisma.customerAccount.deleteMany({ where: { id: { in: [winnerAccount.id, loserAccount.id] } } });
   const tokenState = await machineRequest({ base: machineBase, path: '/api/hub-agent/token-state', machineSecret, body: { serial: identityOne.serialNumber, identityGeneration: identityOne.identityGeneration, operatorCredentialVersion: 1 } });
   if (tokenState.response.status !== 200 || tokenState.body.operatorCredentialDelivery?.version !== 2) fail(`Operator credential delivery did not expose the next version (${tokenState.response.status})`);
   if (tokenState.body.hubInstallId !== hubOne.id) fail('Authenticated token-state did not return this machine identity\'s canonical hub installation ID');
@@ -2275,7 +2358,7 @@ async function customerAuthorizationChecks(deliveryEnv) {
   const operatorSession = operatorLogin.session;
   const operatorToken = operatorLogin.token;
   const operatorWork = await prisma.companyOperationalWorkItem.create({ data: { publicReference: `DIN-${sha256(`handoff-${crypto.randomUUID()}`).slice(0, 16).toUpperCase()}`, kind: 'INITIAL_HUB_INSTALLATION', state: 'ASSIGNED', homeId: homeOne.id, hubInstallationId: hubOne.id, certifiedSerialNumber: identityOne.serialNumber, assignedEmployeeId: operatorEmployee.id, createdByEmployeeId: operatorEmployee.id, reason: 'Disposable browser-bound operator handoff test' } });
-  customerFixture = { accountId: account.id, loginEmail: email, loginPassword: customerPassword, loginInstallationId: trustedInstallationId, loginPublicKey: phone.publicKey, sessionId: session.id, trustedDeviceId: trusted.id, trustedPhonePrivateKey: phone.privateKey, customerSessionSecret: rawSession, offlineAuthorisationId: tenantOffline.body.authorisation.id, revocableTrustedDeviceId: revocableTrustedDevice.id, revocableRawSession, revocablePhonePrivateKey: revocablePhone.privateKey, revocableOfflineAuthorisationId: revocableOffline.body.authorisation.id, propertyAccountId: propertyAccount.id, propertySessionId: propertySession.id, propertyTrustedDeviceId: propertyTrusted.id, managerAccountId: managerAccount.id, managerMembershipId: managerMembership.id, managerSessionId: managerSession.id, managerTrustedDeviceId: managerTrusted.id, homeOneId: homeOne.id, homeTwoId: homeTwo.id, hubOneId: hubOne.id, hubTwoId: hubTwo.id, identityOneId: identityOne.id, identityTwoId: identityTwo.id, tenantDeviceId: tenantDevice.id, machineSecret, tenantMembershipId: tenantMembership.id, ownerMembershipId: ownerMembership.id, propertyMembershipId: propertyMembership.id, areaOneId: areaOne.id, areaOneOsId: areaOne.osAreaId, areaTwoId: areaTwo.id, areaTwoOsId: areaTwo.osAreaId, tenantToken: tenantToken.body.token, ownerToken: ownerToken.body.token, propertyToken: propertyToken.body.token, managerToken: managerToken.body.token, ticketId, stepUpTicketId, identityOneSigningPrivateKey: identityOneSigning.privateKey, identityOneSigningPublicKey: identityOneSigning.publicKey, identityOneEncryptionPrivateKey: identityOneEncryption.privateKey, identityOneEncryptionPublicKey: identityOneEncryption.publicKey, identityOneSerial: identityOne.serialNumber, identityOneGeneration: identityOne.identityGeneration, operatorEmployeeId: operatorEmployee.id, operatorSessionId: operatorSession.id, operatorWorkId: operatorWork.id, operatorToken };
+  customerFixture = { accountId: account.id, loginEmail: email, loginPassword: customerPassword, loginInstallationId: trustedInstallationId, loginPublicKey: phone.publicKey, sessionId: session.id, trustedDeviceId: trusted.id, trustedPhonePrivateKey: phone.privateKey, customerSessionSecret: rawSession, offlineAuthorisationId: tenantOffline.body.authorisation.id, revocableTrustedDeviceId: revocableTrustedDevice.id, revocableRawSession, revocablePhonePrivateKey: revocablePhone.privateKey, revocableOfflineAuthorisationId: revocableOffline.body.authorisation.id, propertyAccountId: propertyAccount.id, propertyEmail, propertySessionId: propertySession.id, propertySessionSecret: propertyRawSession, propertyTrustedDeviceId: propertyTrusted.id, propertyTrustedPhonePrivateKey: propertyPhone.privateKey, managerAccountId: managerAccount.id, managerEmail, managerMembershipId: managerMembership.id, managerSessionId: managerSession.id, managerSessionSecret: managerRawSession, managerTrustedDeviceId: managerTrusted.id, homeOneId: homeOne.id, homeTwoId: homeTwo.id, hubOneId: hubOne.id, hubTwoId: hubTwo.id, identityOneId: identityOne.id, identityTwoId: identityTwo.id, identityTwoSerial: identityTwo.serialNumber, identityTwoGeneration: identityTwo.identityGeneration, identityTwoSigningPrivateKey: identityTwoSigning.privateKey, tenantDeviceId: tenantDevice.id, machineSecret, tenantMembershipId: tenantMembership.id, ownerMembershipId: ownerMembership.id, propertyMembershipId: propertyMembership.id, areaOneId: areaOne.id, areaOneOsId: areaOne.osAreaId, areaTwoId: areaTwo.id, areaTwoOsId: areaTwo.osAreaId, tenantToken: tenantToken.body.token, ownerToken: ownerToken.body.token, propertyToken: propertyToken.body.token, managerToken: managerToken.body.token, ticketId, stepUpTicketId, identityOneSigningPrivateKey: identityOneSigning.privateKey, identityOneSigningPublicKey: identityOneSigning.publicKey, identityOneEncryptionPrivateKey: identityOneEncryption.privateKey, identityOneEncryptionPublicKey: identityOneEncryption.publicKey, identityOneSerial: identityOne.serialNumber, identityOneGeneration: identityOne.identityGeneration, operatorEmployeeId: operatorEmployee.id, operatorSessionId: operatorSession.id, operatorWorkId: operatorWork.id, operatorToken };
 }
 
 async function mobileSessionContractChecks() {
@@ -2494,6 +2577,232 @@ async function tenantMembershipRemovalChecks() {
   console.log('[stage6:integration] PASS: actual tenant-access route proves wrong-home/stale-revision zero-effect denial, fresh proof, selected-membership-only removal, other-home preservation, idempotent retry, final-account warning and account-wide cleanup');
 }
 
+async function ownershipTransferChecks(deliveryEnv) {
+  const base = `http://127.0.0.1:${appPort}`;
+  const fixture = customerFixture;
+  if (!fixture) fail('Ownership transfer checks require the disposable two-home customer fixture');
+  // Earlier operator/OS checks intentionally restart Platform without email
+  // configuration. Re-enter the isolated loopback SES environment before
+  // asserting recipient delivery; never rely on a stale child process.
+  await stopPlatform();
+  await startPlatform(deliveryEnv);
+  const homeId = fixture.homeTwoId;
+  const ownerHeaders = (raw, selectedHomeId = homeId) => ({ cookie: `dinodia_customer_session=${encodeURIComponent(raw)}`,
+    'x-dinodia-home-id': selectedHomeId, 'content-type': 'application/json' });
+  const senderHeaders = ownerHeaders(fixture.customerSessionSecret);
+  const recipientHeaders = { cookie: `dinodia_customer_session=${encodeURIComponent(fixture.propertySessionSecret)}`, 'content-type': 'application/json' };
+  // The initiating owner is a valid, policy-current but deliberately wrong
+  // recipient for resolver-denial checks; the fixture's unrelated manager is
+  // not required to have completed the customer policy gate.
+  const wrongRecipientHeaders = senderHeaders;
+  const acceptHarnessPolicy = async (headers) => fetchJson(`${base}/api/v2/auth/policy/acceptance`, { method: 'POST', headers,
+    body: JSON.stringify({ version: deliveryEnv.DINODIA_NATIVE_POLICY_VERSION,
+      contentSha256: sha256(deliveryEnv.DINODIA_NATIVE_POLICY_TEXT), accepted: true }) });
+  const recipientPolicy = await acceptHarnessPolicy(recipientHeaders);
+  if (recipientPolicy.response.status !== 200) {
+    fail(`The disposable transfer recipient must explicitly accept the current policy before transfer resolution (${JSON.stringify({ recipient: recipientPolicy.response.status })})`);
+  }
+  const transferRows = () => prisma.homeClaimReference.findMany({ where: { homeId, purpose: 'OWNERSHIP_TRANSFER' }, select: { id: true, state: true } });
+  const proofFor = async (identity, rawSession, targetIds, value, selectedHomeId = homeId) => {
+    const headers = ownerHeaders(rawSession, selectedHomeId);
+    const challenge = await fetchJson(`${base}/api/v2/security/step-up/challenge`, { method: 'POST', headers,
+      body: JSON.stringify({ operationKind: 'home.transfer', targetIds, value }) });
+    if (challenge.response.status !== 200) fail(`Ownership transfer step-up challenge denied (${challenge.response.status}/${challenge.body?.error?.code ?? 'no-code'})`);
+    const signature = crypto.sign(null, stepUpChallengeMessage({ challengeId: challenge.body.challengeId, nonce: challenge.body.nonce,
+      operationDigest: challenge.body.operationDigest }), crypto.createPrivateKey(identity.privateKey)).toString('base64url');
+    const proof = await fetchJson(`${base}/api/v2/security/step-up/issue`, { method: 'POST', headers,
+      body: JSON.stringify({ challengeId: challenge.body.challengeId, nonce: challenge.body.nonce, deviceSignature: signature }) });
+    if (proof.response.status !== 200 || typeof proof.body?.proof !== 'string') fail(`Ownership transfer device proof was not issued (${proof.response.status}/${proof.body?.error?.code ?? 'no-code'})`);
+    return proof.body.proof;
+  };
+  const homeBefore = await prisma.home.findUniqueOrThrow({ where: { id: homeId }, select: { managementRevision: true, lifecycle: true, installationStatus: true, activeHubInstallationId: true } });
+  if (homeBefore.lifecycle !== 'ACTIVE' || homeBefore.installationStatus !== 'COMPLETE' || homeBefore.activeHubInstallationId !== fixture.hubTwoId) fail('Transfer fixture is not the already-completed disposable Home');
+
+  const managerOnTransferHome = await prisma.homeMembership.create({ data: { customerAccountId: fixture.managerAccountId, homeId, role: 'PROPERTY_MANAGER' } });
+  const transferTenantUsername = `transfer-tenant-${crypto.randomUUID().slice(0, 10)}`;
+  const transferTenantEmail = `transfer-tenant-${crypto.randomUUID()}@invalid.test`;
+  const transferTenantAccount = await prisma.customerAccount.create({ data: {
+    displayName: 'Preserved transfer tenant', username: transferTenantUsername, usernameNormalized: transferTenantUsername,
+    email: transferTenantEmail, emailNormalized: transferTenantEmail, emailVerifiedAt: new Date(), passwordHash: 'harness-only-password-hash',
+  } });
+  const transferTenant = await prisma.homeMembership.create({ data: { customerAccountId: transferTenantAccount.id, homeId, role: 'TENANT' } });
+  const transferTenantGrant = await prisma.tenantAreaGrant.create({ data: { membershipId: transferTenant.id, areaId: fixture.areaTwoId, homeId } });
+  const startingRows = await transferRows();
+  const startingHomeOneTenant = await prisma.homeMembership.findUniqueOrThrow({ where: { id: fixture.tenantMembershipId }, select: { status: true, role: true } });
+  const noProof = await fetchJson(`${base}/api/v2/homes/${homeId}/ownership-transfer`, { method: 'POST', headers: senderHeaders,
+    body: JSON.stringify({ action: 'START', recipientEmail: `stage6-no-proof-${crypto.randomUUID()}@invalid.test`, expectedManagementRevision: homeBefore.managementRevision,
+      proof: crypto.randomBytes(48).toString('base64url'), idempotencyKey: `transfer-no-proof-${crypto.randomUUID()}` }) });
+  const afterNoProof = await transferRows();
+  const wrongHome = await fetchJson(`${base}/api/v2/homes/${fixture.homeOneId}/ownership-transfer`, { headers: senderHeaders });
+  const managerDenied = await fetchJson(`${base}/api/v2/homes/${homeId}/ownership-transfer`, { headers: ownerHeaders(fixture.managerSessionSecret, homeId) });
+  const afterAllDenied = await transferRows();
+  if (noProof.response.status !== 403 || noProof.body?.error?.code !== 'STEP_UP_REQUIRED' || JSON.stringify(startingRows) !== JSON.stringify(afterNoProof)
+    || wrongHome.response.status !== 404 || ![403, 404].includes(managerDenied.response.status)
+    || JSON.stringify(startingRows) !== JSON.stringify(afterAllDenied)
+    || JSON.stringify(await prisma.homeMembership.findUniqueOrThrow({ where: { id: fixture.tenantMembershipId }, select: { status: true, role: true } })) !== JSON.stringify(startingHomeOneTenant)) {
+    fail(`Missing proof, wrong selected Home or manager access created transfer authority or changed unrelated membership state (${JSON.stringify({ noProof: noProof.response.status, noProofCode: noProof.body?.error?.code,
+      wrongHome: wrongHome.response.status, manager: managerDenied.response.status, managerCode: managerDenied.body?.error?.code, rowsBefore: startingRows.length, rowsAfter: afterAllDenied.length,
+      unrelatedTenant: await prisma.homeMembership.findUniqueOrThrow({ where: { id: fixture.tenantMembershipId }, select: { status: true, role: true } }) })})`);
+  }
+
+  const startingValue = { action: 'START', recipientEmailNormalized: fixture.propertyEmail.toLowerCase(),
+    expectedManagementRevision: homeBefore.managementRevision, confirmation: `I confirm transfer of this Home to ${fixture.propertyEmail.toLowerCase()}` };
+  const startProof = await proofFor({ privateKey: fixture.trustedPhonePrivateKey }, fixture.customerSessionSecret,
+    [homeId, fixture.ownerMembershipId], startingValue);
+  capturedOwnershipTransfer = null;
+  const firstTransferKey = `home-transfer-${crypto.randomUUID()}`;
+  const startBody = { action: 'START', recipientEmail: fixture.propertyEmail, expectedManagementRevision: homeBefore.managementRevision,
+    proof: startProof, idempotencyKey: firstTransferKey };
+  const emailCountBeforeStart = ownershipTransferEmailCount;
+  const firstStart = await fetchJson(`${base}/api/v2/homes/${homeId}/ownership-transfer`, { method: 'POST', headers: senderHeaders, body: JSON.stringify(startBody) });
+  const firstRow = firstStart.body?.transferId ? await prisma.homeClaimReference.findUnique({ where: { id: firstStart.body.transferId }, select: { purpose: true, state: true, transferRecipientEmailHash: true, transferEmailDeliveryStatus: true, consumedAt: true, cancelledAt: true } }) : null;
+  const firstStartRetry = await fetchJson(`${base}/api/v2/homes/${homeId}/ownership-transfer`, { method: 'POST', headers: senderHeaders, body: JSON.stringify(startBody) });
+  const conflictingStart = await fetchJson(`${base}/api/v2/homes/${homeId}/ownership-transfer`, { method: 'POST', headers: senderHeaders,
+    body: JSON.stringify({ ...startBody, recipientEmail: 'different-recipient@invalid.test' }) });
+  if (firstStart.response.status !== 202 || firstStart.body?.state !== 'PENDING' || firstRow?.purpose !== 'OWNERSHIP_TRANSFER'
+    || firstRow.state !== 'AVAILABLE' || firstRow.consumedAt || firstRow.cancelledAt || firstRow.transferEmailDeliveryStatus !== 'ACCEPTED'
+    || !new RegExp(`^dno_transfer_${firstStart.body.transferId}_[A-Za-z0-9_-]{43}$`).test(firstStart.body.reference ?? '')
+    || firstStartRetry.response.status !== 202 || firstStartRetry.body.idempotentReplay !== true
+    || firstStartRetry.body.reference !== firstStart.body.reference || conflictingStart.response.status !== 409
+    || !capturedOwnershipTransfer || capturedOwnershipTransfer.reference !== firstStart.body.reference
+    || ownershipTransferEmailCount !== emailCountBeforeStart + 1) {
+    fail(`Owner transfer start, stable QR/email identity or request idempotency failed (${JSON.stringify({ status: firstStart.response.status, retry: firstStartRetry.response.status, conflict: conflictingStart.response.status, emailCaptured: Boolean(capturedOwnershipTransfer), mailStatus: firstRow?.transferEmailDeliveryStatus })})`);
+  }
+  const firstStatus = await fetchJson(`${base}/api/v2/homes/${homeId}/ownership-transfer`, { headers: senderHeaders });
+  if (firstStatus.response.status !== 200 || firstStatus.body?.activeTransfer?.transferId !== firstStart.body.transferId
+    || firstStatus.body.activeTransfer.expiresAt !== null || firstStatus.body.activeTransfer.state !== 'PENDING') fail('Owner transfer status did not report its current non-expiring state safely');
+
+  const cancelValue = { action: 'CANCEL', transferId: firstStart.body.transferId, expectedTransferUpdatedAt: firstStatus.body.activeTransfer.updatedAt,
+    confirmation: 'I cancel this ownership transfer' };
+  const cancelProof = await proofFor({ privateKey: fixture.trustedPhonePrivateKey }, fixture.customerSessionSecret,
+    [homeId, fixture.ownerMembershipId, firstStart.body.transferId], cancelValue);
+  const cancelKey = `home-transfer-cancel-${crypto.randomUUID()}`;
+  const cancelBody = { action: 'CANCEL', transferId: firstStart.body.transferId,
+    expectedTransferUpdatedAt: firstStatus.body.activeTransfer.updatedAt, proof: cancelProof, idempotencyKey: cancelKey };
+  const cancelled = await fetchJson(`${base}/api/v2/homes/${homeId}/ownership-transfer`, { method: 'POST', headers: senderHeaders, body: JSON.stringify(cancelBody) });
+  const cancelledReplay = await fetchJson(`${base}/api/v2/homes/${homeId}/ownership-transfer`, { method: 'POST', headers: senderHeaders, body: JSON.stringify(cancelBody) });
+  const cancelledRow = await prisma.homeClaimReference.findUniqueOrThrow({ where: { id: firstStart.body.transferId }, select: { state: true, transferCodeHash: true, cancelledAt: true, invalidatedAt: true } });
+  const cancelledChallenges = await prisma.homeClaimChallenge.count({ where: { claimReferenceId: firstStart.body.transferId, consumedAt: null, revokedAt: { not: null } } });
+  const cancelledRedeem = await fetchJson(`${base}/api/v2/ownership-transfers/resolve`, { method: 'POST', headers: wrongRecipientHeaders,
+    body: JSON.stringify({ reference: firstStart.body.reference, idempotencyKey: `cancelled-ref-${crypto.randomUUID()}` }) });
+  if (cancelled.response.status !== 200 || cancelled.body?.state !== 'CANCELLED' || cancelledReplay.response.status !== 200
+    || cancelledReplay.body?.idempotentReplay !== true || cancelledRow.state !== 'CANCELLED' || cancelledRow.transferCodeHash !== null
+    || !cancelledRow.cancelledAt || !cancelledRow.invalidatedAt || cancelledChallenges !== 0
+    || cancelledRedeem.response.status !== 404) fail(`Transfer cancellation did not invalidate code/challenges, reconcile idempotently and deny the cancelled presentation (${JSON.stringify({ cancel: cancelled.response.status,
+      cancelState: cancelled.body?.state, replay: cancelledReplay.response.status, replayFlag: cancelledReplay.body?.idempotentReplay,
+      claimState: cancelledRow.state, codeCleared: cancelledRow.transferCodeHash === null, cancellationRecorded: Boolean(cancelledRow.cancelledAt),
+      invalidationRecorded: Boolean(cancelledRow.invalidatedAt), outstandingChallenges: cancelledChallenges, redeem: cancelledRedeem.response.status, redeemCode: cancelledRedeem.body?.error?.code })})`);
+
+  const secondStartProof = await proofFor({ privateKey: fixture.trustedPhonePrivateKey }, fixture.customerSessionSecret,
+    [homeId, fixture.ownerMembershipId], startingValue);
+  const secondStart = await fetchJson(`${base}/api/v2/homes/${homeId}/ownership-transfer`, { method: 'POST', headers: senderHeaders,
+    body: JSON.stringify({ ...startBody, proof: secondStartProof, idempotencyKey: `home-transfer-email-${crypto.randomUUID()}` }) });
+  const beforeCodeResolve = {
+    home: await prisma.home.findUniqueOrThrow({ where: { id: homeId }, select: { managementRevision: true, activeHubInstallationId: true } }),
+    memberships: await prisma.homeMembership.findMany({ where: { homeId, status: 'ACTIVE' }, orderBy: { id: 'asc' }, select: { id: true, customerAccountId: true, role: true, status: true } }),
+    area: await prisma.area.findUniqueOrThrow({ where: { id: fixture.areaTwoId }, select: { status: true, retiredAt: true } }),
+  };
+  const wrongCodeRecipient = await fetchJson(`${base}/api/v2/ownership-transfers/resolve`, { method: 'POST', headers: wrongRecipientHeaders,
+    body: JSON.stringify({ reference: secondStart.body?.reference, idempotencyKey: `wrong-code-${crypto.randomUUID()}` }) });
+  const afterWrongCodeRecipient = {
+    home: await prisma.home.findUniqueOrThrow({ where: { id: homeId }, select: { managementRevision: true, activeHubInstallationId: true } }),
+    memberships: await prisma.homeMembership.findMany({ where: { homeId, status: 'ACTIVE' }, orderBy: { id: 'asc' }, select: { id: true, customerAccountId: true, role: true, status: true } }),
+    area: await prisma.area.findUniqueOrThrow({ where: { id: fixture.areaTwoId }, select: { status: true, retiredAt: true } }),
+  };
+  const transferCompletionKey = `email-resolve-${crypto.randomUUID()}`;
+  const emailResolve = await fetchJson(`${base}/api/v2/ownership-transfers/resolve`, { method: 'POST', headers: recipientHeaders,
+    body: JSON.stringify({ reference: secondStart.body?.reference, idempotencyKey: transferCompletionKey }) });
+  const emailResolveRetry = await fetchJson(`${base}/api/v2/ownership-transfers/resolve`, { method: 'POST', headers: recipientHeaders,
+    body: JSON.stringify({ reference: secondStart.body?.reference, idempotencyKey: transferCompletionKey }) });
+  const senderTenantAfterTransfer = await prisma.homeMembership.findUniqueOrThrow({ where: { id: fixture.tenantMembershipId }, select: { status: true, role: true } });
+  const recipientHomeOneAfterTransfer = await prisma.homeMembership.findUniqueOrThrow({ where: { id: fixture.propertyMembershipId }, select: { status: true, role: true } });
+  const recipientHomeTwoAfterTransfer = await prisma.homeMembership.findUniqueOrThrow({ where: { customerAccountId_homeId: { customerAccountId: fixture.propertyAccountId, homeId } }, select: { id: true, status: true, role: true } });
+  const managerHomeOneAfterTransfer = await prisma.homeMembership.findUniqueOrThrow({ where: { id: fixture.managerMembershipId }, select: { status: true, role: true } });
+  const managerHomeTwoAfterTransfer = await prisma.homeMembership.findUniqueOrThrow({ where: { id: managerOnTransferHome.id }, select: { status: true, role: true, accessRevision: true } });
+  const tenantAfterTransfer = await prisma.homeMembership.findUniqueOrThrow({ where: { id: transferTenant.id }, select: { status: true, role: true } });
+  const preservedGrant = await prisma.tenantAreaGrant.findUniqueOrThrow({ where: { id: transferTenantGrant.id }, select: { revokedAt: true, revokeReason: true } });
+  const transferredArea = await prisma.area.findUniqueOrThrow({ where: { id: fixture.areaTwoId }, select: { status: true, retiredAt: true } });
+  const firstCompletedClaim = await prisma.homeClaimReference.findUniqueOrThrow({ where: { id: secondStart.body.transferId }, select: { state: true, claimedAccountId: true, consumedAt: true } });
+  if (secondStart.response.status !== 202 || !capturedOwnershipTransfer || capturedOwnershipTransfer.reference !== secondStart.body.reference
+    || wrongCodeRecipient.response.status !== 404 || JSON.stringify(beforeCodeResolve) !== JSON.stringify(afterWrongCodeRecipient)
+    || emailResolve.response.status !== 200 || emailResolve.body?.state !== 'TRANSFERRED' || emailResolveRetry.response.status !== 200
+    || emailResolveRetry.body?.idempotentReplay !== true || senderTenantAfterTransfer.status !== 'ACTIVE' || senderTenantAfterTransfer.role !== 'TENANT'
+    || recipientHomeOneAfterTransfer.status !== 'ACTIVE' || recipientHomeOneAfterTransfer.role !== 'OWNER'
+    || managerHomeOneAfterTransfer.status !== 'ACTIVE' || managerHomeTwoAfterTransfer.status !== 'REMOVED'
+    || managerHomeTwoAfterTransfer.accessRevision < 2 || tenantAfterTransfer.status !== 'ACTIVE' || tenantAfterTransfer.role !== 'TENANT'
+    || preservedGrant.revokedAt || transferredArea.status !== 'ACTIVE' || transferredArea.retiredAt
+    || firstCompletedClaim.state !== 'CONSUMED' || firstCompletedClaim.claimedAccountId !== fixture.propertyAccountId || !firstCompletedClaim.consumedAt
+    || recipientHomeTwoAfterTransfer.status !== 'ACTIVE' || recipientHomeTwoAfterTransfer.role !== 'OWNER'
+    || emailResolve.body.homeMembershipId !== recipientHomeTwoAfterTransfer.id) {
+    fail(`Verified email/QR transfer did not preserve unrelated access and current Home data (${JSON.stringify({ start: secondStart.response.status, wrongRecipient: wrongCodeRecipient.response.status, complete: emailResolve.response.status, replay: emailResolveRetry.response.status, replayFlag: emailResolveRetry.body?.idempotentReplay, senderTenantAfter: senderTenantAfterTransfer, recipientHomeOne: recipientHomeOneAfterTransfer, recipientHomeTwo: recipientHomeTwoAfterTransfer, managerHomeOne: managerHomeOneAfterTransfer, managerHomeTwo: managerHomeTwoAfterTransfer, tenantAfter: tenantAfterTransfer, grantRevoked: Boolean(preservedGrant.revokedAt), areaAfter: transferredArea, completedClaim: firstCompletedClaim, returnedMembership: emailResolve.body?.homeMembershipId })})`);
+  }
+
+  const secondOwnerMembershipId = emailResolve.body.homeMembershipId;
+  const newOwnerValue = { action: 'START', recipientEmailNormalized: fixture.loginEmail.toLowerCase(),
+    expectedManagementRevision: (await prisma.home.findUniqueOrThrow({ where: { id: homeId }, select: { managementRevision: true } })).managementRevision,
+    confirmation: `I confirm transfer of this Home to ${fixture.loginEmail.toLowerCase()}` };
+  const returnProof = await proofFor({ privateKey: fixture.propertyTrustedPhonePrivateKey }, fixture.propertySessionSecret,
+    [homeId, secondOwnerMembershipId], newOwnerValue);
+  const returnTransfer = await fetchJson(`${base}/api/v2/homes/${homeId}/ownership-transfer`, { method: 'POST', headers: ownerHeaders(fixture.propertySessionSecret),
+    body: JSON.stringify({ action: 'START', recipientEmail: fixture.loginEmail, expectedManagementRevision: newOwnerValue.expectedManagementRevision,
+      proof: returnProof, idempotencyKey: `home-transfer-lan-${crypto.randomUUID()}` }) });
+  const transferLabel = `DNO-HOME-${crypto.randomBytes(32).toString('base64url')}`;
+  const transferLabelHash = claimReferenceHash(transferLabel, deliveryEnv.CLAIM_REFERENCE_PEPPER);
+  await prisma.hubInstallation.update({ where: { id: fixture.hubTwoId }, data: { permanentResolverHash: transferLabelHash,
+    permanentResolverGeneration: 1, permanentResolverStatus: 'ACTIVE' } });
+  const resolverMachineSecret = `harness-transfer-machine-${crypto.randomUUID()}`;
+  await prisma.hubCredentialVersion.create({ data: { hubInstallationId: fixture.hubTwoId, version: 1, purpose: 'machine-credential', state: 'ACTIVE',
+    tokenHash: sha256(resolverMachineSecret), encryptedDeliveryEnvelope: { harness: true }, ciphertextKeyVersion: 1,
+    deliveredAt: new Date(), acknowledgedAt: new Date(), activatedAt: new Date() } });
+  const resolverChallenge = await machineRequest({ base, path: '/api/hub-agent/v2/claim/resolver/challenge', machineSecret: resolverMachineSecret,
+    body: { serial: fixture.identityTwoSerial, identityGeneration: fixture.identityTwoGeneration, reference: transferLabel } });
+  if (returnTransfer.response.status !== 202 || resolverChallenge.response.status !== 200 || !resolverChallenge.body?.challengeId) fail(`Actual permanent-label resolver did not issue a fresh challenge for the current transfer (${returnTransfer.response.status}/${resolverChallenge.response.status})`);
+  const resolverCore = { version: 1, serial: fixture.identityTwoSerial, identityGeneration: fixture.identityTwoGeneration,
+    challengeId: resolverChallenge.body.challengeId, challenge: resolverChallenge.body.challenge,
+    resolverGeneration: resolverChallenge.body.resolverGeneration, expiresAt: resolverChallenge.body.expiresAt };
+  const resolverTimestamp = String(Date.now());
+  const resolverNonce = `transfer-resolver-${crypto.randomUUID()}`;
+  const resolverBodyHash = sha256(JSON.stringify(resolverCore));
+  const resolverSignature = crypto.sign(null, Buffer.from(canonicalHubRequest({ method: 'POST', path: '/api/hub-agent/v2/claim/resolver/challenge',
+    timestamp: resolverTimestamp, nonce: resolverNonce, bodyHash: resolverBodyHash }), 'utf8'), crypto.createPrivateKey(fixture.identityTwoSigningPrivateKey)).toString('base64url');
+  const signedResolverProof = { ...resolverCore, timestamp: resolverTimestamp, nonce: resolverNonce, bodyHash: resolverBodyHash, hubSignature: resolverSignature };
+  const membershipsBeforeWrongPermanentRecipient = await prisma.homeMembership.findMany({ where: { homeId, status: 'ACTIVE' }, orderBy: { id: 'asc' }, select: { id: true, customerAccountId: true, role: true } });
+  const transferToOriginalOwner = await fetchJson(`${base}/api/v2/ownership-transfers/resolve`, { method: 'POST', headers: recipientHeaders,
+    body: JSON.stringify({ reference: transferLabel, resolverProof: signedResolverProof, idempotencyKey: `permanent-label-resolve-${crypto.randomUUID()}` }) });
+  const afterWrongPermanentRecipient = await prisma.homeMembership.findMany({ where: { homeId, status: 'ACTIVE' }, orderBy: { id: 'asc' }, select: { id: true, customerAccountId: true, role: true } });
+  const homeAfterReturn = await prisma.home.findUniqueOrThrow({ where: { id: homeId }, select: { managementRevision: true } });
+  const returnClaim = await prisma.homeClaimReference.findUniqueOrThrow({ where: { id: returnTransfer.body.transferId }, select: { state: true, transferRecipientEmailHash: true } });
+  const returnChallenge = await prisma.homeClaimChallenge.findUniqueOrThrow({ where: { id: resolverChallenge.body.challengeId }, select: { consumedAt: true, revokedAt: true } });
+  const expectedPermanentRecipientHash = claimReferenceHash(`dinodia-transfer-recipient-v1:${fixture.loginEmail.toLowerCase()}`, deliveryEnv.CLAIM_REFERENCE_PEPPER);
+  if (transferToOriginalOwner.response.status !== 404 || transferToOriginalOwner.body?.error?.code !== 'RESOURCE_NOT_FOUND'
+    || returnClaim.state !== 'AVAILABLE' || homeAfterReturn.managementRevision !== newOwnerValue.expectedManagementRevision
+    || JSON.stringify(afterWrongPermanentRecipient) !== JSON.stringify(membershipsBeforeWrongPermanentRecipient)
+    || returnChallenge.consumedAt || returnChallenge.revokedAt || returnClaim.transferRecipientEmailHash !== expectedPermanentRecipientHash) {
+    fail(`Wrong verified account did not receive a non-enumerating denial with zero transfer/proof effects (${JSON.stringify({ status: transferToOriginalOwner.response.status,
+      code: transferToOriginalOwner.body?.error?.code, claimState: returnClaim.state, challengeConsumed: Boolean(returnChallenge.consumedAt),
+      challengeRevoked: Boolean(returnChallenge.revokedAt), managementRevision: homeAfterReturn.managementRevision,
+      membershipsUnchanged: JSON.stringify(afterWrongPermanentRecipient) === JSON.stringify(membershipsBeforeWrongPermanentRecipient),
+      recipientBindingUnchanged: returnClaim.transferRecipientEmailHash === expectedPermanentRecipientHash })})`);
+  }
+  const correctPermanentRecipient = await fetchJson(`${base}/api/v2/ownership-transfers/resolve`, { method: 'POST', headers: senderHeaders,
+    body: JSON.stringify({ reference: transferLabel, resolverProof: signedResolverProof, idempotencyKey: `permanent-label-correct-${crypto.randomUUID()}` }) });
+  const permanentChallengeAfter = await prisma.homeClaimChallenge.findUniqueOrThrow({ where: { id: resolverChallenge.body.challengeId }, select: { consumedAt: true, revokedAt: true } });
+  const returnedMembership = await prisma.homeMembership.findUniqueOrThrow({ where: { id: fixture.ownerMembershipId }, select: { role: true, status: true } });
+  const finalAreaGrant = await prisma.tenantAreaGrant.findUniqueOrThrow({ where: { id: transferTenantGrant.id }, select: { revokedAt: true } });
+  const finalHome = await prisma.home.findUniqueOrThrow({ where: { id: homeId }, select: { managementRevision: true, activeHubInstallationId: true } });
+  if (correctPermanentRecipient.response.status !== 200 || correctPermanentRecipient.body?.state !== 'TRANSFERRED'
+    || returnedMembership.status !== 'ACTIVE' || returnedMembership.role !== 'OWNER' || !permanentChallengeAfter.consumedAt
+    || permanentChallengeAfter.revokedAt || finalAreaGrant.revokedAt || finalHome.managementRevision !== newOwnerValue.expectedManagementRevision + 1
+    || finalHome.activeHubInstallationId !== fixture.hubTwoId) {
+    fail(`Fresh signed permanent-label LAN resolution did not transfer exactly once to the email-bound verified recipient (${JSON.stringify({ status: correctPermanentRecipient.response.status, code: correctPermanentRecipient.body?.error?.code, role: returnedMembership.role, challengeConsumed: Boolean(permanentChallengeAfter.consumedAt), managementRevision: finalHome.managementRevision })})`);
+  }
+  const permanentReplay = await fetchJson(`${base}/api/v2/ownership-transfers/resolve`, { method: 'POST', headers: senderHeaders,
+    body: JSON.stringify({ reference: transferLabel, resolverProof: signedResolverProof, idempotencyKey: `permanent-replay-${crypto.randomUUID()}` }) });
+  const finalActiveOwners = await prisma.homeMembership.count({ where: { homeId, role: 'OWNER', status: 'ACTIVE' } });
+  if (![401, 404, 409].includes(permanentReplay.response.status) || finalActiveOwners !== 1) fail('Replayed signed permanent-label challenge caused a second transfer or duplicate owner');
+  console.log('[stage6:integration] PASS: real loopback ownership routes enforce owner-only exact-step-up start/cancel, no-expiry stable QR/email identity, cancellation/replay, verified-recipient binding, fresh signed permanent-label hub challenge, exactly-once role transfer, manager revocation and tenant/other-Home/Area/grant preservation');
+}
+
 async function pendingInvitationRouteChecks(deliveryEnv) {
   const base = `http://127.0.0.1:${appPort}`;
   if (!customerFixture) fail('Pending invitation route checks require the disposable two-home owner fixture');
@@ -2635,51 +2944,47 @@ async function pendingInvitationRouteChecks(deliveryEnv) {
   const accountAfterWrongTemp = await prisma.customerAccount.findUnique({ where: { emailNormalized: newTenantEmail.toLowerCase() }, select: { id: true } });
   const wrongTempCreatedVerification = capturedCustomerVerification;
   capturedCustomerVerification = null;
-  const newTenantUsername = `newtenant-${crypto.randomUUID().slice(0, 12)}`;
-  const wrongLinkedRedeem = temporaryPassword && newTenantInvitation ? await fetchJson(`${base}/api/v2/auth/register`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ invitationId: newTenantInvitation.id, email: newTenantEmail, password: `wrong-stage6-${crypto.randomUUID()}` }) }) : null;
-  const correctTempRegister = temporaryPassword && newTenantInvitation ? await fetchJson(`${base}/api/v2/auth/register`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ invitationId: newTenantInvitation.id, email: newTenantEmail, password: temporaryPassword }) }) : null;
-  const invitationRateBucket = await prisma.authRateLimitBucket.findFirst({ where: { bucketKey: { startsWith: 'customer-invitation-registration:' } }, orderBy: { updatedAt: 'desc' }, select: { bucketKey: true } });
-  if (!invitationRateBucket || invitationRateBucket.bucketKey.length > 160 || invitationRateBucket.bucketKey.includes(newTenantEmail)) {
-    fail('Tenant invitation registration rate-limit identity exceeded its bounded, non-PII storage contract');
-  }
-  const newTenantAccount = correctTempRegister?.response.status === 202 ? await prisma.customerAccount.findUniqueOrThrow({ where: { emailNormalized: newTenantEmail.toLowerCase() }, select: { id: true, usernameNormalized: true, mustChangePassword: true, usernameSelectionRequired: true, emailVerifiedAt: true } }) : null;
-  const boundInvitation = newTenantInvitation ? await prisma.membershipInvitation.findUniqueOrThrow({ where: { id: newTenantInvitation.id }, select: { targetAccountId: true, temporaryCredentialHash: true, state: true } }) : null;
-  const verifiedNewTenant = capturedCustomerVerification ? await fetchJson(`${base}/api/v2/auth/email/verify`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(capturedCustomerVerification) }) : null;
   const newTenantPhone = keyPair();
-  const newTenantLogin = temporaryPassword ? await fetchJson(`${base}/api/v2/session`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ email: newTenantEmail, password: temporaryPassword, deviceInstallationId: `stage6-new-tenant-${crypto.randomUUID()}`, publicKey: newTenantPhone.publicKey, deviceName: 'Disposable new tenant phone', model: 'integration-test', osFamily: 'test', osVersion: 'test' }) }) : null;
-  const newTenantJar = {}; if (newTenantLogin) updateCookieJar(newTenantJar, newTenantLogin.response);
-  const newTenantRequirements = newTenantLogin?.response.status === 200 ? await fetchJson(`${base}/api/v2/auth/requirements`, { headers: { cookie: cookieHeader(newTenantJar) } }) : null;
+  const wrongTempLogin = temporaryPassword ? await fetchJson(`${base}/api/v2/mobile/session`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ email: newTenantEmail, password: `wrong-stage6-${crypto.randomUUID()}`, deviceInstallationId: `stage6-wrong-tenant-${crypto.randomUUID()}`, publicKey: newTenantPhone.publicKey, deviceName: 'Disposable wrong password phone', model: 'integration-test', osFamily: 'test', osVersion: 'test' }) }) : null;
+  const afterWrongTempLogin = await prisma.customerAccount.findUnique({ where: { emailNormalized: newTenantEmail.toLowerCase() }, select: { id: true } });
+  const wrongLinkedRedeem = temporaryPassword && newTenantInvitation ? await fetchJson(`${base}/api/v2/auth/register`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ invitationId: newTenantInvitation.id, email: newTenantEmail, password: temporaryPassword }) }) : null;
+  const newTenantUsername = `newtenant-${crypto.randomUUID().slice(0, 12)}`;
+  const newTenantLogin = temporaryPassword ? await fetchJson(`${base}/api/v2/mobile/session`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ email: newTenantEmail, password: temporaryPassword, deviceInstallationId: `stage6-new-tenant-${crypto.randomUUID()}`, publicKey: newTenantPhone.publicKey, deviceName: 'Disposable new tenant phone', model: 'integration-test', osFamily: 'test', osVersion: 'test' }) }) : null;
+  const newTenantAccount = newTenantLogin?.response.status === 200 ? await prisma.customerAccount.findUniqueOrThrow({ where: { emailNormalized: newTenantEmail.toLowerCase() }, select: { id: true, usernameNormalized: true, mustChangePassword: true, usernameSelectionRequired: true, emailVerifiedAt: true } }) : null;
+  const boundInvitation = newTenantInvitation ? await prisma.membershipInvitation.findUniqueOrThrow({ where: { id: newTenantInvitation.id }, select: { targetAccountId: true, temporaryCredentialHash: true, state: true } }) : null;
+  let newTenantAccessToken = newTenantLogin?.body?.accessToken ?? '';
+  const newTenantAuthHeaders = () => ({ authorization: `Bearer ${newTenantAccessToken}` });
+  const newTenantRequirements = newTenantLogin?.response.status === 200 ? await fetchJson(`${base}/api/v2/auth/requirements`, { headers: newTenantAuthHeaders() }) : null;
   const replacementPassword = `new-tenant-replaced-${crypto.randomUUID()}`;
-  const mandatoryReplacement = newTenantLogin?.response.status === 200 ? await fetchJson(`${base}/api/v2/auth/password/change`, { method: 'POST', headers: { 'content-type': 'application/json', cookie: cookieHeader(newTenantJar) }, body: JSON.stringify({ currentPassword: temporaryPassword, newPassword: replacementPassword }) }) : null;
-  if (mandatoryReplacement) updateCookieJar(newTenantJar, mandatoryReplacement.response);
-  const usernameRequirements = mandatoryReplacement?.response.status === 200 ? await fetchJson(`${base}/api/v2/auth/requirements`, { headers: { cookie: cookieHeader(newTenantJar) } }) : null;
-  const pendingBeforeUsername = mandatoryReplacement?.response.status === 200 ? await fetchJson(`${base}/api/v2/me/pending-relationships`, { headers: { cookie: cookieHeader(newTenantJar) } }) : null;
-  const usernameSelection = newTenantAccount && mandatoryReplacement?.response.status === 200 ? await fetchJson(`${base}/api/v2/me/username`, { method: 'PATCH', headers: { 'content-type': 'application/json', cookie: cookieHeader(newTenantJar) }, body: JSON.stringify({ username: newTenantUsername }) }) : null;
+  const mandatoryReplacement = newTenantLogin?.response.status === 200 ? await fetchJson(`${base}/api/v2/mobile/password/change`, { method: 'POST', headers: { ...newTenantAuthHeaders(), 'content-type': 'application/json' }, body: JSON.stringify({ currentPassword: temporaryPassword, newPassword: replacementPassword }) }) : null;
+  if (mandatoryReplacement?.response.status === 200) newTenantAccessToken = mandatoryReplacement.body?.accessToken ?? '';
+  const usernameRequirements = mandatoryReplacement?.response.status === 200 ? await fetchJson(`${base}/api/v2/auth/requirements`, { headers: newTenantAuthHeaders() }) : null;
+  const pendingBeforeUsername = mandatoryReplacement?.response.status === 200 ? await fetchJson(`${base}/api/v2/me/pending-relationships`, { headers: newTenantAuthHeaders() }) : null;
+  const usernameSelection = newTenantAccount && mandatoryReplacement?.response.status === 200 ? await fetchJson(`${base}/api/v2/me/username`, { method: 'PATCH', headers: { ...newTenantAuthHeaders(), 'content-type': 'application/json' }, body: JSON.stringify({ username: newTenantUsername }) }) : null;
   const selectedTenantAccount = newTenantAccount ? await prisma.customerAccount.findUniqueOrThrow({ where: { id: newTenantAccount.id }, select: { usernameNormalized: true, usernameSelectionRequired: true } }) : null;
   const tenantPolicyVersion = deliveryEnv.DINODIA_NATIVE_POLICY_VERSION;
   const tenantPolicyHash = sha256(deliveryEnv.DINODIA_NATIVE_POLICY_TEXT);
-  const tenantPolicyAcceptance = usernameSelection?.response.status === 200 ? await fetchJson(`${base}/api/v2/auth/policy/acceptance`, { method: 'POST', headers: { 'content-type': 'application/json', cookie: cookieHeader(newTenantJar) }, body: JSON.stringify({ version: tenantPolicyVersion, contentSha256: tenantPolicyHash, accepted: true }) }) : null;
-  const tenantPending = tenantPolicyAcceptance?.response.status === 200 ? await fetchJson(`${base}/api/v2/me/pending-relationships`, { headers: { cookie: cookieHeader(newTenantJar) } }) : null;
+  const tenantPolicyAcceptance = usernameSelection?.response.status === 200 ? await fetchJson(`${base}/api/v2/auth/policy/acceptance`, { method: 'POST', headers: { ...newTenantAuthHeaders(), 'content-type': 'application/json' }, body: JSON.stringify({ version: tenantPolicyVersion, contentSha256: tenantPolicyHash, accepted: true }) }) : null;
+  const tenantPending = tenantPolicyAcceptance?.response.status === 200 ? await fetchJson(`${base}/api/v2/me/pending-relationships`, { headers: newTenantAuthHeaders() }) : null;
   const currentInviteForAcceptance = newTenantInvitation ? await prisma.membershipInvitation.findUniqueOrThrow({ where: { id: newTenantInvitation.id }, select: { updatedAt: true } }) : null;
   const newTenantMembershipBeforeAccept = newTenantAccount ? await prisma.homeMembership.findUnique({ where: { customerAccountId_homeId: { customerAccountId: newTenantAccount.id, homeId: inviter.homeId } }, select: { id: true } }) : null;
-  if (wrongLinkedRedeem?.response.status >= 500 || correctTempRegister?.response.status >= 500) {
-    console.log(`[stage6:integration] tenant registration safe runtime codes: wrong=${wrongLinkedRedeem?.response.headers.get('x-dinodia-stage6-test-error') ?? 'none'} correct=${correctTempRegister?.response.headers.get('x-dinodia-stage6-test-error') ?? 'none'}`);
-  }
-  const acceptedNewTenantInvitation = tenantPending?.response.status === 200 && currentInviteForAcceptance ? await fetchJson(`${base}/api/v2/invitations/${newTenantInvitation.id}/decision`, { method: 'POST', headers: { 'content-type': 'application/json', cookie: cookieHeader(newTenantJar), 'idempotency-key': `stage6-new-tenant-accept-${crypto.randomUUID()}` }, body: JSON.stringify({ decision: 'ACCEPT', expectedUpdatedAt: currentInviteForAcceptance.updatedAt.toISOString() }) }) : null;
+  const acceptedNewTenantInvitation = tenantPending?.response.status === 200 && currentInviteForAcceptance ? await fetchJson(`${base}/api/v2/invitations/${newTenantInvitation.id}/decision`, { method: 'POST', headers: { ...newTenantAuthHeaders(), 'content-type': 'application/json', 'idempotency-key': `stage6-new-tenant-accept-${crypto.randomUUID()}` }, body: JSON.stringify({ decision: 'ACCEPT', expectedUpdatedAt: currentInviteForAcceptance.updatedAt.toISOString() }) }) : null;
   const newTenantMembershipAfterAccept = newTenantAccount ? await prisma.homeMembership.findUnique({ where: { customerAccountId_homeId: { customerAccountId: newTenantAccount.id, homeId: inviter.homeId } }, select: { id: true, status: true, role: true, tenantAreaGrants: { where: { revokedAt: null }, select: { areaId: true } } } }) : null;
   if (newTenantIssue.response.status !== 201 || !newTenantInvitation?.temporaryCredentialHash || newTenantInvitation.targetAccountId
     || !temporaryPassword || !/^[A-Za-z0-9_-]{24,160}$/.test(temporaryPassword) || capturedCustomerInvitation !== newTenantInvitation.id
     || JSON.stringify(newTenantIssue.body).includes(temporaryPassword) || JSON.stringify(newTenantIssue.body).includes(newTenantEmail)
-    || wrongTempRegister.response.status !== 202 || accountAfterWrongTemp || wrongTempCreatedVerification
-    || wrongLinkedRedeem?.response.status !== 202 || correctTempRegister?.response.status !== 202 || !newTenantAccount?.mustChangePassword || !newTenantAccount.usernameSelectionRequired || !newTenantAccount.usernameNormalized.startsWith('setup-')
-    || newTenantAccount.emailVerifiedAt || boundInvitation?.targetAccountId !== newTenantAccount.id || boundInvitation.temporaryCredentialHash !== null || boundInvitation.state !== 'PENDING'
-    || verifiedNewTenant?.response.status !== 200 || newTenantLogin?.response.status !== 200 || newTenantRequirements?.response.status !== 200 || newTenantRequirements.body.nextAction !== 'CHANGE_PASSWORD'
+    || wrongTempRegister.response.status !== 400 || accountAfterWrongTemp || wrongTempCreatedVerification
+    || wrongTempLogin?.response.status !== 401 || afterWrongTempLogin || wrongLinkedRedeem?.response.status !== 400
+    || newTenantLogin?.response.status !== 200 || !/^dno-customer-access-[A-Za-z0-9_-]{32,}$/.test(newTenantLogin.body?.accessToken ?? '') || !/^dno-customer-session-[A-Za-z0-9_-]{32,}$/.test(newTenantLogin.body?.refreshToken ?? '')
+    || !newTenantAccount?.mustChangePassword || !newTenantAccount.usernameSelectionRequired || !newTenantAccount.usernameNormalized.startsWith('setup-')
+    || !newTenantAccount.emailVerifiedAt || boundInvitation?.targetAccountId !== newTenantAccount.id || boundInvitation.temporaryCredentialHash !== null || boundInvitation.state !== 'PENDING'
+    || newTenantRequirements?.response.status !== 200 || newTenantRequirements.body.nextAction !== 'CHANGE_PASSWORD'
     || mandatoryReplacement?.response.status !== 200 || usernameRequirements?.body?.nextAction !== 'CHOOSE_USERNAME' || pendingBeforeUsername?.response.status !== 403
     || usernameSelection?.response.status !== 200 || selectedTenantAccount?.usernameNormalized !== newTenantUsername.toLowerCase() || selectedTenantAccount.usernameSelectionRequired
     || tenantPolicyAcceptance?.response.status !== 200 || tenantPending?.body?.pendingRelationships?.[0]?.allowedActions?.includes('ACCEPT') !== true
     || acceptedNewTenantInvitation?.response.status !== 200 || newTenantMembershipBeforeAccept || newTenantMembershipAfterAccept?.status !== 'ACTIVE'
-    || newTenantMembershipAfterAccept?.role !== 'TENANT' || newTenantMembershipAfterAccept.tenantAreaGrants.length !== 1 || newTenantMembershipAfterAccept.tenantAreaGrants[0].areaId !== areaId) fail(`New tenant invitation did not complete the linked temporary-password, password-replacement, username-selection and explicit-accept journey (${JSON.stringify({ issue: newTenantIssue.response.status, invitation: Boolean(newTenantInvitation), wrongGenericRegistration: wrongTempRegister.response.status, wrongLinkedRedeem: wrongLinkedRedeem?.response.status, wrongLinkedErrorCode: wrongLinkedRedeem?.body?.error?.code || wrongLinkedRedeem?.body?.errorCode || null, registration: correctTempRegister?.response.status, registrationErrorCode: correctTempRegister?.body?.error?.code || correctTempRegister?.body?.errorCode || null, placeholder: newTenantAccount?.usernameNormalized?.startsWith('setup-'), forcedPasswordChange: newTenantAccount?.mustChangePassword, usernameRequired: newTenantAccount?.usernameSelectionRequired, verification: verifiedNewTenant?.response.status, login: newTenantLogin?.response.status, initialAction: newTenantRequirements?.body?.nextAction, replacement: mandatoryReplacement?.response.status, usernameAction: usernameRequirements?.body?.nextAction, pendingBeforeUsername: pendingBeforeUsername?.response.status, usernameSelection: usernameSelection?.response.status, policy: tenantPolicyAcceptance?.response.status, pendingAction: tenantPending?.body?.pendingRelationships?.[0]?.allowedActions, invitationAccept: acceptedNewTenantInvitation?.response.status, membershipBeforeAccept: Boolean(newTenantMembershipBeforeAccept), membershipAfterAccept: newTenantMembershipAfterAccept?.status, grantCount: newTenantMembershipAfterAccept?.tenantAreaGrants.length })})`);
-  console.log('[stage6:integration] PASS: new tenant uses the linked one-time credential, verifies the invited email, replaces the password, chooses a unique username, accepts policy, sees only safe pending metadata and gains exactly the invited Area only after explicit acceptance');
+    || newTenantMembershipAfterAccept?.role !== 'TENANT' || newTenantMembershipAfterAccept.tenantAreaGrants.length !== 1 || newTenantMembershipAfterAccept.tenantAreaGrants[0].areaId !== areaId) fail(`New tenant invitation did not complete the mobile temporary-password, password-replacement, username-selection and explicit-accept journey (${JSON.stringify({ issue: newTenantIssue.response.status, invitation: Boolean(newTenantInvitation), wrongGenericRegistration: wrongTempRegister.response.status, wrongLinkedRedeem: wrongLinkedRedeem?.response.status, login: newTenantLogin?.response.status, loginError: newTenantLogin?.body?.error?.code ?? null, accessShape: /^dno-customer-access-[A-Za-z0-9_-]{32,}$/.test(newTenantLogin?.body?.accessToken ?? ''), refreshShape: /^dno-customer-session-[A-Za-z0-9_-]{32,}$/.test(newTenantLogin?.body?.refreshToken ?? ''), accountPlaceholder: newTenantAccount?.usernameNormalized?.startsWith('setup-'), accountVerified: Boolean(newTenantAccount?.emailVerifiedAt), accountMustChangePassword: newTenantAccount?.mustChangePassword, accountUsernameRequired: newTenantAccount?.usernameSelectionRequired, invitationBound: boundInvitation?.targetAccountId === newTenantAccount?.id, invitationSecretCleared: boundInvitation?.temporaryCredentialHash === null, initialAction: newTenantRequirements?.body?.nextAction, replacement: mandatoryReplacement?.response.status, replacementError: mandatoryReplacement?.body?.error?.code ?? null, replacementAccessShape: /^dno-customer-access-[A-Za-z0-9_-]{32,}$/.test(mandatoryReplacement?.body?.accessToken ?? ''), usernameAction: usernameRequirements?.body?.nextAction, pendingBeforeUsername: pendingBeforeUsername?.response.status, usernameSelection: usernameSelection?.response.status, usernameMatches: selectedTenantAccount?.usernameNormalized === newTenantUsername.toLowerCase(), usernameStillRequired: selectedTenantAccount?.usernameSelectionRequired, policy: tenantPolicyAcceptance?.response.status, pendingAction: tenantPending?.body?.pendingRelationships?.[0]?.allowedActions, invitationAccept: acceptedNewTenantInvitation?.response.status, membershipBeforeAccept: Boolean(newTenantMembershipBeforeAccept), membershipAfterAccept: newTenantMembershipAfterAccept?.status, grantCount: newTenantMembershipAfterAccept?.tenantAreaGrants.length, grantedAreaMatches: newTenantMembershipAfterAccept?.tenantAreaGrants?.[0]?.areaId === areaId })})`);
+  console.log('[stage6:integration] PASS: actual mobile sign-in accepts the recipient-only one-time credential (proving email possession), returns V2 access/refresh credentials, gates password replacement and username choice, then grants exactly the invited Area only after explicit acceptance');
   const headers = { cookie: `dinodia_customer_session=${encodeURIComponent(rawSession)}` };
   const currentPolicyVersion = deliveryEnv.DINODIA_NATIVE_POLICY_VERSION;
   const currentPolicyText = deliveryEnv.DINODIA_NATIVE_POLICY_TEXT;
@@ -3014,6 +3319,160 @@ async function pendingInvitationRouteChecks(deliveryEnv) {
   };
   if (Object.values(roomResultChecks).some((passed) => !passed)) fail(`Actual Room QR journey failed checks ${JSON.stringify(Object.entries(roomResultChecks).filter(([, passed]) => !passed).map(([name]) => name))}; safe diagnostics ${JSON.stringify({ scan: roomPreview.response.status, stale: wrongGeneration.response.status, request: roomRequest.response.status, retry: roomRequestRetry.response.status, retryReplay: roomRequestRetry.body?.idempotentReplay === true, coalesce: roomRequestCoalesce.response.status, coalesceFlag: roomRequestCoalesce.body?.coalesced === true, concurrent: roomRequestConcurrent.response.status, concurrentFlag: roomRequestConcurrent.body?.coalesced === true, singlePending: roomPendingCountAfterConcurrency === 1, cancel: roomCancel.response.status, resubmit: roomFreshRequest.response.status, queue: roomQueue.response.status, queueHasRequest: Boolean(queuedRoom), queueLabelMatches: queuedRoom?.requesterLabel === (roomRequesterCurrent.displayName || 'Verified Dinodia customer'), queueLabel: queuedRoom?.requesterLabel, expectedBoundedLabel: roomRequesterCurrent.displayName || 'Verified Dinodia customer', decision: roomDecision.response.status, decisionRetry: roomDecisionRetry.response.status, anonymous: unauthRoomDecision.response.status })}`);
   console.log('[stage6:integration] PASS: actual Room QR route enforces current QR generation, coalesces idempotent requests, exposes only bounded pending/status data, permits immediate post-cancel resubmission, and grants exactly the approved Area once');
+
+  // The prospective/logged-out path must prove control of the reply address
+  // before creating anything visible to a homeowner. A Room email attempt is
+  // private onboarding state; only successful verification creates the
+  // AreaAccessRequest. Rotation between scans invalidates the old challenge,
+  // while concurrent scans on the new generation coalesce to one challenge.
+  const prospectiveRoomEmail = `room-prospective-${crypto.randomUUID()}@invalid.test`;
+  const prospectiveRoomEmailChanged = `room-changed-${crypto.randomUUID()}@invalid.test`;
+  const prospectiveRoomBefore = {
+    requests: await prisma.areaAccessRequest.count({ where: { areaId: roomArea.id } }),
+    accounts: await prisma.customerAccount.count({ where: { emailNormalized: prospectiveRoomEmail } }),
+    sent: roomAccessVerificationEmailCount,
+  };
+  const oldRoomKey = `room-prospective-old-${crypto.randomUUID()}`;
+  const oldRoomBody = { reference: roomReference, expectedGeneration: roomQr.generation, email: prospectiveRoomEmail, idempotencyKey: oldRoomKey };
+  capturedRoomAccessCode = null;
+  const prospectiveStart = await fetchJson(`${base}/api/public/areas/request-access/email-challenges`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(oldRoomBody) });
+  const oldRoomCode = capturedRoomAccessCode;
+  const oldRoomAttempt = prospectiveStart.body?.requestId ? await prisma.roomAccessEmailAttempt.findUnique({ where: { id: prospectiveStart.body.requestId }, select: { id: true, areaQrCredentialId: true, qrGeneration: true, requesterEmailNormalized: true, state: true } }) : null;
+  const ownerQueueBeforeVerification = await fetchJson(`${base}/api/v2/homes/${inviter.homeId}/area-access-requests`, { headers: roomOwnerHeaders });
+  const preVerificationRows = {
+    requests: await prisma.areaAccessRequest.count({ where: { areaId: roomArea.id } }),
+    accounts: await prisma.customerAccount.count({ where: { emailNormalized: prospectiveRoomEmail } }),
+  };
+  const qrGenerationBeforeChangedBody = await prisma.areaQrCredential.findUniqueOrThrow({ where: { id: roomQr.id }, select: { generation: true } });
+  const changedBody = await fetchJson(`${base}/api/public/areas/request-access/email-challenges`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ ...oldRoomBody, email: prospectiveRoomEmailChanged }) });
+  const generationTwo = roomQr.generation + 1;
+  await prisma.areaQrCredential.update({ where: { id: roomQr.id }, data: { generation: generationTwo } });
+  const newRoomBodies = [0, 1].map((index) => ({ reference: roomReference, expectedGeneration: generationTwo, email: prospectiveRoomEmail, idempotencyKey: `room-prospective-new-${index}-${crypto.randomUUID()}` }));
+  const [currentRoomStartA, currentRoomStartB] = await Promise.all(newRoomBodies.map((body) => fetchJson(`${base}/api/public/areas/request-access/email-challenges`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) })));
+  const currentRoomCode = capturedRoomAccessCode;
+  const attemptsAfterRotation = await prisma.roomAccessEmailAttempt.findMany({ where: { areaQrCredentialId: roomQr.id }, select: { id: true, qrGeneration: true, state: true, coalescedIntoId: true } });
+  const staleRoomVerification = oldRoomCode && prospectiveStart.body?.challengeId ? await fetchJson(`${base}/api/public/areas/request-access/email-challenges/verify`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ requestId: prospectiveStart.body.requestId, challengeId: prospectiveStart.body.challengeId, code: oldRoomCode }) }) : null;
+  const wrongCurrentRoomCode = currentRoomCode ? String((Number(currentRoomCode) + 1) % 1000000).padStart(6, '0') : '';
+  const wrongCurrentRoomVerification = currentRoomCode && currentRoomStartA.body?.challengeId ? await fetchJson(`${base}/api/public/areas/request-access/email-challenges/verify`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ requestId: currentRoomStartA.body.requestId, challengeId: currentRoomStartA.body.challengeId, code: wrongCurrentRoomCode }) }) : null;
+  const requestsAfterWrongRoomCode = await prisma.areaAccessRequest.count({ where: { areaId: roomArea.id } });
+  const accountsAfterWrongRoomCode = await prisma.customerAccount.count({ where: { emailNormalized: prospectiveRoomEmail } });
+  const correctCurrentRoomVerification = currentRoomCode && currentRoomStartA.body?.challengeId ? await fetchJson(`${base}/api/public/areas/request-access/email-challenges/verify`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ requestId: currentRoomStartA.body.requestId, challengeId: currentRoomStartA.body.challengeId, code: currentRoomCode }) }) : null;
+  const correctCurrentRoomReplay = currentRoomCode && currentRoomStartA.body?.challengeId ? await fetchJson(`${base}/api/public/areas/request-access/email-challenges/verify`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ requestId: currentRoomStartA.body.requestId, challengeId: currentRoomStartA.body.challengeId, code: currentRoomCode }) }) : null;
+  const verifiedRoomRequest = correctCurrentRoomVerification?.body?.requestId ? await prisma.areaAccessRequest.findUnique({ where: { id: correctCurrentRoomVerification.body.requestId }, select: { id: true, requesterAccountId: true, requesterEmailNormalized: true, emailVerifiedAt: true, expiresAt: true, updatedAt: true, status: true } }) : null;
+  const ownerQueueAfterVerification = await fetchJson(`${base}/api/v2/homes/${inviter.homeId}/area-access-requests`, { headers: roomOwnerHeaders });
+  const visibleProspectiveRequest = ownerQueueAfterVerification.body?.requests?.find((item) => item.requestId === verifiedRoomRequest?.id);
+  const verifiedRoomAccountCount = await prisma.customerAccount.count({ where: { emailNormalized: prospectiveRoomEmail } });
+
+  capturedCustomerInvitation = null;
+  capturedCustomerInvitationTempPassword = null;
+  capturedCustomerVerification = null;
+  const invitationEmailsBeforeProspectiveApproval = customerInvitationEmailCount;
+  const prospectiveRoomApproval = verifiedRoomRequest ? await fetchJson(`${base}/api/v2/homes/${inviter.homeId}/area-access-requests`, {
+    method: 'POST', headers: { ...roomOwnerHeaders, 'content-type': 'application/json', 'idempotency-key': `room-prospective-approve-${crypto.randomUUID()}` },
+    body: JSON.stringify({ requestId: verifiedRoomRequest.id, decision: 'APPROVE', expectedRevision: verifiedRoomRequest.updatedAt.toISOString(), idempotencyKey: `room-prospective-approve-${crypto.randomUUID()}` }),
+  }) : null;
+  const prospectiveApprovedRow = verifiedRoomRequest ? await prisma.areaAccessRequest.findUnique({ where: { id: verifiedRoomRequest.id }, select: { status: true, requesterAccountId: true, onboardingInvitationId: true, onboardingEmailStatus: true } }) : null;
+  const prospectiveInvitation = prospectiveApprovedRow?.onboardingInvitationId ? await prisma.membershipInvitation.findUnique({ where: { id: prospectiveApprovedRow.onboardingInvitationId }, select: { id: true, targetAccountId: true, targetEmailNormalized: true, temporaryCredentialHash: true, state: true, expiresAt: true, areas: { select: { areaId: true, homeId: true } } } }) : null;
+  const prospectiveTemporaryPassword = capturedCustomerInvitationTempPassword;
+  const prospectiveOwnerResponse = JSON.stringify(prospectiveRoomApproval?.body ?? {});
+  const prospectiveMemberBeforeLogin = await prisma.customerAccount.count({ where: { emailNormalized: prospectiveRoomEmail } });
+  const guestMembershipBeforeAccept = prospectiveInvitation?.targetAccountId ? await prisma.homeMembership.findUnique({ where: { customerAccountId_homeId: { customerAccountId: prospectiveInvitation.targetAccountId, homeId: inviter.homeId } }, select: { id: true } }) : null;
+
+  // Continue the owner-approved prospective guest through the real mobile
+  // temporary-credential, required password/username/current-policy gates and
+  // explicit invitation acceptance. This proves approval alone granted no
+  // membership and that email ownership is not re-verified.
+  const prospectiveGuestPhone = keyPair();
+  const prospectiveGuestLogin = prospectiveTemporaryPassword ? await fetchJson(`${base}/api/v2/mobile/session`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ email: prospectiveRoomEmail, password: prospectiveTemporaryPassword, deviceInstallationId: `stage6-room-guest-${crypto.randomUUID()}`, publicKey: prospectiveGuestPhone.publicKey, deviceName: 'Disposable Room guest phone', model: 'integration-test', osFamily: 'test', osVersion: 'test' }) }) : null;
+  const prospectiveGuestAccount = prospectiveGuestLogin?.response.status === 200 ? await prisma.customerAccount.findUniqueOrThrow({ where: { emailNormalized: prospectiveRoomEmail }, select: { id: true, usernameNormalized: true, mustChangePassword: true, usernameSelectionRequired: true, emailVerifiedAt: true } }) : null;
+  let prospectiveGuestAccessToken = prospectiveGuestLogin?.body?.accessToken ?? '';
+  const prospectiveGuestHeaders = () => ({ authorization: `Bearer ${prospectiveGuestAccessToken}` });
+  const prospectiveGuestRequirements = prospectiveGuestLogin?.response.status === 200 ? await fetchJson(`${base}/api/v2/auth/requirements`, { headers: prospectiveGuestHeaders() }) : null;
+  const prospectiveGuestNewPassword = `room-guest-replacement-${crypto.randomUUID()}`;
+  const prospectiveGuestPasswordChange = prospectiveGuestLogin?.response.status === 200 ? await fetchJson(`${base}/api/v2/mobile/password/change`, { method: 'POST', headers: { ...prospectiveGuestHeaders(), 'content-type': 'application/json' }, body: JSON.stringify({ currentPassword: prospectiveTemporaryPassword, newPassword: prospectiveGuestNewPassword }) }) : null;
+  if (prospectiveGuestPasswordChange?.response.status === 200) prospectiveGuestAccessToken = prospectiveGuestPasswordChange.body?.accessToken ?? '';
+  const prospectiveGuestUsername = `roomguest-${crypto.randomUUID().slice(0, 12)}`;
+  const prospectiveGuestUsernameChange = prospectiveGuestPasswordChange?.response.status === 200 ? await fetchJson(`${base}/api/v2/me/username`, { method: 'PATCH', headers: { ...prospectiveGuestHeaders(), 'content-type': 'application/json' }, body: JSON.stringify({ username: prospectiveGuestUsername }) }) : null;
+  const prospectiveGuestPolicy = prospectiveGuestUsernameChange?.response.status === 200 ? await fetchJson(`${base}/api/v2/auth/policy/acceptance`, { method: 'POST', headers: { ...prospectiveGuestHeaders(), 'content-type': 'application/json' }, body: JSON.stringify({ version: deliveryEnv.DINODIA_NATIVE_POLICY_VERSION, contentSha256: sha256(deliveryEnv.DINODIA_NATIVE_POLICY_TEXT), accepted: true }) }) : null;
+  const prospectiveGuestPending = prospectiveGuestPolicy?.response.status === 200 ? await fetchJson(`${base}/api/v2/me/pending-relationships`, { headers: prospectiveGuestHeaders() }) : null;
+  const prospectiveInvitationForAcceptance = prospectiveInvitation ? await prisma.membershipInvitation.findUnique({ where: { id: prospectiveInvitation.id }, select: { updatedAt: true } }) : null;
+  const prospectiveInvitationAccepted = prospectiveGuestPending?.response.status === 200 && prospectiveInvitationForAcceptance ? await fetchJson(`${base}/api/v2/invitations/${prospectiveInvitation.id}/decision`, { method: 'POST', headers: { ...prospectiveGuestHeaders(), 'content-type': 'application/json', 'idempotency-key': `stage6-room-guest-accept-${crypto.randomUUID()}` }, body: JSON.stringify({ decision: 'ACCEPT', expectedUpdatedAt: prospectiveInvitationForAcceptance.updatedAt.toISOString() }) }) : null;
+  const prospectiveMembershipAfterAccept = prospectiveGuestAccount ? await prisma.homeMembership.findUnique({ where: { customerAccountId_homeId: { customerAccountId: prospectiveGuestAccount.id, homeId: inviter.homeId } }, select: { id: true, role: true, status: true, tenantAreaGrants: { where: { revokedAt: null }, select: { areaId: true, homeId: true } } } }) : null;
+
+  const prospectiveRoomChecks = {
+    unverifiedAttemptPrivate: prospectiveStart.response.status === 202 && prospectiveStart.body?.state === 'VERIFY_EMAIL'
+      && oldRoomAttempt?.areaQrCredentialId === roomQr.id && oldRoomAttempt.qrGeneration === roomQr.generation
+      && preVerificationRows.requests === prospectiveRoomBefore.requests && preVerificationRows.accounts === 0
+      && !ownerQueueBeforeVerification.body?.requests?.some((item) => item.requestId === prospectiveStart.body.requestId),
+    sameKeyChangedBodyDenied: changedBody.response.status === 409 && changedBody.body?.error?.code === 'IDEMPOTENCY_CONFLICT',
+    rotatedQrGetsFreshCoalescedAttempt: [currentRoomStartA, currentRoomStartB].every((result) => result.response.status === 202 && result.body?.state === 'VERIFY_EMAIL')
+      && currentRoomStartA.body.requestId === currentRoomStartB.body.requestId && currentRoomStartA.body.challengeId === currentRoomStartB.body.challengeId
+      && currentRoomStartA.body.requestId !== prospectiveStart.body.requestId
+      && attemptsAfterRotation.some((attempt) => attempt.qrGeneration === roomQr.generation && attempt.id === prospectiveStart.body.requestId)
+      && attemptsAfterRotation.some((attempt) => attempt.qrGeneration === generationTwo && attempt.id === currentRoomStartA.body.requestId && attempt.coalescedIntoId === null)
+      && roomAccessVerificationEmailCount - prospectiveRoomBefore.sent === 2,
+    staleGenerationDeniedAndInvalidated: staleRoomVerification?.response.status === 409 && staleRoomVerification.body?.error?.code === 'REVISION_CONFLICT'
+      && (await prisma.roomAccessEmailAttempt.findUnique({ where: { id: prospectiveStart.body.requestId }, select: { state: true, requesterEmailNormalized: true } }))?.state === 'EXPIRED'
+      && (await prisma.authChallenge.findUnique({ where: { id: prospectiveStart.body.challengeId }, select: { revokedAt: true, targetEmail: true } }))?.revokedAt !== null,
+    wrongCodeHasNoRequestOrAccount: wrongCurrentRoomVerification?.response.status === 409
+      && requestsAfterWrongRoomCode === prospectiveRoomBefore.requests
+      && accountsAfterWrongRoomCode === 0,
+    verifiedCreatesOneRedactedOwnerVisibleRequest: correctCurrentRoomVerification?.response.status === 201
+      && correctCurrentRoomReplay?.response.status === 200 && correctCurrentRoomReplay.body.requestId === correctCurrentRoomVerification.body.requestId
+      && verifiedRoomRequest?.status === 'PENDING' && verifiedRoomRequest.emailVerifiedAt !== null && verifiedRoomAccountCount === 0
+      && visibleProspectiveRequest?.requesterLabel !== prospectiveRoomEmail
+      && JSON.stringify(visibleProspectiveRequest ?? {}).includes('Verified requester')
+      && !(JSON.stringify(visibleProspectiveRequest ?? {}).includes(prospectiveRoomEmail)),
+    approvalInvitesWithoutGrantOrCredentialDisclosure: prospectiveRoomApproval?.response.status === 200
+      && prospectiveRoomApproval.body?.state === 'APPROVED' && prospectiveRoomApproval.body?.membershipId === null
+      && prospectiveApprovedRow?.status === 'APPROVED' && prospectiveApprovedRow.onboardingEmailStatus === 'ACCEPTED'
+      && prospectiveInvitation?.targetAccountId === null && Boolean(prospectiveInvitation.temporaryCredentialHash)
+      && prospectiveInvitation.targetEmailNormalized === prospectiveRoomEmail
+      && prospectiveInvitation.areas.length === 1 && prospectiveInvitation.areas[0].areaId === roomArea.id && prospectiveInvitation.areas[0].homeId === inviter.homeId
+      && prospectiveMemberBeforeLogin === 0 && !guestMembershipBeforeAccept
+      && customerInvitationEmailCount === invitationEmailsBeforeProspectiveApproval + 1
+      && capturedCustomerInvitation === prospectiveInvitation.id && Boolean(prospectiveTemporaryPassword)
+      && !prospectiveOwnerResponse.includes(prospectiveRoomEmail) && !prospectiveOwnerResponse.includes(prospectiveTemporaryPassword),
+    recipientJourneyAcceptsExactArea: prospectiveGuestLogin?.response.status === 200
+      && prospectiveGuestRequirements?.body?.nextAction === 'CHANGE_PASSWORD'
+      && prospectiveGuestAccount?.mustChangePassword === true && prospectiveGuestAccount.usernameSelectionRequired === true
+      && prospectiveGuestAccount.emailVerifiedAt !== null && prospectiveGuestPasswordChange?.response.status === 200
+      && prospectiveGuestUsernameChange?.response.status === 200 && prospectiveGuestPolicy?.response.status === 200
+      && prospectiveGuestPending?.body?.pendingRelationships?.some((item) => item.id === prospectiveInvitation?.id && item.allowedActions?.includes('ACCEPT'))
+      && prospectiveInvitationAccepted?.response.status === 200
+      && prospectiveMembershipAfterAccept?.status === 'ACTIVE' && prospectiveMembershipAfterAccept.role === 'TENANT'
+      && prospectiveMembershipAfterAccept.tenantAreaGrants.length === 1
+      && prospectiveMembershipAfterAccept.tenantAreaGrants[0].areaId === roomArea.id && prospectiveMembershipAfterAccept.tenantAreaGrants[0].homeId === inviter.homeId,
+  };
+  if (Object.values(prospectiveRoomChecks).some((passed) => !passed)) fail(`Prospective logged-out Room QR flow failed checks ${JSON.stringify(Object.entries(prospectiveRoomChecks).filter(([, passed]) => !passed).map(([name]) => name))}; safe diagnostics ${JSON.stringify({ start: prospectiveStart.response.status, stale: staleRoomVerification?.response.status, concurrent: [currentRoomStartA.response.status, currentRoomStartB.response.status], changedBody: changedBody.response.status, changedBodyCode: changedBody.body?.error?.code, changedBodyMessage: changedBody.body?.error?.message, qrGenerationAtChangedBody: qrGenerationBeforeChangedBody.generation, qrGenerationExpected: oldRoomBody.expectedGeneration, wrongCode: wrongCurrentRoomVerification?.response.status, wrongCodeCanonical: wrongCurrentRoomVerification?.body?.error?.code, verify: correctCurrentRoomVerification?.response.status, verifyCanonical: correctCurrentRoomVerification?.body?.error?.code, verifyReplay: correctCurrentRoomReplay?.response.status, verifyReplayCanonical: correctCurrentRoomReplay?.body?.error?.code, ownerQueueStatus: ownerQueueAfterVerification.response.status, ownerVisible: Boolean(visibleProspectiveRequest), approval: prospectiveRoomApproval?.response.status, invite: Boolean(prospectiveInvitation), login: prospectiveGuestLogin?.response.status, password: prospectiveGuestPasswordChange?.response.status, username: prospectiveGuestUsernameChange?.response.status, policy: prospectiveGuestPolicy?.response.status, accept: prospectiveInvitationAccepted?.response.status, membership: prospectiveMembershipAfterAccept?.status, grantCount: prospectiveMembershipAfterAccept?.tenantAreaGrants.length ?? 0 })}`);
+  console.log('[stage6:integration] PASS: anonymous Room QR email verification remains private before proof, stale QR generations deny, concurrent scans coalesce, approval creates a recipient-only Area invitation without membership, and explicit acceptance grants exactly that Area');
+
+  // A completed but not-yet-claimed installation is legitimately ownerless
+  // and remains PENDING_INSTALLATION until the guarded first-owner activation.
+  const ownerlessHome = await prisma.home.create({ data: { lifecycle: 'PENDING_INSTALLATION', installationStatus: 'COMPLETE' } });
+  const ownerlessArea = await prisma.area.create({ data: { homeId: ownerlessHome.id, osAreaId: `stage6-ownerless-${crypto.randomUUID()}`, originalName: 'Private test area', status: 'ACTIVE' } });
+  const ownerlessReference = `dno_room_${crypto.randomBytes(32).toString('base64url')}`;
+  const ownerlessQr = await prisma.areaQrCredential.create({ data: { areaId: ownerlessArea.id, resolverHash: sha256(ownerlessReference) }, select: { id: true, generation: true } });
+  const ownerlessEmail = `room-ownerless-${crypto.randomUUID()}@invalid.test`;
+  const ownerlessScan = await fetchJson(`${base}/api/public/areas/scan`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ reference: ownerlessReference }) });
+  const ownerlessChallenge = await fetchJson(`${base}/api/public/areas/request-access/email-challenges`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ reference: ownerlessReference, expectedGeneration: ownerlessQr.generation, email: ownerlessEmail, idempotencyKey: `room-ownerless-${crypto.randomUUID()}` }) });
+  const ownerlessChecks = ownerlessScan.response.status === 409 && ownerlessChallenge.response.status === 409
+    && ownerlessChallenge.body?.error?.code === 'ROOM_ACCESS_HOME_NOT_READY'
+    && await prisma.roomAccessEmailAttempt.count({ where: { areaId: ownerlessArea.id } }) === 0
+    && await prisma.areaAccessRequest.count({ where: { areaId: ownerlessArea.id } }) === 0
+    && await prisma.customerAccount.count({ where: { emailNormalized: ownerlessEmail } }) === 0;
+  if (!ownerlessChecks) fail(`Ownerless Room QR did not fail closed before account/request creation (safe statuses ${ownerlessScan.response.status}/${ownerlessChallenge.response.status})`);
+  await prisma.areaQrCredential.delete({ where: { id: ownerlessQr.id } });
+  await prisma.area.delete({ where: { id: ownerlessArea.id } });
+  await prisma.home.delete({ where: { id: ownerlessHome.id } });
+  const roomAttempts = await prisma.roomAccessEmailAttempt.findMany({ where: { areaId: roomArea.id }, select: { id: true } });
+  await prisma.authChallenge.deleteMany({ where: { targetResourceId: { in: roomAttempts.map((attempt) => attempt.id) } } });
+  if (prospectiveInvitation) await prisma.membershipInvitation.deleteMany({ where: { id: prospectiveInvitation.id } });
+  await prisma.areaAccessRequest.deleteMany({ where: { areaId: roomArea.id } });
+  await prisma.roomAccessEmailAttempt.deleteMany({ where: { areaId: roomArea.id } });
+  if (prospectiveGuestAccount) await prisma.customerAccount.deleteMany({ where: { id: prospectiveGuestAccount.id } });
+  await prisma.tenantAreaGrant.deleteMany({ where: { areaId: roomArea.id } });
+  console.log('[stage6:integration] PASS: ownerless Room QR is denied before retaining an attempt, creating an account, or exposing an owner request');
   await prisma.areaAccessRequest.deleteMany({ where: { areaId: roomArea.id } });
   await prisma.tenantAreaGrant.deleteMany({ where: { areaId: roomArea.id } });
   await prisma.areaQrCredential.deleteMany({ where: { areaId: roomArea.id } });
@@ -4511,7 +4970,9 @@ try {
   await bootstrapDeliveryChecks(deliveryEnv);
   await customerAuthenticationLifecycleChecks(deliveryEnv);
   await customerAuthorizationChecks(deliveryEnv);
-  if (process.env.STAGE6_TENANT_REMOVAL_ONLY === '1') {
+  if (process.env.STAGE6_TRANSFER_ONLY === '1') {
+    await ownershipTransferChecks(deliveryEnv);
+  } else if (process.env.STAGE6_TENANT_REMOVAL_ONLY === '1') {
     await tenantMembershipRemovalChecks();
   } else {
     await pendingInvitationRouteChecks(deliveryEnv);
@@ -4520,6 +4981,7 @@ try {
     await osChecks();
     await operatorMutationChecks();
     await tenantMembershipRemovalChecks();
+    await ownershipTransferChecks(deliveryEnv);
   }
   const childTargets = verifyChildOutboundTargets();
   console.log(`[stage1:integration] PASS: live Platform routes, locked Dinodia OS HTTP, browser isolation, authenticated native WebSocket command authorization and denial exercised against disposable PostgreSQL; parent=${[...outboundTargets].sort().join(',')}; children=${childTargets.join(',')}`);

@@ -12,6 +12,8 @@ export const REQUIRED_MIGRATION = '20261003000000_native_v2_stage3_domain_schema
 export const REQUIRED_MODEL_COUNT = 65;
 export const COMPATIBLE_ADDITIVE_MIGRATIONS: Readonly<Record<string, string>> = Object.freeze({
   '20261006120000_stage6_invited_tenant_username_setup': '9b01d403fac2d37a59fc53be24c3f6296d3f0eaced2485530123b9e09946581c',
+  '20261006150000_stage6_ownership_transfer_claim': '7ec2190ff0da90755807a07683f441a8dee9063aea24234c80f5167052634226',
+  '20261006170000_stage6_prospective_room_access': '9477efc725c6f6a40b509842cd6a63f77eb7e1391ea4ce8a3fe87a933c2a8620',
   '20261006100000_stage6_apns_registration_and_notification_preferences': 'ccd425dec69f71f7a56d613de4990e56f79a45d217f823098a215b64c4fdd4db',
   '20261005130000_stage6_mobile_access_credentials': 'b69e02b571c4cdf3163c5d474b429fe5d4dee28ff9600a7804c70071179facc4',
   '20261005120000_stage6_customer_refresh_families': '434892c56b3aebca319292c6dda8db58d0a6e5d5b27129f593fdc3b674b3acef',
@@ -41,7 +43,8 @@ export function isSchemaReady(migrations: readonly CompletedMigration[], modelCo
   if (hasMobileAccess && !newer.some((migration) => migration.migration_name === '20261005120000_stage6_customer_refresh_families')) return false;
   if (newer.some((migration) => migration.migration_name === '20261006100000_stage6_apns_registration_and_notification_preferences')
     && (!hasMobileAccess || !newer.some((migration) => migration.migration_name === '20261005120000_stage6_customer_refresh_families'))) return false;
+  const hasProspectiveRoomAccess = newer.some((migration) => migration.migration_name === '20261006170000_stage6_prospective_room_access');
   const hasStage5 = newer.some((migration) => migration.migration_name === '20261004150000_stage5_hub_sync_v2');
   if (hasStage5 && !newer.some((migration) => migration.migration_name === '20261004050000_stage4_customer_lan_tls_identity')) return false;
-  return modelCount === REQUIRED_MODEL_COUNT + (hasStage5 ? 1 : 0);
+  return modelCount === REQUIRED_MODEL_COUNT + (hasStage5 ? 1 : 0) + (hasProspectiveRoomAccess ? 1 : 0);
 }

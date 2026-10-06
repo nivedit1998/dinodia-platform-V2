@@ -270,6 +270,7 @@ const fixtureCases = [
   ["selected-tenant-private-device.json", "device", (v) => v.device, true],
   ["multi-home-memberships.json", "membership", (v) => ({ accountId: v.accountId, ...v.memberships[0] }), true],
   ["notification-security-mandatory.json", "notification", (v) => v, true],
+  ["ownership-transfer-api.json", "ownershipTransferStatus", (v) => v.status, true],
   ["override-area-name.json", "override", (v) => v, true],
   ["stale-and-unavailable-control-state.json", "envelope", (v) => v, true],
   ["stale-and-unavailable-control-state.json", "controlState", (v) => v.data, true],

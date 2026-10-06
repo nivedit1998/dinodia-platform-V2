@@ -90,11 +90,26 @@ export interface CustomerRoomQrScanRequest { reference: string }
 export interface CustomerRoomQrScanReceipt { schemaVersion: typeof DINODIA_V1; ok: true; state: 'AVAILABLE'; areaLabel: string; qrGeneration: number; requestValiditySeconds: number }
 export interface CustomerRoomAccessRequestRequest { reference: string; expectedGeneration: number; idempotencyKey: string }
 export interface CustomerRoomAccessRequestReceipt { schemaVersion: typeof DINODIA_V1; ok: true; requestId: OpaqueId; areaLabel: string; state: 'PENDING'; expiresAt: string; revision: string; coalesced: boolean; idempotentReplay: boolean }
+export interface PublicRoomAccessEmailChallengeRequest { reference: string; expectedGeneration: number; email: string; idempotencyKey: string }
+export interface PublicRoomAccessEmailChallengeReceipt { schemaVersion: typeof DINODIA_V1; ok: true; state: 'VERIFY_EMAIL'|'PENDING'; requestId: OpaqueId; challengeId?: OpaqueId; expiresAt: string; revision?: string; emailSubmission: 'ACCEPTED'|'PENDING'|'NOT_REQUIRED'; idempotentReplay: boolean }
+export interface PublicRoomAccessEmailVerificationRequest { requestId: OpaqueId; challengeId: OpaqueId; code: string }
+export interface PublicRoomAccessEmailVerificationReceipt { schemaVersion: typeof DINODIA_V1; ok: true; state: 'PENDING'; requestId: OpaqueId; expiresAt: string; revision: string; idempotentReplay: boolean }
 export interface CustomerRoomAccessCancelRequest { expectedRevision: string; idempotencyKey: string }
 export interface CustomerRoomAccessDecisionRequest { requestId: OpaqueId; decision: 'APPROVE'|'REJECT'; expectedRevision: string; idempotencyKey: string }
 export interface CustomerRoomAccessDecisionReceipt { schemaVersion: typeof DINODIA_V1; ok: true; requestId: OpaqueId; state: 'APPROVED'|'REJECTED'; membershipId: OpaqueId|null; idempotentReplay: boolean }
 export interface CustomerHomeClaimResolveReceipt { schemaVersion: typeof DINODIA_V1; ok: true; claimId: OpaqueId; generation: number; state: 'SETUP'; expiresAt: string }
-export interface CustomerHomeClaimResolveRequest { reference: string }
+export interface CustomerHomeClaimResolverProof {
+  version: 1; serial: string; identityGeneration: number; challengeId: OpaqueId; challenge: string;
+  resolverGeneration: number; expiresAt: string; timestamp: string; nonce: string; bodyHash: string; hubSignature: string;
+}
+export interface CustomerHomeClaimResolveRequest { reference: string; resolverProof?: CustomerHomeClaimResolverProof }
+export interface CustomerHomeClaimLanEndpointRequest { reference: string }
+export interface CustomerHomeClaimLanEndpointReceipt { schemaVersion: typeof DINODIA_V1; ok: true; lanEndpoint: CustomerLanEndpoint }
+export interface CustomerLanEndpoint {
+  state: 'verified_lan'; origin: string; publicHubId: string; certificateGeneration: number; currentSpkiPin: string;
+  currentNotBefore: string; currentNotAfter: string; nextCertificateGeneration?: number; nextSpkiPin?: string;
+  nextNotBefore?: string; nextNotAfter?: string; reportedAt: string; validUntil: string;
+}
 export type CustomerHomeClaimSetupStep = 'PROFILE'|'ADDRESS'|'ADDRESS_CONFIRMATION'|'POLICY';
 export interface CustomerHomeClaimSetupRequest { expectedRevision: number; step: CustomerHomeClaimSetupStep; mutation: Record<string, unknown> }
 export interface CustomerHomeClaimCompleteRequest { expectedRevision: number; idempotencyKey: string }
@@ -106,6 +121,14 @@ export interface CustomerHomeClaimSetupStatus {
 export interface CustomerHomeClaimAddress { schemaVersion: typeof DINODIA_V1; ok: true; claimId: OpaqueId; addressLine1: string|null; addressLine2: string|null; city: string|null; region: string|null; postcode: string|null; country: string|null; timezone: string|null; addressRevision: number; addressDigest: string }
 export interface CustomerHomeClaimSetupReceipt { schemaVersion: typeof DINODIA_V1; ok: true; claimId: OpaqueId; step: 'PROFILE'|'ADDRESS'|'ADDRESS_CONFIRMATION'|'POLICY'; expiresAt: string; revision: number }
 export interface CustomerHomeClaimCompleteReceipt { schemaVersion: typeof DINODIA_V1; ok: true; claimId: OpaqueId; state: 'PENDING_INSTALLATION'|'ACTIVE'; idempotentReplay: boolean; postcode: string|null }
+export interface OwnershipTransferSummary { transferId: OpaqueId; state: 'PENDING'; createdAt: string; updatedAt: string; reference: string; recipientEmail: string; emailDeliveryStatus: 'PENDING'|'ACCEPTED'|'FAILED'; expiresAt: null }
+export interface OwnershipTransferStatus { schemaVersion: typeof DINODIA_V1; homeId: OpaqueId; managementRevision: number; activeTransfer: OwnershipTransferSummary|null }
+export interface OwnershipTransferStartRequest { action: 'START'; recipientEmail: string; expectedManagementRevision: number; proof: string; idempotencyKey: string }
+export interface OwnershipTransferCancelRequest { action: 'CANCEL'; transferId: OpaqueId; expectedTransferUpdatedAt: string; proof: string; idempotencyKey: string }
+export interface OwnershipTransferResolveRequest { reference: string; idempotencyKey: string; resolverProof?: CustomerHomeClaimResolverProof }
+export interface OwnershipTransferStartReceipt { schemaVersion: typeof DINODIA_V1; ok: true; transferId: OpaqueId; reference: string; state: 'PENDING'; emailDeliveryStatus: 'PENDING'|'ACCEPTED'|'FAILED'; idempotentReplay: boolean }
+export interface OwnershipTransferCancelReceipt { schemaVersion: typeof DINODIA_V1; ok: true; transferId: OpaqueId; state: 'CANCELLED'; idempotentReplay: boolean }
+export interface OwnershipTransferResolveReceipt { schemaVersion: typeof DINODIA_V1; ok: true; transferId: OpaqueId; homeId: OpaqueId; homeMembershipId: OpaqueId; state: 'TRANSFERRED'; idempotentReplay: boolean }
 export interface PublicSupportEmailChallengeRequest { replyEmail: string; category: NativeSupportCategory; description: string }
 export interface PublicSupportEmailChallengeReceipt { schemaVersion: typeof DINODIA_V1; ok: true; state: 'PENDING'; challengeId: OpaqueId; expiresAt: string; emailSubmission: 'ACCEPTED'|'FAILED' }
 export interface PublicSupportEmailVerificationRequest { challengeId: OpaqueId; code: string; category: NativeSupportCategory; description: string }
@@ -489,6 +512,29 @@ export function validateCustomerRoomAccessRequestReceipt(value: unknown): value 
     && value.state === 'PENDING' && utcTimestamp(value.expiresAt) && utcTimestamp(value.revision)
     && typeof value.coalesced === 'boolean' && typeof value.idempotentReplay === 'boolean';
 }
+export function validatePublicRoomAccessEmailChallengeRequest(value: unknown): value is PublicRoomAccessEmailChallengeRequest {
+  return object(value) && hasOnlyKeys(value, ['reference','expectedGeneration','email','idempotencyKey'])
+    && validateCustomerRoomQrScanRequest({ reference: value.reference }) && Number.isSafeInteger(value.expectedGeneration)
+    && Number(value.expectedGeneration) > 0 && typeof value.email === 'string' && value.email.trim().length <= 320
+    && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value.email.trim()) && idempotencyKey(value.idempotencyKey);
+}
+export function validatePublicRoomAccessEmailChallengeReceipt(value: unknown): value is PublicRoomAccessEmailChallengeReceipt {
+  return object(value) && hasOnlyKeys(value, ['schemaVersion','ok','state','requestId','challengeId','expiresAt','revision','emailSubmission','idempotentReplay'])
+    && value.schemaVersion === DINODIA_V1 && value.ok === true && ['VERIFY_EMAIL','PENDING'].includes(String(value.state))
+    && id(value.requestId) && (value.challengeId === undefined || id(value.challengeId)) && utcTimestamp(value.expiresAt)
+    && ['ACCEPTED','PENDING','NOT_REQUIRED'].includes(String(value.emailSubmission)) && typeof value.idempotentReplay === 'boolean'
+    && (value.state === 'VERIFY_EMAIL' ? Boolean(value.challengeId) && value.revision === undefined
+      : value.challengeId === undefined && value.emailSubmission === 'NOT_REQUIRED' && utcTimestamp(value.revision));
+}
+export function validatePublicRoomAccessEmailVerificationRequest(value: unknown): value is PublicRoomAccessEmailVerificationRequest {
+  return object(value) && hasOnlyKeys(value, ['requestId','challengeId','code']) && id(value.requestId) && id(value.challengeId)
+    && typeof value.code === 'string' && /^\d{6}$/.test(value.code);
+}
+export function validatePublicRoomAccessEmailVerificationReceipt(value: unknown): value is PublicRoomAccessEmailVerificationReceipt {
+  return object(value) && hasOnlyKeys(value, ['schemaVersion','ok','state','requestId','expiresAt','revision','idempotentReplay'])
+    && value.schemaVersion === DINODIA_V1 && value.ok === true && value.state === 'PENDING' && id(value.requestId)
+    && utcTimestamp(value.expiresAt) && utcTimestamp(value.revision) && typeof value.idempotentReplay === 'boolean';
+}
 export function validateCustomerRoomAccessCancelRequest(value: unknown): value is CustomerRoomAccessCancelRequest {
   return object(value) && hasOnlyKeys(value, ['expectedRevision','idempotencyKey']) && utcTimestamp(value.expectedRevision) && idempotencyKey(value.idempotencyKey);
 }
@@ -499,12 +545,33 @@ export function validateCustomerRoomAccessDecisionRequest(value: unknown): value
 export function validateCustomerRoomAccessDecisionReceipt(value: unknown, expectedRequestId: string): value is CustomerRoomAccessDecisionReceipt {
   return object(value) && hasOnlyKeys(value, ['schemaVersion','ok','requestId','state','membershipId','idempotentReplay'])
     && value.schemaVersion === DINODIA_V1 && value.ok === true && value.requestId === expectedRequestId
-    && (value.state === 'APPROVED' ? id(value.membershipId) : value.state === 'REJECTED' && value.membershipId === null)
+    && (value.state === 'APPROVED' ? value.membershipId === null || id(value.membershipId) : value.state === 'REJECTED' && value.membershipId === null)
     && typeof value.idempotentReplay === 'boolean';
 }
 const nullableText = (value: unknown, limit: number): value is string|null => value === null || nonEmptyText(value, limit);
 export function validateCustomerHomeClaimResolveRequest(value: unknown): value is CustomerHomeClaimResolveRequest {
-  return object(value) && hasOnlyKeys(value, ['reference']) && typeof value.reference === 'string' && /^dno_home_[A-Za-z0-9_-]{40,64}$/.test(value.reference);
+  if (!object(value) || !hasOnlyKeys(value, ['reference','resolverProof']) || typeof value.reference !== 'string') return false;
+  const qrReference = /^dno_home_[A-Za-z0-9_-]{40,64}$/.test(value.reference);
+  const permanentLabel = /^DNO-HOME-[A-Za-z0-9_-]{32,64}$/.test(value.reference);
+  if (qrReference && value.resolverProof === undefined) return true;
+  if (!permanentLabel || !object(value.resolverProof)
+    || !hasOnlyKeys(value.resolverProof, ['version','serial','identityGeneration','challengeId','challenge','resolverGeneration','expiresAt','timestamp','nonce','bodyHash','hubSignature'])) return false;
+  const proof = value.resolverProof;
+  return proof.version === 1 && nonEmptyText(proof.serial, 160) && Number.isSafeInteger(proof.identityGeneration) && Number(proof.identityGeneration) > 0
+    && id(proof.challengeId) && typeof proof.challenge === 'string' && /^[A-Za-z0-9_-]{20,128}$/.test(proof.challenge)
+    && Number.isSafeInteger(proof.resolverGeneration) && Number(proof.resolverGeneration) > 0
+    && utcTimestamp(proof.expiresAt) && typeof proof.timestamp === 'string' && /^\d{10,16}$/.test(proof.timestamp)
+    && typeof proof.nonce === 'string' && /^[A-Za-z0-9_-]{16,128}$/.test(proof.nonce)
+    && typeof proof.bodyHash === 'string' && /^[a-f0-9]{64}$/.test(proof.bodyHash)
+    && typeof proof.hubSignature === 'string' && /^[A-Za-z0-9_-]{40,2048}$/.test(proof.hubSignature);
+}
+export function validateCustomerHomeClaimLanEndpointRequest(value: unknown): value is CustomerHomeClaimLanEndpointRequest {
+  return object(value) && hasOnlyKeys(value, ['reference']) && typeof value.reference === 'string'
+    && /^DNO-HOME-[A-Za-z0-9_-]{32,64}$/.test(value.reference);
+}
+export function validateCustomerHomeClaimLanEndpointReceipt(value: unknown, now = Date.now()): value is CustomerHomeClaimLanEndpointReceipt {
+  return object(value) && hasOnlyKeys(value, ['schemaVersion','ok','lanEndpoint']) && value.schemaVersion === DINODIA_V1
+    && value.ok === true && validateCustomerLanEndpoint(value.lanEndpoint, now);
 }
 export function validateCustomerHomeClaimSetupRequest(value: unknown): value is CustomerHomeClaimSetupRequest {
   if (!object(value) || !hasOnlyKeys(value, ['expectedRevision','step','mutation']) || !Number.isSafeInteger(value.expectedRevision)
@@ -563,6 +630,53 @@ export function validateCustomerHomeClaimCompleteReceipt(value: unknown, expecte
     && value.ok === true && value.claimId === expectedClaimId && ['PENDING_INSTALLATION','ACTIVE'].includes(String(value.state))
     && typeof value.idempotentReplay === 'boolean' && nullableText(value.postcode, 32);
 }
+const ownershipTransferReference = (value: unknown): value is string => typeof value === 'string'
+  && /^dno_transfer_[0-9a-f-]{36}_[A-Za-z0-9_-]{40,64}$/.test(value);
+function validateOwnershipTransferSummary(value: unknown): value is OwnershipTransferSummary {
+  return object(value) && hasOnlyKeys(value, ['transferId','state','createdAt','updatedAt','reference','recipientEmail','emailDeliveryStatus','expiresAt'])
+    && id(value.transferId) && value.state === 'PENDING' && utcTimestamp(value.createdAt) && utcTimestamp(value.updatedAt)
+    && ownershipTransferReference(value.reference) && typeof value.recipientEmail === 'string' && value.recipientEmail.length <= 320
+    && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value.recipientEmail)
+    && ['PENDING','ACCEPTED','FAILED'].includes(String(value.emailDeliveryStatus)) && value.expiresAt === null;
+}
+export function validateOwnershipTransferStatus(value: unknown, expectedHomeId: string): value is OwnershipTransferStatus {
+  return object(value) && hasOnlyKeys(value, ['schemaVersion','homeId','managementRevision','activeTransfer'])
+    && value.schemaVersion === DINODIA_V1 && id(expectedHomeId) && value.homeId === expectedHomeId
+    && Number.isSafeInteger(value.managementRevision) && Number(value.managementRevision) >= 1
+    && (value.activeTransfer === null || validateOwnershipTransferSummary(value.activeTransfer));
+}
+export function validateOwnershipTransferStartRequest(value: unknown): value is OwnershipTransferStartRequest {
+  return object(value) && hasOnlyKeys(value, ['action','recipientEmail','expectedManagementRevision','proof','idempotencyKey'])
+    && value.action === 'START' && typeof value.recipientEmail === 'string' && value.recipientEmail.length <= 320
+    && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value.recipientEmail)
+    && Number.isSafeInteger(value.expectedManagementRevision) && Number(value.expectedManagementRevision) >= 1
+    && typeof value.proof === 'string' && value.proof.length >= 40 && value.proof.length <= 8192 && idempotencyKey(value.idempotencyKey);
+}
+export function validateOwnershipTransferCancelRequest(value: unknown): value is OwnershipTransferCancelRequest {
+  return object(value) && hasOnlyKeys(value, ['action','transferId','expectedTransferUpdatedAt','proof','idempotencyKey'])
+    && value.action === 'CANCEL' && id(value.transferId) && utcTimestamp(value.expectedTransferUpdatedAt)
+    && typeof value.proof === 'string' && value.proof.length >= 40 && value.proof.length <= 8192 && idempotencyKey(value.idempotencyKey);
+}
+export function validateOwnershipTransferResolveRequest(value: unknown): value is OwnershipTransferResolveRequest {
+  if (!object(value) || !hasOnlyKeys(value, ['reference','idempotencyKey','resolverProof']) || !idempotencyKey(value.idempotencyKey)) return false;
+  if (ownershipTransferReference(value.reference)) return value.resolverProof === undefined;
+  return typeof value.reference === 'string' && /^DNO-HOME-[A-Za-z0-9_-]{32,64}$/.test(value.reference)
+    && value.resolverProof !== undefined && validateCustomerHomeClaimResolveRequest({ reference: value.reference, resolverProof: value.resolverProof });
+}
+export function validateOwnershipTransferStartReceipt(value: unknown): value is OwnershipTransferStartReceipt {
+  return object(value) && hasOnlyKeys(value, ['schemaVersion','ok','transferId','reference','state','emailDeliveryStatus','idempotentReplay'])
+    && value.schemaVersion === DINODIA_V1 && value.ok === true && id(value.transferId) && ownershipTransferReference(value.reference)
+    && value.state === 'PENDING' && ['PENDING','ACCEPTED','FAILED'].includes(String(value.emailDeliveryStatus)) && typeof value.idempotentReplay === 'boolean';
+}
+export function validateOwnershipTransferCancelReceipt(value: unknown): value is OwnershipTransferCancelReceipt {
+  return object(value) && hasOnlyKeys(value, ['schemaVersion','ok','transferId','state','idempotentReplay'])
+    && value.schemaVersion === DINODIA_V1 && value.ok === true && id(value.transferId) && value.state === 'CANCELLED' && typeof value.idempotentReplay === 'boolean';
+}
+export function validateOwnershipTransferResolveReceipt(value: unknown): value is OwnershipTransferResolveReceipt {
+  return object(value) && hasOnlyKeys(value, ['schemaVersion','ok','transferId','homeId','homeMembershipId','state','idempotentReplay'])
+    && value.schemaVersion === DINODIA_V1 && value.ok === true && id(value.transferId) && id(value.homeId)
+    && id(value.homeMembershipId) && value.state === 'TRANSFERRED' && typeof value.idempotentReplay === 'boolean';
+}
 /** The short-lived hub bearer is accepted only for its exact selected membership and home. */
 export function validateCustomerHubSession(value: unknown, expected: { homeId: string; membershipId: string }, now = Date.now()): value is CustomerHubSession {
   if (!object(value) || !hasOnlyKeys(value, ['ok','token','expiresAt','homeId','membershipId','hubEndpoint']) || value.ok !== true || typeof value.token !== 'string' || value.token.length < 1 || value.token.length > 8192 || value.token === 'TEST_ONLY_PLACEHOLDER_NOT_A_BEARER' || !utcTimestamp(value.expiresAt) || !id(expected.homeId) || !id(expected.membershipId) || value.homeId !== expected.homeId || value.membershipId !== expected.membershipId) return false;
@@ -595,7 +709,7 @@ export function validateCustomerHubSession(value: unknown, expected: { homeId: s
   const expiresAt = Date.parse(value.expiresAt);
   return expiresAt > now && expiresAt <= now + 5 * 60 * 1000 + 1000;
 }
-const stepUpOperations = new Set(['trusted_device_remove','customer_password_change','customer_profile_change','customer_email_change','tenant_membership_remove','support_ticket_close','support_access_approve','support_access_revoke','alexa_unlink','heating_sensitive_command','device_sensitive_command']);
+const stepUpOperations = new Set(['trusted_device_remove','customer_password_change','customer_profile_change','customer_email_change','tenant_membership_remove','home.transfer','support_ticket_close','support_access_approve','support_access_revoke','alexa_unlink','heating_sensitive_command','device_sensitive_command']);
 function validStepUpDescriptor(value: unknown): boolean {
   const keys = ['version','serial','identityGeneration','actorId','customerSessionId','trustedDeviceId','homeId','membershipId','hubInstallId','operationKind','targetIds','controlId','descriptorRevision','descriptorDigest','operationDigest','nonce','issuedAt','hubSignature'];
   return object(value) && Object.keys(value).length === keys.length && hasOnlyKeys(value, keys) && value.version === 1 && id(value.serial) && Number.isInteger(value.identityGeneration) && Number(value.identityGeneration) > 0 && id(value.actorId) && id(value.customerSessionId) && id(value.trustedDeviceId) && id(value.homeId) && id(value.membershipId) && id(value.hubInstallId) && stepUpOperations.has(String(value.operationKind)) && Array.isArray(value.targetIds) && value.targetIds.length > 0 && value.targetIds.length <= 20 && value.targetIds.every(id) && new Set(value.targetIds).size === value.targetIds.length && id(value.controlId) && Number.isInteger(value.descriptorRevision) && Number(value.descriptorRevision) >= 0 && (value.descriptorDigest === null || typeof value.descriptorDigest === 'string' && /^[0-9a-f]{64}$/.test(value.descriptorDigest)) && typeof value.operationDigest === 'string' && /^[0-9a-f]{64}$/.test(value.operationDigest) && typeof value.nonce === 'string' && codePointLength(value.nonce) >= 20 && codePointLength(value.nonce) <= 128 && /^[A-Za-z0-9_-]+$/.test(value.nonce) && Number.isSafeInteger(value.issuedAt) && Number(value.issuedAt) > 0 && typeof value.hubSignature === 'string' && codePointLength(value.hubSignature) >= 32 && codePointLength(value.hubSignature) <= 2048 && /^[A-Za-z0-9_-]+$/.test(value.hubSignature);
@@ -639,24 +753,28 @@ export function validateOfflineAuthorisationReceipt(value: unknown): boolean {
   if (!object(value) || !hasOnlyKeys(value, ['ok','authorisation']) || value.ok !== true || !object(value.authorisation) || !hasOnlyKeys(value.authorisation, ['id','homeId','membershipId','trustedDeviceId','areaIds','scopes','policyRevision','hubInstallationId','membershipRevision','issuedAt','lanEndpoint'])) return false;
   const row = value.authorisation;
   const hasEnrollmentBinding = ['hubInstallationId','membershipRevision','issuedAt','lanEndpoint'].some((key) => Object.hasOwn(row, key));
-  if (hasEnrollmentBinding && (!id(row.hubInstallationId) || !Number.isInteger(row.membershipRevision) || Number(row.membershipRevision) < 0 || !utcTimestamp(row.issuedAt) || !validCustomerLanEndpoint(row.lanEndpoint))) return false;
+  if (hasEnrollmentBinding && (!id(row.hubInstallationId) || !Number.isInteger(row.membershipRevision) || Number(row.membershipRevision) < 0 || !utcTimestamp(row.issuedAt) || !validateCustomerLanEndpoint(row.lanEndpoint))) return false;
   return id(row.id) && id(row.homeId) && id(row.membershipId) && id(row.trustedDeviceId) && Array.isArray(row.areaIds) && row.areaIds.length > 0 && row.areaIds.every(id) && new Set(row.areaIds).size === row.areaIds.length && sameJsonValue(row.scopes, ['tenant:device-command']) && Number.isInteger(row.policyRevision) && Number(row.policyRevision) >= 0;
 }
 
-function validCustomerLanEndpoint(value: unknown): boolean {
+export function validateCustomerLanEndpoint(value: unknown, now = Date.now()): value is CustomerLanEndpoint {
   if (!object(value) || !hasOnlyKeys(value, ['state','origin','publicHubId','certificateGeneration','currentSpkiPin','currentNotBefore','currentNotAfter','nextCertificateGeneration','nextSpkiPin','nextNotBefore','nextNotAfter','reportedAt','validUntil'])
     || value.state !== 'verified_lan' || typeof value.publicHubId !== 'string' || !/^[a-f0-9]{20}$/.test(value.publicHubId)
     || value.origin !== `https://dinodia-${value.publicHubId}.local:8123`
     || !Number.isSafeInteger(value.certificateGeneration) || Number(value.certificateGeneration) < 1
     || typeof value.currentSpkiPin !== 'string' || !/^sha256\/[A-Za-z0-9+/]{43}=$/.test(value.currentSpkiPin)
     || !utcTimestamp(value.currentNotBefore) || !utcTimestamp(value.currentNotAfter) || Date.parse(value.currentNotBefore) >= Date.parse(value.currentNotAfter)
-    || !utcTimestamp(value.reportedAt) || !utcTimestamp(value.validUntil) || Date.parse(value.validUntil) <= Date.parse(value.reportedAt)) return false;
+    || !utcTimestamp(value.reportedAt) || !utcTimestamp(value.validUntil) || Date.parse(value.validUntil) <= Date.parse(value.reportedAt)
+    || Date.parse(value.reportedAt) > now || now - Date.parse(value.reportedAt) > 420_000 || Date.parse(value.validUntil) <= now
+    || Date.parse(value.validUntil) > Date.parse(value.reportedAt) + 420_000
+    || Date.parse(value.currentNotBefore) > now || Date.parse(value.currentNotAfter) <= now) return false;
   const next = ['nextCertificateGeneration','nextSpkiPin','nextNotBefore','nextNotAfter'];
   const hasNext = next.some((key) => Object.hasOwn(value, key));
   return !hasNext || next.every((key) => Object.hasOwn(value, key))
     && Number.isSafeInteger(value.nextCertificateGeneration) && Number(value.nextCertificateGeneration) > Number(value.certificateGeneration)
     && typeof value.nextSpkiPin === 'string' && /^sha256\/[A-Za-z0-9+/]{43}=$/.test(value.nextSpkiPin)
     && utcTimestamp(value.nextNotBefore) && utcTimestamp(value.nextNotAfter)
+    && Date.parse(value.nextNotAfter) > now
     && Date.parse(value.nextNotBefore) < Date.parse(value.nextNotAfter) && value.nextSpkiPin !== value.currentSpkiPin;
 }
 export function validateOfflineRevocationReceipt(value: unknown): boolean {

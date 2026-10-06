@@ -432,7 +432,7 @@ test('readiness requires the exact Stage 3 schema plus reviewed additive Stage 4
   assert.match(read('scripts/verify_native_v2_migration_target.mjs'), /--stage5-incident-source-kind/);
   assert.match(read('package.json'), /stage5:incident-source-kind:migration:target/);
   assert.match(read('src/lib/foundation.ts'), /REQUIRED_MODEL_COUNT = 65/);
-  assert.match(read('src/lib/foundation.ts'), /REQUIRED_MODEL_COUNT \+ \(hasStage5 \? 1 : 0\)/);
+  assert.match(read('src/lib/foundation.ts'), /REQUIRED_MODEL_COUNT \+ \(hasStage5 \? 1 : 0\) \+ \(hasProspectiveRoomAccess \? 1 : 0\)/);
 });
 
 test('normal hub routes require the acknowledged machine credential', () => {
@@ -644,7 +644,7 @@ test('R4 production paths use opaque browser-bound handoffs, committed claim cle
   assert.match(consume, /browserBindingHash/);
   assert.match(consume, /setupAttemptId/);
   assert.match(consume, /handoff\.consumedAt/);
-  assert.match(claim, /const result = await prisma\.\$transaction/);
+  assert.match(claim, /const result = await serializableTransaction\(/);
   assert.match(claim, /if \(result\.expired\) throw/);
   assert.match(claim, /pendingSetupCount/);
   assert.match(cloud, /reservedTunnelName/);
@@ -688,12 +688,16 @@ test('R4 production paths use opaque browser-bound handoffs, committed claim cle
   assert.match(resolver, /permanentResolverHash/);
   assert.match(resolver, /homeClaimChallenge\.create/);
   assert.match(resolver, /state: \{ in: \['AVAILABLE', 'RESERVED'\] \}/);
-  assert.match(readOs('src/server.js'), /\/_dinodia\/setup\/claim-challenge/);
+  const osServer = readOs('src/server.js');
+  assert.match(osServer, /\/api\/dinodia\/v1\/claim-resolver\/challenge/);
+  assert.match(osServer, /Permanent-label Home authority is never resolved over the installer-only/);
+  assert.doesNotMatch(osServer, /requestPermanentClaimChallenge\(reference\)[\s\S]{0,160}\/_dinodia\/setup\/claim-challenge/);
   assert.match(readOs('src/platformPairing.js'), /requestPermanentClaimChallenge/);
   const resolverHarness = read('src/app/api/internal/stage1/claim/route.ts');
+  const resolverService = read('src/lib/stage1ClaimResolver.ts');
   assert.match(resolverHarness, /action === 'resolve'/);
-  assert.match(resolverHarness, /signedResponseDigest/);
-  assert.match(resolverHarness, /resolver_challenge_replayed/);
+  assert.match(resolverService, /signedResponseDigest/);
+  assert.match(resolverService, /resolver_challenge_replayed/);
   assert.match(resolverHarness, /constantTimeEqual/);
 });
 

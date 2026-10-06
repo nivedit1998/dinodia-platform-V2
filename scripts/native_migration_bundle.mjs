@@ -5,6 +5,8 @@ export const STAGE6_CUSTOMER_MIGRATIONS = Object.freeze([
   '20261005130000_stage6_mobile_access_credentials',
   '20261006100000_stage6_apns_registration_and_notification_preferences',
   '20261006120000_stage6_invited_tenant_username_setup',
+  '20261006150000_stage6_ownership_transfer_claim',
+  '20261006170000_stage6_prospective_room_access',
 ]);
 
 export function migrationBundleIdentity(names, checksums) {

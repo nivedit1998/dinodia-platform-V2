@@ -41,7 +41,7 @@ export async function sendCustomerInvitationEmail(input: {
   const link = `${ORIGIN}/app/auth#invitation=${encodeURIComponent(input.invitationId)}`;
   const roleText = input.role === 'TENANT' ? 'tenant' : 'property manager';
   const credentialText = input.temporaryPassword
-    ? `\n\nOne-time temporary password: ${input.temporaryPassword}\n\nOpen the invitation link, enter this one-time password and your invited email, then verify the email link. Sign in with the one-time password, replace it, choose your own username, and only then accept the invitation.`
+    ? `\n\nOne-time temporary password: ${input.temporaryPassword}\n\nOpen the invitation link and sign in using this invited email address and one-time password. Its successful first use confirms access to this email address. Dinodia will then require you to replace the temporary password, choose your own username, review current policy and explicitly accept the invitation before any Home access is granted.`
     : '\n\nIf you already have a Dinodia account, keep using your existing sign-in details. Otherwise, register and verify this email address before accepting.';
   const expires = input.expiresAt.toISOString();
   const client = new SESv2Client({ region, ...(testEndpoint ? { endpoint: testEndpoint } : {}) });
@@ -53,7 +53,7 @@ export async function sendCustomerInvitationEmail(input: {
         Subject: { Data: 'Dinodia Smart Living Home invitation', Charset: 'UTF-8' },
         Body: {
           Text: { Data: `You have been invited as a ${roleText} for the property with postcode ${input.postcode}.\n\nReview the invitation securely: ${link}${credentialText}\n\nThe invitation expires at ${expires}. Sending this message does not grant Home access.`, Charset: 'UTF-8' },
-          Html: { Data: `<p>You have been invited as a ${escapeHtml(roleText)} for the property with postcode ${escapeHtml(input.postcode)}.</p><p><a href="${escapeHtml(link)}">Review invitation</a></p>${input.temporaryPassword ? `<p>One-time temporary password: <strong>${escapeHtml(input.temporaryPassword)}</strong></p><p>Open the invitation link, enter this password and your invited email, verify the email link, then sign in with the one-time password. Replace it, choose your own username, and explicitly accept the invitation.</p>` : '<p>Existing accounts keep their current credentials. New property managers register and verify this email using credentials they choose.</p>'}<p>The invitation expires at ${escapeHtml(expires)}. Sending this message does not grant Home access.</p>`, Charset: 'UTF-8' },
+          Html: { Data: `<p>You have been invited as a ${escapeHtml(roleText)} for the property with postcode ${escapeHtml(input.postcode)}.</p><p><a href="${escapeHtml(link)}">Review invitation</a></p>${input.temporaryPassword ? `<p>One-time temporary password: <strong>${escapeHtml(input.temporaryPassword)}</strong></p><p>Open the invitation link and sign in using this invited email address and one-time password. Its successful first use confirms access to this email address. Dinodia will then require you to replace the temporary password, choose your own username, review current policy and explicitly accept the invitation before any Home access is granted.</p>` : '<p>Existing accounts keep their current credentials. New property managers register and verify this email using credentials they choose.</p>'}<p>The invitation expires at ${escapeHtml(expires)}. Sending this message does not grant Home access.</p>`, Charset: 'UTF-8' },
         },
       } },
     }));

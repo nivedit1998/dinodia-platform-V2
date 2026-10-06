@@ -17,7 +17,8 @@ export async function POST(request: Request) {
     // The key and reference are never logged. Rate-limit by the keyed digest,
     // not by the raw QR payload.
     await enforcePersistentRateLimit(`customer-home-claim:${customer.id}:${hashClaimReference(body.reference)}`, 12, 15 * 60 * 1000);
-    const result = await redeemClaimContract({ reference: body.reference, customerAccountId: customer.id, emailVerified: Boolean(customer.emailVerifiedAt), principal: customer });
+    const result = await redeemClaimContract({ reference: body.reference, customerAccountId: customer.id, emailVerified: Boolean(customer.emailVerifiedAt), principal: customer,
+      ...(body.resolverProof === undefined ? {} : { resolverProof: body.resolverProof as unknown as Record<string, unknown> }) });
     const receipt = { schemaVersion: 'dinodia.v1', ok: true, claimId: result.reservationId, generation: result.generation, state: 'SETUP', expiresAt: result.expiresAt.toISOString() };
     if (!validateCustomerHomeClaimResolveReceipt(receipt)) throw new Stage1AuthError(500, 'INTERNAL_ERROR', 'The Home claim receipt failed validation');
     return NextResponse.json(receipt, { status: 200, headers: { 'Cache-Control': 'no-store', Pragma: 'no-cache' } });

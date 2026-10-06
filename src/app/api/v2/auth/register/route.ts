@@ -6,8 +6,6 @@ import { Stage1AuthError } from '@/lib/stage1Auth';
 import { nativeV1ErrorResponse } from '@/lib/contracts/nativeV1Error';
 import { enforcePersistentRateLimit } from '@/lib/rateLimit';
 import { issueCustomerAuthChallenge } from '@/lib/customerAuthChallenges';
-import { startInvitedTenantRegistration } from '@/lib/customerInvitationRegistration';
-import { validateInvitedTenantRegistrationRequest } from '@/lib/contracts/dinodiaV1';
 
 export const dynamic = 'force-dynamic';
 
@@ -16,16 +14,6 @@ function record(value: unknown): value is Record<string, unknown> { return !!val
 export async function POST(request: Request) {
   try {
     const body = await request.json().catch(() => null);
-    if (record(body) && Object.keys(body).sort().join(',') === 'email,invitationId,password') {
-      const invitationRequest = { invitationId: body.invitationId, email: typeof body.email === 'string' ? body.email.trim().toLowerCase() : body.email, password: body.password };
-      if (!validateInvitedTenantRegistrationRequest(invitationRequest)) {
-        throw new Stage1AuthError(400, 'customer_registration_invalid', 'The invitation sign-in details are invalid');
-      }
-      const email = invitationRequest.email;
-      const accountId = await startInvitedTenantRegistration({ invitationId: invitationRequest.invitationId, email, temporaryPassword: invitationRequest.password });
-      const challenge = await issueCustomerAuthChallenge({ accountId, email, purpose: 'CUSTOMER_EMAIL_VERIFY' });
-      return NextResponse.json({ ok: true, challengeId: challenge.id, expiresAt: challenge.expiresAt.toISOString(), state: 'PENDING' }, { status: 202, headers: { 'Cache-Control': 'no-store', Pragma: 'no-cache' } });
-    }
     const allowed = new Set(['displayName', 'username', 'email', 'password']);
     if (!record(body) || Object.keys(body).some((key) => !allowed.has(key)) || Object.keys(body).length !== allowed.size) {
       throw new Stage1AuthError(400, 'customer_registration_invalid', 'Name, username, email and password are required');
@@ -54,32 +42,33 @@ export async function POST(request: Request) {
         where: { targetEmailNormalized: email, role: 'TENANT', state: 'PENDING', expiresAt: { gt: new Date() }, temporaryCredentialHash: { not: null } },
         select: { id: true }, take: 1,
       });
-      // A tenant with a one-time invitation credential must use the linked
-      // invitation registration path. This general form never accepts that
-      // credential or lets the invitee select the final username early.
-      if (pendingTenantInvitations.length === 0) {
-        const passwordHash = hashPassword(password);
-        try {
-          const created = await prisma.customerAccount.create({ data: {
-            displayName,
-            username,
-            usernameNormalized,
-            email,
-            emailNormalized: email,
-            passwordHash,
-            status: 'ACTIVE',
-          }, select: { id: true } });
-          accountId = created.id;
-          await prisma.auditEvent.create({ data: {
-            actorType: 'CUSTOMER', actorId: created.id, category: 'SECURITY', action: 'customer_registration_started',
-            targetType: 'CustomerAccount', targetId: created.id, metadata: { outcome: 'email_verification_pending' },
-            purgeAt: new Date(Date.now() + 365 * 24 * 60 * 60 * 1000),
-          } });
-        } catch (error) {
-          if (!(error && typeof error === 'object' && 'code' in error && String((error as { code?: unknown }).code) === 'P2002')) throw error;
-          // Concurrent registration for the same normalized email remains an
-          // indistinguishable accepted response; it never creates a second account.
-        }
+      if (pendingTenantInvitations.length > 0) {
+        // The linked one-time password is redeemed only by the normal sign-in
+        // endpoint; this registration form cannot create a placeholder account,
+        // send a second verification message or choose the tenant's username.
+        throw new Stage1AuthError(400, 'customer_registration_invalid', 'Use the invitation link to sign in with the one-time password.');
+      }
+      const passwordHash = hashPassword(password);
+      try {
+        const created = await prisma.customerAccount.create({ data: {
+          displayName,
+          username,
+          usernameNormalized,
+          email,
+          emailNormalized: email,
+          passwordHash,
+          status: 'ACTIVE',
+        }, select: { id: true } });
+        accountId = created.id;
+        await prisma.auditEvent.create({ data: {
+          actorType: 'CUSTOMER', actorId: created.id, category: 'SECURITY', action: 'customer_registration_started',
+          targetType: 'CustomerAccount', targetId: created.id, metadata: { outcome: 'email_verification_pending' },
+          purgeAt: new Date(Date.now() + 365 * 24 * 60 * 60 * 1000),
+        } });
+      } catch (error) {
+        if (!(error && typeof error === 'object' && 'code' in error && String((error as { code?: unknown }).code) === 'P2002')) throw error;
+        // Concurrent registration for the same normalized email remains an
+        // indistinguishable accepted response; it never creates a second account.
       }
     }
     const challenge = await issueCustomerAuthChallenge({ accountId, email, purpose: 'CUSTOMER_EMAIL_VERIFY' });

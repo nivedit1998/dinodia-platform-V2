@@ -7,6 +7,7 @@ import { recordFailedAuthentication, Stage1AuthError, cookieToken } from '@/lib/
 import { verifyPassword } from '@/lib/passwords';
 import { constantTimeEqual, randomSecret, sha256 } from '@/lib/stage1Crypto';
 import { enforcePersistentRateLimit } from '@/lib/rateLimit';
+import { consumeInvitedTenantCredentialForLogin } from '@/lib/customerInvitationRegistration';
 
 export const dynamic = 'force-dynamic';
 
@@ -144,7 +145,15 @@ export async function POST(request: Request) {
     const deviceName = input.deviceName.trim();
     await enforcePersistentRateLimit(`customer-login:${sha256(email)}`, 8, 15 * 60 * 1000);
     try { crypto.createPublicKey(publicKey); } catch { throw new Stage1AuthError(400, 'trusted_device_key_invalid', 'The trusted-device public key is invalid'); }
-    const account = await prisma.customerAccount.findUnique({ where: { emailNormalized: email }, select: { id: true, status: true, emailVerifiedAt: true, passwordHash: true, securityVersion: true } });
+    let account = await prisma.customerAccount.findUnique({ where: { emailNormalized: email }, select: { id: true, status: true, emailVerifiedAt: true, passwordHash: true, securityVersion: true } });
+    if (!account) {
+      // A new tenant's email-delivered one-time credential proves possession
+      // of the invited address. It creates only a gated account, never a Home
+      // membership; password replacement, username choice and invitation
+      // acceptance remain separate server-enforced steps.
+      const invitedAccountId = await consumeInvitedTenantCredentialForLogin({ email, password });
+      if (invitedAccountId) account = await prisma.customerAccount.findUnique({ where: { id: invitedAccountId }, select: { id: true, status: true, emailVerifiedAt: true, passwordHash: true, securityVersion: true } });
+    }
     if (!account || account.status !== 'ACTIVE' || !account.emailVerifiedAt || !(await verifyPassword(password, account.passwordHash))) {
       await recordFailedAuthentication('customer_login_failed', email);
       throw new Stage1AuthError(401, 'customer_credentials_invalid', 'The customer credentials are invalid');

@@ -2,6 +2,8 @@ import crypto from 'node:crypto';
 import type { Prisma } from '@prisma/client';
 import { prisma } from './prisma';
 import { Stage1AuthError, type CustomerAccountSessionPrincipal } from './stage1Auth';
+import { consumeSignedClaimResolverProof } from './stage1ClaimResolver';
+import { serializableTransaction } from './serializableTransaction';
 
 const RESERVATION_MS = 30 * 60 * 1000;
 const POLICY_VERSION_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,79}$/;
@@ -153,18 +155,31 @@ export function hashClaimReference(value: string): string {
   return crypto.createHmac('sha256', claimPepper()).update(String(value), 'utf8').digest('hex');
 }
 
-export async function redeemClaimContract(input: { reference: string; customerAccountId: string; emailVerified: boolean; principal?: CustomerAccountSessionPrincipal }) {
+export async function redeemClaimContract(input: { reference: string; customerAccountId: string; emailVerified: boolean; principal?: CustomerAccountSessionPrincipal; resolverProof?: Record<string, unknown> }) {
+  if (input.principal && input.principal.id !== input.customerAccountId) throw new Stage1AuthError(403, 'claim_account_mismatch', 'The signed-in account does not match this claim');
   if (!input.emailVerified) throw new Stage1AuthError(403, 'claim_email_unverified', 'Email verification is required before a claim can be reserved');
-  const result = await prisma.$transaction(async (tx) => {
+  const usesPermanentLabel = input.resolverProof !== undefined;
+  const qrReference = /^dno_home_[A-Za-z0-9_-]{40,64}$/.test(input.reference);
+  const permanentLabel = /^DNO-HOME-[A-Za-z0-9_-]{32,64}$/.test(input.reference);
+  if (!(qrReference && !usesPermanentLabel) && !(permanentLabel && usesPermanentLabel)) throw new Stage1AuthError(400, 'claim_reference_invalid', 'A current Home QR or verified local hub label is required');
+  const result = await serializableTransaction(async (tx) => {
     await assertClaimSessionCurrent(tx, input.principal);
-    // Serialize all claim attempts for the same physical reference. This is
-    // the database-level first-wins rule; application-side checks alone race.
-    await tx.$queryRaw`SELECT "id" FROM "HomeClaimReference" WHERE "companyQrReferenceHash" = ${hashClaimReference(input.reference)} FOR UPDATE`;
+    let resolvedClaimId: string | null = null;
+    if (usesPermanentLabel) {
+      const resolved = await consumeSignedClaimResolverProof(tx, input.resolverProof!, { purpose: 'INITIAL_OWNER' });
+      resolvedClaimId = resolved.claimReferenceId;
+    } else {
+      // Serialize all QR claim attempts for the same physical reference. This
+      // is the database-level first-wins rule; application-side checks race.
+      await tx.$queryRaw`SELECT "id" FROM "HomeClaimReference" WHERE "companyQrReferenceHash" = ${hashClaimReference(input.reference)} FOR UPDATE`;
+    }
     // Expiry is evaluated only after the serialization lock. A request queued
     // before expiresAt cannot redeem the reservation using stale request time.
     const now = new Date();
-    const reference = await tx.homeClaimReference.findUnique({ where: { companyQrReferenceHash: hashClaimReference(input.reference) }, select: { id: true, homeId: true, hubInstallationId: true, state: true, generation: true } });
-    if (!reference || !['AVAILABLE', 'RESERVED'].includes(reference.state)) throw new Stage1AuthError(409, 'claim_unavailable', 'This property claim is unavailable');
+    const reference = resolvedClaimId
+      ? await tx.homeClaimReference.findUnique({ where: { id: resolvedClaimId }, select: { id: true, homeId: true, hubInstallationId: true, state: true, generation: true, purpose: true } })
+      : await tx.homeClaimReference.findUnique({ where: { companyQrReferenceHash: hashClaimReference(input.reference) }, select: { id: true, homeId: true, hubInstallationId: true, state: true, generation: true, purpose: true } });
+    if (!reference || reference.purpose !== 'INITIAL_OWNER' || !['AVAILABLE', 'RESERVED'].includes(reference.state)) throw new Stage1AuthError(409, 'claim_unavailable', 'This property claim is unavailable');
     const existing = await tx.homeClaimReservation.findFirst({ where: { claimReferenceId: reference.id, state: 'ACTIVE' }, select: { id: true, claimReferenceId: true, customerAccountId: true, expiresAt: true } });
     if (existing && existing.expiresAt > now && existing.customerAccountId !== input.customerAccountId) throw new Stage1AuthError(409, 'claim_already_reserved', 'This property is currently being claimed');
     // Redemption, polling and rescanning are reads for an already active

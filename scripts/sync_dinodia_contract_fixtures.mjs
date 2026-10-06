@@ -50,6 +50,7 @@ for (const fixture of [
   'offline-home-selection.json',
   'prototype-scenarios.json',
   'room-qr-lifecycle.json',
+  'tenant-membership-removal-final-warning.json',
   'claim-first-wins.json',
   'claim-lifecycle.json',
   'stage2-decision-matrix.json',

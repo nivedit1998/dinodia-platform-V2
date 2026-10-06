@@ -21,6 +21,46 @@ export async function POST(request: Request) {
     if (!ALLOWED_OPERATIONS.has(operationKind)) throw new Stage1AuthError(400, 'step_up_fields_invalid', 'A supported operation and target are required');
     const value = body.value ?? null;
     let operationValue: unknown = value;
+    if (operationKind === 'home.transfer') {
+      if (customer.role !== 'OWNER' || targetIds.length < 2 || targetIds[0] !== customer.homeId || targetIds[1] !== customer.membershipId
+        || !value || typeof value !== 'object' || Array.isArray(value)) {
+        throw new Stage1AuthError(403, 'transfer_owner_required', 'Only the current homeowner can confirm a transfer for this selected Home');
+      }
+      const transferValue = value as Record<string, unknown>;
+      if (transferValue.action === 'START') {
+        const email = String(transferValue.recipientEmailNormalized ?? '').trim().toLowerCase();
+        if (Object.keys(transferValue).sort().join(',') !== 'action,confirmation,expectedManagementRevision,recipientEmailNormalized'
+          || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 320
+          || !Number.isSafeInteger(transferValue.expectedManagementRevision)
+          || transferValue.confirmation !== `I confirm transfer of this Home to ${email}`) {
+          throw new Stage1AuthError(400, 'step_up_fields_invalid', 'Confirm the exact recipient and current Home revision');
+        }
+        const [home, owner, recipient] = await Promise.all([
+          prisma.home.findUnique({ where: { id: customer.homeId }, select: { lifecycle: true, installationStatus: true, managementRevision: true } }),
+          prisma.homeMembership.findFirst({ where: { id: customer.membershipId, customerAccountId: customer.id, homeId: customer.homeId, role: 'OWNER', status: 'ACTIVE' }, select: { id: true } }),
+          prisma.customerAccount.findUnique({ where: { emailNormalized: email }, select: { id: true, status: true } }),
+        ]);
+        if (targetIds.length !== 2 || !home || home.lifecycle !== 'ACTIVE' || home.installationStatus !== 'COMPLETE'
+          || home.managementRevision !== transferValue.expectedManagementRevision || !owner
+          || recipient?.id === customer.id || recipient?.status === 'SUSPENDED') {
+          throw new Stage1AuthError(409, 'REVISION_CONFLICT', 'The owner, recipient or Home changed. Refresh before confirming.');
+        }
+      } else if (transferValue.action === 'CANCEL') {
+        const transferId = String(transferValue.transferId ?? '');
+        const expectedUpdatedAt = String(transferValue.expectedTransferUpdatedAt ?? '');
+        if (Object.keys(transferValue).sort().join(',') !== 'action,confirmation,expectedTransferUpdatedAt,transferId'
+          || targetIds.length !== 3 || targetIds[2] !== transferId
+          || !/^[0-9a-f-]{36}$/i.test(transferId) || !/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{1,3})?Z$/.test(expectedUpdatedAt)
+          || transferValue.confirmation !== 'I cancel this ownership transfer') {
+          throw new Stage1AuthError(400, 'step_up_fields_invalid', 'Confirm cancellation of the exact current transfer');
+        }
+        const claim = await prisma.homeClaimReference.findFirst({ where: { id: transferId, homeId: customer.homeId,
+          outgoingOwnerMembershipId: customer.membershipId, purpose: 'OWNERSHIP_TRANSFER', state: 'AVAILABLE' }, select: { updatedAt: true } });
+        if (!claim || claim.updatedAt.toISOString() !== expectedUpdatedAt) throw new Stage1AuthError(409, 'REVISION_CONFLICT', 'The transfer changed. Refresh before cancelling.');
+      } else {
+        throw new Stage1AuthError(400, 'step_up_fields_invalid', 'A supported transfer action is required');
+      }
+    }
     if (operationKind === 'device_sensitive_command' || operationKind === 'heating_sensitive_command') {
       assertCustomerCanCommand(customer);
       if (targetIds.length !== 1) throw new Stage1AuthError(400, 'step_up_target_invalid', 'A device step-up must target one current control');

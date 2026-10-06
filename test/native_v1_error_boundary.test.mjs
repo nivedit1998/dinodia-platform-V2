@@ -33,6 +33,7 @@ test('Native V1 maps expiry, scope, freshness and infrastructure failures to can
     [{ status: 401, code: 'area_policy_stale', message: 'Refresh' }, 'UPDATE_REQUIRED'],
     [{ status: 409, code: 'claim_policy_required', message: 'Accept the current customer policy' }, 'UPDATE_REQUIRED'],
     [{ status: 409, code: 'claim_address_confirmation_required', message: 'Confirm the current address' }, 'REVISION_CONFLICT'],
+    [{ status: 409, code: 'IDEMPOTENCY_CONFLICT', message: 'This request key was used for different content' }, 'IDEMPOTENCY_CONFLICT'],
     [{ status: 409, code: 'FINAL_RELATIONSHIP_CONFIRMATION_REQUIRED', message: 'Confirm whole-account deletion' }, 'FINAL_RELATIONSHIP_CONFIRMATION_REQUIRED'],
     [{ status: 409, code: 'claim_reservation_expired', message: 'The claim expired' }, 'RESOURCE_NOT_FOUND'],
     [{ status: 503, code: 'home_hub_unavailable', message: 'Offline' }, 'HUB_UNAVAILABLE'],
