@@ -3,7 +3,7 @@ const volatileRuntimeColumns = new Map([
   // Signed heartbeat freshness and endpoint-report timestamps may advance
   // while the value-free Production preservation inventory is running. Pin,
   // hostname, generation, pairing and endpoint values remain immutable here.
-  ['HubInstallation', new Set(['lastSeenAt', 'onlineStateEvaluatedAt', 'updatedAt', 'lanEndpointReportedAt', 'lanTlsReportedAt'])],
+  ['HubInstallation', new Set(['lastSeenAt', 'onlineStateEvaluatedAt', 'updatedAt', 'lanEndpointReportedAt', 'lanTlsReportedAt', 'lastSuccessfulSyncAt'])],
   // The fixed scheduler legitimately advances leases/cursors while a
   // production migration is being applied. Preserve row cardinality and the
   // immutable taskId/dispatcher ownership; only its runtime state may move.

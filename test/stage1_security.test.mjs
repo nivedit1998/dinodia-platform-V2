@@ -12,7 +12,7 @@ const osRoot = process.env.DINODIA_OS_ROOT || path.resolve(root, '..', 'Dinodia 
 const readOs = (file) => fs.readFileSync(path.join(osRoot, file), 'utf8');
 const requireOsModule = (file) => createRequire(import.meta.url)(path.join(osRoot, file));
 
-test('Stage 3 preservation proof isolates only volatile ReplayNonce runtime churn', () => {
+test('migration preservation isolates volatile runtime churn without masking domain-row changes', () => {
   const before = {
     rowCounts: { Home: '2', ReplayNonce: '4' },
     rowContentDigests: { Home: 'home-digest', ReplayNonce: 'nonce-before' },
@@ -37,16 +37,16 @@ test('Stage 3 preservation proof isolates only volatile ReplayNonce runtime chur
   const hubBefore = {
     rowCounts: { HubInstallation: '1' },
     rowContentDigests: { HubInstallation: 'hub-before' },
-    columnContentDigests: { HubInstallation: { id: 'id', lastSeenAt: 't1', onlineStateEvaluatedAt: 't1', updatedAt: 't1', lanEndpointReportedAt: 't1', lanTlsReportedAt: 't1', baseUrl: 'endpoint1' } },
+    columnContentDigests: { HubInstallation: { id: 'id', lastSeenAt: 't1', onlineStateEvaluatedAt: 't1', updatedAt: 't1', lanEndpointReportedAt: 't1', lanTlsReportedAt: 't1', lastSuccessfulSyncAt: 't1', baseUrl: 'endpoint1' } },
   };
   const hubAfter = {
     rowCounts: { HubInstallation: '1' },
     rowContentDigests: { HubInstallation: 'hub-after' },
-    columnContentDigests: { HubInstallation: { id: 'id', lastSeenAt: 't2', onlineStateEvaluatedAt: 't2', updatedAt: 't2', lanEndpointReportedAt: 't2', lanTlsReportedAt: 't2', baseUrl: 'endpoint1' } },
+    columnContentDigests: { HubInstallation: { id: 'id', lastSeenAt: 't2', onlineStateEvaluatedAt: 't2', updatedAt: 't2', lanEndpointReportedAt: 't2', lanTlsReportedAt: 't2', lastSuccessfulSyncAt: 't2', baseUrl: 'endpoint1' } },
   };
   assert.deepEqual(compareExistingTablePreservation(hubBefore, hubAfter).volatileChanges, [{
     table: 'HubInstallation', rowCountChanged: false, rowContentChanged: true,
-    changedColumns: ['lastSeenAt', 'onlineStateEvaluatedAt', 'updatedAt', 'lanEndpointReportedAt', 'lanTlsReportedAt'],
+    changedColumns: ['lastSeenAt', 'onlineStateEvaluatedAt', 'updatedAt', 'lanEndpointReportedAt', 'lanTlsReportedAt', 'lastSuccessfulSyncAt'],
   }]);
   assert.throws(() => compareExistingTablePreservation(hubBefore, {
     ...hubAfter,
