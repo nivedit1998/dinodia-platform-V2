@@ -8,6 +8,7 @@ import { verifyPassword } from '@/lib/passwords';
 import { constantTimeEqual, randomSecret, sha256 } from '@/lib/stage1Crypto';
 import { enforcePersistentRateLimit } from '@/lib/rateLimit';
 import { consumeInvitedTenantCredentialForLogin } from '@/lib/customerInvitationRegistration';
+import { serializableTransaction } from '@/lib/serializableTransaction';
 
 export const dynamic = 'force-dynamic';
 
@@ -32,19 +33,29 @@ export async function GET(request: Request) {
   try {
     const rawSession = cookieToken(request, 'dinodia_customer_session');
     if (!rawSession) throw new Stage1AuthError(401, 'customer_session_required', 'A customer session is required');
-    const now = new Date();
     const tokenHash = sha256(rawSession);
-    const refreshCandidate = await prisma.customerSession.findUnique({ where: { refreshTokenHash: tokenHash }, select: { sessionFamilyId: true } });
+    const refreshCandidate = await prisma.customerSession.findUnique({ where: { refreshTokenHash: tokenHash }, select: {
+      id: true, customerAccountId: true, trustedDeviceId: true, sessionFamilyId: true,
+    } });
     if (!refreshCandidate) throw new Stage1AuthError(401, 'customer_session_invalid', 'The customer session is invalid');
     await enforcePersistentRateLimit(`customer-session-refresh:${refreshCandidate.sessionFamilyId}`, 120, 60 * 60 * 1000);
-    const rotated = await prisma.$transaction(async (tx) => {
-      await tx.$queryRaw`SELECT "id" FROM "CustomerSession" WHERE "refreshTokenHash" = ${tokenHash} FOR UPDATE`;
-      const previous = await tx.customerSession.findUnique({ where: { refreshTokenHash: tokenHash }, select: {
+    const rotated = await serializableTransaction(async (tx) => {
+      // Match the account -> session -> trusted-device lock order used by
+      // password changes and trusted-device removal. The initial lookup only
+      // selects stable foreign-key IDs; every authority decision is repeated
+      // from the locked rows below.
+      await tx.$queryRaw`SELECT "id" FROM "CustomerAccount" WHERE "id" = ${refreshCandidate.customerAccountId}::uuid FOR UPDATE`;
+      await tx.$queryRaw`SELECT "id" FROM "CustomerSession" WHERE "id" = ${refreshCandidate.id}::uuid AND "customerAccountId" = ${refreshCandidate.customerAccountId}::uuid FOR UPDATE`;
+      await tx.$queryRaw`SELECT "id" FROM "TrustedDevice" WHERE "id" = ${refreshCandidate.trustedDeviceId}::uuid FOR UPDATE`;
+      const now = new Date();
+      const previous = await tx.customerSession.findUnique({ where: { id: refreshCandidate.id }, select: {
         id: true, customerAccountId: true, trustedDeviceId: true, trustedDeviceSessionVersion: true,
         securityVersion: true, revokedAt: true, revokeReason: true, expiresAt: true, absoluteExpiresAt: true,
-        sessionFamilyId: true,
+        sessionFamilyId: true, refreshTokenHash: true,
       } });
-      if (!previous) return { error: 'invalid' as const };
+      if (!previous || previous.refreshTokenHash !== tokenHash
+        || previous.customerAccountId !== refreshCandidate.customerAccountId
+        || previous.trustedDeviceId !== refreshCandidate.trustedDeviceId) return { error: 'invalid' as const };
       if (previous.revokedAt) {
         if (previous.revokeReason === 'refresh_token_rotated') {
           await tx.customerSession.updateMany({
@@ -80,8 +91,8 @@ export async function GET(request: Request) {
       }, select: { id: true, expiresAt: true, absoluteExpiresAt: true } });
       await tx.trustedDevice.update({ where: { id: trusted.id }, data: { lastUsedAt: now } });
       await tx.auditEvent.create({ data: { actorType: 'CUSTOMER', actorId: account.id, category: 'SECURITY', action: 'customer_session_refreshed', targetType: 'CustomerSession', targetId: next.id, metadata: { outcome: 'rotated', previousSessionId: previous.id }, purgeAt: new Date(now.getTime() + 365 * 24 * 60 * 60 * 1000) } });
-      return { session: next, raw: nextRaw, accountId: account.id, trustedDeviceId: trusted.id, requiresPasswordChange: account.mustChangePassword };
-    }, { isolationLevel: 'Serializable' });
+      return { session: next, raw: nextRaw, refreshedAt: now, accountId: account.id, trustedDeviceId: trusted.id, requiresPasswordChange: account.mustChangePassword };
+    }, 2);
     if ('error' in rotated) {
       if (rotated.error === 'expired') throw new Stage1AuthError(401, 'customer_session_invalid', 'The customer session has expired');
       if (rotated.error === 'reused') throw new Stage1AuthError(401, 'customer_session_invalid', 'The customer session is no longer active');
@@ -122,7 +133,7 @@ export async function GET(request: Request) {
       throw new Stage1AuthError(500, 'native_v1_contract_invalid', 'The account session response failed contract validation');
     }
     const response = NextResponse.json(accountContext, { headers: { 'Cache-Control': 'no-store', Pragma: 'no-cache' } });
-    response.headers.append('Set-Cookie', sessionCookie(rotated.raw, session.absoluteExpiresAt, now));
+    response.headers.append('Set-Cookie', sessionCookie(rotated.raw, session.absoluteExpiresAt, rotated.refreshedAt));
     return response;
   } catch (error) { return nativeV1ErrorResponse(error); }
 }

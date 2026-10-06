@@ -3482,6 +3482,216 @@ async function pendingInvitationRouteChecks(deliveryEnv) {
 
 }
 
+async function browserSessionRefreshChecks({ base, loginPayload, accountId }) {
+  const issueBrowserSession = async (deviceInstallationId = loginPayload.deviceInstallationId, publicKey = loginPayload.publicKey) => {
+    // This harness owns a disposable database. Clear only this fixture account's
+    // login throttle between issued-session cases so the security test does not
+    // accidentally turn the production rate-limit threshold into a test cap.
+    await prisma.authRateLimitBucket.deleteMany({ where: { bucketKey: `customer-login:${sha256(loginPayload.email.trim().toLowerCase())}` } });
+    const result = await fetchJson(`${base}/api/v2/session`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ ...loginPayload, deviceInstallationId, publicKey }),
+    });
+    const jar = {};
+    updateCookieJar(jar, result.response);
+    const raw = cookieValue(jar, 'dinodia_customer_session');
+    if (result.response.status !== 200 || !raw) fail('Could not issue a disposable browser session for the refresh boundary checks');
+    const row = await prisma.customerSession.findUniqueOrThrow({
+      where: { refreshTokenHash: sha256(raw) },
+      select: { id: true, customerAccountId: true, trustedDeviceId: true, sessionFamilyId: true, expiresAt: true, absoluteExpiresAt: true, revokedAt: true, lastUsedAt: true },
+    });
+    if (row.customerAccountId !== accountId || row.revokedAt) fail('The disposable refresh session did not bind to its issued customer account');
+    return { raw, row };
+  };
+  const cookieFor = (raw) => `dinodia_customer_session=${encodeURIComponent(raw)}`;
+  const refresh = (raw, path) => fetchJson(`${base}${path}`, { headers: { cookie: cookieFor(raw) } });
+  const replacementCookie = (response) => {
+    const jar = {};
+    updateCookieJar(jar, response);
+    return cookieValue(jar, 'dinodia_customer_session');
+  };
+  const countSuccessfulRefreshAudit = () => prisma.auditEvent.count({ where: { actorId: accountId, action: 'customer_session_refreshed', targetType: 'CustomerSession' } });
+
+  const valid = await issueBrowserSession();
+  const validRefresh = await refresh(valid.raw, '/api/v2/auth/session');
+  const validNextRaw = replacementCookie(validRefresh.response);
+  const validRows = await prisma.customerSession.findMany({ where: { sessionFamilyId: valid.row.sessionFamilyId }, select: { id: true, revokedAt: true, revokeReason: true, expiresAt: true } });
+  const validProtectedRead = validNextRaw
+    ? await fetchJson(`${base}/api/v2/trusted-devices`, { headers: { cookie: cookieFor(validNextRaw) } })
+    : null;
+  if (validRefresh.response.status !== 200 || !validNextRaw || validRows.length !== 2
+    || !validRows.some((row) => row.id === valid.row.id && row.revokeReason === 'refresh_token_rotated' && row.revokedAt)
+    || !validRows.some((row) => row.id !== valid.row.id && !row.revokedAt && row.expiresAt > new Date())
+    || validProtectedRead?.response.status !== 200) {
+    fail('A valid browser refresh before the inactivity/absolute limits did not rotate once and authorize its protected account read');
+  }
+  console.log('[stage6:integration] PASS: valid browser refresh rotates one session before both expiry limits and the new session can read its own trusted-device projection');
+
+  const replay = await refresh(valid.raw, '/api/v2/session');
+  const replayRows = await prisma.customerSession.findMany({ where: { sessionFamilyId: valid.row.sessionFamilyId }, select: { id: true, revokedAt: true, revokeReason: true } });
+  const replayProtectedRead = await fetchJson(`${base}/api/v2/trusted-devices`, { headers: { cookie: cookieFor(validNextRaw) } });
+  if (replay.response.status !== 401 || replay.body.error?.code !== 'TOKEN_EXPIRED'
+    || replacementCookie(replay.response)
+    || replayRows.some((row) => !row.revokedAt)
+    || replayRows.find((row) => row.id === valid.row.id)?.revokeReason !== 'refresh_token_rotated'
+    || replayRows.find((row) => row.id !== valid.row.id)?.revokeReason !== 'refresh_token_reuse'
+    || replayProtectedRead.response.status !== 401) {
+    fail('Reusing a rotated browser refresh credential did not revoke its family before protected access');
+  }
+  console.log('[stage6:integration] PASS: replay through the canonical browser-session alias revokes the rotated family and the replacement can no longer read protected account data');
+
+  const concurrent = await issueBrowserSession();
+  const simultaneous = await Promise.all([
+    refresh(concurrent.raw, '/api/v2/auth/session'),
+    refresh(concurrent.raw, '/api/v2/session'),
+  ]);
+  const concurrentRows = await prisma.customerSession.findMany({ where: { sessionFamilyId: concurrent.row.sessionFamilyId }, select: { id: true, revokedAt: true, revokeReason: true } });
+  const concurrentSuccesses = simultaneous.filter((result) => result.response.status === 200);
+  const concurrentDenials = simultaneous.filter((result) => result.response.status === 401 && result.body.error?.code === 'TOKEN_EXPIRED');
+  const concurrentReplacement = concurrentSuccesses.length === 1 ? replacementCookie(concurrentSuccesses[0].response) : null;
+  const concurrentProtectedRead = concurrentReplacement
+    ? await fetchJson(`${base}/api/v2/trusted-devices`, { headers: { cookie: cookieFor(concurrentReplacement) } })
+    : null;
+  if (concurrentSuccesses.length !== 1 || concurrentDenials.length !== 1
+    || concurrentRows.length !== 2 || concurrentRows.some((row) => !row.revokedAt)
+    || concurrentRows.find((row) => row.id === concurrent.row.id)?.revokeReason !== 'refresh_token_rotated'
+    || concurrentRows.find((row) => row.id !== concurrent.row.id)?.revokeReason !== 'refresh_token_reuse'
+    || !concurrentReplacement || concurrentProtectedRead?.response.status !== 401) {
+    fail(`Concurrent browser refresh did not produce one rotation followed by family revocation (${JSON.stringify({ statuses: simultaneous.map((result) => result.response.status), errors: simultaneous.map((result) => result.body?.error?.code), rows: concurrentRows.length, active: concurrentRows.filter((row) => !row.revokedAt).length, protectedStatus: concurrentProtectedRead?.response.status ?? null })})`);
+  }
+  console.log('[stage6:integration] PASS: simultaneous browser refreshes issue at most one replacement and a concurrent replay revokes the family before protected access');
+
+  const revokedDeviceIdentity = keyPair();
+  const revokedDeviceSession = await issueBrowserSession(`stage6-f06h-revoked-${crypto.randomUUID()}`, revokedDeviceIdentity.publicKey);
+  const revokedDeviceBefore = await prisma.trustedDevice.findUniqueOrThrow({ where: { id: revokedDeviceSession.row.trustedDeviceId }, select: { revokedAt: true, sessionVersion: true, lastUsedAt: true } });
+  const revokedSessionBefore = await prisma.customerSession.findUniqueOrThrow({ where: { id: revokedDeviceSession.row.id }, select: { revokedAt: true, revokeReason: true, expiresAt: true, absoluteExpiresAt: true, lastUsedAt: true } });
+  const revokedDeviceAuditBefore = await countSuccessfulRefreshAudit();
+  let releaseDeviceChange;
+  let markAccountLocked;
+  const deviceChangeReleased = new Promise((resolve) => { releaseDeviceChange = resolve; });
+  const accountLockReady = new Promise((resolve) => { markAccountLocked = resolve; });
+  let deviceChangeTransaction;
+  let observedAuthorityLockWait = false;
+  let revocationOutcome;
+  try {
+    deviceChangeTransaction = prisma.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT "id" FROM "CustomerAccount" WHERE "id" = ${accountId}::uuid FOR UPDATE`;
+      markAccountLocked();
+      await deviceChangeReleased;
+      await tx.trustedDevice.update({ where: { id: revokedDeviceSession.row.trustedDeviceId }, data: { revokedAt: new Date(), sessionVersion: { increment: 1 } } });
+    }, { timeout: 15000 });
+    await accountLockReady;
+    const pending = refresh(revokedDeviceSession.raw, '/api/v2/auth/session');
+    const waitUntil = Date.now() + 3000;
+    while (Date.now() < waitUntil) {
+      const waiting = await prisma.$queryRaw`SELECT count(*)::int AS "count" FROM pg_stat_activity WHERE datname = current_database() AND pid <> pg_backend_pid() AND wait_event_type = 'Lock' AND query ILIKE '%CustomerAccount%' AND query ILIKE '%FOR UPDATE%'`;
+      if (waiting.some((row) => row.count > 0)) { observedAuthorityLockWait = true; break; }
+      await sleep(25);
+    }
+    if (!observedAuthorityLockWait) fail('Browser refresh did not reach the held account-authority lock before concurrent trusted-device revocation');
+    releaseDeviceChange();
+    await deviceChangeTransaction;
+    revocationOutcome = await pending;
+  } finally {
+    if (deviceChangeTransaction && !observedAuthorityLockWait) {
+      releaseDeviceChange();
+      await deviceChangeTransaction;
+    }
+  }
+  const revokedDeviceAfter = await prisma.trustedDevice.findUniqueOrThrow({ where: { id: revokedDeviceSession.row.trustedDeviceId }, select: { revokedAt: true, sessionVersion: true, lastUsedAt: true } });
+  const revokedSessionAfter = await prisma.customerSession.findUniqueOrThrow({ where: { id: revokedDeviceSession.row.id }, select: { revokedAt: true, revokeReason: true, expiresAt: true, absoluteExpiresAt: true, lastUsedAt: true } });
+  const revokedDeviceAuditAfter = await countSuccessfulRefreshAudit();
+  const revokedDeviceProtectedRead = await fetchJson(`${base}/api/v2/trusted-devices`, { headers: { cookie: cookieFor(revokedDeviceSession.raw) } });
+  const revokedDeviceRows = await prisma.customerSession.count({ where: { sessionFamilyId: revokedDeviceSession.row.sessionFamilyId } });
+  if (!observedAuthorityLockWait || revocationOutcome?.response.status !== 401 || revocationOutcome.body.error?.code !== 'TOKEN_EXPIRED'
+    || replacementCookie(revocationOutcome.response) || revokedDeviceRows !== 1
+    || revokedSessionAfter.revokedAt !== revokedSessionBefore.revokedAt || revokedSessionAfter.revokeReason !== revokedSessionBefore.revokeReason
+    || revokedSessionAfter.expiresAt.getTime() !== revokedSessionBefore.expiresAt.getTime()
+    || revokedSessionAfter.absoluteExpiresAt.getTime() !== revokedSessionBefore.absoluteExpiresAt.getTime()
+    || revokedSessionAfter.lastUsedAt?.getTime() !== revokedSessionBefore.lastUsedAt?.getTime()
+    || !revokedDeviceAfter.revokedAt || revokedDeviceAfter.sessionVersion !== revokedDeviceBefore.sessionVersion + 1
+    || revokedDeviceAfter.lastUsedAt?.getTime() !== revokedDeviceBefore.lastUsedAt?.getTime()
+    || revokedDeviceAuditAfter !== revokedDeviceAuditBefore || revokedDeviceProtectedRead.response.status !== 401) {
+    fail(`Refresh after queued trusted-device revocation changed or restored authority (${JSON.stringify({ observedAuthorityLockWait, status: revocationOutcome?.response.status, error: revocationOutcome?.body?.error?.code, replacement: Boolean(replacementCookie(revocationOutcome.response)), familyRows: revokedDeviceRows, auditDelta: revokedDeviceAuditAfter - revokedDeviceAuditBefore, protectedStatus: revokedDeviceProtectedRead.response.status })})`);
+  }
+  await prisma.customerSession.deleteMany({ where: { trustedDeviceId: revokedDeviceSession.row.trustedDeviceId } });
+  await prisma.trustedDevice.delete({ where: { id: revokedDeviceSession.row.trustedDeviceId } });
+  console.log('[stage6:integration] PASS: refresh queued behind account authority rechecks a concurrently revoked trusted installation and denies without session renewal or protected disclosure');
+
+  const assertExpiredWithoutEffects = async ({ label, path, absolute = false, locked = false }) => {
+    const issued = await issueBrowserSession();
+    const deadline = locked ? new Date(Date.now() + 3500) : new Date(Date.now());
+    await prisma.customerSession.update({ where: { id: issued.row.id }, data: absolute
+      ? { expiresAt: deadline, absoluteExpiresAt: deadline }
+      : { expiresAt: deadline } });
+    const before = await prisma.customerSession.findUniqueOrThrow({ where: { id: issued.row.id }, select: { revokedAt: true, revokeReason: true, expiresAt: true, absoluteExpiresAt: true, lastUsedAt: true, accessTokenHash: true, accessTokenExpiresAt: true } });
+    const trustedBefore = await prisma.trustedDevice.findUniqueOrThrow({ where: { id: issued.row.trustedDeviceId }, select: { lastUsedAt: true, revokedAt: true, sessionVersion: true } });
+    const auditBefore = await countSuccessfulRefreshAudit();
+    let releaseLock;
+    let markLocked;
+    const lockReleased = new Promise((resolve) => { releaseLock = resolve; });
+    const lockReady = new Promise((resolve) => { markLocked = resolve; });
+    let lockTransaction;
+    let observedLockWait = false;
+    if (locked) {
+      lockTransaction = prisma.$transaction(async (tx) => {
+        await tx.$queryRaw`SELECT "id" FROM "CustomerSession" WHERE "id" = ${issued.row.id}::uuid FOR UPDATE`;
+        markLocked();
+        await lockReleased;
+      }, { timeout: 15000 });
+      await lockReady;
+    }
+    let outcome;
+    try {
+      const pending = refresh(issued.raw, path);
+      if (locked) {
+        const waitUntil = Math.min(deadline.getTime() - 100, Date.now() + 2500);
+        while (Date.now() < waitUntil) {
+          const waiting = await prisma.$queryRaw`SELECT count(*)::int AS "count" FROM pg_stat_activity WHERE datname = current_database() AND pid <> pg_backend_pid() AND wait_event_type = 'Lock' AND query ILIKE '%CustomerSession%' AND query ILIKE '%FOR UPDATE%'`;
+          if (waiting.some((row) => row.count > 0)) { observedLockWait = true; break; }
+          await sleep(25);
+        }
+        if (!observedLockWait) fail(`${label}: the actual browser refresh did not reach the held session-row lock`);
+        await sleep(Math.max(0, deadline.getTime() + 300 - Date.now()));
+        releaseLock();
+        await lockTransaction;
+      }
+      outcome = await pending;
+    } finally {
+      if (locked && !observedLockWait) {
+        releaseLock();
+        await lockTransaction;
+      }
+    }
+    const afterRows = await prisma.customerSession.findMany({ where: { sessionFamilyId: issued.row.sessionFamilyId }, select: { id: true, revokedAt: true, revokeReason: true, expiresAt: true, absoluteExpiresAt: true, lastUsedAt: true, accessTokenHash: true, accessTokenExpiresAt: true } });
+    const afterTrusted = await prisma.trustedDevice.findUniqueOrThrow({ where: { id: issued.row.trustedDeviceId }, select: { lastUsedAt: true, revokedAt: true, sessionVersion: true } });
+    const auditAfter = await countSuccessfulRefreshAudit();
+    const staleProtectedRead = await fetchJson(`${base}/api/v2/trusted-devices`, { headers: { cookie: cookieFor(issued.raw) } });
+    const issuedRowAfter = afterRows.find((row) => row.id === issued.row.id);
+    const newRows = afterRows.filter((row) => row.id !== issued.row.id);
+    const safe = outcome?.response.status === 401 && outcome.body.error?.code === 'TOKEN_EXPIRED'
+      && !replacementCookie(outcome.response) && newRows.length === 0
+      && issuedRowAfter?.revokedAt === before.revokedAt && issuedRowAfter?.revokeReason === before.revokeReason
+      && issuedRowAfter?.expiresAt.getTime() === before.expiresAt.getTime()
+      && issuedRowAfter?.absoluteExpiresAt.getTime() === before.absoluteExpiresAt.getTime()
+      && issuedRowAfter?.lastUsedAt.getTime() === before.lastUsedAt.getTime()
+      && issuedRowAfter?.accessTokenHash === before.accessTokenHash
+      && issuedRowAfter?.accessTokenExpiresAt?.getTime() === before.accessTokenExpiresAt?.getTime()
+      && afterTrusted.lastUsedAt.getTime() === trustedBefore.lastUsedAt.getTime()
+      && afterTrusted.revokedAt?.getTime() === trustedBefore.revokedAt?.getTime()
+      && afterTrusted.sessionVersion === trustedBefore.sessionVersion
+      && auditAfter === auditBefore && staleProtectedRead.response.status === 401;
+    if (!safe) fail(`${label}: expiry denial changed session/device authority, created a refresh receipt or disclosed protected account data (${JSON.stringify({ observedLockWait, status: outcome?.response.status, error: outcome?.body?.error?.code, replacement: Boolean(replacementCookie(outcome.response)), newRows: newRows.length, auditDelta: auditAfter - auditBefore, protectedStatus: staleProtectedRead.response.status })})`);
+    console.log(`[stage6:integration] PASS: ${label} denied with TOKEN_EXPIRED; lockWait=${observedLockWait}; no replacement/session/audit/device mutation or protected disclosure`);
+  };
+
+  await assertExpiredWithoutEffects({ label: 'browser refresh at the expiry boundary', path: '/api/v2/auth/session' });
+  await assertExpiredWithoutEffects({ label: 'browser refresh with an expired absolute deadline', path: '/api/v2/session', absolute: true });
+  await assertExpiredWithoutEffects({ label: 'browser refresh queued across inactivity expiry', path: '/api/v2/auth/session', locked: true });
+  await assertExpiredWithoutEffects({ label: 'browser refresh queued across absolute expiry', path: '/api/v2/session', absolute: true, locked: true });
+}
+
 async function customerAuthenticationLifecycleChecks(deliveryEnv) {
   const base = `http://127.0.0.1:${appPort}`;
   sesShouldFail = false;
@@ -3524,6 +3734,8 @@ async function customerAuthenticationLifecycleChecks(deliveryEnv) {
   let accountSession = await prisma.customerSession.findUniqueOrThrow({ where: { refreshTokenHash: sha256(rawSession) }, select: { id: true, revokedAt: true, expiresAt: true, absoluteExpiresAt: true } });
   if (login.response.status !== 200 || !rawSession || accountSession.expiresAt.getTime() > accountSession.absoluteExpiresAt.getTime()) fail('Verified customer did not receive a bounded account-global session');
 
+  await browserSessionRefreshChecks({ base, loginPayload, accountId: account.id });
+
   const secondPhone = keyPair();
   const secondInstallationId = `customer-auth-second-phone-${crypto.randomUUID()}`;
   const secondLogin = await fetchJson(`${base}/api/v2/session`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ ...loginPayload, deviceInstallationId: secondInstallationId, publicKey: secondPhone.publicKey, deviceName: 'Disposable second phone' }) });
@@ -3533,10 +3745,12 @@ async function customerAuthenticationLifecycleChecks(deliveryEnv) {
   const trustedDevices = await fetchJson(`${base}/api/v2/trusted-devices`, { headers: { cookie: `dinodia_customer_session=${encodeURIComponent(rawSession)}` } });
   const anonymousTrustedDevices = await fetchJson(`${base}/api/v2/trusted-devices`);
   const listedDevices = trustedDevices.body?.devices;
+  const initialSessionAfterRefreshCases = await prisma.customerSession.findUnique({ where: { refreshTokenHash: sha256(rawSession) }, select: { revokedAt: true, revokeReason: true, expiresAt: true, absoluteExpiresAt: true } });
+  const trustedDeviceCountAfterRefreshCases = await prisma.trustedDevice.count({ where: { customerAccountId: account.id } });
   if (trustedDevices.response.status !== 200 || !Array.isArray(listedDevices) || listedDevices.length !== 2
     || listedDevices.filter((device) => device.thisDevice).length !== 1
     || listedDevices.some((device) => 'publicKey' in device || 'deviceInstallationId' in device || 'refreshTokenHash' in device)
-    || anonymousTrustedDevices.response.status !== 401) fail('Account-global trusted-device inventory exposed credentials, omitted either phone, or allowed anonymous access');
+    || anonymousTrustedDevices.response.status !== 401) fail(`Account-global trusted-device inventory exposed credentials, omitted either phone, or allowed anonymous access (${JSON.stringify({ authenticatedStatus: trustedDevices.response.status, authenticatedError: trustedDevices.body?.error?.code, deviceCount: Array.isArray(listedDevices) ? listedDevices.length : null, thisDeviceCount: Array.isArray(listedDevices) ? listedDevices.filter((device) => device.thisDevice).length : null, anonymousStatus: anonymousTrustedDevices.response.status, originalSessionRevoked: Boolean(initialSessionAfterRefreshCases?.revokedAt), originalSessionRevokeReason: initialSessionAfterRefreshCases?.revokeReason ?? null, trustedDeviceCount: trustedDeviceCountAfterRefreshCases })})`);
   console.log('[stage6:integration] PASS: account-global trusted-device inventory identifies only the signed-in account phones without returning key, installation, or session secrets');
   await prisma.customerAccount.update({ where: { id: account.id }, data: { mustChangePassword: true } });
   const passwordGateRestore = await fetchJson(`${base}/api/v2/session`, { headers: { cookie: `dinodia_customer_session=${encodeURIComponent(rawSession)}` } });
