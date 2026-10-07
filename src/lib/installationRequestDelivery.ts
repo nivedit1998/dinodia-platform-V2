@@ -1,7 +1,7 @@
 import { SESv2Client, SendEmailCommand } from '@aws-sdk/client-sesv2';
 import { prisma } from './prisma';
 import { decryptPlatformEnvelope } from './hubOperatorCredentials';
-import { readApnsConfig, sendInstallationCompletePush, type ApnsConfig, type ApnsEnvironment, type ApnsResult } from './apnsDelivery';
+import { readApnsConfig, sendHomeAccessChangedPush, sendInstallationCompletePush, type ApnsConfig, type ApnsEnvironment, type ApnsResult } from './apnsDelivery';
 
 const PORTAL_QUEUE = 'https://dinodia-platform-v2.vercel.app/installer/installation-requests';
 const EMAIL = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -19,6 +19,11 @@ type DeliveryCounts = {
   pushDeferred: number;
   pushFailed: number;
   pushSuppressed: number;
+  accessRemovalAccepted: number;
+  accessRemovalDeferred: number;
+  accessRemovalFailed: number;
+  accessRemovalSuppressed: number;
+  accessRemovalExpired: number;
 };
 
 function configuration(): { client: SESv2Client; source: string; operationsAddress: string | null } | null {
@@ -65,7 +70,7 @@ export async function dispatchInstallationPushReceipts(
   now = new Date(),
   dependencies: { config?: ApnsConfig | null; send?: (input: { config: ApnsConfig; environment: ApnsEnvironment; deviceToken: string; requestId: string; expiresAt: Date }) => Promise<ApnsResult> } = {},
 ) {
-  const counts = { accepted: 0, deferred: 0, failed: 0, suppressed: 0 };
+  const counts = { accepted: 0, deferred: 0, failed: 0, suppressed: 0, expired: 0 };
   const receipts = await prisma.nativeNotificationDeliveryReceipt.findMany({
     where: { family: 'OWNER_INSTALLATION_UPDATE', channel: 'PUSH', status: 'PENDING', deliverAfter: { lte: now }, expiresAt: { gt: now }, attemptCount: { lt: 8 }, idempotencyKey: { startsWith: 'installation-request:' } },
     orderBy: [{ deliverAfter: 'asc' }, { id: 'asc' }], take: RECEIPT_LIMIT,
@@ -160,6 +165,106 @@ function nextAttempt(now: Date, attempt: number): Date {
 }
 
 /**
+ * Delivers the generic tenant/property-manager removal notice from the same
+ * two-minute operations dispatcher. Recipient email/APNs values are encrypted
+ * in the independent outbox so a final-account cleanup cannot erase the notice
+ * before delivery. Provider acceptance is not represented as inbox delivery.
+ */
+export async function dispatchHomeownerAccessRemovalNotices(now = new Date(), dependencies: {
+  sendEmail?: (input: { recipient: string; noticeId: string }) => Promise<boolean>;
+  sendPush?: (input: { environment: ApnsEnvironment; deviceToken: string; noticeId: string; expiresAt: Date }) => Promise<ApnsResult>;
+} = {}) {
+  const counts = { accepted: 0, deferred: 0, failed: 0, suppressed: 0, expired: 0 };
+  const stale = new Date(now.getTime() - 5 * 60_000);
+  await prisma.nativeDomainOutbox.updateMany({ where: { aggregateType: 'HomeownerAccessRemovalNotice',
+    eventType: { in: ['TENANT_ACCESS_REMOVAL_NOTICE', 'PROPERTY_MANAGER_ACCESS_REMOVAL_NOTICE'] }, state: 'PROCESSING',
+    updatedAt: { lt: stale }, expiresAt: { gt: now }, attempts: { lt: 8 } }, data: { state: 'PENDING', nextAttemptAt: now } });
+  await prisma.nativeDomainOutbox.updateMany({ where: { aggregateType: 'HomeownerAccessRemovalNotice',
+    eventType: { in: ['TENANT_ACCESS_REMOVAL_NOTICE', 'PROPERTY_MANAGER_ACCESS_REMOVAL_NOTICE'] }, state: 'PROCESSING',
+    attempts: { gte: 8 }, expiresAt: { gt: now } }, data: { state: 'FAILED' } });
+  const abandonedExpired = await prisma.nativeDomainOutbox.updateMany({ where: { aggregateType: 'HomeownerAccessRemovalNotice',
+    eventType: { in: ['TENANT_ACCESS_REMOVAL_NOTICE', 'PROPERTY_MANAGER_ACCESS_REMOVAL_NOTICE'] }, state: 'PROCESSING', expiresAt: { lte: now } }, data: { state: 'EXPIRED' } });
+  const expired = await prisma.nativeDomainOutbox.updateMany({ where: { aggregateType: 'HomeownerAccessRemovalNotice',
+    eventType: { in: ['TENANT_ACCESS_REMOVAL_NOTICE', 'PROPERTY_MANAGER_ACCESS_REMOVAL_NOTICE'] }, state: 'PENDING', expiresAt: { lte: now } }, data: { state: 'EXPIRED' } });
+  counts.expired += expired.count + abandonedExpired.count;
+  const rows = await prisma.nativeDomainOutbox.findMany({ where: { aggregateType: 'HomeownerAccessRemovalNotice',
+    eventType: { in: ['TENANT_ACCESS_REMOVAL_NOTICE', 'PROPERTY_MANAGER_ACCESS_REMOVAL_NOTICE'] }, state: 'PENDING',
+    nextAttemptAt: { lte: now }, expiresAt: { gt: now }, attempts: { lt: 8 } },
+    orderBy: [{ nextAttemptAt: 'asc' }, { createdAt: 'asc' }, { id: 'asc' }], take: RECEIPT_LIMIT,
+    select: { id: true, eventType: true, expiresAt: true, attempts: true, payload: true } });
+  const configured = dependencies.sendEmail && dependencies.sendPush ? null : configuration();
+  const apns = dependencies.sendPush ? null : readApnsConfig();
+  for (const row of rows) {
+    const payload = row.payload && typeof row.payload === 'object' && !Array.isArray(row.payload)
+      ? row.payload as Record<string, unknown> : null;
+    let noticeId = '';
+    let decoded: Record<string, unknown> | null = null;
+    try {
+      const sealed = payload?.sealed;
+      if (!sealed || typeof sealed !== 'object' || Array.isArray(sealed)) throw new Error('sealed payload invalid');
+      decoded = JSON.parse(decryptPlatformEnvelope(JSON.stringify(sealed))) as Record<string, unknown>;
+      noticeId = String(payload?.noticeId ?? '');
+    } catch { /* invalid encrypted payload is suppressed below */ }
+    if (!decoded || decoded.version !== 1 || !/^[0-9a-f-]{36}$/i.test(noticeId)) {
+      await prisma.nativeDomainOutbox.updateMany({ where: { id: row.id, state: 'PENDING', attempts: row.attempts }, data: { state: 'FAILED' } });
+      counts.suppressed += 1;
+      continue;
+    }
+    const channel = decoded.channel;
+    const isEmail = channel === 'EMAIL' && typeof decoded.recipient === 'string' && EMAIL.test(decoded.recipient) && decoded.recipient.length <= 320;
+    const isPush = channel === 'PUSH' && typeof decoded.deviceToken === 'string'
+      && /^(?:[A-Fa-f0-9]{2}){32,256}$/.test(decoded.deviceToken)
+      && (decoded.environment === 'DEVELOPMENT' || decoded.environment === 'PRODUCTION')
+      && typeof decoded.trustedDeviceId === 'string' && /^[0-9a-f-]{36}$/i.test(decoded.trustedDeviceId);
+    if (!isEmail && !isPush) {
+      await prisma.nativeDomainOutbox.updateMany({ where: { id: row.id, state: 'PENDING', attempts: row.attempts }, data: { state: 'FAILED' } });
+      counts.suppressed += 1;
+      continue;
+    }
+    if (isEmail && !dependencies.sendEmail && (!configured || !configured.source)) {
+      await prisma.nativeDomainOutbox.updateMany({ where: { id: row.id, state: 'PENDING', attempts: row.attempts },
+        data: { nextAttemptAt: nextAttempt(now, Math.max(1, row.attempts + 1)) } });
+      counts.deferred += 1; continue;
+    }
+    if (isPush && !dependencies.sendPush && !apns) {
+      await prisma.nativeDomainOutbox.updateMany({ where: { id: row.id, state: 'PENDING', attempts: row.attempts },
+        data: { nextAttemptAt: nextAttempt(now, Math.max(1, row.attempts + 1)) } });
+      counts.deferred += 1; continue;
+    }
+    const claimed = await prisma.nativeDomainOutbox.updateMany({ where: { id: row.id, state: 'PENDING', attempts: row.attempts,
+      nextAttemptAt: { lte: now }, expiresAt: { gt: now } }, data: { state: 'PROCESSING', attempts: { increment: 1 } } });
+    if (claimed.count !== 1) continue;
+    let accepted = false;
+    let invalidToken = false;
+    try {
+      if (isEmail) {
+        accepted = dependencies.sendEmail
+          ? await dependencies.sendEmail({ recipient: decoded.recipient as string, noticeId })
+          : Boolean(configured && await sendTextEmail(configured.client, configured.source, decoded.recipient as string,
+            'Dinodia Smart Living access changed', 'Access to one of your Dinodia Smart Living homes has changed. Sign in to review your active homes. This message contains no property or device details.'));
+      } else {
+        const result = dependencies.sendPush
+          ? await dependencies.sendPush({ environment: decoded.environment as ApnsEnvironment, deviceToken: decoded.deviceToken as string, noticeId, expiresAt: row.expiresAt })
+          : await sendHomeAccessChangedPush({ config: apns!, environment: decoded.environment as ApnsEnvironment,
+            deviceToken: decoded.deviceToken as string, requestId: noticeId, expiresAt: row.expiresAt });
+        accepted = result.outcome === 'ACCEPTED';
+        invalidToken = result.outcome === 'INVALID_TOKEN';
+      }
+    } catch { accepted = false; }
+    const attempt = row.attempts + 1;
+    const terminal = invalidToken || attempt >= 8;
+    await prisma.nativeDomainOutbox.updateMany({ where: { id: row.id, state: 'PROCESSING', attempts: attempt }, data: accepted
+      ? { state: 'DELIVERED' }
+      : terminal ? { state: 'FAILED' } : { state: 'PENDING', nextAttemptAt: nextAttempt(now, attempt) } });
+    if (accepted) counts.accepted += 1;
+    else if (terminal) counts.failed += 1;
+    else counts.deferred += 1;
+  }
+  configured?.client.destroy();
+  return counts;
+}
+
+/**
  * Sends only bounded, non-sensitive installation notices from the existing
  * two-minute operations dispatcher. Provider acceptance is recorded as SENT;
  * it is not represented as inbox delivery. Missing SES/recipient configuration
@@ -170,6 +275,7 @@ export async function dispatchInstallationRequestNotifications(now = new Date())
     operationsAccepted: 0, operationsDeferred: 0, operationsFailed: 0,
     completionAccepted: 0, completionDeferred: 0, completionSuppressed: 0,
     pushAccepted: 0, pushDeferred: 0, pushFailed: 0, pushSuppressed: 0,
+    accessRemovalAccepted: 0, accessRemovalDeferred: 0, accessRemovalFailed: 0, accessRemovalSuppressed: 0, accessRemovalExpired: 0,
   };
   const configured = configuration();
   // A dispatcher process can disappear after claiming an outbox row. Reopen a
@@ -283,6 +389,12 @@ export async function dispatchInstallationRequestNotifications(now = new Date())
   counts.pushDeferred += push.deferred;
   counts.pushFailed += push.failed;
   counts.pushSuppressed += push.suppressed;
+  const removal = await dispatchHomeownerAccessRemovalNotices(now);
+  counts.accessRemovalAccepted += removal.accepted;
+  counts.accessRemovalDeferred += removal.deferred;
+  counts.accessRemovalFailed += removal.failed;
+  counts.accessRemovalSuppressed += removal.suppressed;
+  counts.accessRemovalExpired += removal.expired;
   configured?.client.destroy();
   return counts;
 }

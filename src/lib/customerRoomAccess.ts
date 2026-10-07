@@ -9,6 +9,7 @@ import { enforcePersistentRateLimit } from './rateLimit';
 import { sendRoomAccessVerificationCode } from './customerAuthEmail';
 import { sendCustomerInvitationEmail } from './customerInvitationEmail';
 import { hashPassword } from './passwords';
+import { consumeStepUpInTransaction } from './sensitiveOperationStepUp';
 
 type Tx = Prisma.TransactionClient;
 const REQUEST_MS = 7 * 24 * 60 * 60 * 1000;
@@ -379,7 +380,7 @@ export async function listHomeRoomAccessRequests(input: { homeId: string; custom
   });
 }
 
-export async function decideHomeRoomAccessRequest(input: { requestId: string; homeId: string; customer: CustomerAccountSessionPrincipal; decision: 'APPROVE'|'REJECT'; expectedRevision: string; idempotencyKey: string }) {
+export async function decideHomeRoomAccessRequest(input: { requestId: string; homeId: string; customer: CustomerAccountSessionPrincipal; decision: 'APPROVE'|'REJECT'; expectedRevision: string; idempotencyKey: string; proof: string }) {
   const namespace = `home-room-access-decision:v1:${input.homeId}`;
   const requestHash = bodyDigest({ requestId: input.requestId, homeId: input.homeId, decision: input.decision, expectedRevision: input.expectedRevision, accountId: input.customer.id });
   const outcome = await serializableTransaction(async (tx) => {
@@ -388,17 +389,20 @@ export async function decideHomeRoomAccessRequest(input: { requestId: string; ho
     // is re-read under the property lock below before any grant is written.
     await tx.$queryRaw`SELECT "id" FROM "Home" WHERE "id" = ${input.homeId}::uuid FOR UPDATE`;
     await tx.$queryRaw`SELECT "id" FROM "AreaAccessRequest" WHERE "id" = ${input.requestId}::uuid FOR UPDATE`;
-    const old = await replay(tx, namespace, input.customer.id, input.idempotencyKey, requestHash);
-    if (old) return { receipt: { ...old, idempotentReplay: true }, delivery: undefined, remember: undefined };
     const now = new Date();
     const [membership, request] = await Promise.all([
-      tx.homeMembership.findUnique({ where: { customerAccountId_homeId: { customerAccountId: input.customer.id, homeId: input.homeId } }, select: { id: true, role: true, status: true } }),
+      tx.homeMembership.findUnique({ where: { customerAccountId_homeId: { customerAccountId: input.customer.id, homeId: input.homeId } }, select: { id: true, role: true, status: true, accessRevision: true } }),
       tx.areaAccessRequest.findUnique({ where: { id: input.requestId }, select: { id: true, homeId: true, areaId: true, areaQrCredentialId: true, requesterAccountId: true, requesterEmailNormalized: true, emailVerifiedAt: true, onboardingInvitationId: true, onboardingEmailStatus: true, status: true, expiresAt: true, updatedAt: true,
         area: { select: { originalName: true, status: true } }, qrCredential: { select: { status: true, areaId: true } } } }),
     ]);
     if (!membership || membership.status !== 'ACTIVE' || !['OWNER', 'PROPERTY_MANAGER'].includes(membership.role)) throw new Stage1AuthError(404, 'RESOURCE_NOT_FOUND', 'Room access requests are not available');
-    const home = await tx.home.findUnique({ where: { id: input.homeId }, select: { lifecycle: true, installationStatus: true, managementRevision: true } });
+    const home = await tx.home.findUnique({ where: { id: input.homeId }, select: { lifecycle: true, installationStatus: true, managementRevision: true, activeHubInstallationId: true } });
     if (!request || request.homeId !== input.homeId || home?.lifecycle !== 'ACTIVE' || home.installationStatus !== 'COMPLETE') throw new Stage1AuthError(404, 'RESOURCE_NOT_FOUND', 'This Room access request is not available');
+    // A saved response is useful after a lost network reply, but it never
+    // substitutes for current account authority. Revalidate the selected
+    // owner's/manager's live membership and Home before returning it.
+    const old = await replay(tx, namespace, input.customer.id, input.idempotencyKey, requestHash);
+    if (old) return { receipt: { ...old, idempotentReplay: true }, delivery: undefined, remember: undefined };
     if (request.status === (input.decision === 'APPROVE' ? 'APPROVED' : 'REJECTED')) {
       if (input.decision === 'APPROVE' && request.onboardingInvitationId && request.onboardingEmailStatus !== 'ACCEPTED') {
         const invitation = await tx.membershipInvitation.findUnique({ where: { id: request.onboardingInvitationId }, select: { id: true, targetEmail: true, targetAccountId: true, expiresAt: true, home: { select: { postcode: true } } } });
@@ -414,6 +418,16 @@ export async function decideHomeRoomAccessRequest(input: { requestId: string; ho
     }
     if (request.status !== 'PENDING' || request.expiresAt <= now || request.area.status !== 'ACTIVE' || request.qrCredential.status !== 'ACTIVE' || request.qrCredential.areaId !== request.areaId) throw new Stage1AuthError(409, 'REVISION_CONFLICT', 'This Room request is no longer eligible for a decision');
     if (iso(request.updatedAt) !== input.expectedRevision) throw new Stage1AuthError(409, 'REVISION_CONFLICT', 'This Room request changed. Refresh and retry.');
+    if (input.customer.credentialKind !== 'access' || !home.activeHubInstallationId) throw new Stage1AuthError(401, 'AUTH_REQUIRED', 'A current selected-home session is required');
+    const hub = await tx.hubInstallation.findFirst({ where: { id: home.activeHubInstallationId, homeId: input.homeId, lifecycleStatus: 'ACTIVE' }, select: { id: true, accessPolicyRevision: true } });
+    if (!hub) throw new Stage1AuthError(404, 'RESOURCE_NOT_FOUND', 'Room access requests are not available');
+    await consumeStepUpInTransaction(tx, {
+      proof: input.proof, customerAccountId: input.customer.id, customerSessionId: input.customer.sessionId,
+      trustedDeviceId: input.customer.trustedDeviceId, homeId: input.homeId, membershipId: membership.id,
+      hubInstallationId: hub.id, operationKind: 'home_room_access_decision', targetIds: [request.id],
+      value: { decision: input.decision, expectedRevision: input.expectedRevision },
+      policyRevision: Math.max(membership.accessRevision, hub.accessPolicyRevision),
+    }, now);
     let membershipId: string | null = null;
     let requesterAccountId = request.requesterAccountId;
     let onboardingInvitationId: string | null = null;

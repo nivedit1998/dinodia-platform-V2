@@ -3,12 +3,14 @@ import { nativeV1ErrorResponse } from '@/lib/contracts/nativeV1Error';
 import { validateOwnershipTransferResolveReceipt, validateOwnershipTransferResolveRequest } from '@/lib/contracts/dinodiaV1';
 import { requireCustomerAccountSession, Stage1AuthError } from '@/lib/stage1Auth';
 import { redeemOwnershipTransfer } from '@/lib/ownershipTransfer';
+import { homeownerLifecycleMutationsEnabled, LIFECYCLE_REHEARSAL_REQUIRED } from '@/lib/homeownerLifecycleAvailability';
 
 export const dynamic = 'force-dynamic';
 
 export async function POST(request: Request) {
   try {
     const customer = await requireCustomerAccountSession(request);
+    if (!homeownerLifecycleMutationsEnabled()) throw new Stage1AuthError(503, LIFECYCLE_REHEARSAL_REQUIRED, 'Ownership transfer is unavailable until its safety rehearsal is approved');
     const body = await request.json().catch(() => null) as Record<string, unknown> | null;
     if (!validateOwnershipTransferResolveRequest(body)) {
       throw new Stage1AuthError(400, 'VALIDATION_FAILED', 'A valid transfer QR or emailed code is required');

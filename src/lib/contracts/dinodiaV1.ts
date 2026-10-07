@@ -86,6 +86,26 @@ export interface HomeInvitationAreasReceipt {
   schemaVersion: typeof DINODIA_V1; ok: true; homeId: OpaqueId; managementRevision: number;
   areas: Array<{ id: OpaqueId; name: string }>;
 }
+export interface HomeownerTenantAreaGrantsRequest { areaIds: OpaqueId[]; expectedAccessRevision: number; expectedManagementRevision: number; proof: string }
+export interface HomeownerTenantAreaGrantsReceipt {
+  schemaVersion: typeof DINODIA_V1; ok: true; homeId: OpaqueId; tenantMembershipId: OpaqueId; areaIds: OpaqueId[];
+  changed: boolean; managementRevision: number; accessRevision: number; decommissionTombstoneCount: number;
+}
+export interface HomeownerTenantRemovalRequest { expectedAccessRevision: number; expectedManagementRevision: number; proof: string; idempotencyKey: string }
+export interface HomeownerTenantRemovalReceipt {
+  schemaVersion: typeof DINODIA_V1; ok: true; homeId: OpaqueId; tenantMembershipId: OpaqueId; state: 'REMOVED';
+  managementRevision: number; accessRevision: number; hubEnforcement: 'PENDING'; idempotentReplay: boolean;
+}
+export interface HomeownerManagerRemovalRequest { expectedManagementRevision: number; proof: string; idempotencyKey: string }
+export interface HomeownerManagerRemovalReceipt {
+  schemaVersion: typeof DINODIA_V1; ok: true; homeId: OpaqueId; managerMembershipId: OpaqueId; state: 'REMOVED';
+  managementRevision: number; idempotentReplay: boolean;
+}
+export interface HomeownerManagementActivityItem { id: OpaqueId; occurredAt: string; activity: string; actor: string; target: string }
+export interface HomeownerManagementActivityPage {
+  schemaVersion: typeof DINODIA_V1; ok: true; homeId: OpaqueId; items: HomeownerManagementActivityItem[];
+  nextCursor: string | null; retentionStartAt: string; asOf: string;
+}
 export interface CustomerRoomQrScanRequest { reference: string }
 export interface CustomerRoomQrScanReceipt { schemaVersion: typeof DINODIA_V1; ok: true; state: 'AVAILABLE'; areaLabel: string; qrGeneration: number; requestValiditySeconds: number }
 export interface CustomerRoomAccessRequestRequest { reference: string; expectedGeneration: number; idempotencyKey: string }
@@ -95,7 +115,7 @@ export interface PublicRoomAccessEmailChallengeReceipt { schemaVersion: typeof D
 export interface PublicRoomAccessEmailVerificationRequest { requestId: OpaqueId; challengeId: OpaqueId; code: string }
 export interface PublicRoomAccessEmailVerificationReceipt { schemaVersion: typeof DINODIA_V1; ok: true; state: 'PENDING'; requestId: OpaqueId; expiresAt: string; revision: string; idempotentReplay: boolean }
 export interface CustomerRoomAccessCancelRequest { expectedRevision: string; idempotencyKey: string }
-export interface CustomerRoomAccessDecisionRequest { requestId: OpaqueId; decision: 'APPROVE'|'REJECT'; expectedRevision: string; idempotencyKey: string }
+export interface CustomerRoomAccessDecisionRequest { requestId: OpaqueId; decision: 'APPROVE'|'REJECT'; expectedRevision: string; idempotencyKey: string; proof: string }
 export interface CustomerRoomAccessDecisionReceipt { schemaVersion: typeof DINODIA_V1; ok: true; requestId: OpaqueId; state: 'APPROVED'|'REJECTED'; membershipId: OpaqueId|null; idempotentReplay: boolean }
 export interface CustomerHomeClaimResolveReceipt { schemaVersion: typeof DINODIA_V1; ok: true; claimId: OpaqueId; generation: number; state: 'SETUP'; expiresAt: string }
 export interface CustomerHomeClaimResolverProof {
@@ -491,6 +511,58 @@ export function validateHomeInvitationAreasReceipt(value: unknown, expectedHomeI
     && value.areas.every((area) => object(area) && hasOnlyKeys(area, ['id','name']) && id(area.id) && nonEmptyText(area.name, 120))
     && new Set(value.areas.map((area) => (area as Record<string, unknown>).id)).size === value.areas.length;
 }
+export function validateHomeownerTenantAreaGrantsRequest(value: unknown): value is HomeownerTenantAreaGrantsRequest {
+  return object(value) && hasOnlyKeys(value, ['areaIds','expectedAccessRevision','expectedManagementRevision','proof'])
+    && Array.isArray(value.areaIds) && value.areaIds.length <= 64 && value.areaIds.every(id)
+    && new Set(value.areaIds).size === value.areaIds.length
+    && Number.isSafeInteger(value.expectedAccessRevision) && Number(value.expectedAccessRevision) >= 0
+    && Number.isSafeInteger(value.expectedManagementRevision) && Number(value.expectedManagementRevision) >= 1
+    && typeof value.proof === 'string' && codePointLength(value.proof) >= 32 && codePointLength(value.proof) <= 16384;
+}
+export function validateHomeownerTenantAreaGrantsReceipt(value: unknown, expectedHomeId: string, expectedMembershipId: string): value is HomeownerTenantAreaGrantsReceipt {
+  return object(value) && hasOnlyKeys(value, ['schemaVersion','ok','homeId','tenantMembershipId','areaIds','changed','managementRevision','accessRevision','decommissionTombstoneCount'])
+    && value.schemaVersion === DINODIA_V1 && value.ok === true && value.homeId === expectedHomeId
+    && value.tenantMembershipId === expectedMembershipId && Array.isArray(value.areaIds) && value.areaIds.length <= 64
+    && value.areaIds.every(id) && new Set(value.areaIds).size === value.areaIds.length
+    && typeof value.changed === 'boolean' && Number.isSafeInteger(value.managementRevision) && Number(value.managementRevision) >= 1
+    && Number.isSafeInteger(value.accessRevision) && Number(value.accessRevision) >= 0
+    && Number.isSafeInteger(value.decommissionTombstoneCount) && Number(value.decommissionTombstoneCount) >= 0;
+}
+export function validateHomeownerTenantRemovalRequest(value: unknown): value is HomeownerTenantRemovalRequest {
+  return object(value) && Object.keys(value).sort().join(',') === 'expectedAccessRevision,expectedManagementRevision,idempotencyKey,proof'
+    && Number.isSafeInteger(value.expectedAccessRevision) && Number(value.expectedAccessRevision) >= 0
+    && Number.isSafeInteger(value.expectedManagementRevision) && Number(value.expectedManagementRevision) >= 1
+    && typeof value.proof === 'string' && codePointLength(value.proof) >= 32 && codePointLength(value.proof) <= 16384
+    && idempotencyKey(value.idempotencyKey);
+}
+export function validateHomeownerTenantRemovalReceipt(value: unknown, expectedHomeId: string, expectedMembershipId: string): value is HomeownerTenantRemovalReceipt {
+  return object(value) && hasOnlyKeys(value, ['schemaVersion','ok','homeId','tenantMembershipId','state','managementRevision','accessRevision','hubEnforcement','idempotentReplay'])
+    && value.schemaVersion === DINODIA_V1 && value.ok === true && value.homeId === expectedHomeId && value.tenantMembershipId === expectedMembershipId
+    && value.state === 'REMOVED' && Number.isSafeInteger(value.managementRevision) && Number(value.managementRevision) >= 1
+    && Number.isSafeInteger(value.accessRevision) && Number(value.accessRevision) >= 1 && value.hubEnforcement === 'PENDING'
+    && typeof value.idempotentReplay === 'boolean';
+}
+export function validateHomeownerManagerRemovalRequest(value: unknown): value is HomeownerManagerRemovalRequest {
+  return object(value) && Object.keys(value).sort().join(',') === 'expectedManagementRevision,idempotencyKey,proof'
+    && Number.isSafeInteger(value.expectedManagementRevision) && Number(value.expectedManagementRevision) >= 1
+    && typeof value.proof === 'string' && codePointLength(value.proof) >= 32 && codePointLength(value.proof) <= 16384
+    && idempotencyKey(value.idempotencyKey);
+}
+export function validateHomeownerManagerRemovalReceipt(value: unknown, expectedHomeId: string, expectedMembershipId: string): value is HomeownerManagerRemovalReceipt {
+  return object(value) && hasOnlyKeys(value, ['schemaVersion','ok','homeId','managerMembershipId','state','managementRevision','idempotentReplay'])
+    && value.schemaVersion === DINODIA_V1 && value.ok === true && value.homeId === expectedHomeId && value.managerMembershipId === expectedMembershipId
+    && value.state === 'REMOVED' && Number.isSafeInteger(value.managementRevision) && Number(value.managementRevision) >= 1
+    && typeof value.idempotentReplay === 'boolean';
+}
+export function validateHomeownerManagementActivityPage(value: unknown, expectedHomeId: string): value is HomeownerManagementActivityPage {
+  return object(value) && hasOnlyKeys(value, ['schemaVersion','ok','homeId','items','nextCursor','retentionStartAt','asOf'])
+    && value.schemaVersion === DINODIA_V1 && value.ok === true && value.homeId === expectedHomeId
+    && Array.isArray(value.items) && value.items.length <= 100 && value.items.every((item) => object(item)
+      && hasOnlyKeys(item, ['id','occurredAt','activity','actor','target']) && id(item.id) && utcTimestamp(item.occurredAt)
+      && nonEmptyText(item.activity, 120) && nonEmptyText(item.actor, 160) && nonEmptyText(item.target, 80))
+    && (value.nextCursor === null || typeof value.nextCursor === 'string' && /^[A-Za-z0-9_-]{1,256}$/.test(value.nextCursor))
+    && utcTimestamp(value.retentionStartAt) && utcTimestamp(value.asOf);
+}
 const idempotencyKey = (value: unknown): value is string => typeof value === 'string' && /^[A-Za-z0-9._:-]{16,160}$/.test(value);
 export function validateCustomerRoomQrScanRequest(value: unknown): value is CustomerRoomQrScanRequest {
   return object(value) && hasOnlyKeys(value, ['reference']) && typeof value.reference === 'string' && /^dno_room_[A-Za-z0-9_-]{40,64}$/.test(value.reference);
@@ -539,8 +611,9 @@ export function validateCustomerRoomAccessCancelRequest(value: unknown): value i
   return object(value) && hasOnlyKeys(value, ['expectedRevision','idempotencyKey']) && utcTimestamp(value.expectedRevision) && idempotencyKey(value.idempotencyKey);
 }
 export function validateCustomerRoomAccessDecisionRequest(value: unknown): value is CustomerRoomAccessDecisionRequest {
-  return object(value) && hasOnlyKeys(value, ['requestId','decision','expectedRevision','idempotencyKey'])
-    && id(value.requestId) && (value.decision === 'APPROVE' || value.decision === 'REJECT') && utcTimestamp(value.expectedRevision) && idempotencyKey(value.idempotencyKey);
+  return object(value) && hasOnlyKeys(value, ['requestId','decision','expectedRevision','idempotencyKey','proof'])
+    && id(value.requestId) && (value.decision === 'APPROVE' || value.decision === 'REJECT') && utcTimestamp(value.expectedRevision)
+    && idempotencyKey(value.idempotencyKey) && typeof value.proof === 'string' && codePointLength(value.proof) >= 40 && codePointLength(value.proof) <= 8192;
 }
 export function validateCustomerRoomAccessDecisionReceipt(value: unknown, expectedRequestId: string): value is CustomerRoomAccessDecisionReceipt {
   return object(value) && hasOnlyKeys(value, ['schemaVersion','ok','requestId','state','membershipId','idempotentReplay'])
@@ -709,7 +782,7 @@ export function validateCustomerHubSession(value: unknown, expected: { homeId: s
   const expiresAt = Date.parse(value.expiresAt);
   return expiresAt > now && expiresAt <= now + 5 * 60 * 1000 + 1000;
 }
-const stepUpOperations = new Set(['trusted_device_remove','customer_password_change','customer_profile_change','customer_email_change','tenant_membership_remove','tenant_device_remove','home.transfer','support_ticket_close','support_access_approve','support_access_revoke','alexa_unlink','heating_sensitive_command','device_sensitive_command']);
+const stepUpOperations = new Set(['trusted_device_remove','customer_password_change','customer_profile_change','customer_email_change','tenant_membership_remove','home_tenant_remove','home_property_manager_remove','tenant_device_remove','tenant_area_grants_replace','home.transfer','home_room_access_decision','support_ticket_close','support_access_approve','support_access_revoke','alexa_unlink','heating_sensitive_command','device_sensitive_command']);
 function validStepUpDescriptor(value: unknown): boolean {
   const keys = ['version','serial','identityGeneration','actorId','customerSessionId','trustedDeviceId','homeId','membershipId','hubInstallId','operationKind','targetIds','controlId','descriptorRevision','descriptorDigest','operationDigest','nonce','issuedAt','hubSignature'];
   return object(value) && Object.keys(value).length === keys.length && hasOnlyKeys(value, keys) && value.version === 1 && id(value.serial) && Number.isInteger(value.identityGeneration) && Number(value.identityGeneration) > 0 && id(value.actorId) && id(value.customerSessionId) && id(value.trustedDeviceId) && id(value.homeId) && id(value.membershipId) && id(value.hubInstallId) && stepUpOperations.has(String(value.operationKind)) && Array.isArray(value.targetIds) && value.targetIds.length > 0 && value.targetIds.length <= 20 && value.targetIds.every(id) && new Set(value.targetIds).size === value.targetIds.length && id(value.controlId) && Number.isInteger(value.descriptorRevision) && Number(value.descriptorRevision) >= 0 && (value.descriptorDigest === null || typeof value.descriptorDigest === 'string' && /^[0-9a-f]{64}$/.test(value.descriptorDigest)) && typeof value.operationDigest === 'string' && /^[0-9a-f]{64}$/.test(value.operationDigest) && typeof value.nonce === 'string' && codePointLength(value.nonce) >= 20 && codePointLength(value.nonce) <= 128 && /^[A-Za-z0-9_-]+$/.test(value.nonce) && Number.isSafeInteger(value.issuedAt) && Number(value.issuedAt) > 0 && typeof value.hubSignature === 'string' && codePointLength(value.hubSignature) >= 32 && codePointLength(value.hubSignature) <= 2048 && /^[A-Za-z0-9_-]+$/.test(value.hubSignature);

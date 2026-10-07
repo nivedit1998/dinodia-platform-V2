@@ -76,6 +76,19 @@ async function postHttp2(input: ApnsRequest): Promise<ApnsResponse> {
 export async function sendInstallationCompletePush(input: {
   config: ApnsConfig; environment: ApnsEnvironment; deviceToken: string; requestId: string; expiresAt: Date;
 }, poster: ApnsPoster = postHttp2): Promise<ApnsResult> {
+  return sendBoundedApnsAlert(input, { title: 'Installation update', body: 'A permanent-device installation request is complete.' }, poster);
+}
+
+/** Generic, content-minimal security alert; no home name, address or target identity is sent. */
+export async function sendHomeAccessChangedPush(input: {
+  config: ApnsConfig; environment: ApnsEnvironment; deviceToken: string; requestId: string; expiresAt: Date;
+}, poster: ApnsPoster = postHttp2): Promise<ApnsResult> {
+  return sendBoundedApnsAlert(input, { title: 'Home access changed', body: 'Access to a Dinodia Smart Living home has changed. Sign in to review your homes.' }, poster);
+}
+
+async function sendBoundedApnsAlert(input: {
+  config: ApnsConfig; environment: ApnsEnvironment; deviceToken: string; requestId: string; expiresAt: Date;
+}, alert: { title: string; body: string }, poster: ApnsPoster): Promise<ApnsResult> {
   if (!TOKEN_PATTERN.test(input.deviceToken) || !/^[0-9a-f-]{36}$/i.test(input.requestId)
     || !Number.isFinite(input.expiresAt.getTime())) return { outcome: 'FAILED' };
   const host = input.environment === 'DEVELOPMENT' ? 'api.sandbox.push.apple.com' : 'api.push.apple.com';
@@ -91,7 +104,7 @@ export async function sendInstallationCompletePush(input: {
         'apns-expiration': String(Math.floor(input.expiresAt.getTime() / 1000)),
         'apns-collapse-id': input.requestId,
       },
-      body: JSON.stringify({ aps: { alert: { title: 'Installation update', body: 'A permanent-device installation request is complete.' }, sound: 'default' } }),
+      body: JSON.stringify({ aps: { alert, sound: 'default' } }),
     });
   } catch { return { outcome: 'RETRY' }; }
   if (response.status === 200) return { outcome: 'ACCEPTED' };

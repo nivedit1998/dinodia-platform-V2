@@ -10,6 +10,7 @@ import { operationDigest, targetDigest } from '@/lib/sensitiveOperationStepUp';
 import { sha256 } from '@/lib/stage1Crypto';
 import { serializableTransaction } from '@/lib/serializableTransaction';
 import { validateTenantMembershipRemovalPreview, validateTenantMembershipRemovalReceipt, validateTenantMembershipRemovalRequest } from '@/lib/contracts/dinodiaV1';
+import { deleteTenantPrivateDeviceCloudData } from '@/lib/nativeTenantDeviceCleanup';
 
 export const dynamic = 'force-dynamic';
 
@@ -193,7 +194,11 @@ export async function DELETE(request: Request, context: { params: Promise<{ home
       await tx.hubInstallation.updateMany({ where: { homeId, id: { in: [...affectedHubIds] } }, data: {
         cleanupState: 'WAITING_FOR_TENANT_DEVICE_CLEANUP', cleanupGeneration: { increment: 1 },
       } });
-      if (privateDevices.length) await tx.nativeDevice.deleteMany({ where: { id: { in: privateDevices.map((deviceRow) => deviceRow.id) }, homeId, ownerMembershipId: membership.id, managementClass: 'TENANT_DEVICE' } });
+      if (privateDevices.length) {
+        const privateDeviceIds = privateDevices.map((deviceRow) => deviceRow.id);
+        await deleteTenantPrivateDeviceCloudData(tx, { homeId, deviceIds: privateDeviceIds });
+        await tx.nativeDevice.deleteMany({ where: { id: { in: privateDeviceIds }, homeId, ownerMembershipId: membership.id, managementClass: 'TENANT_DEVICE' } });
+      }
 
       const accessRequests = await tx.supportAccessRequest.findMany({ where: { homeId, targetMembershipId: membership.id,
         status: { in: ['REQUESTED', 'APPROVED', 'ISSUED', 'REDEEMED'] } }, select: { id: true, ticketId: true } });

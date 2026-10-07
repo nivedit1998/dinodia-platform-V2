@@ -51,7 +51,10 @@ export async function runNativeOperations(now = new Date()) {
   let expiredSupportCount = 0;
   let expiredRequestCount = 0;
   let releasedClaims = 0;
-  let installationDelivery = { operationsAccepted: 0, operationsDeferred: 0, operationsFailed: 0, completionAccepted: 0, completionDeferred: 0, completionSuppressed: 0 };
+  let installationDelivery = { operationsAccepted: 0, operationsDeferred: 0, operationsFailed: 0,
+    completionAccepted: 0, completionDeferred: 0, completionSuppressed: 0, pushAccepted: 0, pushDeferred: 0,
+    pushFailed: 0, pushSuppressed: 0, accessRemovalAccepted: 0, accessRemovalDeferred: 0,
+    accessRemovalFailed: 0, accessRemovalSuppressed: 0, accessRemovalExpired: 0 };
   const failures: string[] = [];
   const isolate = async (taskId: string, run: () => Promise<void>) => {
     try { await run(); } catch { failures.push(taskId); }

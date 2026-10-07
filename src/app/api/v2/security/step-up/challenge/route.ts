@@ -21,6 +21,43 @@ export async function POST(request: Request) {
     if (!ALLOWED_OPERATIONS.has(operationKind)) throw new Stage1AuthError(400, 'step_up_fields_invalid', 'A supported operation and target are required');
     const value = body.value ?? null;
     let operationValue: unknown = value;
+    if (operationKind === 'tenant_area_grants_replace') {
+      const grants = value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null;
+      if (!['OWNER', 'PROPERTY_MANAGER'].includes(customer.role) || targetIds.length !== 1
+        || !grants || Object.keys(grants).sort().join(',') !== 'areaIds,expectedAccessRevision,expectedManagementRevision'
+        || !Array.isArray(grants.areaIds) || grants.areaIds.length > 64
+        || !grants.areaIds.every((id) => typeof id === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(id))
+        || new Set(grants.areaIds).size !== grants.areaIds.length
+        || !Number.isSafeInteger(grants.expectedAccessRevision) || !Number.isSafeInteger(grants.expectedManagementRevision)) {
+        throw new Stage1AuthError(403, 'step_up_operation_invalid', 'A current tenant Area-grant change must be confirmed');
+      }
+      const [home, target, actor, areas] = await Promise.all([
+        prisma.home.findFirst({ where: { id: customer.homeId, lifecycle: 'ACTIVE', installationStatus: 'COMPLETE' }, select: { managementRevision: true } }),
+        prisma.homeMembership.findFirst({ where: { id: targetIds[0], homeId: customer.homeId, role: 'TENANT', status: 'ACTIVE', customerAccount: { status: 'ACTIVE' } }, select: { accessRevision: true } }),
+        prisma.homeMembership.findFirst({ where: { id: customer.membershipId, homeId: customer.homeId, customerAccountId: customer.id, role: { in: ['OWNER', 'PROPERTY_MANAGER'] }, status: 'ACTIVE' }, select: { id: true } }),
+        grants.areaIds.length ? prisma.area.findMany({ where: { id: { in: grants.areaIds as string[] }, homeId: customer.homeId, status: 'ACTIVE' }, select: { id: true } }) : Promise.resolve([]),
+      ]);
+      if (!home || !target || !actor || home.managementRevision !== grants.expectedManagementRevision
+        || target.accessRevision !== grants.expectedAccessRevision || areas.length !== grants.areaIds.length) {
+        throw new Stage1AuthError(409, 'REVISION_CONFLICT', 'The tenant or Area access changed. Refresh before confirming.');
+      }
+      operationValue = { ...grants, areaIds: [...grants.areaIds as string[]].sort() };
+    }
+    if (operationKind === 'home_room_access_decision') {
+      const decision = value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null;
+      if (!['OWNER', 'PROPERTY_MANAGER'].includes(customer.role) || targetIds.length !== 1
+        || !decision || Object.keys(decision).sort().join(',') !== 'decision,expectedRevision'
+        || !['APPROVE', 'REJECT'].includes(String(decision.decision))
+        || typeof decision.expectedRevision !== 'string'
+        || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/.test(decision.expectedRevision)) {
+        throw new Stage1AuthError(403, 'step_up_operation_invalid', 'A current selected-home Room decision must be confirmed');
+      }
+      const roomRequest = await prisma.areaAccessRequest.findFirst({ where: {
+        id: targetIds[0], homeId: customer.homeId, status: 'PENDING', expiresAt: { gt: new Date() },
+        emailVerifiedAt: { not: null }, updatedAt: new Date(decision.expectedRevision), area: { status: 'ACTIVE' },
+      }, select: { id: true } });
+      if (!roomRequest) throw new Stage1AuthError(409, 'REVISION_CONFLICT', 'This Room request changed. Refresh before confirming.');
+    }
     if (operationKind === 'home.transfer') {
       if (customer.role !== 'OWNER' || targetIds.length < 2 || targetIds[0] !== customer.homeId || targetIds[1] !== customer.membershipId
         || !value || typeof value !== 'object' || Array.isArray(value)) {
@@ -159,6 +196,43 @@ export async function POST(request: Request) {
       ]);
       if (!membership || !home || membership.accessRevision !== removalValue.accessRevision || home.managementRevision !== removalValue.homeManagementRevision) {
         throw new Stage1AuthError(409, 'REVISION_CONFLICT', 'Refresh the selected Home before confirming access removal');
+      }
+    }
+    if (operationKind === 'home_tenant_remove') {
+      const removal = value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null;
+      if (!['OWNER', 'PROPERTY_MANAGER'].includes(customer.role) || targetIds.length !== 1
+        || !removal || Object.keys(removal).sort().join(',') !== 'expectedAccessRevision,expectedManagementRevision'
+        || !Number.isSafeInteger(removal.expectedAccessRevision) || Number(removal.expectedAccessRevision) < 0
+        || !Number.isSafeInteger(removal.expectedManagementRevision) || Number(removal.expectedManagementRevision) < 1) {
+        throw new Stage1AuthError(403, 'MEMBERSHIP_FORBIDDEN', 'Only the current owner or manager can confirm removal of a tenant from this Home');
+      }
+      const [actor, tenant, home] = await Promise.all([
+        prisma.homeMembership.findFirst({ where: { id: customer.membershipId, customerAccountId: customer.id, homeId: customer.homeId,
+          role: { in: ['OWNER', 'PROPERTY_MANAGER'] }, status: 'ACTIVE' }, select: { id: true } }),
+        prisma.homeMembership.findFirst({ where: { id: targetIds[0], homeId: customer.homeId, role: 'TENANT', status: 'ACTIVE', customerAccount: { status: 'ACTIVE' } }, select: { id: true, accessRevision: true } }),
+        prisma.home.findFirst({ where: { id: customer.homeId, lifecycle: 'ACTIVE', installationStatus: 'COMPLETE' }, select: { managementRevision: true } }),
+      ]);
+      if (!actor || !tenant || !home || tenant.accessRevision !== removal.expectedAccessRevision
+        || home.managementRevision !== removal.expectedManagementRevision) {
+        throw new Stage1AuthError(409, 'REVISION_CONFLICT', 'The tenant or Home changed. Refresh before confirming removal.');
+      }
+    }
+    if (operationKind === 'home_property_manager_remove') {
+      const removal = value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null;
+      if (customer.role !== 'OWNER' || targetIds.length !== 1 || targetIds[0] === customer.membershipId
+        || !removal || Object.keys(removal).join(',') !== 'expectedManagementRevision'
+        || !Number.isSafeInteger(removal.expectedManagementRevision) || Number(removal.expectedManagementRevision) < 1) {
+        throw new Stage1AuthError(403, 'MEMBERSHIP_FORBIDDEN', 'Only the original owner can confirm removal of a property manager');
+      }
+      const [actor, manager, home] = await Promise.all([
+        prisma.homeMembership.findFirst({ where: { id: customer.membershipId, customerAccountId: customer.id, homeId: customer.homeId,
+          role: 'OWNER', status: 'ACTIVE' }, select: { id: true } }),
+        prisma.homeMembership.findFirst({ where: { id: targetIds[0], homeId: customer.homeId, role: 'PROPERTY_MANAGER', status: 'ACTIVE' }, select: { id: true, customerAccountId: true } }),
+        prisma.home.findFirst({ where: { id: customer.homeId, lifecycle: 'ACTIVE', installationStatus: 'COMPLETE' }, select: { managementRevision: true } }),
+      ]);
+      if (!actor || !manager || manager.customerAccountId === customer.id || !home
+        || home.managementRevision !== removal.expectedManagementRevision) {
+        throw new Stage1AuthError(409, 'REVISION_CONFLICT', 'The manager or Home changed. Refresh before confirming removal.');
       }
     }
     if (operationKind === 'tenant_device_remove') {

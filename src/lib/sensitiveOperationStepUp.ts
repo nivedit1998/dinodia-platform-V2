@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import type { Prisma } from '@prisma/client';
 import { prisma } from './prisma';
 import { Stage1AuthError } from './stage1Auth';
 import { signStepUpPayload } from './stepUpProofCodec';
@@ -32,7 +33,7 @@ export function operationDigest(input: { operationKind?: string; operation?: str
   }), 'utf8').digest('hex');
 }
 
-export const ALLOWED_OPERATIONS = new Set(['trusted_device_remove', 'customer_password_change', 'customer_profile_change', 'customer_email_change', 'tenant_membership_remove', 'tenant_device_remove', 'home.transfer', 'support_ticket_close', 'support_access_approve', 'support_access_revoke', 'alexa_unlink', 'heating_sensitive_command', 'device_sensitive_command']);
+export const ALLOWED_OPERATIONS = new Set(['trusted_device_remove', 'customer_password_change', 'customer_profile_change', 'customer_email_change', 'tenant_membership_remove', 'home_tenant_remove', 'home_property_manager_remove', 'tenant_device_remove', 'tenant_area_grants_replace', 'home.transfer', 'home_room_access_decision', 'support_ticket_close', 'support_access_approve', 'support_access_revoke', 'alexa_unlink', 'heating_sensitive_command', 'device_sensitive_command']);
 
 function platformPrivateKey(): crypto.KeyObject {
   const pem = String(process.env.DINODIA_APP_SESSION_PRIVATE_KEY ?? '').replaceAll('\\n', '\n');
@@ -108,6 +109,25 @@ export async function consumeStepUp(input: { proof: string; customerAccountId: s
   const digest = operationDigest(input);
   const targetDigestValue = targetDigest(input.targetIds);
   const updated = await prisma.stepUpAuthorization.updateMany({ where: { nonceHash, customerAccountId: input.customerAccountId, customerSessionId: input.customerSessionId, trustedDeviceId: input.trustedDeviceId, homeId: input.homeId, membershipId: input.membershipId, operationKind: input.operationKind, targetDigest: targetDigestValue, normalizedValueDigest: digest, policyRevision: input.policyRevision, consumedAt: null, revokedAt: null, expiresAt: { gt: now } }, data: { consumedAt: now } });
+  if (updated.count !== 1) throw new Stage1AuthError(403, 'step_up_invalid', 'The operation confirmation is invalid, expired, replayed or does not match the requested operation');
+  return { ok: true };
+}
+
+/** Consume a proof inside the same database transaction as its protected mutation. */
+export async function consumeStepUpInTransaction(tx: Prisma.TransactionClient, input: {
+  proof: string; customerAccountId: string; customerSessionId: string; trustedDeviceId: string;
+  homeId: string; membershipId: string; hubInstallationId: string; operationKind: string;
+  targetIds: string[]; value: unknown; policyRevision: number;
+}, now = new Date()) {
+  const nonceHash = crypto.createHash('sha256').update(input.proof).digest('hex');
+  const digest = operationDigest(input);
+  const targetDigestValue = targetDigest(input.targetIds);
+  const updated = await tx.stepUpAuthorization.updateMany({ where: {
+    nonceHash, customerAccountId: input.customerAccountId, customerSessionId: input.customerSessionId,
+    trustedDeviceId: input.trustedDeviceId, homeId: input.homeId, membershipId: input.membershipId,
+    operationKind: input.operationKind, targetDigest: targetDigestValue, normalizedValueDigest: digest,
+    policyRevision: input.policyRevision, consumedAt: null, revokedAt: null, expiresAt: { gt: now },
+  }, data: { consumedAt: now } });
   if (updated.count !== 1) throw new Stage1AuthError(403, 'step_up_invalid', 'The operation confirmation is invalid, expired, replayed or does not match the requested operation');
   return { ok: true };
 }

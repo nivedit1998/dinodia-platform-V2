@@ -7,11 +7,12 @@ export class NativeAreaAccessError extends Error {
 
 export async function replaceTenantAreaGrants(db: Prisma.TransactionClient, input: {
   actorAccountId: string; actorMembershipId: string; tenantMembershipId: string; homeId: string;
-  areaIds: readonly string[]; expectedManagementRevision: number; now?: Date;
+  areaIds: readonly string[]; expectedManagementRevision: number; expectedAccessRevision: number; now?: Date;
 }) {
   const now = input.now ?? new Date();
   const areaIds = [...new Set(input.areaIds)].sort();
   if (!Number.isSafeInteger(input.expectedManagementRevision) || input.expectedManagementRevision < 0
+    || !Number.isSafeInteger(input.expectedAccessRevision) || input.expectedAccessRevision < 0
     || areaIds.length !== input.areaIds.length || areaIds.length > 500 || !areaIds.every(canonicalPublicId)) throw new NativeAreaAccessError('INVALID_GRANT_SET');
   const [actor, tenant, home, areas] = await Promise.all([
     db.homeMembership.findFirst({ where: { id: input.actorMembershipId, customerAccountId: input.actorAccountId, homeId: input.homeId, status: 'ACTIVE', role: { in: ['OWNER', 'PROPERTY_MANAGER'] }, customerAccount: { status: 'ACTIVE' } }, select: { id: true } }),
@@ -21,11 +22,22 @@ export async function replaceTenantAreaGrants(db: Prisma.TransactionClient, inpu
   ]);
   if (!actor || !tenant || !home) throw new NativeAreaAccessError('MEMBERSHIP_FORBIDDEN');
   if (areas.length !== areaIds.length) throw new NativeAreaAccessError('AREA_FORBIDDEN');
-  if (home.managementRevision !== input.expectedManagementRevision) throw new NativeAreaAccessError('REVISION_CONFLICT');
+  if (home.managementRevision !== input.expectedManagementRevision || tenant.accessRevision !== input.expectedAccessRevision) throw new NativeAreaAccessError('REVISION_CONFLICT');
   const current = await db.tenantAreaGrant.findMany({ where: { membershipId: tenant.id, homeId: input.homeId, revokedAt: null }, select: { areaId: true } });
   const currentIds = current.map((grant) => grant.areaId).sort();
   if (currentIds.length === areaIds.length && currentIds.every((id, index) => id === areaIds[index])) return { changed: false, managementRevision: home.managementRevision, accessRevision: tenant.accessRevision };
   const removedAreaIds = currentIds.filter((id) => !areaIds.includes(id));
+  // A tenant-authored automation that targets an Area losing its grant must
+  // not survive with an action that can no longer be authorised. Delete only
+  // that tenant's automations with an action in a removed canonical Area;
+  // unrelated memberships and automations remain untouched.
+  if (removedAreaIds.length) {
+    await db.nativeAutomation.deleteMany({ where: {
+      homeId: input.homeId,
+      createdByMembershipId: tenant.id,
+      actions: { some: { homeId: input.homeId, areaId: { in: removedAreaIds } } },
+    } });
+  }
   const affectedTenantDevices = removedAreaIds.length ? await db.nativeDevice.findMany({
     where: {
       homeId: input.homeId, ownerMembershipId: tenant.id, managementClass: 'TENANT_DEVICE', lifecycle: { notIn: ['RETIRED', 'REMOVED'] },

@@ -16,3 +16,14 @@ export async function setTenantDeviceCustomerLabel(db: Prisma.TransactionClient,
   if (updated.count !== 1) throw new Error('Device owner or inventory revision changed');
   return { customerLabel, inventoryRevision: input.expectedInventoryRevision + 1 };
 }
+
+/** Presentation names are nullable overlays; source names remain authoritative. */
+export function currentNativeDisplayName(originalName: string, overrideName: string | null): string {
+  const override = overrideName?.normalize('NFC').trim();
+  return override || originalName;
+}
+
+/** Stable normalization used only to compute ephemeral visual groups. */
+export function normalizedNativeDisplayName(value: string): string {
+  return value.normalize('NFC').trim().replace(/\s+/gu, ' ').toLocaleLowerCase('en-GB');
+}

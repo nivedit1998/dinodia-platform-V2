@@ -86,7 +86,7 @@ test('every Native V2 route method has an explicit role-profile and AC cross-ref
   const indexed = new Set();
   for (const row of acRouteMatrix.routes) {
     assert.ok(Array.isArray(row.acceptanceCriteria) && row.acceptanceCriteria.length > 0, `AC cross-reference missing for ${row.file}`);
-    for (const criterion of row.acceptanceCriteria) assert.match(criterion, /^AC-(?:02\.(?:[1-9]|[1-3][0-9]|4[0-5])|06\.(?:[1-9]|[1-2][0-9]|3[0-5])|07\.(?:[1-9]|1[0-9]|2[0-3])|08\.(?:[1-9]|1[0-9]|2[0-2]))$/, `invalid AC reference ${criterion} in ${row.file}`);
+    for (const criterion of row.acceptanceCriteria) assert.match(criterion, /^AC-(?:02\.(?:[1-9]|[1-3][0-9]|4[0-5])|06\.(?:[1-9]|[1-2][0-9]|3[0-5])|07\.(?:[1-9]|1[0-9]|2[0-3])|08\.(?:[1-9]|1[0-9]|2[0-2])|09\.(?:[1-9]|[1-3][0-9]))$/, `invalid AC reference ${criterion} in ${row.file}`);
     for (const method of row.methods) {
       const profile = typeof row.principalProfile === 'string' ? row.principalProfile : row.principalProfile?.[method];
       assert.ok(profile, `principal profile missing for ${method} ${routePath(row.file)}`);
@@ -146,7 +146,18 @@ test('support approval inbox has an explicit selected-membership privacy contrac
 test('all active Native V2 non-Alexa routes preserve the canonical Native V1 error adapter', () => {
   for (const row of coverage.routes.filter((item) => !['explicit_feature_disabled', 'delegates_to_canonical_customer_session_handlers'].includes(item.boundary))) {
     const source = fs.readFileSync(path.join(root, row.file), 'utf8');
-    assert.match(source, /nativeV1ErrorResponse/, `${row.file} must map errors through the canonical envelope`);
+    if (/nativeV1ErrorResponse/.test(source)) continue;
+    // A small compatibility path may delegate to the canonical route handler;
+    // verify that concrete target owns the error adapter instead of requiring
+    // every alias to duplicate its error mapping.
+    const delegated = source.match(/import\s+\{([^}]+)\}\s+from\s+['"]([^'"]+)['"]/);
+    assert.ok(delegated, `${row.file} must either map errors directly or delegate to a canonical route`);
+    assert.ok(row.methods.every((method) => delegated[1].includes(method)), `${row.file} must delegate each indexed method`);
+    const targetBase = path.resolve(path.dirname(path.join(root, row.file)), delegated[2]);
+    const targets = [`${targetBase}.ts`, path.join(targetBase, 'route.ts')];
+    const target = targets.find((candidate) => fs.existsSync(candidate));
+    assert.ok(target, `${row.file} delegation target must exist`);
+    assert.match(fs.readFileSync(target, 'utf8'), /nativeV1ErrorResponse/, `${row.file} delegated handler must map errors through the canonical envelope`);
   }
 });
 

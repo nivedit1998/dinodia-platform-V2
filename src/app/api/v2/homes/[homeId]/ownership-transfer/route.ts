@@ -4,6 +4,7 @@ import { requireCustomerAccountSession, Stage1AuthError } from '@/lib/stage1Auth
 import { requireCustomerSelectedHome } from '@/lib/customerSelectedHome';
 import { validateOwnershipTransferCancelRequest, validateOwnershipTransferCancelReceipt, validateOwnershipTransferStartReceipt, validateOwnershipTransferStartRequest, validateOwnershipTransferStatus } from '@/lib/contracts/dinodiaV1';
 import { cancelOwnershipTransfer, currentOwnershipTransfer, startOwnershipTransfer, type TransferPrincipal } from '@/lib/ownershipTransfer';
+import { homeownerLifecycleMutationsEnabled, LIFECYCLE_REHEARSAL_REQUIRED } from '@/lib/homeownerLifecycleAvailability';
 
 export const dynamic = 'force-dynamic';
 const noStore = { headers: { 'Cache-Control': 'no-store', Pragma: 'no-cache' } };
@@ -39,6 +40,7 @@ export async function POST(request: Request, context: { params: Promise<{ homeId
     const principal = selectedPrincipal(account, selected);
     const body = await request.json().catch(() => null) as Record<string, unknown> | null;
     if (validateOwnershipTransferStartRequest(body)) {
+      if (!homeownerLifecycleMutationsEnabled()) throw new Stage1AuthError(503, LIFECYCLE_REHEARSAL_REQUIRED, 'Ownership transfer is unavailable until its safety rehearsal is approved');
       const receipt = { schemaVersion: 'dinodia.v1' as const, ok: true as const, ...await startOwnershipTransfer({ principal, homeId, recipientEmail: body.recipientEmail,
         expectedManagementRevision: body.expectedManagementRevision, proof: body.proof, idempotencyKey: body.idempotencyKey }) };
       if (!validateOwnershipTransferStartReceipt(receipt)) throw new Stage1AuthError(503, 'CONTRACT_RECEIPT_INVALID', 'The transfer receipt is unavailable');

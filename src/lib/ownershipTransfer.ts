@@ -9,6 +9,7 @@ import { operationDigest, targetDigest } from '@/lib/sensitiveOperationStepUp';
 import { sha256 } from '@/lib/stage1Crypto';
 import { consumeSignedClaimResolverProof } from '@/lib/stage1ClaimResolver';
 import { serializableTransaction } from '@/lib/serializableTransaction';
+import { cleanupCustomerAccountIfOrphaned } from '@/lib/customerRelationshipCleanup';
 
 const START_NS = 'customer-home-transfer-start';
 const CANCEL_NS = 'customer-home-transfer-cancel';
@@ -236,31 +237,6 @@ export async function cancelOwnershipTransfer(input: { principal: TransferPrinci
   });
 }
 
-async function cleanupRemovedAccount(tx: Prisma.TransactionClient, accountId: string, homeId: string, now: Date) {
-  const account = await tx.customerAccount.findUnique({ where: { id: accountId }, select: { id: true, emailNormalized: true } });
-  if (!account) return false;
-  const [memberships, invitations, requests, setups, reservations] = await Promise.all([
-    tx.homeMembership.count({ where: { customerAccountId: accountId, status: 'ACTIVE' } }),
-    tx.membershipInvitation.count({ where: { state: 'PENDING', expiresAt: { gt: now }, OR: [{ targetAccountId: accountId }, { targetEmailNormalized: account.emailNormalized }] } }),
-    tx.areaAccessRequest.count({ where: { requesterAccountId: accountId, status: 'PENDING', expiresAt: { gt: now } } }),
-    tx.pendingHomeSetup.count({ where: { customerAccountId: accountId, state: { in: ['PROFILE_REQUIRED','ADDRESS_REQUIRED','POLICY_REQUIRED','PENDING_INSTALLATION','READY_TO_ACTIVATE'] }, expiredAt: null, reservation: { state: 'ACTIVE', expiresAt: { gt: now } } } }),
-    tx.homeClaimReservation.count({ where: { customerAccountId: accountId, state: 'ACTIVE', expiresAt: { gt: now } } }),
-  ]);
-  if (memberships + invitations + requests + setups + reservations > 0) return false;
-  const devices = await tx.trustedDevice.findMany({ where: { customerAccountId: accountId }, select: { id: true } });
-  const deviceIds = devices.map((device) => device.id);
-  await tx.customerSession.updateMany({ where: { customerAccountId: accountId, revokedAt: null }, data: { revokedAt: now, revokeReason: 'ownership_transferred', accessTokenHash: null, accessTokenExpiresAt: null } });
-  await tx.trustedDevice.updateMany({ where: { customerAccountId: accountId, revokedAt: null }, data: { revokedAt: now, sessionVersion: { increment: 1 }, apnsTokenCiphertext: null, apnsTokenDigest: null, pushRevokedAt: now } });
-  if (deviceIds.length) await tx.offlineMembershipAuthorisation.updateMany({ where: { trustedDeviceId: { in: deviceIds }, revokedAt: null }, data: { revokedAt: now, revokeReason: 'ownership_transferred' } });
-  await tx.stepUpChallenge.updateMany({ where: { customerAccountId: accountId, consumedAt: null, cancelledAt: null }, data: { cancelledAt: now } });
-  await tx.stepUpAuthorization.updateMany({ where: { customerAccountId: accountId, consumedAt: null, revokedAt: null }, data: { revokedAt: now } });
-  await tx.supportTicket.updateMany({ where: { customerAccountId: accountId }, data: { status: 'CLOSED', closedAt: now, selectedMembershipId: null,
-    description: '[Closed and redacted after relationship removal]', title: null, areaId: null, deviceId: null,
-    safeDiagnostics: Prisma.DbNull, customerResolution: null, revision: { increment: 1 } } });
-  await tx.customerAccount.delete({ where: { id: accountId } });
-  return true;
-}
-
 export async function redeemOwnershipTransfer(input: { principal: { id: string; sessionId: string; trustedDeviceId: string; tokenHash: string; credentialKind: 'access'|'refresh'; securityVersion: number; trustedDeviceSessionVersion: number }; reference: string; idempotencyKey: string; resolverProof?: Record<string, unknown> }) {
   const usesPermanentLabel = input.resolverProof !== undefined;
   if ((!/^dno_transfer_[0-9a-f-]{36}_[A-Za-z0-9_-]{40,64}$/.test(input.reference)
@@ -367,7 +343,9 @@ export async function redeemOwnershipTransfer(input: { principal: { id: string; 
       responseStatus: 200, responseDigest: sha256(JSON.stringify(receipt)), responseBody: receipt as Prisma.InputJsonValue,
       expiresAt: new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000) } });
     const accountsToCleanup = [...new Set(revokedMemberships.map((row) => row.customerAccountId))];
-    for (const removedAccountId of accountsToCleanup) await cleanupRemovedAccount(tx, removedAccountId, claim.homeId, now);
+    for (const removedAccountId of accountsToCleanup) {
+      await cleanupCustomerAccountIfOrphaned(tx, removedAccountId, now, 'ownership_transferred', 'OWNERSHIP_TRANSFER_ACCOUNT_CLEANUP');
+    }
     return receipt;
   });
 }
