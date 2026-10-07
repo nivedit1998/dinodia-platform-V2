@@ -37,6 +37,29 @@ export function encryptPlatformEnvelope(value: string): Record<string, string> {
   return { version: '1', algorithm: 'aes-256-gcm', iv: iv.toString('base64'), tag: cipher.getAuthTag().toString('base64'), ciphertext: ciphertext.toString('base64') };
 }
 
+/** Decrypts a bounded Platform-owned AES-GCM envelope without exposing key material. */
+export function decryptPlatformEnvelope(serialized: string): string {
+  if (typeof serialized !== 'string' || serialized.length > 8192) throw new Error('encrypted envelope invalid');
+  const value = JSON.parse(serialized) as Record<string, unknown>;
+  if (!value || Array.isArray(value) || Object.keys(value).sort().join('|') !== ['algorithm', 'ciphertext', 'iv', 'tag', 'version'].sort().join('|')
+    || value.version !== '1' || value.algorithm !== 'aes-256-gcm'
+    || typeof value.iv !== 'string' || typeof value.tag !== 'string' || typeof value.ciphertext !== 'string') {
+    throw new Error('encrypted envelope invalid');
+  }
+  const configured = String(process.env.PLATFORM_DATA_ENCRYPTION_KEY ?? '');
+  const key = Buffer.from(configured, 'base64');
+  const iv = Buffer.from(value.iv, 'base64');
+  const tag = Buffer.from(value.tag, 'base64');
+  const ciphertext = Buffer.from(value.ciphertext, 'base64');
+  if (key.length !== 32 || iv.length !== 12 || tag.length !== 16 || ciphertext.length < 1 || ciphertext.length > 4096
+    || iv.toString('base64') !== value.iv || tag.toString('base64') !== value.tag || ciphertext.toString('base64') !== value.ciphertext) {
+    throw new Error('encrypted envelope invalid');
+  }
+  const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
+  decipher.setAuthTag(tag);
+  return Buffer.concat([decipher.update(ciphertext), decipher.final()]).toString('utf8');
+}
+
 export async function createPendingOperatorCredential(hubInstallationId: string, version: number): Promise<{ id: string; version: number; state: string }> {
   const secret = `dno_ops_${randomSecret(32)}`;
   const installation = await prisma.hubInstallation.findUnique({ where: { id: hubInstallationId }, select: { manufacturingIdentity: { select: { encryptionPublicKey: true } } } });

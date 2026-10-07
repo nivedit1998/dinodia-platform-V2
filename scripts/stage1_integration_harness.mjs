@@ -58,6 +58,9 @@ let ownershipTransferEmailCount = 0;
 let capturedPublicSupportCode;
 let capturedRoomAccessCode;
 let roomAccessVerificationEmailCount = 0;
+let installationOperationsEmailCount = 0;
+let installationCompletionEmailCount = 0;
+const installationEmailBodies = [];
 let capturedCustomerAuthPath;
 let customerFixture;
 let fakePhysicalCommandCount = 0;
@@ -115,6 +118,39 @@ function loadNativeV1Contract() {
   return loaded.exports;
 }
 const nativeV1Contract = loadNativeV1Contract();
+function loadInstallationPushDispatcher() {
+  const require = createRequire(import.meta.url);
+  const ts = require('typescript');
+  const source = fs.readFileSync(path.join(root, 'src/lib/installationRequestDelivery.ts'), 'utf8');
+  const compiled = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, esModuleInterop: true } }).outputText;
+  const loaded = { exports: {} };
+  const decryptPlatformEnvelope = (serialized) => {
+    const envelope = JSON.parse(serialized);
+    const key = Buffer.from(process.env.PLATFORM_DATA_ENCRYPTION_KEY || '', 'base64');
+    const decipher = crypto.createDecipheriv('aes-256-gcm', key, Buffer.from(envelope.iv, 'base64'));
+    decipher.setAuthTag(Buffer.from(envelope.tag, 'base64'));
+    return Buffer.concat([decipher.update(Buffer.from(envelope.ciphertext, 'base64')), decipher.final()]).toString('utf8');
+  };
+  const localRequire = (specifier) => {
+    if (specifier === './prisma') return { prisma };
+    if (specifier === './hubOperatorCredentials') return { decryptPlatformEnvelope };
+    if (specifier === './apnsDelivery') return { readApnsConfig: () => null, sendInstallationCompletePush: async () => ({ outcome: 'RETRY' }) };
+    if (specifier === '@aws-sdk/client-sesv2') return {
+      SESv2Client: class { destroy() {} async send() { return { MessageId: 'stage8-test-message' }; } },
+      SendEmailCommand: class { constructor(input) { this.input = input; } },
+    };
+    return require(specifier);
+  };
+  new Function('require', 'module', 'exports', compiled)(localRequire, loaded, loaded.exports);
+  return loaded.exports.dispatchInstallationPushReceipts;
+}
+function encryptStage8PlatformToken(token, encodedKey) {
+  const key = Buffer.from(encodedKey, 'base64');
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+  const ciphertext = Buffer.concat([cipher.update(token, 'utf8'), cipher.final()]);
+  return JSON.stringify({ version: '1', algorithm: 'aes-256-gcm', iv: iv.toString('base64'), tag: cipher.getAuthTag().toString('base64'), ciphertext: ciphertext.toString('base64') });
+}
 function assertParentCredentialsAreNotForwarded() {
   const fakeParent = {
     ...process.env,
@@ -281,6 +317,7 @@ function baseEnv() {
     // configuration to leak back into this disposable server.
     AWS_ACCESS_KEY_ID: '', AWS_SECRET_ACCESS_KEY: '', AWS_REGION: '',
     SES_FROM_EMAIL: '', COMPANY_PORTAL_INITIAL_CXO_EMAIL: '', SES_TEST_ENDPOINT: '',
+    APNS_TEAM_ID: '', APNS_KEY_ID: '', APNS_AUTH_KEY_P8: '',
     DATABASE_URL: databaseUrl, DIRECT_URL: databaseUrl,
     SUPABASE_PROJECT_REF: 'fppzzesvukjbsfmxmfxe', VERCEL_PROJECT_ID: 'prj_8oa8iA73XjP54Ciix9LQKZ8k1f6y',
     NEXT_PUBLIC_APP_URL: 'https://dinodia-platform-v2.vercel.app', NEXT_PUBLIC_SUPABASE_URL: 'https://fppzzesvukjbsfmxmfxe.supabase.co',
@@ -420,6 +457,14 @@ async function startFakeSes() {
     request.on('end', () => {
       const body = Buffer.concat(chunks).toString('utf8');
       if (!sesShouldFail) {
+        if (body.includes('New Dinodia Smart Living installation request')) {
+          installationOperationsEmailCount += 1;
+          installationEmailBodies.push(body);
+        }
+        if (body.includes('Dinodia Smart Living installation request complete')) {
+          installationCompletionEmailCount += 1;
+          installationEmailBodies.push(body);
+        }
         capturedInvitation = body.match(/#invitation=([A-Za-z0-9_-]{40,64})/)?.[1] || capturedInvitation;
         const customerInvitation = body.match(/#invitation=([0-9a-f-]{36})/i)?.[1];
         if (customerInvitation) { capturedCustomerInvitation = customerInvitation; customerInvitationEmailCount += 1; }
@@ -774,11 +819,13 @@ async function customerAuthorizationChecks(deliveryEnv) {
   await prisma.tenantAreaGrant.create({ data: { membershipId: tenantMembership.id, areaId: areaOne.id, homeId: homeOne.id } });
   const propertyEmail = `stage1-owner-${crypto.randomUUID()}@invalid.test`;
   const propertyUsername = `stage1-owner-${crypto.randomUUID().slice(0, 8)}`;
-  const propertyAccount = await prisma.customerAccount.create({ data: { displayName: 'Stage 1 homeowner', username: propertyUsername, usernameNormalized: propertyUsername, email: propertyEmail, emailNormalized: propertyEmail, emailVerifiedAt: now, passwordHash: 'harness-only-password-hash' } });
+  const propertyPassword = `harness-owner-${crypto.randomUUID()}`;
+  const propertyAccount = await prisma.customerAccount.create({ data: { displayName: 'Stage 1 homeowner', username: propertyUsername, usernameNormalized: propertyUsername, email: propertyEmail, emailNormalized: propertyEmail, emailVerifiedAt: now, passwordHash: hashPassword(propertyPassword) } });
   const propertyMembership = await prisma.homeMembership.create({ data: { customerAccountId: propertyAccount.id, homeId: homeOne.id, role: 'OWNER' } });
   const managerEmail = `stage1-manager-${crypto.randomUUID()}@invalid.test`;
   const managerUsername = `stage1-manager-${crypto.randomUUID().slice(0, 8)}`;
-  const managerAccount = await prisma.customerAccount.create({ data: { displayName: 'Stage 1 property manager', username: managerUsername, usernameNormalized: managerUsername, email: managerEmail, emailNormalized: managerEmail, emailVerifiedAt: now, passwordHash: 'harness-only-password-hash' } });
+  const managerPassword = `harness-manager-${crypto.randomUUID()}`;
+  const managerAccount = await prisma.customerAccount.create({ data: { displayName: 'Stage 1 property manager', username: managerUsername, usernameNormalized: managerUsername, email: managerEmail, emailNormalized: managerEmail, emailVerifiedAt: now, passwordHash: hashPassword(managerPassword) } });
   const managerMembership = await prisma.homeMembership.create({ data: { customerAccountId: managerAccount.id, homeId: homeOne.id, role: 'PROPERTY_MANAGER' } });
   await prisma.home.updateMany({ where: { id: { in: [homeOne.id, homeTwo.id] } }, data: { lifecycle: 'ACTIVE', installationStatus: 'COMPLETE' } });
   const phone = keyPair();
@@ -852,7 +899,8 @@ async function customerAuthorizationChecks(deliveryEnv) {
   console.log('[stage1:integration] PASS: real account-session route restores two role-distinct homes and tenant area grants, denies anonymous restore, and returns no hub bearer');
   const propertyPhone = keyPair();
   const propertyPhoneThumbprint = crypto.createHash('sha256').update(crypto.createPublicKey(propertyPhone.publicKey).export({ type: 'spki', format: 'der' })).digest('hex');
-  const propertyTrusted = await prisma.trustedDevice.create({ data: { customerAccountId: propertyAccount.id, deviceInstallationId: `harness-owner-phone-${crypto.randomUUID()}`, publicKey: propertyPhone.publicKey, publicKeyThumbprint: propertyPhoneThumbprint, deviceName: 'Harness homeowner phone' } });
+  const propertyInstallationId = `harness-owner-phone-${crypto.randomUUID()}`;
+  const propertyTrusted = await prisma.trustedDevice.create({ data: { customerAccountId: propertyAccount.id, deviceInstallationId: propertyInstallationId, publicKey: propertyPhone.publicKey, publicKeyThumbprint: propertyPhoneThumbprint, deviceName: 'Harness homeowner phone' } });
   const propertyRawSession = `harness-owner-session-${crypto.randomUUID()}`;
   const propertySession = await prisma.customerSession.create({ data: { customerAccountId: propertyAccount.id, trustedDeviceId: propertyTrusted.id, refreshTokenHash: sha256(propertyRawSession), securityVersion: propertyAccount.securityVersion, trustedDeviceSessionVersion: propertyTrusted.sessionVersion, expiresAt: new Date(Date.now() + 60 * 60 * 1000) } });
   const managerPhone = keyPair();
@@ -1332,6 +1380,13 @@ async function customerAuthorizationChecks(deliveryEnv) {
   console.log('[stage3:integration] PASS: expired POLICY submission is denied without changing acceptance, expiry/revisions, Home/address confirmation, sessions, trusted devices or claim authority');
   await prisma.homeClaimReservation.update({ where: { id: pendingId }, data: { expiresAt: new Date(Date.now() + 30_000) } });
   console.log('[stage3:integration] PASS: the actual claim route accepts only the server-current policy, rejects arbitrary/stale versions without effects, and extends once after a server-authorized version change');
+  // The test above deliberately changes the server-owned policy version to
+  // prove a real authorized update. Restore the harness baseline before later
+  // route fixtures seed their accepted-policy rows; otherwise they correctly
+  // receive UPDATE_REQUIRED against the intentionally changed test version.
+  deliveryEnv.DINODIA_NATIVE_POLICY_VERSION = initialCurrentPolicyVersion;
+  await stopPlatform();
+  await startPlatform(deliveryEnv);
 
   let addressInput = { addressLine1: '1 Registered Lane', city: 'London', postcode: 'N1 1AA', country: 'GB', timezone: 'Europe/London' };
   const addressSave = await claimAction({ action: 'mutate', reservationId: pendingId, customerAccountId: pendingAccount.id, step: 'ADDRESS', mutation: addressInput });
@@ -2358,7 +2413,241 @@ async function customerAuthorizationChecks(deliveryEnv) {
   const operatorSession = operatorLogin.session;
   const operatorToken = operatorLogin.token;
   const operatorWork = await prisma.companyOperationalWorkItem.create({ data: { publicReference: `DIN-${sha256(`handoff-${crypto.randomUUID()}`).slice(0, 16).toUpperCase()}`, kind: 'INITIAL_HUB_INSTALLATION', state: 'ASSIGNED', homeId: homeOne.id, hubInstallationId: hubOne.id, certifiedSerialNumber: identityOne.serialNumber, assignedEmployeeId: operatorEmployee.id, createdByEmployeeId: operatorEmployee.id, reason: 'Disposable browser-bound operator handoff test' } });
-  customerFixture = { accountId: account.id, loginEmail: email, loginPassword: customerPassword, loginInstallationId: trustedInstallationId, loginPublicKey: phone.publicKey, sessionId: session.id, trustedDeviceId: trusted.id, trustedPhonePrivateKey: phone.privateKey, customerSessionSecret: rawSession, offlineAuthorisationId: tenantOffline.body.authorisation.id, revocableTrustedDeviceId: revocableTrustedDevice.id, revocableRawSession, revocablePhonePrivateKey: revocablePhone.privateKey, revocableOfflineAuthorisationId: revocableOffline.body.authorisation.id, propertyAccountId: propertyAccount.id, propertyEmail, propertySessionId: propertySession.id, propertySessionSecret: propertyRawSession, propertyTrustedDeviceId: propertyTrusted.id, propertyTrustedPhonePrivateKey: propertyPhone.privateKey, managerAccountId: managerAccount.id, managerEmail, managerMembershipId: managerMembership.id, managerSessionId: managerSession.id, managerSessionSecret: managerRawSession, managerTrustedDeviceId: managerTrusted.id, homeOneId: homeOne.id, homeTwoId: homeTwo.id, hubOneId: hubOne.id, hubTwoId: hubTwo.id, identityOneId: identityOne.id, identityTwoId: identityTwo.id, identityTwoSerial: identityTwo.serialNumber, identityTwoGeneration: identityTwo.identityGeneration, identityTwoSigningPrivateKey: identityTwoSigning.privateKey, tenantDeviceId: tenantDevice.id, machineSecret, tenantMembershipId: tenantMembership.id, ownerMembershipId: ownerMembership.id, propertyMembershipId: propertyMembership.id, areaOneId: areaOne.id, areaOneOsId: areaOne.osAreaId, areaTwoId: areaTwo.id, areaTwoOsId: areaTwo.osAreaId, tenantToken: tenantToken.body.token, ownerToken: ownerToken.body.token, propertyToken: propertyToken.body.token, managerToken: managerToken.body.token, ticketId, stepUpTicketId, identityOneSigningPrivateKey: identityOneSigning.privateKey, identityOneSigningPublicKey: identityOneSigning.publicKey, identityOneEncryptionPrivateKey: identityOneEncryption.privateKey, identityOneEncryptionPublicKey: identityOneEncryption.publicKey, identityOneSerial: identityOne.serialNumber, identityOneGeneration: identityOne.identityGeneration, operatorEmployeeId: operatorEmployee.id, operatorSessionId: operatorSession.id, operatorWorkId: operatorWork.id, operatorToken };
+  customerFixture = { accountId: account.id, loginEmail: email, loginPassword: customerPassword, loginInstallationId: trustedInstallationId, loginPublicKey: phone.publicKey, sessionId: session.id, trustedDeviceId: trusted.id, trustedPhonePrivateKey: phone.privateKey, customerSessionSecret: rawSession, offlineAuthorisationId: tenantOffline.body.authorisation.id, revocableTrustedDeviceId: revocableTrustedDevice.id, revocableRawSession, revocablePhonePrivateKey: revocablePhone.privateKey, revocableOfflineAuthorisationId: revocableOffline.body.authorisation.id, propertyAccountId: propertyAccount.id, propertyEmail, propertyPassword, propertyInstallationId, propertyPublicKey: propertyPhone.publicKey, propertySessionId: propertySession.id, propertySessionSecret: propertyRawSession, propertyTrustedDeviceId: propertyTrusted.id, propertyTrustedPhonePrivateKey: propertyPhone.privateKey, managerAccountId: managerAccount.id, managerEmail, managerPassword, managerMembershipId: managerMembership.id, managerInstallationId: managerTrusted.deviceInstallationId, managerPublicKey: managerPhone.publicKey, managerSessionId: managerSession.id, managerSessionSecret: managerRawSession, managerTrustedDeviceId: managerTrusted.id, homeOneId: homeOne.id, homeTwoId: homeTwo.id, hubOneId: hubOne.id, hubTwoId: hubTwo.id, identityOneId: identityOne.id, identityTwoId: identityTwo.id, identityTwoSerial: identityTwo.serialNumber, identityTwoGeneration: identityTwo.identityGeneration, identityTwoSigningPrivateKey: identityTwoSigning.privateKey, tenantDeviceId: tenantDevice.id, machineSecret, tenantMembershipId: tenantMembership.id, ownerMembershipId: ownerMembership.id, propertyMembershipId: propertyMembership.id, areaOneId: areaOne.id, areaOneOsId: areaOne.osAreaId, areaTwoId: areaTwo.id, areaTwoOsId: areaTwo.osAreaId, tenantToken: tenantToken.body.token, ownerToken: ownerToken.body.token, propertyToken: propertyToken.body.token, managerToken: managerToken.body.token, ticketId, stepUpTicketId, identityOneSigningPrivateKey: identityOneSigning.privateKey, identityOneSigningPublicKey: identityOneSigning.publicKey, identityOneEncryptionPrivateKey: identityOneEncryption.privateKey, identityOneEncryptionPublicKey: identityOneEncryption.publicKey, identityOneSerial: identityOne.serialNumber, identityOneGeneration: identityOne.identityGeneration, operatorEmployeeId: operatorEmployee.id, operatorSessionId: operatorSession.id, operatorWorkId: operatorWork.id, operatorToken };
+  await installationRequestRouteChecks(deliveryEnv);
+}
+
+async function installationRequestRouteChecks(deliveryEnv) {
+  const fixture = customerFixture;
+  if (!fixture) fail('Stage 8 installation-request checks require the disposable customer/employee fixture');
+  const base = `http://127.0.0.1:${appPort}`;
+  const requestUrl = `${base}/api/v2/homes/${encodeURIComponent(fixture.homeOneId)}/installation-requests`;
+  const key = `stage8-install-${crypto.randomUUID()}`;
+  const payload = { category: 'LIGHTING', notes: 'Disposable commissioning-route test', areaId: fixture.areaOneId };
+  const ownerHeaders = { 'content-type': 'application/json', cookie: `dinodia_customer_session=${encodeURIComponent(fixture.propertySessionSecret)}`, 'x-dinodia-home-id': fixture.homeOneId, 'idempotency-key': key };
+  // Resolve and accept only the policy version returned by the running server.
+  // Earlier claim regressions intentionally rotate policy configuration, so a
+  // fixture-seeded version must not be mistaken for current authority here.
+  const requirements = await fetchJson(`${base}/api/v2/auth/requirements`, { headers: { cookie: ownerHeaders.cookie } });
+  if (requirements.response.status !== 200 || !requirements.body?.policy?.version || !/^[a-f0-9]{64}$/.test(requirements.body?.policy?.contentSha256 ?? '')) fail('Owner commissioning fixture could not obtain the server-owned current policy decision');
+  const currentPolicyAcceptance = requirements.body.accepted === true ? requirements : await fetchJson(`${base}/api/v2/auth/policy/acceptance`, {
+    method: 'POST', headers: { cookie: ownerHeaders.cookie, 'content-type': 'application/json' },
+    body: JSON.stringify({ version: requirements.body.policy.version, contentSha256: requirements.body.policy.contentSha256, accepted: true }),
+  });
+  if (requirements.body.accepted !== true && (currentPolicyAcceptance.response.status !== 200 || currentPolicyAcceptance.body?.policyVersion !== requirements.body.policy.version)) fail('Owner commissioning fixture could not accept the actual server-current policy');
+  const mobileLogin = await fetchJson(`${base}/api/v2/mobile/session`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({
+    email: fixture.propertyEmail, password: fixture.propertyPassword,
+    deviceInstallationId: fixture.propertyInstallationId, publicKey: fixture.propertyPublicKey,
+    deviceName: 'Disposable commissioning owner', model: 'integration-test', osFamily: 'test', osVersion: 'test',
+  }) });
+  const ownerApiHeaders = { 'content-type': 'application/json', authorization: `Bearer ${mobileLogin.body?.accessToken ?? ''}`, 'x-dinodia-home-id': fixture.homeOneId, 'idempotency-key': key };
+  if (mobileLogin.response.status !== 200 || !/^dno-customer-access-[A-Za-z0-9_-]{32,}$/.test(mobileLogin.body?.accessToken ?? '')) fail('Owner commissioning route did not receive a real issued disposable mobile access session');
+  const beforeRequests = await prisma.permanentDeviceInstallationRequest.count({ where: { homeId: fixture.homeOneId } });
+  const beforeWork = await prisma.companyOperationalWorkItem.count({ where: { homeId: fixture.homeOneId, kind: 'PERMANENT_DEVICE_INSTALLATION' } });
+  const beforeMail = await prisma.nativeDomainOutbox.count({ where: { homeId: fixture.homeOneId, eventType: 'INSTALLATION_REQUEST_EMAIL', state: 'PENDING' } });
+  const first = await fetchJson(requestUrl, { method: 'POST', headers: ownerApiHeaders, body: JSON.stringify(payload) });
+  const duplicate = await fetchJson(requestUrl, { method: 'POST', headers: ownerApiHeaders, body: JSON.stringify(payload) });
+  const createdId = first.body?.request?.id;
+  if (createdId) fixture.stage8RequestIds = [createdId];
+  if (first.response.status !== 201 || !createdId || first.body.request.status !== 'SUBMITTED'
+    || duplicate.response.status !== 201 || duplicate.body?.request?.id !== createdId
+    || await prisma.permanentDeviceInstallationRequest.count({ where: { homeId: fixture.homeOneId } }) !== beforeRequests + 1
+    || await prisma.nativeDomainOutbox.count({ where: { homeId: fixture.homeOneId, eventType: 'INSTALLATION_REQUEST_EMAIL', state: 'PENDING' } }) !== beforeMail + 1
+    || await prisma.companyOperationalWorkItem.count({ where: { homeId: fixture.homeOneId, kind: 'PERMANENT_DEVICE_INSTALLATION' } }) !== beforeWork) {
+    fail(`Owner installation request was not created once with one durable operations event (${first.response.status}/${first.body?.error?.code ?? first.body?.errorCode ?? 'no-code'}/${duplicate.response.status}/${duplicate.body?.error?.code ?? duplicate.body?.errorCode ?? 'no-code'})`);
+  }
+  const changedRetry = await fetchJson(requestUrl, { method: 'POST', headers: ownerApiHeaders, body: JSON.stringify({ ...payload, category: 'HEATING' }) });
+  if (changedRetry.response.status !== 409 || changedRetry.body?.error?.code !== 'IDEMPOTENCY_CONFLICT'
+    || await prisma.permanentDeviceInstallationRequest.count({ where: { homeId: fixture.homeOneId } }) !== beforeRequests + 1
+    || await prisma.nativeDomainOutbox.count({ where: { homeId: fixture.homeOneId, eventType: 'INSTALLATION_REQUEST_EMAIL', state: 'PENDING' } }) !== beforeMail + 1) {
+    fail('Changed installation request replay was not rejected without another request or operations event');
+  }
+  const requestRow = await prisma.permanentDeviceInstallationRequest.findUniqueOrThrow({ where: { id: createdId }, select: { requestedAreaId: true, requesterMembershipId: true, requesterAccountId: true, status: true } });
+  if (requestRow.requestedAreaId !== fixture.areaOneId || requestRow.requesterMembershipId !== fixture.propertyMembershipId || requestRow.requesterAccountId !== fixture.propertyAccountId || requestRow.status !== 'SUBMITTED') fail('Installation request lost its canonical Home/Area/requester binding');
+
+  // The open request belongs to the Home, not to the account that happened to
+  // submit it. Prove the current manager can see/cancel an unstarted request,
+  // while a former requester whose membership is no longer active sees no
+  // protected request projection. All authority changes here are disposable.
+  const managerCookie = `dinodia_customer_session=${encodeURIComponent(fixture.managerSessionSecret)}`;
+  const managerRequirements = await fetchJson(`${base}/api/v2/auth/requirements`, { headers: { cookie: managerCookie } });
+  if (managerRequirements.response.status !== 200 || !managerRequirements.body?.policy?.version) fail('Current manager could not resolve the authoritative policy decision');
+  if (managerRequirements.body.accepted !== true) {
+    const managerPolicy = await fetchJson(`${base}/api/v2/auth/policy/acceptance`, { method: 'POST', headers: { cookie: managerCookie, 'content-type': 'application/json' }, body: JSON.stringify({ version: managerRequirements.body.policy.version, contentSha256: managerRequirements.body.policy.contentSha256, accepted: true }) });
+    if (managerPolicy.response.status !== 200) fail('Disposable current manager could not accept the server-owned policy version');
+  }
+  const managerLogin = await fetchJson(`${base}/api/v2/mobile/session`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({
+    email: fixture.managerEmail, password: fixture.managerPassword, deviceInstallationId: fixture.managerInstallationId,
+    publicKey: fixture.managerPublicKey, deviceName: 'Disposable current property manager', model: 'integration-test', osFamily: 'test', osVersion: 'test',
+  }) });
+  const managerHeaders = { authorization: `Bearer ${managerLogin.body?.accessToken ?? ''}`, 'x-dinodia-home-id': fixture.homeOneId };
+  const secondKey = `stage8-transfer-safe-${crypto.randomUUID()}`;
+  const secondRequest = await fetchJson(requestUrl, { method: 'POST', headers: { ...ownerApiHeaders, 'idempotency-key': secondKey }, body: JSON.stringify({ category: 'SECURITY', notes: 'Disposable retained Home request', areaId: null }) });
+  const managerList = await fetchJson(requestUrl, { headers: managerHeaders });
+  const managerSeesBoth = managerList.body?.requests?.some((entry) => entry.id === createdId && entry.status === 'SUBMITTED')
+    && managerList.body?.requests?.some((entry) => entry.id === secondRequest.body?.request?.id && entry.status === 'SUBMITTED');
+  const extraAuthorityCancel = await fetchJson(`${base}/api/v2/homes/${encodeURIComponent(fixture.homeOneId)}/installation-requests/${encodeURIComponent(createdId)}/cancel`, {
+    method: 'POST', headers: { ...managerHeaders, 'content-type': 'application/json', 'idempotency-key': `stage8-cancel-extra-${crypto.randomUUID()}` },
+    body: JSON.stringify({ expectedRevision: 1, homeId: fixture.homeTwoId }),
+  });
+  const unchangedAfterExtraAuthority = await prisma.permanentDeviceInstallationRequest.findUniqueOrThrow({ where: { id: createdId }, select: { status: true, revision: true } });
+  const managerCancelUrl = `${base}/api/v2/homes/${encodeURIComponent(fixture.homeOneId)}/installation-requests/${encodeURIComponent(secondRequest.body?.request?.id ?? '')}/cancel`;
+  const managerCancelHeaders = { ...managerHeaders, 'content-type': 'application/json', 'idempotency-key': `stage8-manager-cancel-${crypto.randomUUID()}` };
+  const managerCancelled = await fetchJson(managerCancelUrl, { method: 'POST', headers: managerCancelHeaders, body: JSON.stringify({ expectedRevision: 1 }) });
+  const managerCancelRetry = await fetchJson(managerCancelUrl, { method: 'POST', headers: managerCancelHeaders, body: JSON.stringify({ expectedRevision: 1 }) });
+  const cancelledRow = secondRequest.body?.request?.id ? await prisma.permanentDeviceInstallationRequest.findUnique({ where: { id: secondRequest.body.request.id }, select: { status: true, revision: true } }) : null;
+  if (managerLogin.response.status !== 200 || !/^dno-customer-access-[A-Za-z0-9_-]{32,}$/.test(managerLogin.body?.accessToken ?? '')
+    || secondRequest.response.status !== 201 || !managerSeesBoth || managerCancelled.response.status !== 200 || managerCancelled.body?.request?.status !== 'CANCELLED'
+    || extraAuthorityCancel.response.status !== 400 || extraAuthorityCancel.body?.error?.code !== 'VALIDATION_FAILED'
+    || unchangedAfterExtraAuthority.status !== 'SUBMITTED' || unchangedAfterExtraAuthority.revision !== 1
+    || managerCancelRetry.response.status !== 200 || cancelledRow?.status !== 'CANCELLED' || cancelledRow.revision !== 2) {
+    fail(`Current Home manager could not view and idempotently cancel another authorized member's unstarted installation request (${managerLogin.response.status}/${secondRequest.response.status}/${managerList.response.status}/${managerCancelled.response.status}/${managerCancelRetry.response.status})`);
+  }
+  await prisma.$transaction(async (tx) => {
+    await tx.homeMembership.update({ where: { id: fixture.propertyMembershipId }, data: { status: 'REMOVED', removedAt: new Date(), removalReason: 'stage8_disposable_transfer_visibility' } });
+    await tx.homeMembership.update({ where: { id: fixture.managerMembershipId }, data: { role: 'OWNER' } });
+  });
+  const formerRequesterList = await fetchJson(requestUrl, { headers: ownerApiHeaders });
+  const stillOpenForManager = await fetchJson(requestUrl, { headers: managerHeaders });
+  await prisma.$transaction(async (tx) => {
+    await tx.homeMembership.update({ where: { id: fixture.managerMembershipId }, data: { role: 'PROPERTY_MANAGER' } });
+    await tx.homeMembership.update({ where: { id: fixture.propertyMembershipId }, data: { status: 'ACTIVE', removedAt: null, removalReason: null } });
+  });
+  if (formerRequesterList.response.status !== 404 || Object.hasOwn(formerRequesterList.body ?? {}, 'requests')
+    || stillOpenForManager.response.status !== 200 || !stillOpenForManager.body.requests.some((entry) => entry.id === createdId)) {
+    fail('Removing the original requester membership did not hide Home request updates from that former member while preserving the current Home authority view');
+  }
+
+  await prisma.nativeDomainOutbox.updateMany({ where: { aggregateType: 'PermanentDeviceInstallationRequest', aggregateId: createdId, eventType: 'INSTALLATION_REQUEST_EMAIL', state: 'PENDING' }, data: {
+    state: 'PROCESSING', attempts: 1, updatedAt: new Date(Date.now() - 6 * 60_000),
+  } });
+  const operationsMailBefore = installationOperationsEmailCount;
+  const operationsDispatch = await fetchJson(`${base}/api/cron/native-operations`, { method: 'POST', headers: { authorization: `Bearer ${deliveryEnv.CRON_SECRET}` } });
+  const operationsOutbox = await prisma.nativeDomainOutbox.findFirst({ where: { aggregateType: 'PermanentDeviceInstallationRequest', aggregateId: createdId, eventType: 'INSTALLATION_REQUEST_EMAIL' }, select: { state: true, attempts: true } });
+  if (![200, 207].includes(operationsDispatch.response.status) || operationsDispatch.body?.installationDelivery?.operationsAccepted < 1
+    || operationsOutbox?.state !== 'DELIVERED' || operationsOutbox.attempts !== 2 || installationOperationsEmailCount !== operationsMailBefore + 1) {
+    fail(`The shared two-minute dispatcher did not deliver one bounded operations notice (${operationsDispatch.response.status}/${operationsOutbox?.state ?? 'missing'})`);
+  }
+  if (installationEmailBodies.at(-1)?.includes(payload.notes) || installationEmailBodies.at(-1)?.includes('Disposable commissioning-route test')) fail('The operations email exposed customer-provided request notes');
+
+  const beforeCrossHome = await prisma.permanentDeviceInstallationRequest.count({ where: { homeId: fixture.homeTwoId } });
+  const crossHome = await fetchJson(`${base}/api/v2/homes/${encodeURIComponent(fixture.homeTwoId)}/installation-requests`, {
+    method: 'POST', headers: { ...ownerApiHeaders, 'x-dinodia-home-id': fixture.homeTwoId, 'idempotency-key': `stage8-cross-home-${crypto.randomUUID()}` }, body: JSON.stringify({ ...payload, areaId: fixture.areaTwoId }),
+  });
+  const wrongArea = await fetchJson(requestUrl, { method: 'POST', headers: { ...ownerApiHeaders, 'idempotency-key': `stage8-wrong-area-${crypto.randomUUID()}` }, body: JSON.stringify({ ...payload, areaId: fixture.areaTwoId }) });
+  const tenantDenied = await fetchJson(requestUrl, {
+    method: 'POST', headers: { 'content-type': 'application/json', cookie: `dinodia_customer_session=${encodeURIComponent(fixture.customerSessionSecret)}`, 'x-dinodia-home-id': fixture.homeOneId, 'idempotency-key': `stage8-tenant-denied-${crypto.randomUUID()}` }, body: JSON.stringify(payload),
+  });
+  const requestsAfterDenials = await prisma.permanentDeviceInstallationRequest.count({ where: { homeId: fixture.homeOneId } });
+  if (![404, 400].includes(crossHome.response.status) || wrongArea.response.status !== 400 || wrongArea.body?.error?.code !== 'VALIDATION_FAILED'
+    || ![403, 404].includes(tenantDenied.response.status) || requestsAfterDenials !== beforeRequests + 2
+    || await prisma.permanentDeviceInstallationRequest.count({ where: { homeId: fixture.homeTwoId } }) !== beforeCrossHome) {
+    fail(`Wrong-home, wrong-area or tenant request was not denied without creating request authority (${crossHome.response.status}/${wrongArea.response.status}/${tenantDenied.response.status})`);
+  }
+
+  const queue = await fetchJson(`${base}/api/installer/installation-requests`, { headers: { 'x-dinodia-employee-session': fixture.operatorToken } });
+  const queued = queue.body?.requests?.find((entry) => entry.requestId === createdId);
+  if (queue.response.status !== 200 || !queued || queued.status !== 'SUBMITTED' || queued.requestedAreaId !== fixture.areaOneId) fail('Assigned installation staff cannot see the exact submitted request in the protected queue');
+  const startKey = `stage8-start-${crypto.randomUUID()}`;
+  const startUrl = `${base}/api/installer/installation-requests/${encodeURIComponent(createdId)}/start`;
+  const startHeaders = { 'content-type': 'application/json', 'x-dinodia-employee-session': fixture.operatorToken, 'idempotency-key': startKey };
+  const started = await fetchJson(startUrl, { method: 'POST', headers: startHeaders, body: JSON.stringify({ expectedRevision: 1 }) });
+  const startRetry = await fetchJson(startUrl, { method: 'POST', headers: startHeaders, body: JSON.stringify({ expectedRevision: 1 }) });
+  const work = await prisma.companyOperationalWorkItem.findUnique({ where: { permanentInstallationRequestId: createdId }, select: { id: true, kind: true, state: true, homeId: true, hubInstallationId: true, assignedEmployeeId: true } });
+  if (work) fixture.stage8WorkIds = [work.id];
+  if (started.response.status !== 201 || started.body?.state !== 'IN_PROGRESS' || startRetry.response.status !== 201 || startRetry.body?.workflowId !== started.body.workflowId
+    || !work || work.id !== started.body.workflowId || work.kind !== 'PERMANENT_DEVICE_INSTALLATION' || work.state !== 'IN_PROGRESS'
+    || work.homeId !== fixture.homeOneId || work.hubInstallationId !== fixture.hubOneId || work.assignedEmployeeId !== fixture.operatorEmployeeId
+    || await prisma.companyOperationalWorkItem.count({ where: { permanentInstallationRequestId: createdId } }) !== 1) {
+    fail(`Assigned-staff start did not create exactly one bound work item with safe retry (${started.response.status}/${started.body?.errorCode ?? started.body?.error?.code ?? 'no-code'}/${startRetry.response.status}/${startRetry.body?.errorCode ?? startRetry.body?.error?.code ?? 'no-code'})`);
+  }
+  const requestAfterStart = await prisma.permanentDeviceInstallationRequest.findUniqueOrThrow({ where: { id: createdId }, select: { status: true, revision: true } });
+  const cancelAfterStart = await fetchJson(`${base}/api/v2/homes/${encodeURIComponent(fixture.homeOneId)}/installation-requests/${encodeURIComponent(createdId)}/cancel`, {
+    method: 'POST', headers: { ...ownerApiHeaders, 'idempotency-key': `stage8-cancel-started-${crypto.randomUUID()}` }, body: JSON.stringify({ expectedRevision: requestAfterStart.revision }),
+  });
+  const beforeCompletionOutbox = await prisma.nativeDomainOutbox.count({ where: { aggregateType: 'PermanentDeviceInstallationRequest', aggregateId: createdId, eventType: 'INSTALLATION_REQUEST_COMPLETED' } });
+  const completion = await fetchJson(`${base}/api/installer/installation-requests/${encodeURIComponent(createdId)}/complete`, {
+    method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-employee-session': fixture.operatorToken, 'idempotency-key': `stage8-complete-too-early-${crypto.randomUUID()}` }, body: JSON.stringify({ expectedRevision: requestAfterStart.revision }),
+  });
+  if (requestAfterStart.status !== 'IN_PROGRESS' || cancelAfterStart.response.status !== 409
+    || completion.response.status !== 409 || completion.body?.errorCode !== 'DEVICE_RESULT_REQUIRED'
+    || await prisma.nativeDomainOutbox.count({ where: { aggregateType: 'PermanentDeviceInstallationRequest', aggregateId: createdId, eventType: 'INSTALLATION_REQUEST_COMPLETED' } }) !== beforeCompletionOutbox) {
+    fail(`Started work was cancellable or completion bypassed the installed-device result gate (${cancelAfterStart.response.status}/${completion.response.status}/${completion.body?.errorCode || 'none'})`);
+  }
+  const installedDevice = await prisma.nativeDevice.create({ data: {
+    homeId: fixture.homeOneId, hubInstallationId: fixture.hubOneId, installationRequestId: createdId,
+    osDeviceId: `stage8-completion-device-${crypto.randomUUID()}`, originalName: 'Disposable installed property device',
+    technicalLabel: 'property_device', customerLabel: 'Test light', managementClass: 'PROPERTY_DEVICE', deviceType: 'light', lifecycle: 'INSTALLED', installedAt: new Date(),
+    assignments: { create: { areaId: fixture.areaOneId, homeId: fixture.homeOneId, source: 'NATIVE_STAFF_COMMISSIONING', actorType: 'EMPLOYEE', actorId: fixture.operatorEmployeeId } },
+  }, select: { id: true } });
+  const completionPushToken = crypto.randomBytes(32).toString('hex');
+  const platformKey = Buffer.from(deliveryEnv.PLATFORM_DATA_ENCRYPTION_KEY, 'base64');
+  await prisma.trustedDevice.update({ where: { id: fixture.propertyTrustedDeviceId }, data: {
+    apnsTokenCiphertext: encryptStage8PlatformToken(completionPushToken, deliveryEnv.PLATFORM_DATA_ENCRYPTION_KEY),
+    apnsTokenDigest: crypto.createHmac('sha256', platformKey).update('dinodia-v2-apns-token-v1\0').update(completionPushToken).digest('hex'),
+    apnsEnvironment: 'DEVELOPMENT', apnsKeyVersion: 1, apnsTokenRevision: { increment: 1 },
+    pushEnabledAt: new Date(), pushRevokedAt: null, lastDeliveryHealth: 'REGISTERED',
+  } });
+  const entitledBeforeCompletion = await prisma.homeMembership.findMany({
+    where: { homeId: fixture.homeOneId, status: 'ACTIVE', OR: [
+      { role: 'OWNER' },
+      { id: fixture.propertyMembershipId, customerAccountId: fixture.propertyAccountId, role: 'PROPERTY_MANAGER' },
+    ], customerAccount: { is: { status: 'ACTIVE', emailVerifiedAt: { not: null } } } },
+    select: { id: true, customerAccountId: true },
+  });
+  const completionKey = `stage8-complete-${crypto.randomUUID()}`;
+  const completionUrl = `${base}/api/installer/installation-requests/${encodeURIComponent(createdId)}/complete`;
+  const completionHeaders = { 'content-type': 'application/json', 'x-dinodia-employee-session': fixture.operatorToken, 'idempotency-key': completionKey };
+  const completed = await fetchJson(completionUrl, { method: 'POST', headers: completionHeaders, body: JSON.stringify({ expectedRevision: requestAfterStart.revision }) });
+  const completionReplay = await fetchJson(completionUrl, { method: 'POST', headers: completionHeaders, body: JSON.stringify({ expectedRevision: requestAfterStart.revision }) });
+  const completionOutbox = await prisma.nativeDomainOutbox.findMany({ where: { aggregateType: 'PermanentDeviceInstallationRequest', aggregateId: createdId, eventType: 'INSTALLATION_REQUEST_COMPLETED' }, select: { state: true, expiresAt: true } });
+  const completionReceipts = await prisma.nativeNotificationDeliveryReceipt.findMany({ where: { homeId: fixture.homeOneId, idempotencyKey: { startsWith: `installation-request:${createdId}:completion:` } }, select: { customerAccountId: true, membershipId: true, trustedDeviceId: true, channel: true, status: true, expiresAt: true } });
+  if (completed.response.status !== 200 || completed.body?.status !== 'COMPLETED' || completed.body?.deviceId !== installedDevice.id
+    || completionReplay.response.status !== 200 || completionReplay.body?.deviceId !== installedDevice.id
+    || completionOutbox.length !== 1 || completionOutbox[0].expiresAt.getTime() <= Date.now() || completionOutbox[0].expiresAt.getTime() > Date.now() + 30 * 86400_000
+    || completionReceipts.length !== entitledBeforeCompletion.length + 1
+    || completionReceipts.some((receipt) => !entitledBeforeCompletion.some((recipient) => recipient.id === receipt.membershipId && recipient.customerAccountId === receipt.customerAccountId))
+    || completionReceipts.filter((receipt) => receipt.channel === 'PUSH').length !== 1
+    || completionReceipts.find((receipt) => receipt.channel === 'PUSH')?.trustedDeviceId !== fixture.propertyTrustedDeviceId
+    || completionReceipts.some((receipt) => receipt.status !== 'PENDING' || receipt.expiresAt.getTime() > Date.now() + 30 * 86400_000)) {
+    fail(`Successful installation completion did not create one bounded event and deduplicated current-recipient email/push receipts (${completed.response.status}/${completionReplay.response.status}/${completionOutbox.length}/${completionReceipts.length})`);
+  }
+  const completionMailBefore = installationCompletionEmailCount;
+  const completionDispatch = await fetchJson(`${base}/api/cron/native-operations`, { method: 'POST', headers: { authorization: `Bearer ${deliveryEnv.CRON_SECRET}` } });
+  const deliveredReceipts = await prisma.nativeNotificationDeliveryReceipt.findMany({ where: { homeId: fixture.homeOneId, idempotencyKey: { startsWith: `installation-request:${createdId}:completion:` } }, select: { customerAccountId: true, channel: true, status: true } });
+  if (![200, 207].includes(completionDispatch.response.status) || installationCompletionEmailCount !== completionMailBefore + entitledBeforeCompletion.length
+    || deliveredReceipts.filter((receipt) => receipt.channel === 'EMAIL').some((receipt) => receipt.status !== 'SENT')
+    || deliveredReceipts.filter((receipt) => receipt.channel === 'PUSH').some((receipt) => receipt.status !== 'PENDING')
+    || (await prisma.nativeNotificationDeliveryReceipt.findFirst({ where: { homeId: fixture.homeOneId, idempotencyKey: { startsWith: `installation-request:${createdId}:completion:push:` } }, select: { lastErrorCode: true } }))?.lastErrorCode !== 'PUSH_PROVIDER_NOT_CONFIGURED'
+    || installationEmailBodies.slice(-entitledBeforeCompletion.length).some((body) => body.includes(payload.notes))) {
+    fail(`Completion notices did not reach the current entitled email recipients or preserve honest push state (${completionDispatch.response.status}/${installationCompletionEmailCount - completionMailBefore})`);
+  }
+  const managerPushReceiptId = `installation-request:${createdId}:completion:push:${fixture.managerAccountId}:${fixture.managerTrustedDeviceId}`;
+  const managerPushReceipt = await prisma.nativeNotificationDeliveryReceipt.create({ data: {
+    customerAccountId: fixture.managerAccountId, trustedDeviceId: fixture.managerTrustedDeviceId,
+    membershipId: fixture.managerMembershipId, homeId: fixture.homeOneId, family: 'OWNER_INSTALLATION_UPDATE', channel: 'PUSH',
+    idempotencyKey: managerPushReceiptId, deliverAfter: new Date(), expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000), status: 'PENDING',
+  }, select: { id: true } });
+  const previousEncryptionKey = process.env.PLATFORM_DATA_ENCRYPTION_KEY;
+  process.env.PLATFORM_DATA_ENCRYPTION_KEY = deliveryEnv.PLATFORM_DATA_ENCRYPTION_KEY;
+  let acceptedPushes = 0;
+  let acceptedPushTokenMatches = 0;
+  const testPushKey = crypto.generateKeyPairSync('ec', { namedCurve: 'prime256v1' }).privateKey;
+  const pushResult = await loadInstallationPushDispatcher()(new Date(), {
+    config: { teamId: 'ABCDEFGHIJ', keyId: 'KLMNOPQRST', privateKey: testPushKey },
+    send: async (input) => { acceptedPushes += 1; if (input.deviceToken === completionPushToken && input.requestId === createdId) acceptedPushTokenMatches += 1; return { outcome: 'ACCEPTED' }; },
+  });
+  if (previousEncryptionKey === undefined) delete process.env.PLATFORM_DATA_ENCRYPTION_KEY;
+  else process.env.PLATFORM_DATA_ENCRYPTION_KEY = previousEncryptionKey;
+  const acceptedPushReceipt = await prisma.nativeNotificationDeliveryReceipt.findFirst({ where: { idempotencyKey: { startsWith: `installation-request:${createdId}:completion:push:${fixture.propertyAccountId}:` } }, select: { status: true, lastErrorCode: true } });
+  const suppressedManagerReceipt = await prisma.nativeNotificationDeliveryReceipt.findUnique({ where: { id: managerPushReceipt.id }, select: { status: true, lastErrorCode: true } });
+  if (pushResult.accepted !== 1 || pushResult.suppressed !== 1 || pushResult.failed !== 0 || acceptedPushes !== 1 || acceptedPushTokenMatches !== 1
+    || acceptedPushReceipt?.status !== 'SENT' || acceptedPushReceipt.lastErrorCode !== null
+    || suppressedManagerReceipt?.status !== 'SUPPRESSED' || suppressedManagerReceipt.lastErrorCode !== 'NO_CURRENT_PUSH_AUTHORITY') {
+    fail('Push receipt delivery did not send once to the current authorized owner and suppress a non-requester manager without sending');
+  }
+  fixture.stage8RequestIds = [createdId];
+  console.log('[stage8:integration] PASS: actual owner request is Home/Area-bound and idempotent; changed replay, wrong Home/Area and tenant are denied without extra rows; current manager sees and idempotently cancels an unstarted request; after disposable owner transfer the former requester sees no request data while the new owner retains it; the existing two-minute task sends one privacy-bounded operations email; staff work is assigned/retried once, cancellation after start and premature completion fail closed; a real disposable device record enables one idempotent completion, bounded event and current-entitlement email/push receipts');
 }
 
 async function mobileSessionContractChecks() {
@@ -5227,6 +5516,8 @@ async function cleanup() {
     await prisma.offlineMembershipAuthorisation.deleteMany({ where: { trustedDeviceId: customerFixture.trustedDeviceId } }).catch(() => {});
     await prisma.operatorHandoff.deleteMany({ where: { hubInstallationId: customerFixture.hubOneId } }).catch(() => {});
     await prisma.operatorBrowserAttempt.deleteMany({ where: { hubInstallationId: customerFixture.hubOneId } }).catch(() => {});
+    if (customerFixture.stage8WorkIds?.length) await prisma.companyOperationalWorkItem.deleteMany({ where: { id: { in: customerFixture.stage8WorkIds } } }).catch(() => {});
+    if (customerFixture.stage8RequestIds?.length) await prisma.permanentDeviceInstallationRequest.deleteMany({ where: { id: { in: customerFixture.stage8RequestIds } } }).catch(() => {});
     await prisma.companyOperationalWorkItem.deleteMany({ where: { id: customerFixture.operatorWorkId } }).catch(() => {});
     await prisma.employeeSession.deleteMany({ where: { id: customerFixture.operatorSessionId } }).catch(() => {});
     await prisma.companyEmployeeAccount.deleteMany({ where: { id: customerFixture.operatorEmployeeId } }).catch(() => {});
@@ -5324,7 +5615,7 @@ try {
   const sesEndpoint = `http://127.0.0.1:${sesPort}`;
   assertLoopbackTestEndpoint(sesEndpoint);
   const disposablePolicyText = 'Disposable test-only customer policy for the Stage 6 integration harness. It is not Production legal copy.';
-  const deliveryEnv = { ...env, V2_ENVIRONMENT: 'test', COMPANY_PORTAL_INITIAL_CXO_EMAIL: 'niveditgupta@dinodiasmartliving.com', AWS_REGION: 'eu-north-1', SES_FROM_EMAIL: 'no-reply@dinodiasmartliving.com', AWS_ACCESS_KEY_ID: 'stage1-test-access-key', AWS_SECRET_ACCESS_KEY: 'stage1-test-secret', SES_TEST_ENDPOINT: sesEndpoint,
+  const deliveryEnv = { ...env, V2_ENVIRONMENT: 'test', COMPANY_PORTAL_INITIAL_CXO_EMAIL: 'niveditgupta@dinodiasmartliving.com', DINODIA_INSTALLATION_OPERATIONS_EMAIL: 'operations-test@dinodia.example', AWS_REGION: 'eu-north-1', SES_FROM_EMAIL: 'no-reply@dinodiasmartliving.com', AWS_ACCESS_KEY_ID: 'stage1-test-access-key', AWS_SECRET_ACCESS_KEY: 'stage1-test-secret', SES_TEST_ENDPOINT: sesEndpoint,
     DINODIA_NATIVE_POLICY_TITLE: 'Disposable Stage 6 policy fixture', DINODIA_NATIVE_POLICY_TEXT: disposablePolicyText, DINODIA_NATIVE_POLICY_CONTENT_SHA256: sha256(disposablePolicyText) };
   await startPlatform(deliveryEnv);
   await bootstrapDeliveryChecks(deliveryEnv);

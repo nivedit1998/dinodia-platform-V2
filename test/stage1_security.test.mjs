@@ -88,8 +88,10 @@ function loadTypeScriptModule(relativePath, overrides = {}) {
   const source = read(relativePath);
   const compiled = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, esModuleInterop: true } }).outputText;
   const module = { exports: {} };
+  const isolatedInstallationDelivery = { dispatchInstallationRequestNotifications: async () => ({ operationsAccepted: 0, operationsDeferred: 0, operationsFailed: 0, completionAccepted: 0, completionDeferred: 0, completionSuppressed: 0 }) };
   const localRequire = (specifier) => overrides[specifier] ?? require(specifier);
-  new Function('require', 'module', 'exports', compiled)(localRequire, module, module.exports);
+  const taskRequire = (specifier) => overrides[specifier] ?? (specifier === './installationRequestDelivery' ? isolatedInstallationDelivery : require(specifier));
+  new Function('require', 'module', 'exports', compiled)(relativePath === 'src/lib/nativeOperations.ts' ? taskRequire : localRequire, module, module.exports);
   return module.exports;
 }
 

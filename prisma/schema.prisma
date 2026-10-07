@@ -230,6 +230,7 @@ enum NativeTaskDispatcher {
 
 enum CompanyWorkKind {
   INITIAL_HUB_INSTALLATION
+  PERMANENT_DEVICE_INSTALLATION
   PHYSICAL_CONFIGURATION_CORRECTION
   HUB_RECOVERY
 }
@@ -436,6 +437,7 @@ model CompanyEmployeeAccount {
 
   assignedWork             CompanyOperationalWorkItem[]   @relation("AssignedWork")
   createdWork              CompanyOperationalWorkItem[]   @relation("CreatedWork")
+  commissioningSessions    NativeCommissioningSession[]   @relation("CommissioningEmployee")
   redeemedAttempts         HubProvisioningAttempt[]       @relation("ProvisioningRedeemer")
   releasedReservations     HomeClaimReservation[]         @relation("ReservationReleaser")
   exceptionalTransferCases ExceptionalOwnershipTransfer[]
@@ -715,42 +717,44 @@ model TenantAreaGrant {
 }
 
 model NativeDevice {
-  id                  String                  @id @default(uuid()) @db.Uuid
-  homeId              String                  @db.Uuid
-  hubInstallationId   String                  @db.Uuid
-  osDeviceId          String                  @db.VarChar(160)
-  originalName        String                  @db.VarChar(160)
-  overrideName        String?                 @db.VarChar(160)
-  technicalLabel      String                  @db.VarChar(80)
-  customerLabel       String?                 @db.VarChar(40)
-  analyticsCategory   DeviceAnalyticsCategory @default(NONE)
-  managementClass     DeviceManagementClass
-  ownerMembershipId   String?                 @db.Uuid
-  deviceType          String                  @db.VarChar(120)
-  manufacturer        String?                 @db.VarChar(160)
-  model               String?                 @db.VarChar(160)
-  protocol            String?                 @db.VarChar(80)
-  capabilitySummary   Json?
-  descriptorRevision  Int                     @default(1)
-  descriptorDigest    String?                 @db.VarChar(128)
-  onlineState         DeviceOnlineState       @default(UNKNOWN)
-  lastSeenAt          DateTime?
-  radiatorTemperature Decimal?                @db.Decimal(6, 2)
-  radiatorReadingAt   DateTime?
-  lifecycle           DeviceLifecycleState    @default(DISCOVERED)
-  installedAt         DateTime?
-  retiredAt           DateTime?
-  cleanupDeadlineAt   DateTime?
-  inventoryRevision   Int                     @default(1)
-  createdAt           DateTime                @default(now())
-  updatedAt           DateTime                @updatedAt
+  id                    String                  @id @default(uuid()) @db.Uuid
+  homeId                String                  @db.Uuid
+  hubInstallationId     String                  @db.Uuid
+  osDeviceId            String                  @db.VarChar(160)
+  originalName          String                  @db.VarChar(160)
+  overrideName          String?                 @db.VarChar(160)
+  technicalLabel        String                  @db.VarChar(80)
+  customerLabel         String?                 @db.VarChar(40)
+  analyticsCategory     DeviceAnalyticsCategory @default(NONE)
+  managementClass       DeviceManagementClass
+  ownerMembershipId     String?                 @db.Uuid
+  installationRequestId String?                 @db.Uuid
+  deviceType            String                  @db.VarChar(120)
+  manufacturer          String?                 @db.VarChar(160)
+  model                 String?                 @db.VarChar(160)
+  protocol              String?                 @db.VarChar(80)
+  capabilitySummary     Json?
+  descriptorRevision    Int                     @default(1)
+  descriptorDigest      String?                 @db.VarChar(128)
+  onlineState           DeviceOnlineState       @default(UNKNOWN)
+  lastSeenAt            DateTime?
+  radiatorTemperature   Decimal?                @db.Decimal(6, 2)
+  radiatorReadingAt     DateTime?
+  lifecycle             DeviceLifecycleState    @default(DISCOVERED)
+  installedAt           DateTime?
+  retiredAt             DateTime?
+  cleanupDeadlineAt     DateTime?
+  inventoryRevision     Int                     @default(1)
+  createdAt             DateTime                @default(now())
+  updatedAt             DateTime                @updatedAt
 
-  home                 Home                            @relation(fields: [homeId], references: [id], onDelete: Cascade)
-  hubInstallation      HubInstallation                 @relation(fields: [hubInstallationId], references: [id], onDelete: Cascade)
-  ownerMembership      HomeMembership?                 @relation(fields: [ownerMembershipId], references: [id], onDelete: SetNull)
+  home                 Home                                @relation(fields: [homeId], references: [id], onDelete: Cascade)
+  hubInstallation      HubInstallation                     @relation(fields: [hubInstallationId], references: [id], onDelete: Cascade)
+  ownerMembership      HomeMembership?                     @relation(fields: [ownerMembershipId], references: [id], onDelete: SetNull)
+  installationRequest  PermanentDeviceInstallationRequest? @relation(fields: [installationRequestId], references: [id], onDelete: SetNull)
   assignments          DeviceAreaAssignment[]
   sourceAliases        NativeDeviceSourceAlias[]
-  commissioningResults NativeCommissioningSession[]    @relation("CommissionedDevice")
+  commissioningResults NativeCommissioningSession[]        @relation("CommissionedDevice")
   usageBuckets         NativeDeviceUsageBucket[]
   temperatureSamples   NativeTemperatureSample[]
   automationActions    NativeAutomationAction[]
@@ -760,6 +764,7 @@ model NativeDevice {
 
   @@unique([hubInstallationId, osDeviceId])
   @@unique([id, homeId])
+  @@index([installationRequestId])
   @@index([homeId, managementClass, lifecycle])
   @@index([ownerMembershipId, lifecycle])
 }
@@ -805,31 +810,34 @@ model HubManufacturingIdentity {
 }
 
 model CompanyOperationalWorkItem {
-  id                    String           @id @default(uuid()) @db.Uuid
-  publicReference       String           @unique @db.VarChar(32)
-  kind                  CompanyWorkKind
-  state                 CompanyWorkState @default(ASSIGNED)
-  homeId                String?          @db.Uuid
-  hubInstallationId     String?          @db.Uuid
-  certifiedSerialNumber String?          @db.VarChar(120)
-  assignedEmployeeId    String           @db.Uuid
-  createdByEmployeeId   String           @db.Uuid
-  reason                String           @db.VarChar(500)
-  notes                 String?          @db.VarChar(2000)
-  workRevision          Int              @default(1)
-  checklistRevision     Int?
-  startedAt             DateTime?
-  completedAt           DateTime?
-  reopenedAt            DateTime?
-  cancelledAt           DateTime?
-  createdAt             DateTime         @default(now())
-  updatedAt             DateTime         @updatedAt
+  id                             String           @id @default(uuid()) @db.Uuid
+  publicReference                String           @unique @db.VarChar(32)
+  kind                           CompanyWorkKind
+  state                          CompanyWorkState @default(ASSIGNED)
+  homeId                         String?          @db.Uuid
+  hubInstallationId              String?          @db.Uuid
+  permanentInstallationRequestId String?          @unique @db.Uuid
+  certifiedSerialNumber          String?          @db.VarChar(120)
+  assignedEmployeeId             String           @db.Uuid
+  createdByEmployeeId            String           @db.Uuid
+  reason                         String           @db.VarChar(500)
+  notes                          String?          @db.VarChar(2000)
+  workRevision                   Int              @default(1)
+  checklistRevision              Int?
+  startedAt                      DateTime?
+  completedAt                    DateTime?
+  reopenedAt                     DateTime?
+  cancelledAt                    DateTime?
+  createdAt                      DateTime         @default(now())
+  updatedAt                      DateTime         @updatedAt
 
-  home                 Home?                    @relation(fields: [homeId], references: [id], onDelete: SetNull)
-  hubInstallation      HubInstallation?         @relation(fields: [hubInstallationId], references: [id], onDelete: SetNull)
-  assignedEmployee     CompanyEmployeeAccount   @relation("AssignedWork", fields: [assignedEmployeeId], references: [id], onDelete: Restrict)
-  createdBy            CompanyEmployeeAccount   @relation("CreatedWork", fields: [createdByEmployeeId], references: [id], onDelete: Restrict)
-  provisioningAttempts HubProvisioningAttempt[]
+  home                         Home?                               @relation(fields: [homeId], references: [id], onDelete: SetNull)
+  hubInstallation              HubInstallation?                    @relation(fields: [hubInstallationId], references: [id], onDelete: SetNull)
+  permanentInstallationRequest PermanentDeviceInstallationRequest? @relation(fields: [permanentInstallationRequestId], references: [id], onDelete: SetNull)
+  assignedEmployee             CompanyEmployeeAccount              @relation("AssignedWork", fields: [assignedEmployeeId], references: [id], onDelete: Restrict)
+  createdBy                    CompanyEmployeeAccount              @relation("CreatedWork", fields: [createdByEmployeeId], references: [id], onDelete: Restrict)
+  provisioningAttempts         HubProvisioningAttempt[]
+  commissioningSessions        NativeCommissioningSession[]        @relation("CommissioningWork")
 
   @@unique([id, homeId])
   @@index([assignedEmployeeId, state])
@@ -1758,7 +1766,8 @@ model PermanentDeviceInstallationRequest {
   customerReference     String                                   @unique @db.VarChar(32)
   homeId                String                                   @db.Uuid
   requestedAreaId       String?                                  @db.Uuid
-  requesterMembershipId String                                   @db.Uuid
+  requesterMembershipId String?                                  @db.Uuid
+  requesterAccountId    String?                                  @db.Uuid
   category              PermanentDeviceInstallationCategory
   customerNotes         String?                                  @db.VarChar(1000)
   status                PermanentDeviceInstallationRequestStatus @default(SUBMITTED)
@@ -1771,9 +1780,12 @@ model PermanentDeviceInstallationRequest {
   createdAt             DateTime                                 @default(now())
   updatedAt             DateTime                                 @updatedAt
 
-  home      Home           @relation(fields: [homeId], references: [id], onDelete: Cascade)
-  area      Area?          @relation(fields: [requestedAreaId], references: [id], onDelete: Restrict)
-  requester HomeMembership @relation(fields: [requesterMembershipId], references: [id], onDelete: Restrict)
+  home                  Home                         @relation(fields: [homeId], references: [id], onDelete: Cascade)
+  area                  Area?                        @relation(fields: [requestedAreaId], references: [id], onDelete: Restrict)
+  requester             HomeMembership?              @relation(fields: [requesterMembershipId], references: [id], onDelete: SetNull)
+  workItem              CompanyOperationalWorkItem?
+  devices               NativeDevice[]
+  commissioningSessions NativeCommissioningSession[]
 
   @@index([status, createdAt])
   @@index([homeId, createdAt])
@@ -1781,33 +1793,50 @@ model PermanentDeviceInstallationRequest {
 }
 
 model NativeCommissioningSession {
-  id                     String                   @id @default(uuid()) @db.Uuid
-  homeId                 String                   @db.Uuid
-  hubInstallationId      String                   @db.Uuid
-  requestingMembershipId String                   @db.Uuid
-  requestedAreaId        String?                  @db.Uuid
-  requestedName          String                   @db.VarChar(160)
-  customerLabel          String?                  @db.VarChar(40)
-  managementClass        DeviceManagementClass
-  protocol               String                   @db.VarChar(40)
-  state                  NativeCommissioningState @default(REQUESTED)
-  revision               Int                      @default(1)
-  expiresAt              DateTime
-  closedAt               DateTime?
-  finalDeviceId          String?                  @db.Uuid
-  idempotencyKeyHash     String                   @db.VarChar(128)
-  createdAt              DateTime                 @default(now())
-  updatedAt              DateTime                 @updatedAt
+  id                             String                   @id @default(uuid()) @db.Uuid
+  homeId                         String                   @db.Uuid
+  hubInstallationId              String                   @db.Uuid
+  requestingMembershipId         String?                  @db.Uuid
+  requestingEmployeeId           String?                  @db.Uuid
+  permanentInstallationRequestId String?                  @db.Uuid
+  workItemId                     String?                  @db.Uuid
+  employeeSessionId              String?                  @db.Uuid
+  operatorHandoffId              String?                  @db.Uuid
+  workRevision                   Int?
+  requestedAreaId                String?                  @db.Uuid
+  requestedName                  String                   @db.VarChar(160)
+  customerLabel                  String?                  @db.VarChar(40)
+  selectedCandidateRef           String?                  @db.VarChar(80)
+  selectedOsDeviceId             String?                  @db.VarChar(160)
+  catalogueStatus                String?                  @db.VarChar(32)
+  catalogueRevision              Int?
+  catalogueDigest                String?                  @db.VarChar(64)
+  finalDisposition               String?                  @db.VarChar(24)
+  managementClass                DeviceManagementClass
+  protocol                       String                   @db.VarChar(40)
+  state                          NativeCommissioningState @default(REQUESTED)
+  revision                       Int                      @default(1)
+  expiresAt                      DateTime
+  closedAt                       DateTime?
+  finalDeviceId                  String?                  @db.Uuid
+  idempotencyKeyHash             String                   @db.VarChar(128)
+  createdAt                      DateTime                 @default(now())
+  updatedAt                      DateTime                 @updatedAt
 
-  home                 Home            @relation(fields: [homeId], references: [id], onDelete: Cascade)
-  hubInstallation      HubInstallation @relation(fields: [hubInstallationId], references: [id], onDelete: Restrict)
-  requestingMembership HomeMembership  @relation(fields: [requestingMembershipId], references: [id], onDelete: Restrict)
-  requestedArea        Area?           @relation(fields: [requestedAreaId], references: [id], onDelete: Restrict)
-  finalDevice          NativeDevice?   @relation("CommissionedDevice", fields: [finalDeviceId], references: [id], onDelete: SetNull)
+  home                         Home                                @relation(fields: [homeId], references: [id], onDelete: Cascade)
+  hubInstallation              HubInstallation                     @relation(fields: [hubInstallationId], references: [id], onDelete: Restrict)
+  requestingMembership         HomeMembership?                     @relation(fields: [requestingMembershipId], references: [id], onDelete: Restrict)
+  requestingEmployee           CompanyEmployeeAccount?             @relation("CommissioningEmployee", fields: [requestingEmployeeId], references: [id], onDelete: Restrict)
+  permanentInstallationRequest PermanentDeviceInstallationRequest? @relation(fields: [permanentInstallationRequestId], references: [id], onDelete: Restrict)
+  workItem                     CompanyOperationalWorkItem?         @relation("CommissioningWork", fields: [workItemId], references: [id], onDelete: Restrict)
+  requestedArea                Area?                               @relation(fields: [requestedAreaId], references: [id], onDelete: Restrict)
+  finalDevice                  NativeDevice?                       @relation("CommissionedDevice", fields: [finalDeviceId], references: [id], onDelete: SetNull)
 
   @@unique([homeId, idempotencyKeyHash])
   @@index([hubInstallationId, state, expiresAt])
   @@index([requestingMembershipId, state])
+  @@index([requestingEmployeeId, state])
+  @@index([permanentInstallationRequestId, state])
 }
 
 model NativeDeviceUsageBucket {

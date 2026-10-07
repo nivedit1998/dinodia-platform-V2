@@ -4,6 +4,7 @@ import type { Prisma } from '@prisma/client';
 import { reconcileCredentialLifecycle } from './hubOperatorCredentials';
 import { releaseExpiredClaim } from './stage1ClaimContract';
 import { createPropertySupportNotifications } from './supportNotifications';
+import { dispatchInstallationRequestNotifications } from './installationRequestDelivery';
 
 export const NATIVE_OPERATION_BATCH_LIMIT = 100;
 export const NATIVE_DISPATCH_LEASE_MS = 120_000;
@@ -50,6 +51,7 @@ export async function runNativeOperations(now = new Date()) {
   let expiredSupportCount = 0;
   let expiredRequestCount = 0;
   let releasedClaims = 0;
+  let installationDelivery = { operationsAccepted: 0, operationsDeferred: 0, operationsFailed: 0, completionAccepted: 0, completionDeferred: 0, completionSuppressed: 0 };
   const failures: string[] = [];
   const isolate = async (taskId: string, run: () => Promise<void>) => {
     try { await run(); } catch { failures.push(taskId); }
@@ -71,12 +73,13 @@ export async function runNativeOperations(now = new Date()) {
       const expired = await prisma.supportAccessRequest.updateMany({ where: { id: request.id, status: { in: ['REQUESTED', 'APPROVED', 'ISSUED'] }, codeExpiresAt: { lte: now } }, data: { status: 'EXPIRED', revision: { increment: 1 } } });
       expiredRequestCount += expired.count;
     }
+    installationDelivery = await dispatchInstallationRequestNotifications(now);
   });
   await isolate('claim_reservation_expiry', async () => {
     const claims = await prisma.homeClaimReservation.findMany({ where: { state: 'ACTIVE', expiresAt: { lte: now } }, orderBy: { expiresAt: 'asc' }, take: NATIVE_OPERATION_BATCH_LIMIT, select: { id: true } });
     for (const claim of claims) if ((await releaseExpiredClaim(claim.id, {}, now)).released) releasedClaims += 1;
   });
-  return { tasks: taskIds, expiredSupport: expiredSupportCount, expiredRequests: expiredRequestCount, releasedClaims, failedTasks: failures };
+  return { tasks: taskIds, expiredSupport: expiredSupportCount, expiredRequests: expiredRequestCount, releasedClaims, installationDelivery, failedTasks: failures };
 }
 
 export async function runNativeMaintenance(now = new Date()) {

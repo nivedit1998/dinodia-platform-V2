@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url';
 import dotenv from 'dotenv';
 import { PrismaClient } from '@prisma/client';
 import { assertMigrationDoesNotReferenceVolatileRuntimeTables, compareExistingTablePreservation } from './native_migration_preservation.mjs';
-import { migrationBundleIdentity, STAGE6_CUSTOMER_MIGRATIONS, unexpectedPendingMigrations } from './native_migration_bundle.mjs';
+import { migrationBundleIdentity, STAGE6_CUSTOMER_MIGRATIONS, STAGE8_COMMISSIONING_MIGRATION, unexpectedPendingMigrations } from './native_migration_bundle.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const projectRef = 'fppzzesvukjbsfmxmfxe';
@@ -20,9 +20,10 @@ const stage5Sync = flags.has('--stage5-sync');
 const stage5IncidentDeadlines = flags.has('--stage5-incident-deadlines');
 const stage5IncidentSourceKind = flags.has('--stage5-incident-source-kind');
 const stage6CustomerAuth = flags.has('--stage6-customer-auth');
+const stage8Commissioning = flags.has('--stage8-commissioning');
 const stage5Target = stage5Sync || stage5IncidentDeadlines || stage5IncidentSourceKind;
-const selectedStage = stage6CustomerAuth ? 6 : stage5Target ? 5 : stage4LanTls ? 4 : 3;
-const migrationNames = stage6CustomerAuth ? [...STAGE6_CUSTOMER_MIGRATIONS] : [stage5IncidentSourceKind
+const selectedStage = stage8Commissioning ? 8 : stage6CustomerAuth ? 6 : stage5Target ? 5 : stage4LanTls ? 4 : 3;
+const migrationNames = stage8Commissioning ? [STAGE8_COMMISSIONING_MIGRATION] : stage6CustomerAuth ? [...STAGE6_CUSTOMER_MIGRATIONS] : [stage5IncidentSourceKind
   ? '20261005100000_stage5_incident_source_kind'
   : stage5IncidentDeadlines
   ? '20261005070000_stage5_hub_incident_deadline'
@@ -135,8 +136,8 @@ async function inventory(client, baselineColumns = undefined) {
 let client;
 try {
   const args = process.argv.slice(2);
-  if ([stage4LanTls, stage5Sync, stage5IncidentDeadlines, stage5IncidentSourceKind, stage6CustomerAuth, flags.has('--stage3-domain-schema')].filter(Boolean).length > 1) fail('select exactly one reviewed migration target');
-  if (!args.includes(confirm) || args.some((arg) => ![confirm, '--apply', '--confirm-additive-forward-migration', '--stage4-lan-tls', '--stage5-sync', '--stage5-incident-deadlines', '--stage5-incident-source-kind', '--stage6-customer-auth', '--stage3-domain-schema'].includes(arg) && !arg.startsWith('--expected-migration-sha256=') && !arg.startsWith('--expected-migrations-sha256='))) fail(`pass ${confirm}; apply additionally requires the explicit additive-forward-migration confirmation`);
+  if ([stage4LanTls, stage5Sync, stage5IncidentDeadlines, stage5IncidentSourceKind, stage6CustomerAuth, stage8Commissioning, flags.has('--stage3-domain-schema')].filter(Boolean).length > 1) fail('select exactly one reviewed migration target');
+  if (!args.includes(confirm) || args.some((arg) => ![confirm, '--apply', '--confirm-additive-forward-migration', '--stage4-lan-tls', '--stage5-sync', '--stage5-incident-deadlines', '--stage5-incident-source-kind', '--stage6-customer-auth', '--stage8-commissioning', '--stage3-domain-schema'].includes(arg) && !arg.startsWith('--expected-migration-sha256=') && !arg.startsWith('--expected-migrations-sha256='))) fail(`pass ${confirm}; apply additionally requires the explicit additive-forward-migration confirmation`);
   if (target.supabaseProjectRef !== projectRef) fail('checked-in V2 target manifest does not match the authorized project');
   if (envFile.SUPABASE_PROJECT_REF !== projectRef || envFile.VERCEL_PROJECT_ID !== target.vercelProjectId) fail('project-local environment identity does not match the authorized V2 Production target');
   const db = parseUrl(databaseUrl, 'DATABASE_URL');

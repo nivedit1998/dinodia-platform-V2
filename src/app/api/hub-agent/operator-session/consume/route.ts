@@ -46,11 +46,28 @@ export async function POST(request: Request) {
       }
       if (phase === 'prepare') return { handoffSecretEnvelope: handoff.handoffEnvelope };
       if (sha256(handoffSecret) !== handoff.handoffHash) throw new Stage1AuthError(401, 'handoff_secret_invalid', 'The one-use operator handoff secret is invalid');
-      const work = await tx.companyOperationalWorkItem.findUnique({ where: { id: handoff.workflowId }, select: { id: true, assignedEmployeeId: true, homeId: true, hubInstallationId: true, certifiedSerialNumber: true, state: true, workRevision: true } });
-      if (!work || work.assignedEmployeeId !== handoff.employeeId || work.homeId !== handoff.homeId || work.hubInstallationId !== handoff.hubInstallationId || !['ASSIGNED', 'IN_PROGRESS', 'REOPENED'].includes(work.state)) throw new Stage1AuthError(403, 'workflow_revoked', 'The operator workflow is no longer valid');
+      const work = await tx.companyOperationalWorkItem.findUnique({ where: { id: handoff.workflowId }, select: { id: true, kind: true, assignedEmployeeId: true, homeId: true, hubInstallationId: true, certifiedSerialNumber: true, state: true, workRevision: true, permanentInstallationRequestId: true } });
+      const scopes = Array.isArray(handoffScope.scopes) ? handoffScope.scopes.map(String) : [];
+      const permanentInstallation = scopes.length === 1 && scopes[0] === 'os:permanent-installation';
+      if (!work || work.assignedEmployeeId !== handoff.employeeId || work.homeId !== handoff.homeId || work.hubInstallationId !== handoff.hubInstallationId
+        || permanentInstallation && (work.kind !== 'PERMANENT_DEVICE_INSTALLATION' || work.state !== 'IN_PROGRESS' || !work.permanentInstallationRequestId)
+        || !permanentInstallation && (scopes.length !== 1 || scopes[0] !== 'os:admin' || !['ASSIGNED', 'IN_PROGRESS', 'REOPENED'].includes(work.state))) throw new Stage1AuthError(403, 'workflow_revoked', 'The operator workflow is no longer valid');
       const employeeSessionId = String(handoffScope.employeeSessionId ?? '');
       const workRevision = Number(handoffScope.workRevision);
       if (!employeeSessionId || !Number.isInteger(workRevision) || workRevision !== work.workRevision || String(handoffScope.serialNumber ?? '') !== hub.identity.serialNumber || Number(handoffScope.identityGeneration) !== Number(hub.identity.identityGeneration) || work.certifiedSerialNumber !== hub.identity.serialNumber) throw new Stage1AuthError(403, 'workflow_authority_stale', 'The operator workflow authority has changed');
+      let requestId: string | undefined;
+      let areaOptions: Array<{ id: string; name: string }> | undefined;
+      if (permanentInstallation) {
+        requestId = String(handoffScope.requestId || '');
+        if (!/^[0-9a-f-]{36}$/i.test(requestId) || requestId !== work.permanentInstallationRequestId) throw new Stage1AuthError(403, 'installation_request_revoked', 'The assigned installation request changed');
+        const currentRequest = await tx.permanentDeviceInstallationRequest.findFirst({ where: { id: requestId, homeId: handoff.homeId, status: 'IN_PROGRESS', workItem: { is: { id: work.id, assignedEmployeeId: handoff.employeeId, workRevision } } }, select: { id: true, requestedAreaId: true } });
+        if (!currentRequest) throw new Stage1AuthError(403, 'installation_request_revoked', 'The assigned installation request is no longer current');
+        const areas = await tx.area.findMany({ where: { homeId: handoff.homeId, status: 'ACTIVE', ...(currentRequest.requestedAreaId ? { id: currentRequest.requestedAreaId } : {}) }, select: { id: true, originalName: true }, orderBy: { originalName: 'asc' }, take: 64 });
+        const suppliedOptions = Array.isArray(handoffScope.areaOptions) ? handoffScope.areaOptions as Array<{ id?: unknown; name?: unknown }> : [];
+        areaOptions = suppliedOptions.filter((entry) => areas.some((area) => area.id === String(entry?.id || '')) && typeof entry?.name === 'string')
+          .map((entry) => ({ id: String(entry.id), name: String(entry.name).slice(0, 120) }));
+        if (!areas.length || areaOptions.length !== areas.length || areas.some((area) => !areaOptions!.some((option) => option.id === area.id && option.name === area.originalName))) throw new Stage1AuthError(403, 'installation_area_changed', 'The assigned original Area options changed; relaunch from Company Portal');
+      }
       const credential = await tx.hubCredentialVersion.findFirst({ where: { hubInstallationId: hub.installation.id, purpose: 'operator-credential', state: { in: ['ACTIVE', 'GRACE'] } }, orderBy: { version: 'desc' }, select: { version: true } });
       const policyEnabled = internalOperatorDaySessionEnabled();
       const issuedAt = Math.floor(now.getTime() / 1000) * 1000;
@@ -58,7 +75,7 @@ export async function POST(request: Request) {
       const grantExpiresAt = issuedAt + sessionLifetimeSeconds * 1000;
       const operatorJti = crypto.randomUUID();
       const credentialVersion = credential?.version ?? 0;
-      const grant = createHubBoundOperatorGrant({ employeeId: handoff.employeeId, hubId: hub.installation.serialNumberSnapshot, workflowId: handoff.workflowId, scope: ['os:admin'], recentAuthAt: issuedAt, issuedAt, expiresAt: grantExpiresAt, credentialVersion, homeId: handoff.homeId, identityGeneration: hub.identity.identityGeneration, handoffId: handoff.id, employeeSessionId, workRevision, operatorJti });
+      const grant = createHubBoundOperatorGrant({ employeeId: handoff.employeeId, hubId: hub.installation.serialNumberSnapshot, workflowId: handoff.workflowId, scope: permanentInstallation ? scopes : ['os:admin'], ...(areaOptions ? { areaIds: areaOptions.map((area) => area.id), areaOptions } : {}), ...(requestId ? { requestId } : {}), recentAuthAt: issuedAt, issuedAt, expiresAt: grantExpiresAt, credentialVersion, homeId: handoff.homeId, identityGeneration: hub.identity.identityGeneration, handoffId: handoff.id, employeeSessionId, workRevision, operatorJti });
       const encryptedSessionGrant = encryptOperatorGrant(grant, hub.identity.encryptionPublicKey, 1);
       const consumed = await tx.operatorHandoff.updateMany({ where: { id: handoff.id, consumedAt: null, revokedAt: null, expiresAt: { gt: now }, setupAttemptId, browserBindingHash: sha256(browserBinding) }, data: { consumedAt: now, scope: { ...handoffScope, operatorJti, credentialVersion } } });
       if (consumed.count !== 1) throw new Stage1AuthError(401, 'handoff_replay', 'The operator handoff was already consumed or revoked');

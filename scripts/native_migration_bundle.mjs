@@ -9,6 +9,8 @@ export const STAGE6_CUSTOMER_MIGRATIONS = Object.freeze([
   '20261006170000_stage6_prospective_room_access',
 ]);
 
+export const STAGE8_COMMISSIONING_MIGRATION = '20261006180000_stage8_commissioning_and_installation';
+
 export function migrationBundleIdentity(names, checksums) {
   const migrations = [...new Set(names)].sort().map((name) => {
     const sha256 = checksums.get(name);

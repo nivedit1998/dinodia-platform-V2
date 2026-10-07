@@ -5,7 +5,7 @@ import { Stage1AuthError } from './stage1Auth';
 import { manufacturingIdentityPayload } from './manufacturingEnrollment';
 
 export type AuthenticatedHub = {
-  installation: { id: string; homeId: string; serialNumberSnapshot: string; accessPolicyRevision: number; state: string; reservedHostname: string | null; reservedTunnelName: string | null; cloudflareTunnelId: string | null; cloudflareReservationToken: string | null };
+  installation: { id: string; homeId: string; serialNumberSnapshot: string; accessPolicyRevision: number; state: string; reservedHostname: string | null; reservedTunnelName: string | null; cloudflareTunnelId: string | null; cloudflareReservationToken: string | null; capabilitySummary: unknown };
   identity: { id: string; serialNumber: string; identityGeneration: number; signingPublicKey: string; encryptionPublicKey: string; signingKeyFingerprint: string; encryptionKeyFingerprint: string; status: string };
   body: Record<string, unknown>;
 };
@@ -26,7 +26,7 @@ export async function authenticateHub(request: Request, rawBody: string, options
   if (!serial || !Number.isInteger(generation) || generation < 1) throw new Stage1AuthError(401, 'hub_identity_missing', 'The hub identity is invalid');
   const identity = await prisma.hubManufacturingIdentity.findFirst({ where: { serialNumber: serial, identityGeneration: generation, status: 'ACTIVE' }, select: { id: true, serialNumber: true, identityGeneration: true, signingPublicKey: true, encryptionPublicKey: true, signingKeyFingerprint: true, encryptionKeyFingerprint: true, status: true } });
   if (!identity) throw new Stage1AuthError(401, 'hub_identity_revoked', 'The hub identity is not active');
-  const installation = await prisma.hubInstallation.findUnique({ where: { serialNumberSnapshot: serial }, select: { id: true, homeId: true, serialNumberSnapshot: true, accessPolicyRevision: true, state: true, reservedHostname: true, reservedTunnelName: true, cloudflareTunnelId: true, cloudflareReservationToken: true } });
+  const installation = await prisma.hubInstallation.findUnique({ where: { serialNumberSnapshot: serial }, select: { id: true, homeId: true, serialNumberSnapshot: true, accessPolicyRevision: true, state: true, reservedHostname: true, reservedTunnelName: true, cloudflareTunnelId: true, cloudflareReservationToken: true, capabilitySummary: true } });
   if (!installation) throw new Stage1AuthError(409, 'hub_not_provisioned', 'The hub is not linked to an installation');
   const machineVersion = Number(request.headers.get('x-dinodia-machine-version') ?? '0');
   const machineSignature = request.headers.get('x-dinodia-machine-signature') ?? '';

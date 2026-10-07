@@ -21,6 +21,7 @@ export const COMPATIBLE_ADDITIVE_MIGRATIONS: Readonly<Record<string, string>> = 
   '20261005100000_stage5_incident_source_kind': '4b7763f5906566bba108196a4fa6ef37acb3623cb2dac33193b4ee836c6bec04',
   '20261004150000_stage5_hub_sync_v2': '0043e8c7870c0afa7f4a5e5e4dd3d290387bc39514e4728f8c9a90fea8b33203',
   '20261004050000_stage4_customer_lan_tls_identity': '8b6f9a3ed68fb00805dbc54ba750fc339da3f375bb6c4a899e286c7b3844a5d1',
+  '20261006180000_stage8_commissioning_and_installation': '2fbf09e82d82c8eca490738e288fc8e78f2bfba313fb895811514aa97a699044',
 });
 export const CANONICAL_PRODUCTION_ORIGIN = 'https://dinodia-platform-v2.vercel.app';
 export function isRuntimeTargetValid(): boolean { return runtimeTargetIsValid(process.env); }
@@ -46,5 +47,7 @@ export function isSchemaReady(migrations: readonly CompletedMigration[], modelCo
   const hasProspectiveRoomAccess = newer.some((migration) => migration.migration_name === '20261006170000_stage6_prospective_room_access');
   const hasStage5 = newer.some((migration) => migration.migration_name === '20261004150000_stage5_hub_sync_v2');
   if (hasStage5 && !newer.some((migration) => migration.migration_name === '20261004050000_stage4_customer_lan_tls_identity')) return false;
+  const hasStage8 = newer.some((migration) => migration.migration_name === '20261006180000_stage8_commissioning_and_installation');
+  if (hasStage8 && (!hasStage5 || !hasProspectiveRoomAccess || !hasMobileAccess)) return false;
   return modelCount === REQUIRED_MODEL_COUNT + (hasStage5 ? 1 : 0) + (hasProspectiveRoomAccess ? 1 : 0);
 }

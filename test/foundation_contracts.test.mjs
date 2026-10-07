@@ -87,7 +87,7 @@ test('safe build identity prefers the real Vercel commit or deployment and never
   assert.equal(safeBuildId({ FOUNDATION_SOURCE_FINGERPRINT: 'not-a-fingerprint' }), 'local');
 });
 
-test('readiness accepts the exact Stage 3 head plus only reviewed additive Stage 4, Stage 5 and Stage 6 migrations', () => {
+test('readiness accepts the exact Stage 3 head plus only reviewed additive Stage 4 through Stage 8 migrations', () => {
   const { REQUIRED_MIGRATION, REQUIRED_MODEL_COUNT, COMPATIBLE_ADDITIVE_MIGRATIONS, isSchemaReady } = loadFoundationRuntime();
   const stage3Checksum = 'b'.repeat(64);
   const stage3 = [{ migration_name: REQUIRED_MIGRATION, checksum: stage3Checksum }];
@@ -101,10 +101,16 @@ test('readiness accepts the exact Stage 3 head plus only reviewed additive Stage
   const mobileAccess = migration('20261005130000_stage6_mobile_access_credentials');
   const refreshFamilies = migration('20261005120000_stage6_customer_refresh_families');
   const stage6 = [prospectiveRoomAccess, ownershipTransfer, invitedTenantUsername, apnsRegistration, mobileAccess, refreshFamilies, ...stage5];
+  const stage8Commissioning = migration('20261006180000_stage8_commissioning_and_installation');
+  const stage8 = [stage8Commissioning, ...stage6];
   assert.equal(isSchemaReady(stage3, REQUIRED_MODEL_COUNT, stage3Checksum), true);
   assert.equal(isSchemaReady(stage4, REQUIRED_MODEL_COUNT, stage3Checksum), true, 'the app rollback remains ready after the additive migration');
   assert.equal(isSchemaReady(stage5, REQUIRED_MODEL_COUNT + 1, stage3Checksum), true, 'the Stage 5 app and Stage 4 rollback remain ready on the additive Stage 5 schema');
   assert.equal(isSchemaReady(stage6, REQUIRED_MODEL_COUNT + 2, stage3Checksum), true, 'the Stage 6 app and compatible rollback remain ready on all reviewed additive Stage 6 schema');
+  assert.equal(isSchemaReady(stage8, REQUIRED_MODEL_COUNT + 2, stage3Checksum), true, 'Stage 8 adds only compatible columns and remains ready without changing the table-count contract');
+  assert.equal(isSchemaReady(stage8, REQUIRED_MODEL_COUNT + 3, stage3Checksum), false, 'Stage 8 does not authorize an unexplained table-count change');
+  assert.equal(isSchemaReady([stage8Commissioning, ...stage5], REQUIRED_MODEL_COUNT + 1, stage3Checksum), false, 'Stage 8 requires the Stage 6 and Stage 5 schema prerequisites');
+  assert.equal(isSchemaReady([{ ...stage8Commissioning, checksum: '0'.repeat(64) }, ...stage6], REQUIRED_MODEL_COUNT + 2, stage3Checksum), false, 'an unreviewed Stage 8 migration checksum is not schema-ready');
   assert.equal(isSchemaReady([ownershipTransfer, ...stage5], REQUIRED_MODEL_COUNT + 1, stage3Checksum), true, 'ownership transfer adds nullable data and remains compatible with the prior Stage 5 app');
   assert.equal(isSchemaReady([invitedTenantUsername, ...stage5], REQUIRED_MODEL_COUNT + 1, stage3Checksum), true, 'the invited-tenant username migration remains compatible with the prior Stage 5 app');
   assert.equal(isSchemaReady([apnsRegistration, ...stage5], REQUIRED_MODEL_COUNT + 1, stage3Checksum), false, 'APNs registration requires the mobile access and refresh-family migrations');
