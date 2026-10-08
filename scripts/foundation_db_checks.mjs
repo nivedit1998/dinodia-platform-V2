@@ -46,9 +46,10 @@ try {
     '20261006150000_stage6_ownership_transfer_claim',
     '20261006170000_stage6_prospective_room_access',
     '20261006180000_stage8_commissioning_and_installation',
+    '20261008100000_stage9_deregister_redacted_support_guard',
   ];
-  if (migration.length !== required.length || required.some((name) => !migrations.has(name)) || required.some((name) => !migrations.get(name).finished_at || migrations.get(name).rolled_back_at)) throw new Error('migration ledger is not exactly the completed native baseline with the reviewed Stage 8 additive commissioning migration');
-  console.log(`[test:stage8-schema] OK: ${names.size} tables, no direct anon/authenticated grants, native baseline and additive Stage 1 through Stage 8 migrations completed`);
+  if (migration.length !== required.length || required.some((name) => !migrations.has(name)) || required.some((name) => !migrations.get(name).finished_at || migrations.get(name).rolled_back_at)) throw new Error('migration ledger is not exactly the completed native baseline with the reviewed Stage 8 and Stage 9 additive migrations');
+  console.log(`[test:stage9-schema] OK: ${names.size} tables, no direct anon/authenticated grants, native baseline and additive Stage 1 through Stage 9 migrations completed`);
 } finally {
   await prisma.$disconnect();
 }

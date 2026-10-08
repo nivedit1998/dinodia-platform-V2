@@ -89,8 +89,10 @@ function loadTypeScriptModule(relativePath, overrides = {}) {
   const compiled = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, esModuleInterop: true } }).outputText;
   const module = { exports: {} };
   const isolatedInstallationDelivery = { dispatchInstallationRequestNotifications: async () => ({ operationsAccepted: 0, operationsDeferred: 0, operationsFailed: 0, completionAccepted: 0, completionDeferred: 0, completionSuppressed: 0 }) };
+  const isolatedHomeDeregistrationCleanup = { resumeHomeDeregistrationAccountCleanup: async () => ({ evaluated: 0, deferred: 0, failed: 0, pending: 0 }) };
   const localRequire = (specifier) => overrides[specifier] ?? require(specifier);
-  const taskRequire = (specifier) => overrides[specifier] ?? (specifier === './installationRequestDelivery' ? isolatedInstallationDelivery : require(specifier));
+  const taskRequire = (specifier) => overrides[specifier] ?? (specifier === './installationRequestDelivery'
+    ? isolatedInstallationDelivery : specifier === './homeDeregistrationCleanup' ? isolatedHomeDeregistrationCleanup : require(specifier));
   new Function('require', 'module', 'exports', compiled)(relativePath === 'src/lib/nativeOperations.ts' ? taskRequire : localRequire, module, module.exports);
   return module.exports;
 }
@@ -107,10 +109,13 @@ test('temporary internal day mode is disabled unless the exact opt-in is present
 test('native task registry dispatches business operations and daily lease cleanup to disjoint owners', async () => {
   const cleanupCalls = [];
   const receiptCleanupCalls = [];
+  const deregistrationReceiptCleanupCalls = [];
+  const homeDeregistrationCleanupCalls = [];
   const { nativeTaskRegistry, runNativeOperations, runNativeMaintenance } = loadTypeScriptModule('src/lib/nativeOperations.ts', {
     './prisma': { prisma: {
       nativeBackgroundTaskState: { updateMany: async (input) => { cleanupCalls.push(input); return { count: 3 }; } },
       hubSyncReceipt: { deleteMany: async (input) => { receiptCleanupCalls.push(input); return { count: 2 }; } },
+      nativeDomainOutbox: { deleteMany: async (input) => { deregistrationReceiptCleanupCalls.push(input); return { count: 1 }; } },
       $transaction: async (callback) => callback({ nativeBackgroundTaskState: { updateMany: async () => ({ count: 0 }) } }),
       supportSession: { findMany: async () => [] },
       supportAccessRequest: { findMany: async () => [], updateMany: async () => ({ count: 0 }) },
@@ -119,6 +124,10 @@ test('native task registry dispatches business operations and daily lease cleanu
     './hubOperatorCredentials': { reconcileCredentialLifecycle: async () => ({ rotated: 0 }) },
     './stage1ClaimContract': { releaseExpiredClaim: async () => ({ released: false }) },
     './supportNotifications': { createPropertySupportNotifications: async () => undefined },
+    './homeDeregistrationCleanup': { resumeHomeDeregistrationAccountCleanup: async (...args) => {
+      homeDeregistrationCleanupCalls.push(args);
+      return { evaluated: 2, deferred: 0, failed: 0, pending: 0 };
+    } },
   });
   assert.deepEqual(nativeTaskRegistry.map(({ taskId, owner }) => [taskId, owner]), [
     ['operator_credential_lifecycle', 'supabase_pg_cron_two_minute'],
@@ -129,13 +138,18 @@ test('native task registry dispatches business operations and daily lease cleanu
   const now = new Date('2026-09-27T12:00:00Z');
   const operations = await runNativeOperations(now);
   assert.deepEqual(operations.tasks, ['operator_credential_lifecycle', 'support_expiry_and_revocation', 'claim_reservation_expiry']);
+  assert.deepEqual(operations.homeDeregistrationAccountCleanup, { evaluated: 2, deferred: 0, failed: 0, pending: 0 });
+  assert.deepEqual(homeDeregistrationCleanupCalls, [[now, { limit: 24 }]], 'deregistration recovery reuses the existing two-minute operations dispatcher');
   assert.equal(cleanupCalls.length, 0);
   const maintenance = await runNativeMaintenance(now);
   assert.deepEqual(maintenance.tasks, ['expired_dispatch_lease_cleanup']);
   assert.equal(maintenance.expiredDispatcherLeases, 3);
   assert.equal(maintenance.expiredSyncReceipts, 2);
+  assert.equal(maintenance.expiredDeregistrationCleanupReceipts, 1);
   assert.deepEqual(cleanupCalls, [{ where: { taskId: { not: 'expired_dispatch_lease_cleanup' }, leaseExpiresAt: { lte: now } }, data: { leaseOwner: null, leaseExpiresAt: null } }]);
   assert.deepEqual(receiptCleanupCalls, [{ where: { expiresAt: { lte: now } } }]);
+  assert.deepEqual(deregistrationReceiptCleanupCalls, [{ where: { aggregateType: 'FullHomeDeregistrationAccountCleanup',
+    eventType: 'FULL_HOME_ACCOUNT_CLEANUP', state: { in: ['DELIVERED', 'FAILED', 'CANCELLED'] }, expiresAt: { lte: now } } }]);
 });
 
 test('native task registry rejects unknown tasks, duplicate tasks and dual-owner drift', () => {

@@ -538,6 +538,14 @@ async function startPlatform(runEnv) {
           const safeCode = line.match(/\bcode:\s*['"]?([A-Za-z0-9_-]{1,64})['"]?/)?.[1];
           if (safeCode) console.log(`[stage6:integration] ownership-transfer email handoff returned bounded code=${safeCode}`);
         }
+        if (line.includes('[stage9:deregister] database-failure ')) {
+          const safeFailure = line.match(/\[stage9:deregister\] database-failure phase=[A-Za-z0-9_.-]{1,160} cleanup=[A-Za-z0-9_.-]{1,160} name=[A-Za-z0-9_.-]{1,160} code=[A-Za-z0-9_.-]{1,160} sqlstate=[A-Za-z0-9_.-]{1,160} field=[A-Za-z0-9_.-]{1,160} model=[A-Za-z0-9_.-]{1,160} constraint=[A-Za-z0-9_.-]{1,160} class=[A-Za-z0-9_.-]{1,160} detail=[A-Za-z0-9_.-]{1,200}/)?.[0];
+          if (safeFailure) console.log(safeFailure);
+        }
+        if (line.includes('[stage9:dereg-cleanup] retryable-failure ')) {
+          const safeFailure = line.match(/\[stage9:dereg-cleanup\] retryable-failure phase=[A-Za-z0-9_.-]{1,120} name=[A-Za-z0-9_.-]{1,120} code=[A-Za-z0-9_.-]{1,120} sqlstate=[A-Za-z0-9_.-]{1,120} constraint=[A-Za-z0-9_.-]{1,120} detail=[A-Za-z0-9_.-]{1,160}/)?.[0];
+          if (safeFailure) console.log(safeFailure);
+        }
       }
     });
   }
@@ -3120,6 +3128,432 @@ async function ownershipTransferChecks(deliveryEnv) {
   console.log('[stage6:integration] PASS: real loopback ownership routes enforce owner-only exact-step-up start/cancel, no-expiry stable QR/email identity, cancellation/replay, verified-recipient binding, fresh signed permanent-label hub challenge, exactly-once role transfer, manager revocation and tenant/other-Home/Area/grant preservation');
 }
 
+async function exceptionalOwnershipTransferChecks(deliveryEnv) {
+  const base = `http://127.0.0.1:${appPort}`;
+  const fixture = customerFixture;
+  if (!fixture) fail('Exceptional ownership transfer checks require the disposable multi-home fixture');
+  const defaultLifecycleEnv = { ...deliveryEnv };
+  delete defaultLifecycleEnv.STAGE9_LIFECYCLE_REHEARSAL;
+  await stopPlatform();
+  await startPlatform(defaultLifecycleEnv);
+  const homeId = fixture.homeTwoId;
+  const previewPath = `${base}/api/installer/home-support/homes/${homeId}/ownership-transfer/exceptional/preview`;
+  const submitPath = `${base}/api/installer/home-support/homes/${homeId}/ownership-transfer/exceptional`;
+  const homeBefore = await prisma.home.findUniqueOrThrow({ where: { id: homeId }, select: { managementRevision: true, lifecycle: true, installationStatus: true } });
+  if (homeBefore.lifecycle !== 'ACTIVE' || homeBefore.installationStatus !== 'COMPLETE') fail('Exceptional-transfer route test requires the completed disposable Home');
+
+  // Add a second outgoing manager with no other Home relationship. This gives
+  // the real claim-completion path an exact notice/cleanup recipient to verify.
+  const notificationManagerEmail = `exceptional-manager-${crypto.randomUUID()}@invalid.test`;
+  const notificationManagerName = `exceptional-manager-${crypto.randomUUID().slice(0, 8)}`;
+  const notificationManager = await prisma.customerAccount.create({ data: {
+    displayName: 'Disposable exceptional-transfer manager', username: notificationManagerName,
+    usernameNormalized: notificationManagerName, email: notificationManagerEmail,
+    emailNormalized: notificationManagerEmail, emailVerifiedAt: new Date(), passwordHash: hashPassword(`exceptional-${crypto.randomUUID()}`),
+  } });
+  const notificationManagerMembership = await prisma.homeMembership.create({ data: {
+    customerAccountId: notificationManager.id, homeId, role: 'PROPERTY_MANAGER',
+  } });
+  await prisma.home.update({ where: { id: homeId }, data: { managementRevision: { increment: 1 } } });
+
+  const cxoPassword = `exceptional-cxo-${crypto.randomUUID()}`;
+  const cxoEmail = `exceptional-cxo-${crypto.randomUUID()}@invalid.test`;
+  const cxo = await prisma.companyEmployeeAccount.create({ data: {
+    displayName: 'Disposable exceptional-transfer CXO', email: cxoEmail, emailNormalized: cxoEmail,
+    role: 'CXO', status: 'ACTIVE', passwordHash: hashPassword(cxoPassword),
+  } });
+  const installerPassword = `exceptional-installer-${crypto.randomUUID()}`;
+  const installerEmail = `exceptional-installer-${crypto.randomUUID()}@invalid.test`;
+  const installer = await prisma.companyEmployeeAccount.create({ data: {
+    displayName: 'Disposable exceptional-transfer installer', email: installerEmail, emailNormalized: installerEmail,
+    role: 'INSTALLER', status: 'ACTIVE', passwordHash: hashPassword(installerPassword),
+  } });
+  const cxoLogin = await loginEmployee(base, cxo, cxoPassword);
+  const installerLogin = await loginEmployee(base, installer, installerPassword);
+  const employeeHeaders = (jar) => ({ cookie: cookieHeader(jar), 'content-type': 'application/json' });
+  const cxoHeaders = employeeHeaders(cxoLogin.jar);
+  const installerHeaders = employeeHeaders(installerLogin.jar);
+  const activeTenant = await prisma.homeMembership.findFirstOrThrow({ where: { homeId, role: 'TENANT', status: 'ACTIVE' },
+    select: { id: true, customerAccount: { select: { email: true, emailNormalized: true } } } });
+  const [currentOwner, initialCaseCount, initialClaimCount] = await Promise.all([
+    prisma.homeMembership.findFirstOrThrow({ where: { homeId, role: 'OWNER', status: 'ACTIVE' }, select: { id: true, customerAccountId: true,
+      accessRevision: true, customerAccount: { select: { emailNormalized: true } } } }),
+    prisma.exceptionalOwnershipTransfer.count({ where: { homeId } }),
+    prisma.homeClaimReference.count({ where: { homeId, purpose: 'OWNERSHIP_TRANSFER' } }),
+  ]);
+  const proposedEmail = fixture.managerEmail.toLowerCase();
+  const candidateAccount = await prisma.customerAccount.findUniqueOrThrow({ where: { emailNormalized: proposedEmail }, select: { id: true, status: true, emailVerifiedAt: true } });
+  const candidateRelationship = await prisma.homeMembership.findUnique({ where: { customerAccountId_homeId: { customerAccountId: candidateAccount.id, homeId } }, select: { status: true, role: true } });
+  if (candidateAccount.status !== 'ACTIVE' || !candidateAccount.emailVerifiedAt || candidateRelationship?.status === 'ACTIVE' && candidateRelationship.role === 'TENANT') {
+    fail('Exceptional successor fixture must be a verified active non-tenant account');
+  }
+
+  const anonymousPreview = await fetchJson(previewPath, { method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ proposedIncomingEmail: proposedEmail }) });
+  const installerPreview = await fetchJson(previewPath, { method: 'POST', headers: installerHeaders,
+    body: JSON.stringify({ proposedIncomingEmail: proposedEmail }) });
+  const installerSubmit = await fetchJson(submitPath, { method: 'POST', headers: { ...installerHeaders, 'idempotency-key': `exceptional-unauthorized-${crypto.randomUUID()}` },
+    body: JSON.stringify({ proposedIncomingEmail: proposedEmail, expectedManagementRevision: homeBefore.managementRevision,
+      reason: 'Unauthorized route test', verificationMethod: 'test', verificationReference: 'denied', staffAttestation: 'No authority' }) });
+  if (anonymousPreview.response.status !== 401 || installerPreview.response.status !== 403 || installerSubmit.response.status !== 403
+    || await prisma.exceptionalOwnershipTransfer.count({ where: { homeId } }) !== initialCaseCount
+    || await prisma.homeClaimReference.count({ where: { homeId, purpose: 'OWNERSHIP_TRANSFER' } }) !== initialClaimCount) {
+    fail(`Anonymous or installer access reached exceptional ownership authority (${JSON.stringify({ anonymous: anonymousPreview.response.status,
+      installerPreview: installerPreview.response.status, installerSubmit: installerSubmit.response.status })})`);
+  }
+
+  const tenantPreview = await fetchJson(previewPath, { method: 'POST', headers: cxoHeaders,
+    body: JSON.stringify({ proposedIncomingEmail: activeTenant.customerAccount.email }) });
+  const ownerPreview = await fetchJson(previewPath, { method: 'POST', headers: cxoHeaders,
+    body: JSON.stringify({ proposedIncomingEmail: currentOwner.customerAccount.emailNormalized }) });
+  if (tenantPreview.response.status !== 200 || tenantPreview.body?.activeTenantSuccessorRejected !== true
+    || !tenantPreview.body?.blockers?.includes('ACTIVE_TENANT_SUCCESSOR')
+    || ownerPreview.response.status !== 200 || ownerPreview.body?.currentOwnerSuccessorRejected !== true
+    || !ownerPreview.body?.blockers?.includes('CURRENT_OWNER_SUCCESSOR')) {
+    fail(`Exceptional preview did not fail closed for the current owner and active tenant (${JSON.stringify({ tenantStatus: tenantPreview.response.status,
+      tenantRejected: tenantPreview.body?.activeTenantSuccessorRejected, ownerStatus: ownerPreview.response.status,
+      ownerRejected: ownerPreview.body?.currentOwnerSuccessorRejected })})`);
+  }
+
+  const defaultPreview = await fetchJson(previewPath, { method: 'POST', headers: cxoHeaders,
+    body: JSON.stringify({ proposedIncomingEmail: proposedEmail }) });
+  const disabledSubmit = await fetchJson(submitPath, { method: 'POST', headers: { ...cxoHeaders, 'idempotency-key': `exceptional-disabled-${crypto.randomUUID()}` },
+    body: JSON.stringify({ proposedIncomingEmail: proposedEmail, expectedManagementRevision: defaultPreview.body?.managementRevision,
+      reason: 'Disposable disabled-path check', verificationMethod: 'controlled rehearsal', verificationReference: 'test-only',
+      staffAttestation: 'Disposable fixture; no production action' }) });
+  if (defaultPreview.response.status !== 200 || defaultPreview.body?.actionAvailable !== false
+    || !defaultPreview.body?.blockers?.includes('STAGE_13_LIFECYCLE_REHEARSAL_REQUIRED')
+    || disabledSubmit.response.status !== 503 || disabledSubmit.body?.errorCode !== 'FEATURE_NOT_ENABLED'
+    || await prisma.exceptionalOwnershipTransfer.count({ where: { homeId } }) !== initialCaseCount
+    || await prisma.homeClaimReference.count({ where: { homeId, purpose: 'OWNERSHIP_TRANSFER' } }) !== initialClaimCount) {
+    fail(`Default lifecycle state did not keep exceptional ownership mutation disabled with zero effects (${JSON.stringify({ preview: defaultPreview.response.status,
+      actionAvailable: defaultPreview.body?.actionAvailable, submit: disabledSubmit.response.status, code: disabledSubmit.body?.error?.code })})`);
+  }
+
+  // The explicit test-only rehearsal switch exercises actual route/service
+  // behavior; it is not enabled for Production by this test or deployment.
+  await stopPlatform();
+  const enabledEnv = { ...defaultLifecycleEnv, STAGE9_LIFECYCLE_REHEARSAL: 'true' };
+  await startPlatform(enabledEnv);
+  const rehearsalCxo = await loginEmployee(base, cxo, cxoPassword);
+  const rehearsalHeaders = employeeHeaders(rehearsalCxo.jar);
+  const preview = await fetchJson(previewPath, { method: 'POST', headers: rehearsalHeaders,
+    body: JSON.stringify({ proposedIncomingEmail: proposedEmail }) });
+  if (preview.response.status !== 200 || preview.body?.eligible !== true || preview.body?.actionAvailable !== true
+    || preview.body?.managementRevision !== (await prisma.home.findUniqueOrThrow({ where: { id: homeId }, select: { managementRevision: true } })).managementRevision) {
+    fail(`Eligible read-only exceptional-transfer preview was not bound to current Home revision (${JSON.stringify({ status: preview.response.status,
+      eligible: preview.body?.eligible, actionAvailable: preview.body?.actionAvailable })})`);
+  }
+  const submitBody = { proposedIncomingEmail: proposedEmail, expectedManagementRevision: preview.body.managementRevision,
+    reason: 'Disposable Stage 9 exceptional ownership workflow test', verificationMethod: 'controlled test evidence',
+    verificationReference: `test-${crypto.randomUUID()}`, staffAttestation: 'Disposable route integration; not a production attestation' };
+  const submitKey = `exceptional-submit-${crypto.randomUUID()}`;
+  const submitted = await fetchJson(submitPath, { method: 'POST', headers: { ...rehearsalHeaders, 'idempotency-key': submitKey }, body: JSON.stringify(submitBody) });
+  const replay = await fetchJson(submitPath, { method: 'POST', headers: { ...rehearsalHeaders, 'idempotency-key': submitKey }, body: JSON.stringify(submitBody) });
+  const changedReplay = await fetchJson(submitPath, { method: 'POST', headers: { ...rehearsalHeaders, 'idempotency-key': submitKey },
+    body: JSON.stringify({ ...submitBody, reason: `${submitBody.reason} changed` }) });
+  if (submitted.response.status !== 202 || submitted.body?.state !== 'SUBMITTED' || submitted.body?.ownershipChanged !== false
+    || submitted.body?.incomingOwnerNotNotified !== true || replay.response.status !== 202 || replay.body?.idempotentReplay !== true
+    || replay.body?.transferReference !== submitted.body?.transferReference || changedReplay.response.status !== 409) {
+    fail(`Exceptional submission did not create one stable normal claim or enforce request identity (${JSON.stringify({ submit: submitted.response.status,
+      state: submitted.body?.state, replay: replay.response.status, replayFlag: replay.body?.idempotentReplay, conflict: changedReplay.response.status })})`);
+  }
+  const [caseRow, claimRow, caseCountAfterSubmit, claimCountAfterSubmit, homeAfterSubmit, managerMembershipAfterSubmit] = await Promise.all([
+    prisma.exceptionalOwnershipTransfer.findUniqueOrThrow({ where: { id: submitted.body.caseId }, select: { status: true, revision: true,
+      proposedIncomingEmailCiphertext: true, claimReferenceId: true } }),
+    prisma.homeClaimReference.findUniqueOrThrow({ where: { id: submitted.body.claimReferenceId }, select: { state: true,
+      transferRecipientEmail: true, transferRecipientEmailHash: true, claimedAccountId: true } }),
+    prisma.exceptionalOwnershipTransfer.count({ where: { homeId } }),
+    prisma.homeClaimReference.count({ where: { homeId, purpose: 'OWNERSHIP_TRANSFER' } }),
+    prisma.home.findUniqueOrThrow({ where: { id: homeId }, select: { managementRevision: true } }),
+    prisma.homeMembership.findUniqueOrThrow({ where: { id: currentOwner.id }, select: { status: true, role: true } }),
+  ]);
+  if (caseRow.status !== 'SUBMITTED' || caseRow.claimReferenceId !== submitted.body.claimReferenceId || claimRow.state !== 'AVAILABLE'
+    || claimRow.transferRecipientEmail !== null || claimRow.transferRecipientEmailHash !== claimReferenceHash(`dinodia-transfer-recipient-v1:${proposedEmail}`, deliveryEnv.CLAIM_REFERENCE_PEPPER)
+    || caseRow.proposedIncomingEmailCiphertext.includes(proposedEmail) || caseCountAfterSubmit !== initialCaseCount + 1
+    || claimCountAfterSubmit !== initialClaimCount + 1 || homeAfterSubmit.managementRevision !== preview.body.managementRevision
+    || managerMembershipAfterSubmit.status !== 'ACTIVE' || managerMembershipAfterSubmit.role !== 'OWNER') {
+    fail(`Exceptional submit stored or applied prohibited authority/plaintext effects (${JSON.stringify({ case: caseRow.status, claim: claimRow.state,
+      recipientPlaintextStored: claimRow.transferRecipientEmail !== null, recipientHashBound: claimRow.transferRecipientEmailHash === claimReferenceHash(`dinodia-transfer-recipient-v1:${proposedEmail}`, deliveryEnv.CLAIM_REFERENCE_PEPPER),
+      newCases: caseCountAfterSubmit - initialCaseCount, newClaims: claimCountAfterSubmit - initialClaimCount, ownerRevisionUnchanged: homeAfterSubmit.managementRevision === preview.body.managementRevision })})`);
+  }
+
+  const cancelKey = `exceptional-cancel-${crypto.randomUUID()}`;
+  const cancelPath = `${submitPath}/${submitted.body.caseId}/cancel`;
+  const cancelBody = { expectedRevision: submitted.body.revision };
+  const cancelled = await fetchJson(cancelPath, { method: 'POST', headers: { ...rehearsalHeaders, 'idempotency-key': cancelKey }, body: JSON.stringify(cancelBody) });
+  const cancelReplay = await fetchJson(cancelPath, { method: 'POST', headers: { ...rehearsalHeaders, 'idempotency-key': cancelKey }, body: JSON.stringify(cancelBody) });
+  const cancelledClaim = await prisma.homeClaimReference.findUniqueOrThrow({ where: { id: submitted.body.claimReferenceId }, select: { state: true,
+    transferCodeHash: true, transferRecipientEmailHash: true, invalidatedAt: true } });
+  if (cancelled.response.status !== 200 || cancelled.body?.state !== 'CANCELLED' || cancelReplay.response.status !== 200
+    || cancelReplay.body?.idempotentReplay !== true || cancelledClaim.state !== 'CANCELLED' || cancelledClaim.transferCodeHash !== null
+    || cancelledClaim.transferRecipientEmailHash !== null || !cancelledClaim.invalidatedAt) {
+    fail(`Exceptional cancellation did not invalidate the claim and reconcile safely (${JSON.stringify({ cancel: cancelled.response.status,
+      replay: cancelReplay.response.status, state: cancelledClaim.state, codeCleared: cancelledClaim.transferCodeHash === null })})`);
+  }
+
+  const freshPreview = await fetchJson(previewPath, { method: 'POST', headers: rehearsalHeaders,
+    body: JSON.stringify({ proposedIncomingEmail: proposedEmail }) });
+  const secondSubmit = await fetchJson(submitPath, { method: 'POST', headers: { ...rehearsalHeaders, 'idempotency-key': `exceptional-resubmit-${crypto.randomUUID()}` },
+    body: JSON.stringify({ ...submitBody, expectedManagementRevision: freshPreview.body.managementRevision }) });
+  if (freshPreview.response.status !== 200 || freshPreview.body?.eligible !== true || secondSubmit.response.status !== 202) {
+    fail(`A cancelled exceptional case did not allow a fresh current-revision case (${JSON.stringify({ preview: freshPreview.response.status, eligible: freshPreview.body?.eligible, submit: secondSubmit.response.status })})`);
+  }
+
+  const candidateHeaders = { cookie: `dinodia_customer_session=${encodeURIComponent(fixture.managerSessionSecret)}`, 'content-type': 'application/json' };
+  const candidatePolicy = await fetchJson(`${base}/api/v2/auth/policy/acceptance`, { method: 'POST', headers: candidateHeaders,
+    body: JSON.stringify({ version: deliveryEnv.DINODIA_NATIVE_POLICY_VERSION,
+      contentSha256: sha256(deliveryEnv.DINODIA_NATIVE_POLICY_TEXT), accepted: true }) });
+  if (candidatePolicy.response.status !== 200) fail(`The verified disposable exceptional successor could not accept current policy (${candidatePolicy.response.status})`);
+  const resolveKey = `exceptional-normal-claim-${crypto.randomUUID()}`;
+  const resolutionStartedAt = new Date();
+  const resolve = await fetchJson(`${base}/api/v2/ownership-transfers/resolve`, { method: 'POST', headers: candidateHeaders,
+    body: JSON.stringify({ reference: secondSubmit.body.transferReference, idempotencyKey: resolveKey }) });
+  const resolveReplay = await fetchJson(`${base}/api/v2/ownership-transfers/resolve`, { method: 'POST', headers: candidateHeaders,
+    body: JSON.stringify({ reference: secondSubmit.body.transferReference, idempotencyKey: resolveKey }) });
+  const expectedNoticeKeys = [
+    `homeowner-removal:${currentOwner.id}:${currentOwner.accessRevision + 1}:email`,
+    `homeowner-removal:${notificationManagerMembership.id}:${notificationManagerMembership.accessRevision + 1}:email`,
+  ];
+  const [completedCase, consumedClaim, successorMembership, outgoingOwner, outgoingManager, tenantAfter, tenantGrantAfter,
+    notices, newNotices, homeAfter] = await Promise.all([
+    prisma.exceptionalOwnershipTransfer.findUniqueOrThrow({ where: { id: secondSubmit.body.caseId }, select: { status: true, revision: true, claimReferenceId: true } }),
+    prisma.homeClaimReference.findUniqueOrThrow({ where: { id: secondSubmit.body.claimReferenceId }, select: { state: true, claimedAccountId: true, consumedAt: true } }),
+    prisma.homeMembership.findUniqueOrThrow({ where: { customerAccountId_homeId: { customerAccountId: candidateAccount.id, homeId } }, select: { status: true, role: true } }),
+    prisma.homeMembership.findUniqueOrThrow({ where: { id: currentOwner.id }, select: { status: true, role: true } }),
+    prisma.homeMembership.findUnique({ where: { id: notificationManagerMembership.id }, select: { status: true, role: true } }),
+    prisma.homeMembership.findUniqueOrThrow({ where: { id: activeTenant.id }, select: { status: true, role: true } }),
+    prisma.tenantAreaGrant.findMany({ where: { membershipId: activeTenant.id, revokedAt: null }, select: { id: true } }),
+    prisma.nativeDomainOutbox.findMany({ where: { homeId, aggregateType: 'HomeownerAccessRemovalNotice', eventType: 'OWNERSHIP_TRANSFER_NOTICE',
+      idempotencyKey: { in: expectedNoticeKeys } }, select: { aggregateId: true, idempotencyKey: true, payload: true } }),
+    prisma.nativeDomainOutbox.findMany({ where: { homeId, aggregateType: 'HomeownerAccessRemovalNotice', eventType: 'OWNERSHIP_TRANSFER_NOTICE',
+      createdAt: { gte: resolutionStartedAt } }, select: { aggregateId: true } }),
+    prisma.home.findUniqueOrThrow({ where: { id: homeId }, select: { managementRevision: true } }),
+  ]);
+  const noticeRecipients = new Set(notices.map((row) => row.aggregateId));
+  const outgoingMembershipIds = new Set([currentOwner.id, notificationManagerMembership.id]);
+  const noticePayloadText = JSON.stringify(notices.map((row) => row.payload));
+  if (resolve.response.status !== 200 || resolve.body?.state !== 'TRANSFERRED' || resolveReplay.response.status !== 200
+    || resolveReplay.body?.idempotentReplay !== true || completedCase.status !== 'COMPLETED'
+    || consumedClaim.state !== 'CONSUMED' || consumedClaim.claimedAccountId !== candidateAccount.id || !consumedClaim.consumedAt
+    || successorMembership.status !== 'ACTIVE' || successorMembership.role !== 'OWNER'
+    || outgoingOwner.status !== 'REMOVED' || (outgoingManager && outgoingManager.status !== 'REMOVED')
+    || tenantAfter.status !== 'ACTIVE' || tenantAfter.role !== 'TENANT' || tenantGrantAfter.length === 0
+    || [...outgoingMembershipIds].some((id) => !noticeRecipients.has(id)) || notices.length !== expectedNoticeKeys.length
+    || newNotices.some((row) => !outgoingMembershipIds.has(row.aggregateId))
+    || noticePayloadText.includes(proposedEmail) || noticePayloadText.includes(fixture.managerEmail)
+    || homeAfter.managementRevision <= freshPreview.body.managementRevision) {
+    fail(`Exceptional successor did not complete through the normal claim with scoped cleanup and notices (${JSON.stringify({ resolve: resolve.response.status,
+      replay: resolveReplay.response.status, case: completedCase.status, claim: consumedClaim.state, successorRole: successorMembership.role,
+      outgoingOwner: outgoingOwner.status, outgoingManager: outgoingManager.status, tenant: tenantAfter.status,
+      tenantGrantCount: tenantGrantAfter.length, noticeCount: noticeRecipients.size })})`);
+  }
+  console.log('[stage9:integration] PASS: exceptional Company Portal preview/submit/cancel is CXO/SOM-only, disabled by default, tenant/current-owner successor blocked, idempotent and privacy-preserving; approved rehearsal resolves through the existing verified claim flow with scoped notices, tenant preservation and no direct ownership mutation');
+}
+
+async function fullHomeDeregistrationChecks(deliveryEnv) {
+  const base = `http://127.0.0.1:${appPort}`;
+  const fixture = customerFixture;
+  if (!fixture) fail('Full-home deregistration rehearsal requires the disposable multi-home customer fixture');
+  await stopPlatform();
+  await startPlatform(deliveryEnv);
+  const homeId = fixture.homeOneId;
+  const headers = { cookie: `dinodia_customer_session=${encodeURIComponent(fixture.propertySessionSecret)}`,
+    'x-dinodia-home-id': homeId, 'content-type': 'application/json' };
+  const ownerRelationshipAtStart = await prisma.homeMembership.findUnique({ where: { id: fixture.propertyMembershipId }, select: { homeId: true, status: true, role: true, customerAccountId: true } });
+  const owner = await prisma.homeMembership.findUniqueOrThrow({ where: { id: fixture.propertyMembershipId },
+    select: { id: true, status: true, role: true, customerAccountId: true } });
+  if (owner.status !== 'ACTIVE' || owner.role !== 'OWNER' || owner.customerAccountId !== fixture.propertyAccountId) fail('Deregistration test must use the real disposable current owner');
+  // The earlier transfer rehearsal intentionally removes this account from
+  // Home 2. Re-establish a real independent relationship for the deletion
+  // preservation assertion; otherwise account cleanup correctly deletes the
+  // now-orphaned account and the test cannot prove cross-home survival.
+  await prisma.homeMembership.update({ where: { customerAccountId_homeId: {
+    customerAccountId: fixture.propertyAccountId, homeId: fixture.homeTwoId,
+  } }, data: { role: 'PROPERTY_MANAGER', status: 'ACTIVE', removedAt: null,
+    removalReason: null, accessRevision: { increment: 1 } } });
+  await fetchJson(`${base}/api/v2/auth/policy/acceptance`, { method: 'POST', headers,
+    body: JSON.stringify({ version: deliveryEnv.DINODIA_NATIVE_POLICY_VERSION,
+      contentSha256: sha256(deliveryEnv.DINODIA_NATIVE_POLICY_TEXT), accepted: true }) });
+
+  // Prove the rehearsal-only switch does not change the safe default.
+  const beforeDisabled = await prisma.home.findUniqueOrThrow({ where: { id: homeId }, select: { lifecycle: true, managementRevision: true } });
+  const disabled = await fetchJson(`${base}/api/v2/homes/${homeId}/deregister-full-home/commit`, { method: 'POST', headers,
+    body: JSON.stringify({ expectedManagementRevision: beforeDisabled.managementRevision, confirmation: 'DEREGISTER FULL HOME', proof: 'x'.repeat(64), idempotencyKey: `dereg-disabled-${crypto.randomUUID()}` }) });
+  if (disabled.response.status !== 503 || disabled.body?.error?.code !== 'FEATURE_NOT_ENABLED') fail(`Deregistration commit was not fail-closed before the explicit disposable rehearsal switch (${disabled.response.status}/${disabled.body?.error?.code ?? 'no-code'}/${disabled.body?.error?.message ?? 'no-message'}; owner=${JSON.stringify(ownerRelationshipAtStart)})`);
+
+  const preview = await fetchJson(`${base}/api/v2/homes/${homeId}/deregister-full-home/preview`, { method: 'POST', headers, body: '{}' });
+  if (preview.response.status !== 200 || preview.body?.state !== 'PREVIEW' || preview.body?.homeId !== homeId) fail('Current owner could not load the bounded read-only deregistration consequences');
+  const crossHomePreview = await fetchJson(`${base}/api/v2/homes/${homeId}/deregister-full-home/preview`, { method: 'POST',
+    headers: { ...headers, 'x-dinodia-home-id': fixture.homeTwoId }, body: '{}' });
+  if (crossHomePreview.response.status !== 404) fail('Wrong selected Home disclosed a deregistration preview');
+
+  const before = await prisma.home.findUniqueOrThrow({ where: { id: homeId }, select: { lifecycle: true, installationStatus: true,
+    managementRevision: true, authorityGeneration: true, customerDataGeneration: true, activeHubInstallationId: true,
+    addressLine1: true, postcode: true, timezone: true, areas: { select: { id: true } } } });
+  const inProgressBefore = await prisma.companyOperationalWorkItem.findMany({ where: { homeId, state: 'IN_PROGRESS' }, orderBy: { id: 'asc' }, select: { id: true, state: true } });
+  const grantArea = before.areas[0]?.id;
+  if (!grantArea) fail('Deregistration rehearsal Home must preserve at least one original Area');
+  await prisma.homeDocument.upsert({ where: { homeId_kind: { homeId, kind: 'FLOORPLAN' } }, create: {
+    homeId, kind: 'FLOORPLAN', document: { version: 1, areas: [{ areaId: grantArea, x: 0, y: 0, width: 8, height: 8 }] }, revision: 1,
+  }, update: { document: { version: 1, areas: [{ areaId: grantArea, x: 0, y: 0, width: 8, height: 8 }] }, revision: { increment: 1 } } });
+  await prisma.area.update({ where: { id: grantArea }, data: { overrideName: 'Disposable Household Rename' } });
+  const permanent = await prisma.nativeDevice.create({ data: { homeId, hubInstallationId: fixture.hubOneId,
+    osDeviceId: `stage9-deregister-permanent-${crypto.randomUUID()}`, originalName: 'Installer permanent light',
+    overrideName: 'Disposable Device Rename', technicalLabel: 'light', managementClass: 'PROPERTY_DEVICE',
+    deviceType: 'light', protocol: 'zigbee', lifecycle: 'INSTALLED', descriptorRevision: 1 } });
+  const tenantDevice = await prisma.nativeDevice.create({ data: { homeId, hubInstallationId: fixture.hubOneId,
+    osDeviceId: `stage9-deregister-private-${crypto.randomUUID()}`, originalName: 'Disposable tenant private device',
+    technicalLabel: 'tenant_device', managementClass: 'TENANT_DEVICE', ownerMembershipId: fixture.tenantMembershipId,
+    deviceType: 'light', protocol: 'test', lifecycle: 'DISCOVERED', descriptorRevision: 1 } });
+  await prisma.deviceAreaAssignment.createMany({ data: [permanent, tenantDevice].map((device) => ({
+    homeId, deviceId: device.id, areaId: grantArea, source: 'STAGE9_DEREGISTRATION_REHEARSAL', actorType: 'SYSTEM',
+  })) });
+  await prisma.nativeDevice.update({ where: { id: tenantDevice.id }, data: { lifecycle: 'INSTALLED' } });
+
+  const enabledEnv = { ...deliveryEnv, STAGE13_DEREGISTRATION_REHEARSAL: 'true' };
+  await stopPlatform();
+  await startPlatform(enabledEnv);
+  const managementRevision = before.managementRevision;
+  const confirmation = 'DEREGISTER FULL HOME';
+  const proofValue = { confirmation, expectedManagementRevision: managementRevision };
+  const targetIds = [homeId, owner.id];
+  const challenge = await fetchJson(`${base}/api/v2/security/step-up/challenge`, { method: 'POST', headers,
+    body: JSON.stringify({ operationKind: 'home.deregister', targetIds, value: proofValue }) });
+  if (challenge.response.status !== 200 || !challenge.body?.challengeId) fail(`Deregistration did not issue a server-bound step-up challenge (${challenge.response.status}/${challenge.body?.error?.code ?? 'none'})`);
+  const signature = crypto.sign(null, stepUpChallengeMessage({ challengeId: challenge.body.challengeId, nonce: challenge.body.nonce,
+    operationDigest: challenge.body.operationDigest }), crypto.createPrivateKey(fixture.propertyTrustedPhonePrivateKey)).toString('base64url');
+  const issued = await fetchJson(`${base}/api/v2/security/step-up/issue`, { method: 'POST', headers,
+    body: JSON.stringify({ challengeId: challenge.body.challengeId, nonce: challenge.body.nonce, deviceSignature: signature }) });
+  if (issued.response.status !== 200 || typeof issued.body?.proof !== 'string') fail('Fresh trusted-phone proof could not be issued for exact full-home deregistration');
+  const commitPath = `${base}/api/v2/homes/${homeId}/deregister-full-home/commit`;
+  const badProof = await fetchJson(commitPath, { method: 'POST', headers, body: JSON.stringify({ expectedManagementRevision: managementRevision,
+    confirmation, proof: `${issued.body.proof}x`, idempotencyKey: `dereg-bad-proof-${crypto.randomUUID()}` }) });
+  const afterDenial = await prisma.home.findUniqueOrThrow({ where: { id: homeId }, select: { lifecycle: true, managementRevision: true, activeHubInstallationId: true } });
+  if (badProof.response.status !== 403 || JSON.stringify(afterDenial) !== JSON.stringify({
+    lifecycle: before.lifecycle, managementRevision: before.managementRevision, activeHubInstallationId: before.activeHubInstallationId,
+  })) fail('Mismatched deregistration proof changed Home authority or lifecycle state');
+
+  const idempotencyKey = `dereg-valid-${crypto.randomUUID()}`;
+  const proofNonceHash = sha256(issued.body.proof);
+  const deregistrationKeyHash = sha256(`${fixture.propertyAccountId}:${homeId}:${idempotencyKey}`);
+  const membershipsBeforeInjectedFailure = await prisma.homeMembership.findMany({ where: { homeId }, orderBy: { id: 'asc' }, select: { id: true, status: true, role: true } });
+  const exceptionalTransferCasesBeforeDeregistration = await prisma.exceptionalOwnershipTransfer.count({ where: { homeId } });
+  const cleanupOutboxBeforeFailure = await prisma.nativeDomainOutbox.count({ where: {
+    homeId, aggregateType: 'FullHomeDeregistrationAccountCleanup', eventType: 'FULL_HOME_ACCOUNT_CLEANUP',
+  } });
+  const fullHomeAuditBeforeFailure = await prisma.auditEvent.count({ where: { homeId, action: 'full_home_deregistration_started' } });
+  await stopPlatform();
+  await startPlatform({ ...enabledEnv, STAGE9_DEREG_TEST_FAILPOINT: 'after_private_data' });
+  const injectedFailure = await fetchJson(commitPath, { method: 'POST', headers, body: JSON.stringify({ expectedManagementRevision: managementRevision,
+    confirmation, proof: issued.body.proof, idempotencyKey }) });
+  const [homeAfterInjectedFailure, membershipsAfterInjectedFailure, privateAfterInjectedFailure, floorplanAfterInjectedFailure,
+    proofAfterInjectedFailure, cleanupOutboxAfterFailure, fullHomeAuditAfterFailure, receiptAfterFailure,
+    exceptionalTransferCasesAfterFailure] = await Promise.all([
+    prisma.home.findUniqueOrThrow({ where: { id: homeId }, select: { lifecycle: true, managementRevision: true, activeHubInstallationId: true } }),
+    prisma.homeMembership.findMany({ where: { homeId }, orderBy: { id: 'asc' }, select: { id: true, status: true, role: true } }),
+    prisma.nativeDevice.findUnique({ where: { id: tenantDevice.id }, select: { id: true } }),
+    prisma.homeDocument.findUnique({ where: { homeId_kind: { homeId, kind: 'FLOORPLAN' } }, select: { id: true } }),
+    prisma.stepUpAuthorization.findFirst({ where: { customerAccountId: fixture.propertyAccountId, nonceHash: proofNonceHash }, select: { consumedAt: true } }),
+    prisma.nativeDomainOutbox.count({ where: { homeId, aggregateType: 'FullHomeDeregistrationAccountCleanup', eventType: 'FULL_HOME_ACCOUNT_CLEANUP' } }),
+    prisma.auditEvent.count({ where: { homeId, action: 'full_home_deregistration_started' } }),
+    prisma.idempotencyRecord.findUnique({ where: { namespace_keyHash: { namespace: 'homeowner-full-home-deregistration:v1', keyHash: deregistrationKeyHash } }, select: { keyHash: true } }),
+    prisma.exceptionalOwnershipTransfer.count({ where: { homeId } }),
+  ]);
+  const membershipsWereRolledBack = JSON.stringify(membershipsAfterInjectedFailure) === JSON.stringify(membershipsBeforeInjectedFailure);
+  if (injectedFailure.response.status !== 500 || injectedFailure.body?.error?.code !== 'INTERNAL_ERROR'
+    || JSON.stringify(homeAfterInjectedFailure) !== JSON.stringify({ lifecycle: before.lifecycle, managementRevision: before.managementRevision, activeHubInstallationId: before.activeHubInstallationId })
+    || !membershipsWereRolledBack || !privateAfterInjectedFailure || !floorplanAfterInjectedFailure
+    || proofAfterInjectedFailure?.consumedAt || cleanupOutboxAfterFailure !== cleanupOutboxBeforeFailure
+    || fullHomeAuditAfterFailure !== fullHomeAuditBeforeFailure || receiptAfterFailure
+    || exceptionalTransferCasesAfterFailure !== exceptionalTransferCasesBeforeDeregistration) {
+    fail(`The late transaction failpoint did not roll back the entire disposable Home transition (${JSON.stringify({ status: injectedFailure.response.status,
+      code: injectedFailure.body?.error?.code, homeUnchanged: JSON.stringify(homeAfterInjectedFailure) === JSON.stringify({ lifecycle: before.lifecycle, managementRevision: before.managementRevision, activeHubInstallationId: before.activeHubInstallationId }),
+      membershipsUnchanged: membershipsWereRolledBack, privateRowPreserved: Boolean(privateAfterInjectedFailure), floorplanPreserved: Boolean(floorplanAfterInjectedFailure),
+      proofStillUnused: !proofAfterInjectedFailure?.consumedAt, cleanupRows: cleanupOutboxAfterFailure, auditRows: fullHomeAuditAfterFailure, receiptCreated: Boolean(receiptAfterFailure) })})`);
+  }
+  await stopPlatform();
+  await startPlatform(enabledEnv);
+  const survivingOwnerLogin = await fetchJson(`${base}/api/v2/mobile/session`, { method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ email: fixture.propertyEmail, password: fixture.propertyPassword,
+      deviceInstallationId: fixture.propertyInstallationId, publicKey: fixture.propertyPublicKey,
+      deviceName: 'Disposable surviving-property verification phone', model: 'integration-test', osFamily: 'test', osVersion: 'test' }) });
+  if (survivingOwnerLogin.response.status !== 200 || typeof survivingOwnerLogin.body?.accessToken !== 'string') {
+    fail(`Could not establish a real account-global session before testing preservation of the unrelated property (${survivingOwnerLogin.response.status})`);
+  }
+  const committed = await fetchJson(commitPath, { method: 'POST', headers, body: JSON.stringify({ expectedManagementRevision: managementRevision,
+    confirmation, proof: issued.body.proof, idempotencyKey }) });
+  if (committed.response.status !== 202 || committed.body?.accountCleanupState !== 'PENDING'
+    || committed.body?.accountCleanupProcessed !== 1 || committed.body?.accountsQueuedForCleanup < 2) {
+    fail(`Full-home deregistration did not commit bounded, restartable account cleanup checkpoints (${JSON.stringify({ status: committed.response.status,
+      state: committed.body?.accountCleanupState, processed: committed.body?.accountCleanupProcessed, queued: committed.body?.accountsQueuedForCleanup })})`);
+  }
+  // A process restart must not lose the remaining per-account checkpoints. The
+  // already-authorized two-minute operations dispatch drains them, without a
+  // second scheduler or a home/customer mutation from the caller.
+  await stopPlatform();
+  await startPlatform(enabledEnv);
+  const cleanupDispatch = await fetchJson(`${base}/api/cron/native-operations`, { method: 'POST',
+    headers: { authorization: `Bearer ${deliveryEnv.CRON_SECRET}` } });
+  const deregistrationCheckpointRows = await prisma.nativeDomainOutbox.findMany({ where: {
+    homeId, aggregateType: 'FullHomeDeregistrationAccountCleanup', eventType: 'FULL_HOME_ACCOUNT_CLEANUP',
+  }, orderBy: [{ createdAt: 'asc' }, { id: 'asc' }], select: { aggregateId: true, state: true, attempts: true } });
+  if (cleanupDispatch.response.status !== 200 || cleanupDispatch.body?.homeDeregistrationAccountCleanup?.pending !== 0
+    || cleanupDispatch.body?.homeDeregistrationAccountCleanup?.failed !== 0
+    || deregistrationCheckpointRows.length < 2 || deregistrationCheckpointRows.some((row) => row.state !== 'DELIVERED')) {
+    fail(`The existing operations dispatch did not resume and finish the durable account-cleanup tail after server restart (${JSON.stringify({ status: cleanupDispatch.response.status,
+      cleanup: cleanupDispatch.body?.homeDeregistrationAccountCleanup, checkpoints: deregistrationCheckpointRows.map(({ state, attempts }) => ({ state, attempts })) })})`);
+  }
+  const [homeAfter, hubAfter, ownerAfter, managerAfter, tenantAfter, permanentAfter, privateAfter, floorplanAfter,
+    areaAfter, otherHomeMembership, ownerOtherHomeContext, closedTickets, inProgressAfter,
+    exceptionalTransferCasesAfter, fullHomeDeregistrationAudit] = await Promise.all([
+    prisma.home.findUniqueOrThrow({ where: { id: homeId }, select: { lifecycle: true, managementRevision: true, authorityGeneration: true,
+      customerDataGeneration: true, activeHubInstallationId: true, addressLine1: true, postcode: true, timezone: true, areas: { select: { id: true } } } }),
+    prisma.hubInstallation.findUniqueOrThrow({ where: { id: fixture.hubOneId }, select: { lifecycleStatus: true, state: true, cleanupState: true, cleanupGeneration: true, accessPolicyRevision: true } }),
+    prisma.homeMembership.findUniqueOrThrow({ where: { id: fixture.propertyMembershipId }, select: { status: true, role: true } }),
+    prisma.homeMembership.findUniqueOrThrow({ where: { id: fixture.managerMembershipId }, select: { status: true, role: true } }),
+    prisma.homeMembership.findUnique({ where: { id: fixture.tenantMembershipId }, select: { status: true, role: true } }),
+    prisma.nativeDevice.findUnique({ where: { id: permanent.id }, select: { id: true, managementClass: true, overrideName: true, lifecycle: true } }),
+    prisma.nativeDevice.findUnique({ where: { id: tenantDevice.id }, select: { id: true } }),
+    prisma.homeDocument.findUnique({ where: { homeId_kind: { homeId, kind: 'FLOORPLAN' } }, select: { id: true } }),
+    prisma.area.findUniqueOrThrow({ where: { id: grantArea }, select: { id: true, overrideName: true, status: true } }),
+    prisma.homeMembership.findUniqueOrThrow({ where: { customerAccountId_homeId: { customerAccountId: fixture.propertyAccountId, homeId: fixture.homeTwoId } }, select: { status: true, role: true } }),
+    fetchJson(`${base}/api/v2/homes/${fixture.homeTwoId}/homeowner-context`, { headers: { authorization: `Bearer ${survivingOwnerLogin.body.accessToken}`, 'x-dinodia-home-id': fixture.homeTwoId } }),
+    prisma.supportTicket.count({ where: { homeId, status: 'CLOSED', customerAccountId: null, selectedMembershipId: null, description: '[Closed and redacted after full-home deregistration]' } }),
+    prisma.companyOperationalWorkItem.findMany({ where: { homeId, state: 'IN_PROGRESS' }, orderBy: { id: 'asc' }, select: { id: true, state: true } }),
+    prisma.exceptionalOwnershipTransfer.count({ where: { homeId } }),
+    prisma.auditEvent.findFirst({ where: { homeId, action: 'full_home_deregistration_started' }, orderBy: { occurredAt: 'desc' }, select: { metadata: true } }),
+  ]);
+  const inaccessibleDeregisteredHome = await fetchJson(`${base}/api/v2/homes/${homeId}/homeowner-context`, { headers });
+  if (committed.response.status !== 202 || committed.body?.state !== 'WAITING_FOR_HUB_CLEANUP'
+    || homeAfter.lifecycle !== 'WAITING_FOR_HUB_CLEANUP' || homeAfter.managementRevision !== managementRevision + 1
+    || homeAfter.authorityGeneration !== before.authorityGeneration + 1 || homeAfter.customerDataGeneration !== before.customerDataGeneration + 1
+    || homeAfter.activeHubInstallationId !== fixture.hubOneId || homeAfter.addressLine1 !== before.addressLine1
+    || homeAfter.postcode !== before.postcode || homeAfter.timezone !== before.timezone
+    || JSON.stringify(homeAfter.areas.map((row) => row.id).sort()) !== JSON.stringify(before.areas.map((row) => row.id).sort())
+    || hubAfter.lifecycleStatus !== 'ACTIVE' || hubAfter.state !== 'ACTIVE' || hubAfter.cleanupState !== 'WAITING_FOR_FULL_HOME_DEREGISTRATION'
+    || hubAfter.cleanupGeneration < 1 || ownerAfter.status !== 'REMOVED' || managerAfter.status !== 'REMOVED'
+    || (tenantAfter !== null && tenantAfter.status !== 'REMOVED')
+    || exceptionalTransferCasesAfter !== 0
+    || closedTickets < 1
+    || (fullHomeDeregistrationAudit?.metadata && fullHomeDeregistrationAudit.metadata.purgedExceptionalTransferCaseCount !== exceptionalTransferCasesBeforeDeregistration)
+    || !permanentAfter || permanentAfter.managementClass !== 'PROPERTY_DEVICE' || permanentAfter.overrideName !== null
+    || privateAfter !== null || floorplanAfter !== null || areaAfter.overrideName !== null || areaAfter.status !== 'ACTIVE'
+    || otherHomeMembership.status !== 'ACTIVE' || otherHomeMembership.role !== 'PROPERTY_MANAGER'
+    || ownerOtherHomeContext.response.status !== 200 || inaccessibleDeregisteredHome.response.status !== 404
+    || inProgressAfter.length !== inProgressBefore.length || inProgressAfter.some((item, index) => item.id !== inProgressBefore[index]?.id || item.state !== 'IN_PROGRESS')) {
+    fail(`Disposable full-home deregistration did not preserve physical infrastructure, pending hub cleanup, unrelated relationships and in-progress work (${JSON.stringify({ status: committed.response.status,
+      errorCode: committed.body?.error?.code, errorMessage: committed.body?.error?.message,
+      state: committed.body?.state, lifecycle: homeAfter.lifecycle, hubCleanup: hubAfter.cleanupState, owner: ownerAfter.status,
+      manager: managerAfter.status, tenant: tenantAfter?.status ?? 'account-cleanup-removed-row', redactedSupportTickets: closedTickets,
+      permanentPreserved: Boolean(permanentAfter), privateRemoved: privateAfter === null,
+      floorplanCleared: floorplanAfter === null, otherHome: `${otherHomeMembership.status}/${otherHomeMembership.role}`, otherHomeRead: ownerOtherHomeContext.response.status,
+      otherHomeError: ownerOtherHomeContext.body?.error?.code, blockedOriginalHomeRead: inaccessibleDeregisteredHome.response.status,
+      inProgressPreserved: inProgressAfter.length === inProgressBefore.length })})`);
+  }
+  console.log('[stage9:integration] PASS: actual loopback full-home deregistration preview/step-up/commit; late failure rolled all rows and proof use back; bounded account cleanup resumed through the existing operations dispatch after restart; current owner/managers/tenants lost Home authority; physical identity/address/areas/hub/tunnel and in-progress work were preserved; private data cleared; unrelated Home access remained; hub enforcement honestly pending');
+}
+
 async function pendingInvitationRouteChecks(deliveryEnv) {
   const base = `http://127.0.0.1:${appPort}`;
   if (!customerFixture) fail('Pending invitation route checks require the disposable two-home owner fixture');
@@ -3193,10 +3627,11 @@ async function pendingInvitationRouteChecks(deliveryEnv) {
   const deferredDeregPreview = await fetchJson(`${base}/api/v2/homes/${inviter.homeId}/deregister-full-home/preview`, { method: 'POST', headers: selectedHomeHeaders, body: JSON.stringify({}) });
   const deferredDeregCommit = await fetchJson(`${base}/api/v2/homes/${inviter.homeId}/deregister-full-home/commit`, { method: 'POST', headers: selectedHomeHeaders, body: JSON.stringify({ idempotencyKey: `stage9-deferred-deregister-${crypto.randomUUID()}` }) });
   const homeLifecycleAfterDeferredActions = await prisma.home.findUniqueOrThrow({ where: { id: inviter.homeId }, select: { lifecycle: true, managementRevision: true, activeHubInstallationId: true, areas: { select: { id: true } } } });
-  if (deferredDeregPreview.response.status !== 503 || deferredDeregPreview.body?.error?.code !== 'FEATURE_NOT_ENABLED'
+  if (deferredDeregPreview.response.status !== 200 || deferredDeregPreview.body?.state !== 'PREVIEW'
+    || deferredDeregPreview.body?.homeId !== inviter.homeId || deferredDeregPreview.body?.effects?.permanentDevicesPreserved < 1
     || deferredDeregCommit.response.status !== 503 || deferredDeregCommit.body?.error?.code !== 'FEATURE_NOT_ENABLED'
     || JSON.stringify(homeLifecycleAfterDeferredActions) !== JSON.stringify(homeLifecycleBeforeDeferredActions)) {
-    fail(`Full-home deregistration did not remain unavailable without changing Home, membership, Area, hub or lifecycle authority before Stage 13 (${JSON.stringify({ previewStatus: deferredDeregPreview.response.status, previewCode: deferredDeregPreview.body?.error?.code ?? null, commitStatus: deferredDeregCommit.response.status, commitCode: deferredDeregCommit.body?.error?.code ?? null, homeUnchanged: JSON.stringify(homeLifecycleAfterDeferredActions) === JSON.stringify(homeLifecycleBeforeDeferredActions) })})`);
+    fail(`Full-home deregistration preview or fail-closed commit did not preserve authority before Stage 13 (${JSON.stringify({ previewStatus: deferredDeregPreview.response.status, previewCode: deferredDeregPreview.body?.error?.code ?? null, commitStatus: deferredDeregCommit.response.status, commitCode: deferredDeregCommit.body?.error?.code ?? null, homeUnchanged: JSON.stringify(homeLifecycleAfterDeferredActions) === JSON.stringify(homeLifecycleBeforeDeferredActions) })})`);
   }
   const tenantsList = await fetchJson(`${base}/api/v2/homes/${inviter.homeId}/tenants`, { headers: selectedHomeHeaders });
   const deviceInformation = await fetchJson(`${base}/api/v2/homes/${inviter.homeId}/devices/${homeownerPropertyDevice.id}/information`, { headers: selectedHomeHeaders });
@@ -6217,6 +6652,8 @@ try {
     await operatorMutationChecks();
     await tenantMembershipRemovalChecks();
     await ownershipTransferChecks(deliveryEnv);
+    await exceptionalOwnershipTransferChecks(deliveryEnv);
+    await fullHomeDeregistrationChecks(deliveryEnv);
   }
   const childTargets = verifyChildOutboundTargets();
   console.log(`[stage1:integration] PASS: live Platform routes, locked Dinodia OS HTTP, browser isolation, authenticated native WebSocket command authorization and denial exercised against disposable PostgreSQL; parent=${[...outboundTargets].sort().join(',')}; children=${childTargets.join(',')}`);

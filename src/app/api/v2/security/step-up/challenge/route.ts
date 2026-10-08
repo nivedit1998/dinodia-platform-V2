@@ -98,6 +98,26 @@ export async function POST(request: Request) {
         throw new Stage1AuthError(400, 'step_up_fields_invalid', 'A supported transfer action is required');
       }
     }
+    if (operationKind === 'home.deregister') {
+      const deregistrationValue = value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null;
+      const expectedManagementRevision = Number(deregistrationValue?.expectedManagementRevision);
+      if (customer.role !== 'OWNER' || targetIds.length !== 2 || targetIds[0] !== customer.homeId
+        || targetIds[1] !== customer.membershipId || !deregistrationValue
+        || Object.keys(deregistrationValue).sort().join(',') !== 'confirmation,expectedManagementRevision'
+        || deregistrationValue.confirmation !== 'DEREGISTER FULL HOME'
+        || !Number.isSafeInteger(expectedManagementRevision) || expectedManagementRevision < 1) {
+        throw new Stage1AuthError(403, 'step_up_operation_invalid', 'Only the current homeowner can confirm full-home deregistration');
+      }
+      const [home, owner] = await Promise.all([
+        prisma.home.findUnique({ where: { id: customer.homeId }, select: { lifecycle: true, installationStatus: true, managementRevision: true } }),
+        prisma.homeMembership.findFirst({ where: { id: customer.membershipId, customerAccountId: customer.id,
+          homeId: customer.homeId, role: 'OWNER', status: 'ACTIVE' }, select: { id: true } }),
+      ]);
+      if (!home || home.lifecycle !== 'ACTIVE' || home.installationStatus !== 'COMPLETE'
+        || home.managementRevision !== expectedManagementRevision || !owner) {
+        throw new Stage1AuthError(409, 'REVISION_CONFLICT', 'The Home changed. Refresh before confirming deregistration.');
+      }
+    }
     if (operationKind === 'device_sensitive_command' || operationKind === 'heating_sensitive_command') {
       assertCustomerCanCommand(customer);
       if (targetIds.length !== 1) throw new Stage1AuthError(400, 'step_up_target_invalid', 'A device step-up must target one current control');

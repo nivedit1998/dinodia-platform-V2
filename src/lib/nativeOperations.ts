@@ -5,6 +5,7 @@ import { reconcileCredentialLifecycle } from './hubOperatorCredentials';
 import { releaseExpiredClaim } from './stage1ClaimContract';
 import { createPropertySupportNotifications } from './supportNotifications';
 import { dispatchInstallationRequestNotifications } from './installationRequestDelivery';
+import { resumeHomeDeregistrationAccountCleanup, type HomeDeregistrationCleanupResult } from './homeDeregistrationCleanup';
 
 export const NATIVE_OPERATION_BATCH_LIMIT = 100;
 export const NATIVE_DISPATCH_LEASE_MS = 120_000;
@@ -55,9 +56,10 @@ export async function runNativeOperations(now = new Date()) {
     completionAccepted: 0, completionDeferred: 0, completionSuppressed: 0, pushAccepted: 0, pushDeferred: 0,
     pushFailed: 0, pushSuppressed: 0, accessRemovalAccepted: 0, accessRemovalDeferred: 0,
     accessRemovalFailed: 0, accessRemovalSuppressed: 0, accessRemovalExpired: 0 };
+  let homeDeregistrationAccountCleanup: HomeDeregistrationCleanupResult = { evaluated: 0, deferred: 0, failed: 0, pending: 0 };
   const failures: string[] = [];
   const isolate = async (taskId: string, run: () => Promise<void>) => {
-    try { await run(); } catch { failures.push(taskId); }
+    try { await run(); } catch { if (!failures.includes(taskId)) failures.push(taskId); }
   };
   await isolate('operator_credential_lifecycle', async () => { await reconcileCredentialLifecycle(now); });
   await isolate('support_expiry_and_revocation', async () => {
@@ -78,11 +80,18 @@ export async function runNativeOperations(now = new Date()) {
     }
     installationDelivery = await dispatchInstallationRequestNotifications(now);
   });
+  // Resume full-home cleanup under the existing two-minute operations task;
+  // this introduces no additional cron or scheduler and remains isolated from
+  // the independent support-email dispatcher above.
+  await isolate('support_expiry_and_revocation', async () => {
+    homeDeregistrationAccountCleanup = await resumeHomeDeregistrationAccountCleanup(now, { limit: 24 });
+  });
   await isolate('claim_reservation_expiry', async () => {
     const claims = await prisma.homeClaimReservation.findMany({ where: { state: 'ACTIVE', expiresAt: { lte: now } }, orderBy: { expiresAt: 'asc' }, take: NATIVE_OPERATION_BATCH_LIMIT, select: { id: true } });
     for (const claim of claims) if ((await releaseExpiredClaim(claim.id, {}, now)).released) releasedClaims += 1;
   });
-  return { tasks: taskIds, expiredSupport: expiredSupportCount, expiredRequests: expiredRequestCount, releasedClaims, installationDelivery, failedTasks: failures };
+  return { tasks: taskIds, expiredSupport: expiredSupportCount, expiredRequests: expiredRequestCount, releasedClaims,
+    homeDeregistrationAccountCleanup, installationDelivery, failedTasks: failures };
 }
 
 export async function runNativeMaintenance(now = new Date()) {
@@ -93,7 +102,12 @@ export async function runNativeMaintenance(now = new Date()) {
     data: { leaseOwner: null, leaseExpiresAt: null },
   });
   const receipts = await prisma.hubSyncReceipt.deleteMany({ where: { expiresAt: { lte: now } } });
-  return { tasks: taskIds, expiredDispatcherLeases: leases.count, expiredSyncReceipts: receipts.count };
+  const deregistrationCleanup = await prisma.nativeDomainOutbox.deleteMany({ where: {
+    aggregateType: 'FullHomeDeregistrationAccountCleanup', eventType: 'FULL_HOME_ACCOUNT_CLEANUP',
+    state: { in: ['DELIVERED', 'FAILED', 'CANCELLED'] }, expiresAt: { lte: now },
+  } });
+  return { tasks: taskIds, expiredDispatcherLeases: leases.count, expiredSyncReceipts: receipts.count,
+    expiredDeregistrationCleanupReceipts: deregistrationCleanup.count };
 }
 
 const taskIdsByDispatcher = {

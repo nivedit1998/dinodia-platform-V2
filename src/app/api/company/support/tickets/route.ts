@@ -16,6 +16,8 @@ export async function GET(request: Request) {
     const accessRequests = await prisma.supportAccessRequest.findMany({ where: { ticketId: { in: tickets.map((ticket) => ticket.id) } }, orderBy: { createdAt: 'desc' }, take: 500, select: { id: true, ticketId: true, status: true, requestedScope: true, createdAt: true } });
     const requestsByTicket = new Map<string, typeof accessRequests>();
     for (const requestRow of accessRequests) requestsByTicket.set(requestRow.ticketId, [...(requestsByTicket.get(requestRow.ticketId) || []), requestRow]);
-    return NextResponse.json({ ok: true, tickets: tickets.map((ticket) => ({ ...ticket, accessRequests: requestsByTicket.get(ticket.id) || [] })) }, { headers: { 'Cache-Control': 'no-store', Pragma: 'no-cache' } });
+    return NextResponse.json({ ok: true, employeeRole: employee.role,
+      tickets: tickets.map((ticket) => ({ ...ticket, accessRequests: requestsByTicket.get(ticket.id) || [] })) },
+    { headers: { 'Cache-Control': 'no-store', Pragma: 'no-cache' } });
   } catch (error) { return authErrorResponse(error); }
 }

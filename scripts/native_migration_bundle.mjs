@@ -10,6 +10,7 @@ export const STAGE6_CUSTOMER_MIGRATIONS = Object.freeze([
 ]);
 
 export const STAGE8_COMMISSIONING_MIGRATION = '20261006180000_stage8_commissioning_and_installation';
+export const STAGE9_DEREGISTRATION_GUARD_MIGRATION = '20261008100000_stage9_deregister_redacted_support_guard';
 
 export function migrationBundleIdentity(names, checksums) {
   const migrations = [...new Set(names)].sort().map((name) => {

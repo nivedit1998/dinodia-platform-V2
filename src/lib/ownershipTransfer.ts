@@ -10,6 +10,8 @@ import { sha256 } from '@/lib/stage1Crypto';
 import { consumeSignedClaimResolverProof } from '@/lib/stage1ClaimResolver';
 import { serializableTransaction } from '@/lib/serializableTransaction';
 import { cleanupCustomerAccountIfOrphaned } from '@/lib/customerRelationshipCleanup';
+import { transferRecipientHash, transferReferenceForClaim } from '@/lib/homeTransferIdentity';
+import { queueHomeownerAccessRemovalNotices } from '@/lib/homeownerAccessRemovalNotices';
 
 const START_NS = 'customer-home-transfer-start';
 const CANCEL_NS = 'customer-home-transfer-cancel';
@@ -24,23 +26,6 @@ export type TransferPrincipal = {
   credentialKind: 'account_access' | 'account_refresh'; securityVersion: number;
   trustedDeviceSessionVersion: number; policyRevision: number;
 };
-
-function pepper(): Buffer {
-  const value = String(process.env.CLAIM_REFERENCE_PEPPER ?? '');
-  if (!value) throw new Stage1AuthError(503, 'claim_reference_unconfigured', 'Transfer authority is not configured');
-  return Buffer.from(value, 'utf8');
-}
-
-/** Stable, unguessable presentation token allows safe idempotent owner retries without storing a bearer secret. */
-export function transferReferenceForClaim(claimId: string): string {
-  if (!UUID.test(claimId)) throw new Stage1AuthError(500, 'transfer_reference_invalid', 'The transfer reference is unavailable');
-  const mac = crypto.createHmac('sha256', pepper()).update(`dinodia-transfer-reference-v1:${claimId}`, 'utf8').digest('base64url');
-  return `dno_transfer_${claimId}_${mac}`;
-}
-
-function transferRecipientHash(email: string): string {
-  return hashClaimReference(`dinodia-transfer-recipient-v1:${email}`);
-}
 
 function policyOrDeny() {
   const policy = currentCustomerPolicy();
@@ -292,7 +277,7 @@ export async function redeemOwnershipTransfer(input: { principal: { id: string; 
       tx.home.findUnique({ where: { id: claim.homeId }, select: { id: true, lifecycle: true, installationStatus: true, managementRevision: true, activeHubInstallationId: true } }),
       tx.hubInstallation.findUnique({ where: { id: claim.hubInstallationId }, select: { id: true, homeId: true, lifecycleStatus: true, permanentResolverGeneration: true, permanentResolverStatus: true } }),
       tx.homeMembership.findFirst({ where: { id: claim.outgoingOwnerMembershipId ?? undefined, homeId: claim.homeId, role: 'OWNER', status: 'ACTIVE' }, select: { id: true, customerAccountId: true } }),
-      tx.homeMembership.findMany({ where: { homeId: claim.homeId, status: 'ACTIVE', role: { in: ['OWNER','PROPERTY_MANAGER'] } }, select: { id: true, customerAccountId: true, role: true } }),
+      tx.homeMembership.findMany({ where: { homeId: claim.homeId, status: 'ACTIVE', role: { in: ['OWNER','PROPERTY_MANAGER'] } }, select: { id: true, customerAccountId: true, role: true, accessRevision: true } }),
     ]);
     if (!currentClaim || currentClaim.state !== 'AVAILABLE' || currentClaim.purpose !== 'OWNERSHIP_TRANSFER'
       || currentClaim.transferRecipientEmailHash !== transferRecipientHash(account.emailNormalized) || !currentHome || currentHome.lifecycle !== 'ACTIVE'
@@ -304,6 +289,10 @@ export async function redeemOwnershipTransfer(input: { principal: { id: string; 
     if (existingMembership?.status === 'ACTIVE' && existingMembership.role === 'TENANT') throw new Stage1AuthError(409, 'transfer_tenant_cleanup_required', 'Tenant access must be removed before transfer acceptance');
     const revokedMemberships = memberships.filter((row) => row.customerAccountId !== account.id);
     const revokedMembershipIds = revokedMemberships.map((row) => row.id);
+    for (const revoked of revokedMemberships) {
+      await queueHomeownerAccessRemovalNotices(tx, { homeId: claim.homeId, membershipId: revoked.id,
+        customerAccountId: revoked.customerAccountId, revision: revoked.accessRevision + 1, kind: 'OWNERSHIP_TRANSFER', now });
+    }
     await tx.homeMembership.updateMany({ where: { id: { in: memberships.filter((row) => row.customerAccountId !== account.id).map((row) => row.id) } },
       data: { status: 'REMOVED', removedAt: now, removalReason: 'ownership_transferred', accessRevision: { increment: 1 } } });
     let newOwnerMembershipId: string;
@@ -338,6 +327,17 @@ export async function redeemOwnershipTransfer(input: { principal: { id: string; 
     await tx.homeClaimChallenge.updateMany({ where: { claimReferenceId: claim.id, consumedAt: null, revokedAt: null }, data: { revokedAt: now } });
     await tx.auditEvent.create({ data: { homeId: claim.homeId, actorType: 'CUSTOMER', actorId: account.id, category: 'ACCESS', action: 'ownership_transfer_completed', targetType: 'HomeClaimReference', targetId: claim.id,
       metadata: { outcome: 'transferred', removedManagementMembershipCount: revokedMembershipIds.length, activeTenantsPreserved: true, pendingInvitationsCancelled: true, roomRequestsCancelled: true, propertySupportAuthorityRevoked: true, managementRevision: nextManagementRevision }, purgeAt: new Date(now.getTime() + RELATIONSHIP_MS) } });
+    const exceptionalCase = await tx.exceptionalOwnershipTransfer.findFirst({ where: { claimReferenceId: claim.id,
+      homeId: claim.homeId, status: { in: ['SUBMITTED', 'UNDER_REVIEW', 'APPROVED'] } }, select: { id: true, revision: true } });
+    if (exceptionalCase) {
+      await tx.exceptionalOwnershipTransfer.update({ where: { id: exceptionalCase.id }, data: {
+        status: 'COMPLETED', completedAt: now, decidedAt: now, revision: { increment: 1 },
+      } });
+      await tx.auditEvent.create({ data: { homeId: claim.homeId, actorType: 'CUSTOMER', actorId: account.id,
+        category: 'ACCESS', action: 'exceptional_transfer_completed', targetType: 'ExceptionalOwnershipTransfer',
+        targetId: exceptionalCase.id, metadata: { outcome: 'completed_through_normal_transfer_claim', ownershipMutatedByCase: false,
+          claimReferenceId: claim.id, revision: exceptionalCase.revision + 1 }, purgeAt: new Date(now.getTime() + RELATIONSHIP_MS) } });
+    }
     const receipt = { schemaVersion: 'dinodia.v1', ok: true, transferId: claim.id, homeId: claim.homeId, homeMembershipId: newOwnerMembershipId, state: 'TRANSFERRED', idempotentReplay: false };
     await tx.idempotencyRecord.create({ data: { namespace: COMPLETE_NS, keyHash, actorId: account.id, homeId: claim.homeId, requestHash,
       responseStatus: 200, responseDigest: sha256(JSON.stringify(receipt)), responseBody: receipt as Prisma.InputJsonValue,

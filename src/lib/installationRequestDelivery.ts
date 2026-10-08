@@ -177,18 +177,18 @@ export async function dispatchHomeownerAccessRemovalNotices(now = new Date(), de
   const counts = { accepted: 0, deferred: 0, failed: 0, suppressed: 0, expired: 0 };
   const stale = new Date(now.getTime() - 5 * 60_000);
   await prisma.nativeDomainOutbox.updateMany({ where: { aggregateType: 'HomeownerAccessRemovalNotice',
-    eventType: { in: ['TENANT_ACCESS_REMOVAL_NOTICE', 'PROPERTY_MANAGER_ACCESS_REMOVAL_NOTICE'] }, state: 'PROCESSING',
+    eventType: { in: ['TENANT_ACCESS_REMOVAL_NOTICE', 'PROPERTY_MANAGER_ACCESS_REMOVAL_NOTICE', 'OWNERSHIP_TRANSFER_NOTICE', 'HOME_DEREGISTRATION_NOTICE'] }, state: 'PROCESSING',
     updatedAt: { lt: stale }, expiresAt: { gt: now }, attempts: { lt: 8 } }, data: { state: 'PENDING', nextAttemptAt: now } });
   await prisma.nativeDomainOutbox.updateMany({ where: { aggregateType: 'HomeownerAccessRemovalNotice',
-    eventType: { in: ['TENANT_ACCESS_REMOVAL_NOTICE', 'PROPERTY_MANAGER_ACCESS_REMOVAL_NOTICE'] }, state: 'PROCESSING',
+    eventType: { in: ['TENANT_ACCESS_REMOVAL_NOTICE', 'PROPERTY_MANAGER_ACCESS_REMOVAL_NOTICE', 'OWNERSHIP_TRANSFER_NOTICE', 'HOME_DEREGISTRATION_NOTICE'] }, state: 'PROCESSING',
     attempts: { gte: 8 }, expiresAt: { gt: now } }, data: { state: 'FAILED' } });
   const abandonedExpired = await prisma.nativeDomainOutbox.updateMany({ where: { aggregateType: 'HomeownerAccessRemovalNotice',
-    eventType: { in: ['TENANT_ACCESS_REMOVAL_NOTICE', 'PROPERTY_MANAGER_ACCESS_REMOVAL_NOTICE'] }, state: 'PROCESSING', expiresAt: { lte: now } }, data: { state: 'EXPIRED' } });
+    eventType: { in: ['TENANT_ACCESS_REMOVAL_NOTICE', 'PROPERTY_MANAGER_ACCESS_REMOVAL_NOTICE', 'OWNERSHIP_TRANSFER_NOTICE', 'HOME_DEREGISTRATION_NOTICE'] }, state: 'PROCESSING', expiresAt: { lte: now } }, data: { state: 'EXPIRED' } });
   const expired = await prisma.nativeDomainOutbox.updateMany({ where: { aggregateType: 'HomeownerAccessRemovalNotice',
-    eventType: { in: ['TENANT_ACCESS_REMOVAL_NOTICE', 'PROPERTY_MANAGER_ACCESS_REMOVAL_NOTICE'] }, state: 'PENDING', expiresAt: { lte: now } }, data: { state: 'EXPIRED' } });
+    eventType: { in: ['TENANT_ACCESS_REMOVAL_NOTICE', 'PROPERTY_MANAGER_ACCESS_REMOVAL_NOTICE', 'OWNERSHIP_TRANSFER_NOTICE', 'HOME_DEREGISTRATION_NOTICE'] }, state: 'PENDING', expiresAt: { lte: now } }, data: { state: 'EXPIRED' } });
   counts.expired += expired.count + abandonedExpired.count;
   const rows = await prisma.nativeDomainOutbox.findMany({ where: { aggregateType: 'HomeownerAccessRemovalNotice',
-    eventType: { in: ['TENANT_ACCESS_REMOVAL_NOTICE', 'PROPERTY_MANAGER_ACCESS_REMOVAL_NOTICE'] }, state: 'PENDING',
+    eventType: { in: ['TENANT_ACCESS_REMOVAL_NOTICE', 'PROPERTY_MANAGER_ACCESS_REMOVAL_NOTICE', 'OWNERSHIP_TRANSFER_NOTICE', 'HOME_DEREGISTRATION_NOTICE'] }, state: 'PENDING',
     nextAttemptAt: { lte: now }, expiresAt: { gt: now }, attempts: { lt: 8 } },
     orderBy: [{ nextAttemptAt: 'asc' }, { createdAt: 'asc' }, { id: 'asc' }], take: RECEIPT_LIMIT,
     select: { id: true, eventType: true, expiresAt: true, attempts: true, payload: true } });

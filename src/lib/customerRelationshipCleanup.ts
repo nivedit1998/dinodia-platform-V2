@@ -1,5 +1,6 @@
 import crypto from 'node:crypto';
 import { Prisma } from '@prisma/client';
+import { hashClaimReference } from './stage1ClaimContract';
 
 /**
  * Remove account-wide authority only after the final durable customer
@@ -14,6 +15,8 @@ export async function cleanupCustomerAccountIfOrphaned(
   reason: string,
   actionType: string,
 ): Promise<{ deleted: boolean; anonymousReference: string | null }> {
+  let cleanupPhase = 'load_account';
+  try {
   const account = await tx.customerAccount.findUnique({ where: { id: accountId }, select: { id: true, emailNormalized: true } });
   if (!account) return { deleted: false, anonymousReference: null };
   const [memberships, invitations, requests, setups, reservations, transfers] = await Promise.all([
@@ -25,7 +28,8 @@ export async function cleanupCustomerAccountIfOrphaned(
       state: { in: ['PROFILE_REQUIRED', 'ADDRESS_REQUIRED', 'POLICY_REQUIRED', 'PENDING_INSTALLATION', 'READY_TO_ACTIVATE'] },
       expiredAt: null, reservation: { state: 'ACTIVE', expiresAt: { gt: now } } } }),
     tx.homeClaimReservation.count({ where: { customerAccountId: accountId, state: 'ACTIVE', expiresAt: { gt: now } } }),
-    tx.homeClaimReference.count({ where: { purpose: 'OWNERSHIP_TRANSFER', state: 'AVAILABLE', transferRecipientEmail: account.emailNormalized,
+    tx.homeClaimReference.count({ where: { purpose: 'OWNERSHIP_TRANSFER', state: 'AVAILABLE',
+      transferRecipientEmailHash: hashClaimReference(`dinodia-transfer-recipient-v1:${account.emailNormalized}`),
       cancelledAt: null, revokedAt: null, invalidatedAt: null } }),
   ]);
   if (memberships + invitations + requests + setups + reservations + transfers > 0) return { deleted: false, anonymousReference: null };
@@ -41,13 +45,40 @@ export async function cleanupCustomerAccountIfOrphaned(
   await tx.stepUpChallenge.updateMany({ where: { customerAccountId: accountId, consumedAt: null, cancelledAt: null }, data: { cancelledAt: now } });
   await tx.stepUpAuthorization.updateMany({ where: { customerAccountId: accountId, consumedAt: null, revokedAt: null }, data: { revokedAt: now } });
   await tx.supportTicket.updateMany({ where: { customerAccountId: accountId }, data: {
-    status: 'CLOSED', closedAt: now, selectedMembershipId: null,
+    status: 'CLOSED', closedAt: now, customerAccountId: null, selectedMembershipId: null,
     description: '[Closed and redacted after relationship removal]', title: null, areaId: null, deviceId: null,
     safeDiagnostics: Prisma.DbNull, customerResolution: null, revision: { increment: 1 },
   } });
   const anonymousReference = `del_${crypto.randomBytes(24).toString('base64url')}`;
+  cleanupPhase = 'write_deletion_receipt';
   await tx.deletionSecurityReceipt.create({ data: { anonymousReference, actionType: actionType.slice(0, 120), actionAt: now,
     purgeAt: new Date(now.getTime() + 365 * 24 * 60 * 60 * 1000) } });
+  // Historical invitations retain a restrictive inviter-membership foreign
+  // key even after the inviting relationship was removed. They have no
+  // remaining authority or recipient purpose once this account is orphaned;
+  // revoke pending generations and erase their recipient/token data before
+  // the account cascade removes its historical memberships.
+  const removedMemberships = await tx.homeMembership.findMany({ where: { customerAccountId: accountId }, select: { id: true } });
+  const removedMembershipIds = removedMemberships.map(({ id }) => id);
+  if (removedMembershipIds.length) {
+    cleanupPhase = 'purge_exceptional_transfer_cases';
+    await tx.exceptionalOwnershipTransfer.deleteMany({ where: { outgoingOwnerMembershipId: { in: removedMembershipIds } } });
+    cleanupPhase = 'revoke_membership_invitations';
+    await tx.membershipInvitation.updateMany({ where: { inviterMembershipId: { in: removedMembershipIds }, state: 'PENDING' },
+      data: { state: 'REVOKED', revokedAt: now } });
+    cleanupPhase = 'purge_membership_invitations';
+    await tx.membershipInvitation.deleteMany({ where: { inviterMembershipId: { in: removedMembershipIds } } });
+    cleanupPhase = 'purge_membership_owned_automations';
+    await tx.nativeAutomation.deleteMany({ where: { createdByMembershipId: { in: removedMembershipIds } } });
+    cleanupPhase = 'detach_membership_commissioning_history';
+    await tx.nativeCommissioningSession.updateMany({ where: { requestingMembershipId: { in: removedMembershipIds } },
+      data: { requestingMembershipId: null } });
+  }
+  cleanupPhase = 'delete_orphaned_customer_account';
   await tx.customerAccount.delete({ where: { id: accountId } });
   return { deleted: true, anonymousReference };
+  } catch (error) {
+    if (error && typeof error === 'object') Object.defineProperty(error, 'customerCleanupPhase', { value: cleanupPhase, configurable: true });
+    throw error;
+  }
 }

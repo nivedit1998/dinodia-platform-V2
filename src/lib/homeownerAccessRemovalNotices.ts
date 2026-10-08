@@ -13,7 +13,7 @@ const EXPIRY_MS = 30 * 24 * 60 * 60 * 1000;
  */
 export async function queueHomeownerAccessRemovalNotices(tx: Prisma.TransactionClient, input: {
   homeId: string; membershipId: string; customerAccountId: string; revision: number;
-  kind: 'TENANT' | 'PROPERTY_MANAGER'; now: Date;
+  kind: 'TENANT' | 'PROPERTY_MANAGER' | 'OWNERSHIP_TRANSFER' | 'FULL_HOME_DEREGISTRATION'; now: Date;
 }) {
   const [account, devices] = await Promise.all([
     tx.customerAccount.findUnique({ where: { id: input.customerAccountId }, select: { email: true, emailVerifiedAt: true, status: true } }),
@@ -22,7 +22,9 @@ export async function queueHomeownerAccessRemovalNotices(tx: Prisma.TransactionC
       select: { id: true, apnsTokenCiphertext: true, apnsEnvironment: true } }),
   ]);
   const expiresAt = new Date(input.now.getTime() + EXPIRY_MS);
-  const type = input.kind === 'TENANT' ? 'TENANT_ACCESS_REMOVAL_NOTICE' : 'PROPERTY_MANAGER_ACCESS_REMOVAL_NOTICE';
+  const type = input.kind === 'TENANT' ? 'TENANT_ACCESS_REMOVAL_NOTICE'
+    : input.kind === 'PROPERTY_MANAGER' ? 'PROPERTY_MANAGER_ACCESS_REMOVAL_NOTICE'
+      : input.kind === 'OWNERSHIP_TRANSFER' ? 'OWNERSHIP_TRANSFER_NOTICE' : 'HOME_DEREGISTRATION_NOTICE';
   const noticeId = crypto.randomUUID();
   const entries: Prisma.NativeDomainOutboxCreateManyInput[] = [];
   if (account?.status === 'ACTIVE' && account.emailVerifiedAt && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(account.email)) {

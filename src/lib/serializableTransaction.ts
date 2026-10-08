@@ -9,11 +9,14 @@ import { prisma } from '@/lib/prisma';
 export async function serializableTransaction<T>(
   operation: (tx: Prisma.TransactionClient) => Promise<T>,
   attempts = 4,
+  transactionBounds: { maxWaitMs?: number; timeoutMs?: number } = {},
 ): Promise<T> {
   for (let attempt = 0; attempt < attempts; attempt += 1) {
     try {
       return await prisma.$transaction(operation, {
         isolationLevel: Prisma.TransactionIsolationLevel.Serializable,
+        ...(transactionBounds.maxWaitMs ? { maxWait: transactionBounds.maxWaitMs } : {}),
+        ...(transactionBounds.timeoutMs ? { timeout: transactionBounds.timeoutMs } : {}),
       });
     } catch (error) {
       const record = typeof error === 'object' && error !== null
