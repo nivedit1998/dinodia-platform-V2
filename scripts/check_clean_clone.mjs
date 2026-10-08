@@ -170,7 +170,9 @@ async function probeApplication(source, env, fixture) {
     });
     const wrongHomeBody = await wrongHome.text();
     if (wrongHome.status !== 403 || wrongHomeBody.includes(fixture.privateHomeMarker) || wrongHomeBody.includes(fixture.privateHomeId) || wrongHomeBody.includes(fixture.allowedHomeId)) {
-      throw new Error('schema-compatible application disclosed data or granted selected-home authority across a wrong-home boundary');
+      let wrongHomeErrorCode = 'non-json';
+      try { wrongHomeErrorCode = JSON.parse(wrongHomeBody)?.error?.code ?? 'missing-code'; } catch { /* Report only a safe classification. */ }
+      throw new Error(`schema-compatible application wrong-home check failed (status=${wrongHome.status}, errorCode=${String(wrongHomeErrorCode).slice(0, 64)}, privateMarker=${wrongHomeBody.includes(fixture.privateHomeMarker)}, privateHomeId=${wrongHomeBody.includes(fixture.privateHomeId)}, allowedHomeId=${wrongHomeBody.includes(fixture.allowedHomeId)})`);
     }
     // Perform the allowed session read last: it rotates the HttpOnly refresh
     // cookie, so the wrong-home denial above must use the pre-rotation cookie
