@@ -7,6 +7,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { createServer } from 'node:http';
 import http from 'node:http';
 import net from 'node:net';
+import { isDeepStrictEqual } from 'node:util';
 import { Prisma, PrismaClient } from '@prisma/client';
 import { stage1RouteInventory } from '../test/stage1_route_inventory.mjs';
 
@@ -3641,7 +3642,9 @@ async function pendingInvitationRouteChecks(deliveryEnv) {
   const propertyTemperatureHistoryCount = await prisma.nativeTemperatureSample.count({ where: { homeId: inviter.homeId, deviceId: homeownerPropertyDevice.id } });
   if (propertyTemperatureHistoryCount !== 1) fail(`The valid permanent Radiator temperature sample was not durably inserted (count=${propertyTemperatureHistoryCount})`);
   await prisma.nativeDevice.update({ where: { id: privateTenantDevice.id }, data: { lifecycle: 'INSTALLED' } });
-  const analyticsFrom = new Date(analyticsHour.getTime() - 60_000).toISOString();
+  // The source sample is five minutes old. Include its exact observation time
+  // even when this test happens during the first few minutes of a UTC hour.
+  const analyticsFrom = new Date(analyticsHour.getTime() - 10 * 60_000).toISOString();
   const analyticsTo = analyticsNow.toISOString();
   const analyticsBootstrap = await fetchJson(`${base}/api/v2/homes/${inviter.homeId}/analytics/bootstrap`, { headers: selectedHomeHeaders });
   const analyticsUsage = await fetchJson(`${base}/api/v2/homes/${inviter.homeId}/analytics/usage?metric=radiator&level=hour&from=${encodeURIComponent(analyticsFrom)}&to=${encodeURIComponent(analyticsTo)}`, { headers: selectedHomeHeaders });
@@ -3665,7 +3668,7 @@ async function pendingInvitationRouteChecks(deliveryEnv) {
     || analyticsAnonymous.response.status !== 401 || analyticsWrongHome.response.status !== 404
     || privateAnalyticsHistoryCount !== 0
     || analyticsExport.status !== 404) {
-    fail(`Native analytics routes did not return only bounded selected-Home permanent-device evidence (${JSON.stringify({ bootstrap: analyticsBootstrap.response.status, usage: analyticsUsage.response.status, privateUsage: analyticsPrivateUsage.response.status, temperature: analyticsTemperature.response.status, anonymous: analyticsAnonymous.response.status, wrongHome: analyticsWrongHome.response.status, export: analyticsExport.status, privateDeviceExcluded: !privateUsageJson.includes(privateTenantDevice.id) })})`);
+    fail(`Native analytics routes did not return only bounded selected-Home permanent-device evidence (${JSON.stringify({ bootstrap: analyticsBootstrap.response.status, bootstrapDevices: analyticsBootstrap.body?.devices?.length ?? 0, propertyDeviceIncluded: analyticsBootstrap.body?.devices?.some((device) => device.id === homeownerPropertyDevice.id) ?? false, usage: analyticsUsage.response.status, usageSelectedDevices: analyticsUsage.body?.selectedDeviceCount ?? null, usageBuckets: analyticsUsage.body?.buckets?.length ?? 0, usageHasOnTime: analyticsUsage.body?.buckets?.some((bucket) => bucket.onMinutes > 0) ?? false, privateUsage: analyticsPrivateUsage.response.status, privateUsageSelectedDevices: analyticsPrivateUsage.body?.selectedDeviceCount ?? null, privateUsageBuckets: analyticsPrivateUsage.body?.buckets?.length ?? 0, temperature: analyticsTemperature.response.status, temperatureSelectedDevices: analyticsTemperature.body?.selectedDeviceCount ?? null, temperaturePoints: analyticsTemperature.body?.points?.length ?? 0, temperatureValuePresent: analyticsTemperature.body?.points?.some((point) => point.celsius === 20.5) ?? false, temperatureCurrentFresh: analyticsTemperature.body?.points?.some((point) => point.celsius === 20.5 && point.currentFresh === true) ?? false, anonymous: analyticsAnonymous.response.status, wrongHome: analyticsWrongHome.response.status, export: analyticsExport.status, privateDeviceExcluded: !privateUsageJson.includes(privateTenantDevice.id) })})`);
   }
   console.log('[stage10:integration] PASS: actual loopback analytics bootstrap, usage and temperature routes returned measured permanent-device data; tenant-private device had zero analytics rows and was absent from selectors, counts and results; anonymous/wrong-Home denied; no export route exists');
 
@@ -3790,6 +3793,87 @@ async function pendingInvitationRouteChecks(deliveryEnv) {
     const temperatureEvent = telemetryPending.find((event) => event.type === 'temperature.sample');
     fail(`The signed OS outbox did not durably ingest and acknowledge its real measurements (${JSON.stringify({ usageRows: telemetryUsageRows.length, activitySeconds: telemetryUsageRows[0]?.onSeconds ?? 0, temperatureRows: telemetryTemperatureRows.length, temperature: telemetryTemperatureRows[0]?.temperature ?? null, observedAt: telemetryTemperatureRows[0]?.sourceObservedAt?.toISOString() ?? null, expectedObservedAt: telemetryObservedAt.toISOString(), validUntil: telemetryTemperatureRows[0]?.validUntil?.toISOString() ?? null, expectedValidUntil: telemetryExpectedValidUntil?.toISOString() ?? null, descriptorValiditySeconds: telemetryValiditySeconds, outboxAcknowledged: telemetryOutboxAfter.acknowledgedSequence >= telemetryRequiredSequence, cursorAdvanced: Number(telemetrySyncCursor.syncAcceptedSequence) >= telemetryRequiredSequence, receiptAdded: telemetryReceiptCount > telemetryReceiptCountBefore, streamMatches: telemetryOutboxAfter.streamId === telemetrySyncCursor.syncStreamId, privateRows: telemetryPrivateRows, deviceClass: telemetryDeviceAfterSync.managementClass, category: telemetryDeviceAfterSync.analyticsCategory, lifecycle: telemetryDeviceAfterSync.lifecycle, descriptorRevision: telemetryDeviceAfterSync.descriptorRevision, catalogRevision: telemetryDeviceAfterSync.capabilitySummary?.controlCatalog?.revision ?? null, catalogControls: (catalogEvent?.payload?.controls || []).map((control) => ({ controlId: control.controlId, semanticRole: control.semanticRole, observable: control.observable, valueType: control.valueType, maxStateValiditySeconds: control.maxStateValiditySeconds })), usageControl: usageEvent?.payload?.controlId ?? null, usageGeneration: usageEvent?.payload?.sourceGeneration ?? null, temperatureControl: temperatureEvent?.payload?.controlId ?? null, temperatureGeneration: temperatureEvent?.payload?.sourceGeneration ?? null, identityGeneration: hub.store.getIdentity()?.generation ?? null })})`);
   }
+  const delayedTemperatureResults = [];
+  for (const sampleCase of [
+    { label: 'delivered-before-expiry', ageMinutes: 20, temperature: 19.8, expectedFresh: true },
+    { label: 'delivered-after-expiry', ageMinutes: 31, temperature: 18.7, expectedFresh: false },
+  ]) {
+    const sourceObservedAt = new Date(telemetryNow.getTime() - sampleCase.ageMinutes * 60_000);
+    const validitySeconds = 30 * 60;
+    const validUntil = new Date(sourceObservedAt.getTime() + validitySeconds * 1000);
+    const delayedOsDeviceId = `stage10-${sampleCase.label}-${crypto.randomUUID()}`;
+    const delayedControlId = `stage10-temperature-${crypto.randomUUID()}`;
+    const delayedDevice = await prisma.nativeDevice.create({ data: {
+      homeId: telemetryHomeId, hubInstallationId: telemetryHubId, osDeviceId: delayedOsDeviceId,
+      originalName: 'Disposable delayed Radiator observation', technicalLabel: 'radiator', analyticsCategory: 'RADIATOR',
+      managementClass: 'PROPERTY_DEVICE', deviceType: 'radiator', lifecycle: 'INSTALLED', descriptorRevision: 1,
+    } });
+    await prisma.deviceAreaAssignment.create({ data: { homeId: telemetryHomeId, deviceId: delayedDevice.id, areaId: telemetryAreaId,
+      validFrom: new Date(sourceObservedAt.getTime() - 86_400_000), source: 'STAGE10_DELAYED_TEMPERATURE', actorType: 'SYSTEM' } });
+    const platformBeforeDelayed = hub.store.getPlatform();
+    await hub.store.savePlatform({ ...platformBeforeDelayed, devicePolicies: { ...(platformBeforeDelayed.devicePolicies || {}), [delayedOsDeviceId]: {
+      osDeviceId: delayedOsDeviceId, managementClass: 'PROPERTY_DEVICE', analyticsCategory: 'RADIATOR', lifecycle: 'INSTALLED',
+      ownerMembershipId: null, descriptorRevision: 1, descriptorDigest: 'b'.repeat(64), osAreaIds: [telemetryOsAreaId],
+    } } });
+    await hub.store.upsertDevice({
+      id: delayedOsDeviceId, name: 'Disposable delayed Radiator observation', protocol: 'zigbee', deviceType: 'radiator',
+      technicalLabel: 'radiator', areaId: telemetryOsAreaId,
+      setup: { status: 'ready', assignmentMode: 'device_inherited_v1', completedAt: sourceObservedAt.toISOString() },
+      state: { heatDemand: 'off', ambientTemperature: sampleCase.temperature },
+      entities: {
+        heatDemand: { id: `delayed-heat-${sampleCase.label}`, name: 'Heat demand', state: 'off',
+          sourceObservedAt: sourceObservedAt.toISOString(), domain: 'climate', category: 'control', capability: {
+            controlId: `stage10-heat-${crypto.randomUUID()}`, kind: 'binary', category: 'control', readable: true, writable: false,
+            observable: true, primary: true, semanticRole: 'active_heat_demand', maxStateValiditySeconds: validitySeconds, bindings: [],
+          } },
+        ambientTemperature: { id: `delayed-temperature-${sampleCase.label}`, name: 'Ambient temperature', state: sampleCase.temperature,
+        sourceObservedAt: sourceObservedAt.toISOString(), domain: 'climate', category: 'diagnostic', capability: {
+          controlId: delayedControlId, kind: 'number', category: 'measurement', readable: true, writable: false, observable: true,
+          primary: true, semanticRole: 'ambient_temperature', maxStateValiditySeconds: validitySeconds, bindings: [],
+        } },
+      },
+    }, { nowMs: telemetryNow.getTime() });
+    const delayedOutboxBefore = hub.store.getSyncOutbox();
+    const delayedEvent = delayedOutboxBefore.events.find((event) => event.type === 'temperature.sample'
+      && event.payload?.osDeviceId === delayedOsDeviceId);
+    const expectedEventKey = sha256([delayedOsDeviceId, delayedControlId, String(customerFixture.identityOneGeneration), sourceObservedAt.toISOString()].join('\n'));
+    if (!delayedEvent || delayedEvent.payload.sourceObservedAt !== sourceObservedAt.toISOString()
+      || delayedEvent.payload.validUntil !== validUntil.toISOString() || delayedEvent.payload.sourceEventKey !== expectedEventKey) {
+      fail(`The OS did not retain the original timestamp/deadline for ${sampleCase.label} (${JSON.stringify({ eventPresent: Boolean(delayedEvent),
+        sourceTimestampMatches: delayedEvent?.payload?.sourceObservedAt === sourceObservedAt.toISOString(),
+        actualSourceAt: delayedEvent?.payload?.sourceObservedAt ?? null, expectedSourceAt: sourceObservedAt.toISOString(),
+        actualValidUntil: delayedEvent?.payload?.validUntil ?? null, expectedValidUntil: validUntil.toISOString(),
+        sourceKeyMatches: delayedEvent?.payload?.sourceEventKey === expectedEventKey })})`);
+    }
+    const delayedBatch = await hub.store.prepareSyncBatch(telemetryHubId, hub.pairing.runtime, Date.now());
+    if (!delayedBatch || !delayedBatch.events.some((event) => event.type === 'temperature.sample' && event.payload?.osDeviceId === delayedOsDeviceId)) {
+      fail(`The delayed ${sampleCase.label} observation was not present in the durable signed outbox batch`);
+    }
+    const delayedReceipt = await machineRequest({ base, path: '/api/hub-agent/v2/sync', machineSecret: customerFixture.machineSecret,
+      body: { serial: customerFixture.identityOneSerial, identityGeneration: customerFixture.identityOneGeneration, ...delayedBatch } });
+    if (delayedReceipt.response.status !== 200 || Number(delayedReceipt.body?.acceptedThroughSequence) < Number(delayedBatch.toSequence)) {
+      fail(`The real Platform sync route did not accept the ${sampleCase.label} historical sample (${delayedReceipt.response.status}/${delayedReceipt.body?.errorCode || 'no-code'})`);
+    }
+    await hub.store.acknowledgeSyncBatch({ streamId: delayedReceipt.body.streamId,
+      acceptedThroughSequence: Number(delayedReceipt.body.acceptedThroughSequence), cloudRevision: Number(delayedReceipt.body.cloudRevision),
+      configurationAppliedRevision: Number(delayedReceipt.body.configurationAppliedRevision) });
+    const savedSample = await prisma.nativeTemperatureSample.findUnique({ where: { sourceEventKey: expectedEventKey },
+      select: { deviceId: true, temperature: true, sourceObservedAt: true, validUntil: true } });
+    const currentReading = await prisma.nativeDevice.findUniqueOrThrow({ where: { id: delayedDevice.id },
+      select: { radiatorTemperature: true, radiatorReadingAt: true } });
+    if (!savedSample || savedSample.deviceId !== delayedDevice.id || Number(savedSample.temperature) !== sampleCase.temperature
+      || savedSample.sourceObservedAt.getTime() !== sourceObservedAt.getTime() || savedSample.validUntil.getTime() !== validUntil.getTime()
+      || (sampleCase.expectedFresh && currentReading.radiatorReadingAt?.getTime() !== sourceObservedAt.getTime())
+      || (!sampleCase.expectedFresh && (currentReading.radiatorReadingAt !== null || currentReading.radiatorTemperature !== null))) {
+      fail(`Delayed temperature history/current-state separation failed for ${sampleCase.label} (${JSON.stringify({ stored: Boolean(savedSample),
+        originalTimestamp: savedSample?.sourceObservedAt?.toISOString() ?? null, expectedTimestamp: sourceObservedAt.toISOString(),
+        storedDeadline: savedSample?.validUntil?.toISOString() ?? null, expectedDeadline: validUntil.toISOString(),
+        currentReadingAt: currentReading.radiatorReadingAt?.toISOString() ?? null, expectedFresh: sampleCase.expectedFresh })})`);
+    }
+    delayedTemperatureResults.push({ label: sampleCase.label, retained: true, currentFresh: sampleCase.expectedFresh,
+      deviceId: delayedDevice.id, sourceObservedAt: sourceObservedAt.toISOString(), temperature: sampleCase.temperature });
+  }
+  console.log(`[stage10:integration] PASS: actual OS Store -> signed route retained delayed temperature timestamps/deadlines before and after expiry; only unexpired evidence updated current state (cases=${JSON.stringify(delayedTemperatureResults.map(({ label, retained, currentFresh }) => ({ label, retained, currentFresh })))})`);
   await prisma.policyAcceptance.upsert({
     where: { customerAccountId_policyKind_policyVersion: { customerAccountId: customerFixture.propertyAccountId, policyKind: 'DINODIA_NATIVE', policyVersion: deliveryEnv.DINODIA_NATIVE_POLICY_VERSION } },
     create: { customerAccountId: customerFixture.propertyAccountId, policyKind: 'DINODIA_NATIVE', policyVersion: deliveryEnv.DINODIA_NATIVE_POLICY_VERSION, acceptedAt: new Date() }, update: {},
@@ -3802,6 +3886,19 @@ async function pendingInvitationRouteChecks(deliveryEnv) {
   }) });
   if (analyticsOwnerLogin.response.status !== 200 || typeof analyticsOwnerLogin.body?.accessToken !== 'string') fail('The route-ingested Stage 10 sample requires a real disposable owner session');
   const telemetryHeaders = { authorization: `Bearer ${analyticsOwnerLogin.body.accessToken}`, 'x-dinodia-home-id': telemetryHomeId };
+  const delayedTemperatureProjections = await Promise.all(delayedTemperatureResults.map(async (sample) => {
+    const from = new Date(Date.parse(sample.sourceObservedAt) - 60 * 60_000).toISOString();
+    const to = telemetryNow.toISOString();
+    const result = await fetchJson(`${base}/api/v2/homes/${telemetryHomeId}/analytics/temperature?level=hour&from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}&deviceIds=${encodeURIComponent(sample.deviceId)}`, { headers: telemetryHeaders });
+    const point = result.body?.points?.find((item) => item.celsius === sample.temperature);
+    return { label: sample.label, status: result.response.status, selectedDeviceCount: result.body?.selectedDeviceCount,
+      currentFresh: point?.currentFresh ?? null, expectedFresh: sample.currentFresh, present: Boolean(point) };
+  }));
+  if (delayedTemperatureProjections.some((result) => result.status !== 200 || result.selectedDeviceCount !== 1
+    || !result.present || result.currentFresh !== result.expectedFresh)) {
+    fail(`The actual owner temperature API did not preserve historical points while honoring finite current freshness (${JSON.stringify(delayedTemperatureProjections)})`);
+  }
+  console.log(`[stage10:integration] PASS: actual owner temperature API returned delayed history before/after expiry and marked current freshness exactly (${JSON.stringify(delayedTemperatureProjections.map(({ label, currentFresh, expectedFresh }) => ({ label, currentFresh, expectedFresh })))})`);
   const telemetryHourStart = new Date(telemetryObservedAt);
   telemetryHourStart.setUTCMinutes(0, 0, 0);
   const telemetryFrom = telemetryHourStart.toISOString();
@@ -3810,8 +3907,8 @@ async function pendingInvitationRouteChecks(deliveryEnv) {
   const telemetryTo = new Date(Date.now() - 1_000).toISOString();
   const [telemetryBootstrap, telemetryUsage, telemetryTemperature, telemetryWrongHome] = await Promise.all([
     fetchJson(`${base}/api/v2/homes/${telemetryHomeId}/analytics/bootstrap`, { headers: telemetryHeaders }),
-    fetchJson(`${base}/api/v2/homes/${telemetryHomeId}/analytics/usage?metric=radiator&level=hour&from=${encodeURIComponent(telemetryFrom)}&to=${encodeURIComponent(telemetryTo)}`, { headers: telemetryHeaders }),
-    fetchJson(`${base}/api/v2/homes/${telemetryHomeId}/analytics/temperature?level=hour&from=${encodeURIComponent(telemetryFrom)}&to=${encodeURIComponent(telemetryTo)}`, { headers: telemetryHeaders }),
+    fetchJson(`${base}/api/v2/homes/${telemetryHomeId}/analytics/usage?metric=radiator&level=hour&from=${encodeURIComponent(telemetryFrom)}&to=${encodeURIComponent(telemetryTo)}&deviceIds=${encodeURIComponent(telemetryDevice.id)}`, { headers: telemetryHeaders }),
+    fetchJson(`${base}/api/v2/homes/${telemetryHomeId}/analytics/temperature?level=hour&from=${encodeURIComponent(telemetryFrom)}&to=${encodeURIComponent(telemetryTo)}&deviceIds=${encodeURIComponent(telemetryDevice.id)}`, { headers: telemetryHeaders }),
     fetchJson(`${base}/api/v2/homes/${telemetryHomeId}/analytics/bootstrap`, { headers: { ...telemetryHeaders, 'x-dinodia-home-id': customerFixture.homeTwoId } }),
   ]);
   if (telemetryBootstrap.response.status !== 200 || !telemetryBootstrap.body.devices?.some((device) => device.id === telemetryDevice.id)
@@ -3821,6 +3918,136 @@ async function pendingInvitationRouteChecks(deliveryEnv) {
     || telemetryWrongHome.response.status !== 404) {
     fail(`The actual signed ingestion-to-owner analytics path or its privacy boundary failed (${JSON.stringify({ bootstrap: telemetryBootstrap.response.status, usage: telemetryUsage.response.status, usageCount: telemetryUsage.body?.selectedDeviceCount, usageBuckets: telemetryUsage.body?.buckets?.map((bucket) => ({ onMinutes: bucket.onMinutes, coverageSeconds: bucket.coverageSeconds, isPartial: bucket.isPartial })), temperature: telemetryTemperature.response.status, temperatureCount: telemetryTemperature.body?.selectedDeviceCount, temperaturePoints: telemetryTemperature.body?.points?.map((point) => ({ celsius: point.celsius, currentFresh: point.currentFresh, sourceAt: point.sourceAt })), wrongHome: telemetryWrongHome.response.status, deviceVisible: Boolean(telemetryBootstrap.body?.devices?.some((device) => device.id === telemetryDevice.id)), privateAbsent: !JSON.stringify(telemetryBootstrap.body).includes(telemetryPrivateDevice.id) })})`);
   }
+
+  // Reproduce F10-A through the real Store producer and machine-authenticated
+  // route: 10:30 valid through 10:32, then account Unknown through 11:00.
+  // The chosen timestamps are the last fully elapsed equivalent hour in the
+  // controlled test clock, so the sync route never receives future evidence.
+  const partialOsDeviceId = `stage10-partial-hour-${crypto.randomUUID()}`;
+  const partialUsageControlId = `stage10-partial-heat-${crypto.randomUUID()}`;
+  const partialTemperatureControlId = `stage10-partial-temp-${crypto.randomUUID()}`;
+  const partialNow = Date.now();
+  const partialHourEndMs = Math.floor(partialNow / 3_600_000) * 3_600_000;
+  const partialObservedAt = new Date(partialHourEndMs - 30 * 60_000);
+  const partialClosedAt = new Date(partialHourEndMs);
+  const partialDevice = await prisma.nativeDevice.create({ data: {
+    homeId: telemetryHomeId, hubInstallationId: telemetryHubId, osDeviceId: partialOsDeviceId,
+    originalName: 'Disposable partial-hour radiator', technicalLabel: 'radiator', analyticsCategory: 'RADIATOR',
+    managementClass: 'PROPERTY_DEVICE', deviceType: 'radiator', manufacturer: 'Disposable integration fixture',
+    model: 'Partial-hour route test', protocol: 'zigbee', lifecycle: 'INSTALLED', descriptorRevision: 1,
+  } });
+  await prisma.deviceAreaAssignment.create({ data: { homeId: telemetryHomeId, deviceId: partialDevice.id, areaId: telemetryAreaId,
+    validFrom: new Date(partialObservedAt.getTime() - 86_400_000), source: 'STAGE10_PARTIAL_HOUR', actorType: 'SYSTEM' } });
+  const priorPartialPlatform = hub.store.getPlatform();
+  await hub.store.savePlatform({ ...priorPartialPlatform, devicePolicies: { ...(priorPartialPlatform.devicePolicies || {}), [partialOsDeviceId]: {
+    osDeviceId: partialOsDeviceId, managementClass: 'PROPERTY_DEVICE', analyticsCategory: 'RADIATOR',
+    lifecycle: 'INSTALLED', ownerMembershipId: null, descriptorRevision: 1, descriptorDigest: 'b'.repeat(64), osAreaIds: [telemetryOsAreaId],
+  } } });
+  await hub.store.upsertDevice({
+    id: partialOsDeviceId, name: 'Disposable partial-hour radiator', protocol: 'zigbee', deviceType: 'radiator',
+    technicalLabel: 'radiator', areaId: telemetryOsAreaId,
+    setup: { status: 'ready', assignmentMode: 'device_inherited_v1', completedAt: partialObservedAt.toISOString() },
+    state: { heatDemand: 'on', ambientTemperature: 19.5 },
+    entities: {
+      heatDemand: { id: 'stage10-partial-heat-entity', name: 'Heat demand', state: 'on', sourceObservedAt: partialObservedAt.toISOString(), domain: 'climate', category: 'control', capability: {
+        controlId: partialUsageControlId, kind: 'binary', category: 'control', readable: true, writable: false, observable: true, primary: true,
+        semanticRole: 'active_heat_demand', maxStateValiditySeconds: 120, bindings: [],
+      } },
+      ambientTemperature: { id: 'stage10-partial-temperature-entity', name: 'Ambient temperature', state: 19.5, sourceObservedAt: partialObservedAt.toISOString(), domain: 'sensor', category: 'measurement', capability: {
+        controlId: partialTemperatureControlId, kind: 'number', category: 'measurement', readable: true, writable: false, observable: true, primary: true,
+        semanticRole: 'ambient_temperature', maxStateValiditySeconds: 1800, bindings: [],
+      } },
+    },
+  }, { nowMs: partialObservedAt.getTime() });
+  await hub.store.advanceSyncUsage(partialClosedAt.getTime());
+  const partialOutbox = hub.store.getSyncOutbox();
+  const partialEvents = partialOutbox.events.filter((event) => event.sequence > partialOutbox.acknowledgedSequence
+    && event.payload?.osDeviceId === partialOsDeviceId);
+  const partialUsageEvent = partialEvents.find((event) => event.type === 'usage.bucket');
+  if (!partialUsageEvent || partialUsageEvent.payload.onSeconds !== 120 || partialUsageEvent.payload.offSeconds !== 0
+    || partialUsageEvent.payload.unknownSeconds !== 1680 || partialUsageEvent.payload.closedAt !== partialClosedAt.toISOString()
+    || partialUsageEvent.payload.coverageStartAt !== partialObservedAt.toISOString()
+    || partialUsageEvent.payload.coverageEndAt !== partialClosedAt.toISOString()) {
+    fail(`The actual OS Store did not preserve the exact partial closed-hour coverage (${JSON.stringify({ event: partialUsageEvent?.payload ?? null })})`);
+  }
+  const partialBatch = await hub.store.prepareSyncBatch(telemetryHubId, hub.pairing.runtime, Date.now());
+  if (!partialBatch || !partialBatch.events.some((event) => event.type === 'usage.bucket' && event.payload?.osDeviceId === partialOsDeviceId)) {
+    fail('The partial closed-hour usage event was not included in the bounded signed outbox batch');
+  }
+  const partialReceiptCountBefore = await prisma.hubSyncReceipt.count({ where: { hubInstallationId: telemetryHubId } });
+  const partialAccepted = await machineRequest({ base, path: '/api/hub-agent/v2/sync', machineSecret: customerFixture.machineSecret,
+    body: { serial: customerFixture.identityOneSerial, identityGeneration: customerFixture.identityOneGeneration, ...partialBatch } });
+  if (partialAccepted.response.status !== 200) fail(`Platform rejected actual partial-hour producer data (${partialAccepted.response.status}/${partialAccepted.body?.errorCode || 'no-code'})`);
+  await hub.store.acknowledgeSyncBatch({ streamId: partialAccepted.body.streamId, acceptedThroughSequence: Number(partialAccepted.body.acceptedThroughSequence),
+    cloudRevision: Number(partialAccepted.body.cloudRevision), configurationAppliedRevision: Number(partialAccepted.body.configurationAppliedRevision) });
+  const partialRows = await prisma.nativeDeviceUsageBucket.findMany({ where: { deviceId: partialDevice.id }, select: {
+    revision: true, onSeconds: true, offSeconds: true, unknownSeconds: true, coverageStartAt: true, coverageEndAt: true, closedAt: true,
+  } });
+  const partialReceiptCountAfter = await prisma.hubSyncReceipt.count({ where: { hubInstallationId: telemetryHubId } });
+  const partialCursor = await prisma.hubInstallation.findUniqueOrThrow({ where: { id: telemetryHubId }, select: { syncAcceptedSequence: true } });
+  const partialUsageRoute = await fetchJson(`${base}/api/v2/homes/${telemetryHomeId}/analytics/usage?metric=radiator&level=hour&from=${encodeURIComponent(new Date(partialObservedAt.getTime() - 30 * 60_000).toISOString())}&to=${encodeURIComponent(new Date(Math.max(partialClosedAt.getTime(), Date.now() - 1_000)).toISOString())}&deviceIds=${encodeURIComponent(partialDevice.id)}`, { headers: telemetryHeaders });
+  const partialRow = partialRows[0];
+  if (partialRows.length !== 1 || partialRow.onSeconds !== 120 || partialRow.offSeconds !== 0 || partialRow.unknownSeconds !== 1680
+    || partialRow.onSeconds + partialRow.offSeconds + partialRow.unknownSeconds !== 1800
+    || partialRow.coverageStartAt?.toISOString() !== partialObservedAt.toISOString()
+    || partialRow.coverageEndAt?.toISOString() !== partialClosedAt.toISOString()
+    || partialRow.closedAt?.toISOString() !== partialClosedAt.toISOString()
+    || partialReceiptCountAfter <= partialReceiptCountBefore || Number(partialCursor.syncAcceptedSequence) < Number(partialBatch.toSequence)
+    || partialUsageRoute.response.status !== 200 || !partialUsageRoute.body.buckets?.some((bucket) => bucket.onMinutes === 2 && bucket.unknownMinutes === 28 && bucket.coverageSeconds === 1800 && bucket.isPartial === true)) {
+    fail(`The signed Platform route did not persist and project the exact partial-hour span (${JSON.stringify({ rows: partialRows.map((row) => ({ on: row.onSeconds, off: row.offSeconds, unknown: row.unknownSeconds, coverageStartAt: row.coverageStartAt, coverageEndAt: row.coverageEndAt, closedAt: row.closedAt })), receiptAdvanced: partialReceiptCountAfter > partialReceiptCountBefore, cursor: Number(partialCursor.syncAcceptedSequence), through: Number(partialBatch.toSequence), usageStatus: partialUsageRoute.response.status, buckets: partialUsageRoute.body?.buckets?.map((bucket) => ({ onMinutes: bucket.onMinutes, unknownMinutes: bucket.unknownMinutes, coverageSeconds: bucket.coverageSeconds, isPartial: bucket.isPartial })) })})`);
+  }
+  console.log('[stage10:integration] PASS: actual Store -> signed sync route -> durable receipt/cursor -> analytics API accepted one 1,800-second closed partial hour: 120 On, 1,680 Unknown, exact 10:30-to-11:00 coverage; no padded Off/Unknown hour');
+
+  // F10-B: queue a second real Store-produced Radiator sample whose source
+  // validity expired before this signed route delivery. It must be retained
+  // as historical evidence, must not become current, and must not replace the
+  // newer fresh reading from the first telemetry device.
+  const delayedDeliveredAt = new Date();
+  const delayedObservedAt = new Date(delayedDeliveredAt.getTime() - 31 * 60_000);
+  const delayedTemperature = 20.8;
+  await hub.store.upsertDevice({
+    id: partialOsDeviceId, name: 'Disposable partial-hour radiator', protocol: 'zigbee', deviceType: 'radiator',
+    technicalLabel: 'radiator', areaId: telemetryOsAreaId,
+    state: { heatDemand: 'on', ambientTemperature: delayedTemperature },
+    entities: { ambientTemperature: { id: 'stage10-partial-temperature-entity', name: 'Ambient temperature', state: delayedTemperature,
+      sourceObservedAt: delayedObservedAt.toISOString(), domain: 'sensor', category: 'measurement', capability: {
+        controlId: partialTemperatureControlId, kind: 'number', category: 'measurement', readable: true, writable: false, observable: true, primary: true,
+        semanticRole: 'ambient_temperature', maxStateValiditySeconds: 1800, bindings: [],
+      } } },
+  }, { nowMs: delayedDeliveredAt.getTime() });
+  const delayedPending = hub.store.getSyncOutbox();
+  const delayedEvents = delayedPending.events.filter((event) => event.sequence > delayedPending.acknowledgedSequence
+    && event.type === 'temperature.sample' && event.payload?.osDeviceId === partialOsDeviceId
+    && event.payload?.sourceObservedAt === delayedObservedAt.toISOString());
+  if (delayedEvents.length !== 1 || delayedEvents[0].payload.temperature !== delayedTemperature
+    || delayedEvents[0].payload.validUntil !== new Date(delayedObservedAt.getTime() + 30 * 60_000).toISOString()) {
+    fail(`The OS discarded or rewrote the genuine delayed temperature observation (${JSON.stringify({ count: delayedEvents.length, payload: delayedEvents[0]?.payload ?? null })})`);
+  }
+  const delayedBatch = await hub.store.prepareSyncBatch(telemetryHubId, hub.pairing.runtime, Date.now());
+  const delayedReceiptCountBefore = await prisma.hubSyncReceipt.count({ where: { hubInstallationId: telemetryHubId } });
+  const delayedAccepted = await machineRequest({ base, path: '/api/hub-agent/v2/sync', machineSecret: customerFixture.machineSecret,
+    body: { serial: customerFixture.identityOneSerial, identityGeneration: customerFixture.identityOneGeneration, ...delayedBatch } });
+  if (delayedAccepted.response.status !== 200) fail(`Signed delayed historical temperature was rejected after source expiry (${delayedAccepted.response.status}/${delayedAccepted.body?.errorCode || 'no-code'})`);
+  await hub.store.acknowledgeSyncBatch({ streamId: delayedAccepted.body.streamId, acceptedThroughSequence: Number(delayedAccepted.body.acceptedThroughSequence),
+    cloudRevision: Number(delayedAccepted.body.cloudRevision), configurationAppliedRevision: Number(delayedAccepted.body.configurationAppliedRevision) });
+  const [delayedRows, delayedTemperatureRoute, currentTemperatureBootstrap, delayedReceiptCountAfter] = await Promise.all([
+    prisma.nativeTemperatureSample.findMany({ where: { homeId: telemetryHomeId, deviceId: partialDevice.id }, orderBy: { sourceObservedAt: 'asc' }, select: { temperature: true, sourceObservedAt: true, validUntil: true } }),
+    fetchJson(`${base}/api/v2/homes/${telemetryHomeId}/analytics/temperature?level=hour&from=${encodeURIComponent(new Date(Math.floor(delayedObservedAt.getTime() / 3_600_000) * 3_600_000).toISOString())}&to=${encodeURIComponent(new Date(Date.now() - 1_000).toISOString())}&deviceIds=${encodeURIComponent(partialDevice.id)}`, { headers: telemetryHeaders }),
+    fetchJson(`${base}/api/v2/homes/${telemetryHomeId}/analytics/bootstrap`, { headers: telemetryHeaders }),
+    prisma.hubSyncReceipt.count({ where: { hubInstallationId: telemetryHubId } }),
+  ]);
+  const delayedPoint = delayedTemperatureRoute.body?.points?.find((point) => point.sourceAt === delayedObservedAt.toISOString());
+  if (delayedRows.length !== 2 || delayedRows[1].temperature.toNumber?.() !== delayedTemperature && Number(delayedRows[1].temperature) !== delayedTemperature
+    || delayedRows[1].sourceObservedAt.getTime() !== delayedObservedAt.getTime()
+    || delayedRows[1].validUntil.getTime() !== delayedObservedAt.getTime() + 30 * 60_000
+    || delayedTemperatureRoute.response.status !== 200 || !delayedPoint || delayedPoint.currentFresh !== false
+    || delayedPoint.validUntil !== new Date(delayedObservedAt.getTime() + 30 * 60_000).toISOString()
+    || currentTemperatureBootstrap.body?.temperature?.latestCelsius !== 20.5 || currentTemperatureBootstrap.body?.temperature?.quality !== 'fresh'
+    || delayedReceiptCountAfter <= delayedReceiptCountBefore) {
+    fail(`Expired delivery did not remain historical-only or replaced current Radiator state (${JSON.stringify({ rows: delayedRows.map((row) => ({ temperature: Number(row.temperature), sourceAt: row.sourceObservedAt.toISOString(), validUntil: row.validUntil.toISOString() })), status: delayedTemperatureRoute.response.status, delayedPoint: delayedPoint ? { celsius: delayedPoint.celsius, currentFresh: delayedPoint.currentFresh, sourceAt: delayedPoint.sourceAt, validUntil: delayedPoint.validUntil } : null, bootstrap: currentTemperatureBootstrap.body?.temperature, receiptAdded: delayedReceiptCountAfter > delayedReceiptCountBefore })})`);
+  }
+  console.log('[stage10:integration] PASS: a real OS-source 20.8°C Radiator sample delivered 31 minutes late was signed, deduplicated and retained with its original 30-minute deadline; analytics marked it historical/not-current and kept the newer fresh current reading');
+
   for (let attempt = 0; attempt < 20; attempt += 1) {
     const pendingOutbox = hub.store.getSyncOutbox();
     if (!pendingOutbox.inFlight && pendingOutbox.acknowledgedSequence >= pendingOutbox.nextSequence - 1) break;
@@ -4282,6 +4509,44 @@ async function pendingInvitationRouteChecks(deliveryEnv) {
     }));
   }
   const layoutWrongOwnerWrite = await fetchJson(`${base}/api/v2/homes/${inviter.homeId}/preferences`, { method: 'PUT', headers: { ...tenantDashboardHeaders, 'content-type': 'application/json' }, body: JSON.stringify({ kind: 'DASHBOARD_LAYOUT', expectedRevision: 5, document: { ...dashboardLayout, tiles: [{ ...dashboardLayout.tiles[0], deviceId: dashboardDevices[1].id }] } }) });
+  const tenantAnalyticsPreferenceBefore = await prisma.memberPreferenceDocument.findUnique({ where: { membershipId_kind: { membershipId: newTenantMembershipAfterAccept.id, kind: 'DASHBOARD_LAYOUT' } }, select: { revision: true } });
+  const tenantAnalyticsPreferenceDenied = await fetchJson(`${base}/api/v2/homes/${inviter.homeId}/preferences`, { method: 'PUT', headers: { ...tenantDashboardHeaders, 'content-type': 'application/json' }, body: JSON.stringify({ kind: 'DASHBOARD_LAYOUT', expectedRevision: tenantAnalyticsPreferenceBefore?.revision ?? 0, document: { version: 1, tiles: [], analyticsTiles: [
+    { id: 'boilerUsage', size: 'SMALL', position: 0 }, { id: 'radiatorUsage', size: 'SMALL', position: 1 },
+    { id: 'homeTemperature', size: 'MEDIUM', position: 2 }, { id: 'lightUsage', size: 'LARGE', position: 3 },
+  ] } }) });
+  const tenantAnalyticsPreferenceAfter = await prisma.memberPreferenceDocument.findUnique({ where: { membershipId_kind: { membershipId: newTenantMembershipAfterAccept.id, kind: 'DASHBOARD_LAYOUT' } }, select: { revision: true } });
+  const ownerAnalyticsPreferenceSeed = await prisma.memberPreferenceDocument.create({ data: { membershipId: inviter.id, kind: 'DASHBOARD_LAYOUT', revision: 1,
+    document: { version: 1, tiles: [{ deviceId: dashboardDevices[2].id, size: 'STANDARD', position: 0, label: 'Kitchen light' }], labelColours: { Lights: '#f2c94c' } } } });
+  const ownerAnalyticsLayout = { version: 1, tiles: [{ deviceId: dashboardDevices[2].id, size: 'STANDARD', position: 0, label: 'Kitchen light' }],
+    labelColours: { Lights: '#f2c94c' }, analyticsTiles: [
+      { id: 'boilerUsage', size: 'SMALL', position: 0 }, { id: 'radiatorUsage', size: 'MEDIUM', position: 1 },
+      { id: 'homeTemperature', size: 'LARGE', position: 2 }, { id: 'lightUsage', size: 'MINI', position: 3 },
+    ] };
+  const ownerAnalyticsLayoutWrite = await fetchJson(`${base}/api/v2/homes/${inviter.homeId}/preferences`, { method: 'PUT', headers: { ...selectedHomeHeaders, 'content-type': 'application/json' },
+    body: JSON.stringify({ kind: 'DASHBOARD_LAYOUT', expectedRevision: ownerAnalyticsPreferenceSeed.revision, document: ownerAnalyticsLayout }) });
+  const ownerAnalyticsLayoutRead = await fetchJson(`${base}/api/v2/homes/${inviter.homeId}/preferences`, { headers: selectedHomeHeaders });
+  const savedOwnerAnalyticsLayout = ownerAnalyticsLayoutRead.body?.preferences?.find((row) => row.kind === 'DASHBOARD_LAYOUT');
+  if (layoutWrite.response.status !== 200 || layoutFourSizeWrites.some((result) => result.response.status !== 200)
+    || layoutWrongOwnerWrite.response.status !== 400 || layoutWrongOwnerWrite.body?.error?.code !== 'VALIDATION_FAILED'
+    || tenantAnalyticsPreferenceDenied.response.status !== 403 || tenantAnalyticsPreferenceDenied.body?.error?.code !== 'SCOPE_DENIED'
+    || tenantAnalyticsPreferenceAfter?.revision !== tenantAnalyticsPreferenceBefore?.revision
+    || ownerAnalyticsLayoutWrite.response.status !== 200 || ownerAnalyticsLayoutWrite.body?.revision !== ownerAnalyticsPreferenceSeed.revision + 1
+    || ownerAnalyticsLayoutRead.response.status !== 200 || savedOwnerAnalyticsLayout?.revision !== ownerAnalyticsPreferenceSeed.revision + 1
+    || !isDeepStrictEqual(savedOwnerAnalyticsLayout?.document?.tiles, ownerAnalyticsLayout.tiles)
+    || !isDeepStrictEqual(savedOwnerAnalyticsLayout?.document?.labelColours, ownerAnalyticsLayout.labelColours)
+    || !isDeepStrictEqual(savedOwnerAnalyticsLayout?.document?.analyticsTiles, ownerAnalyticsLayout.analyticsTiles)) {
+    fail(`Owner-only analytics dashboard layout did not save/reload beside legacy device tiles, or the tenant denial changed a revision (${JSON.stringify({ tenantDenied: tenantAnalyticsPreferenceDenied.response.status,
+      tenantCode: tenantAnalyticsPreferenceDenied.body?.error?.code, tenantRevisionUnchanged: tenantAnalyticsPreferenceAfter?.revision === tenantAnalyticsPreferenceBefore?.revision,
+      legacyLayoutWrite: layoutWrite.response.status, fourSizeWriteStatuses: layoutFourSizeWrites.map((result) => result.response.status),
+      wrongOwnerWrite: layoutWrongOwnerWrite.response.status, wrongOwnerCode: layoutWrongOwnerWrite.body?.error?.code,
+      ownerWrite: ownerAnalyticsLayoutWrite.response.status, ownerWriteCode: ownerAnalyticsLayoutWrite.body?.error?.code,
+      ownerWriteRevision: ownerAnalyticsLayoutWrite.body?.revision, ownerSeedRevision: ownerAnalyticsPreferenceSeed.revision,
+      ownerRead: ownerAnalyticsLayoutRead.response.status, ownerRevision: savedOwnerAnalyticsLayout?.revision,
+      legacyTilesPreserved: isDeepStrictEqual(savedOwnerAnalyticsLayout?.document?.tiles, ownerAnalyticsLayout.tiles),
+      legacyColorsPreserved: isDeepStrictEqual(savedOwnerAnalyticsLayout?.document?.labelColours, ownerAnalyticsLayout.labelColours),
+      analyticsTilesPreserved: isDeepStrictEqual(savedOwnerAnalyticsLayout?.document?.analyticsTiles, ownerAnalyticsLayout.analyticsTiles),
+      savedAnalyticsTileCount: Array.isArray(savedOwnerAnalyticsLayout?.document?.analyticsTiles) ? savedOwnerAnalyticsLayout.document.analyticsTiles.length : null })})`);
+  }
   const renameKey = crypto.randomUUID();
   const renameBody = { action: 'rename', expectedInventoryRevision: dashboardDevices[0].inventoryRevision, overrideName: 'My bedside light' };
   const renameHeaders = { ...tenantDashboardHeaders, 'content-type': 'application/json', 'idempotency-key': renameKey };

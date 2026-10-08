@@ -52,7 +52,7 @@ export async function readNativeAnalyticsBootstrap(homeId: string, timezone: str
       bucketStart: { gte: sevenDays, lte: now }, purgeAt: { gt: now },
       device: { is: { homeId, managementClass: 'PROPERTY_DEVICE', analyticsCategory: category } }, area: { is: { homeId } } },
       orderBy: { bucketStart: 'asc' }, take: ANALYTICS_MAX_ROWS + 1,
-      select: { deviceId: true, areaId: true, bucketStart: true, closedAt: true, onSeconds: true, offSeconds: true, unknownSeconds: true } });
+      select: { deviceId: true, areaId: true, bucketStart: true, coverageStartAt: true, coverageEndAt: true, closedAt: true, onSeconds: true, offSeconds: true, unknownSeconds: true } });
     if (rows.length > ANALYTICS_MAX_ROWS) throw boundedQueryError();
     return { metric: category.toLowerCase(), buckets: aggregateNativeUsage(rows, 'day', timezone) };
   }));
@@ -66,8 +66,9 @@ export async function readNativeAnalyticsBootstrap(homeId: string, timezone: str
       areaIds: device.assignments.map((assignment) => assignment.areaId) })),
     historicalDevices: retiredDevices.map((device) => ({ id: device.id, label: 'Retired device', category: device.analyticsCategory.toLowerCase(), retiredAt: device.retiredAt?.toISOString() ?? null })),
     summaries, temperature: { latestCelsius: latestTemperature && now < latestTemperature.validUntil ? Number(latestTemperature.temperature) : null,
-      quality: !latestTemperature ? 'unknown' : now < latestTemperature.validUntil ? 'fresh' : 'stale',
-      sourceAt: latestTemperature?.sourceObservedAt.toISOString() ?? null },
+      quality: latestTemperature && now < latestTemperature.validUntil ? 'fresh' : 'unknown',
+      sourceAt: latestTemperature?.sourceObservedAt.toISOString() ?? null,
+      validUntil: latestTemperature?.validUntil.toISOString() ?? null },
     historyState: first ? 'available' : 'empty',
   };
 }
@@ -108,7 +109,7 @@ export async function readNativeUsageDetail(homeId: string, timezone: string, se
     ...(filters.areaIds ? { areaId: { in: filters.areaIds } } : {}), ...(filters.deviceIds ? { deviceId: { in: filters.deviceIds } } : {}),
     device: { is: { homeId, managementClass: 'PROPERTY_DEVICE', analyticsCategory: metric } }, area: { is: { homeId } } },
     orderBy: [{ bucketStart: 'asc' }, { deviceId: 'asc' }], take: ANALYTICS_MAX_ROWS + 1,
-    select: { deviceId: true, areaId: true, bucketStart: true, closedAt: true, onSeconds: true, offSeconds: true, unknownSeconds: true } });
+      select: { deviceId: true, areaId: true, bucketStart: true, coverageStartAt: true, coverageEndAt: true, closedAt: true, onSeconds: true, offSeconds: true, unknownSeconds: true } });
   if (rows.length > ANALYTICS_MAX_ROWS) throw boundedQueryError();
   const candidateDeviceIds = [...new Set(rows.map((row) => row.deviceId))];
   const areaIds = [...new Set(rows.map((row) => row.areaId))];

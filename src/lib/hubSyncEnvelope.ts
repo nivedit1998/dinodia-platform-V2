@@ -156,16 +156,30 @@ function validEvent(event: unknown): event is HubSyncEvent {
         && typeof payload.busy === 'boolean' && Number.isSafeInteger(payload.revision) && Number(payload.revision) >= 1
         && !(payload.phase === 'active' && payload.trustState !== 'ready');
     case 'usage.bucket': {
-      if (!exactKeys(payload, ['osDeviceId', 'osAreaId', 'analyticsCategory', 'controlId', 'sourceGeneration', 'bucketStart', 'revision', 'onSeconds', 'offSeconds', 'unknownSeconds', 'closedAt', 'purgeAt'])
+      const legacyKeys = ['osDeviceId', 'osAreaId', 'analyticsCategory', 'controlId', 'sourceGeneration', 'bucketStart', 'revision', 'onSeconds', 'offSeconds', 'unknownSeconds', 'closedAt', 'purgeAt'];
+      const coveredKeys = [...legacyKeys.slice(0, 6), 'coverageStartAt', 'coverageEndAt', ...legacyKeys.slice(6)];
+      const hasCoverage = exactKeys(payload, coveredKeys);
+      if ((!hasCoverage && !exactKeys(payload, legacyKeys))
         || !boundedText(payload.osDeviceId, 160) || !boundedText(payload.osAreaId, 160)
         || !['LIGHT', 'BOILER', 'RADIATOR'].includes(String(payload.analyticsCategory)) || !boundedText(payload.controlId, 160)
         || !Number.isSafeInteger(payload.sourceGeneration) || Number(payload.sourceGeneration) < 1
         || !validUtc(payload.bucketStart) || !/^\d{4}-\d{2}-\d{2}T\d{2}:00:00\.000Z$/.test(String(payload.bucketStart))
+        || hasCoverage && (!validUtc(payload.coverageStartAt) || !validUtc(payload.coverageEndAt))
         || !Number.isSafeInteger(payload.revision) || Number(payload.revision) < 1
         || ![payload.onSeconds, payload.offSeconds, payload.unknownSeconds].every((value) => Number.isSafeInteger(value) && Number(value) >= 0 && Number(value) <= 3600)
         || Number(payload.onSeconds) + Number(payload.offSeconds) + Number(payload.unknownSeconds) > 3600
         || !(payload.closedAt === null || validUtc(payload.closedAt)) || !validUtc(payload.purgeAt) || event.critical) return false;
       const start = Date.parse(String(payload.bucketStart));
+      const totalSeconds = Number(payload.onSeconds) + Number(payload.offSeconds) + Number(payload.unknownSeconds);
+      const closed = payload.closedAt === null ? null : Date.parse(String(payload.closedAt));
+      const coveredStart = hasCoverage ? Date.parse(String(payload.coverageStartAt))
+        : (closed ?? start + totalSeconds * 1000) - totalSeconds * 1000;
+      const coveredEnd = hasCoverage ? Date.parse(String(payload.coverageEndAt))
+        : (closed ?? start + totalSeconds * 1000);
+      if (!Number.isFinite(coveredStart) || !Number.isFinite(coveredEnd)
+        || coveredStart < start || coveredEnd > start + 3600000 || coveredEnd <= coveredStart
+        || coveredEnd - coveredStart !== totalSeconds * 1000
+        || (closed !== null && (closed !== start + 3600000 || coveredEnd !== closed))) return false;
       const purge = Date.parse(String(payload.purgeAt));
       const expectedPurge = new Date(start);
       const originalDay = expectedPurge.getUTCDate();
@@ -178,7 +192,7 @@ function validEvent(event: unknown): event is HubSyncEvent {
         String(payload.controlId), String(payload.sourceGeneration), String(start),
       ].join('|'), 'utf8').digest('hex');
       if (purge !== expectedPurge.getTime() || event.aggregateId !== expectedAggregate) return false;
-      return payload.closedAt === null || Date.parse(String(payload.closedAt)) === start + 3600000;
+      return true;
     }
     case 'temperature.sample':
       return exactKeys(payload, ['osDeviceId', 'osAreaId', 'controlId', 'sourceGeneration', 'sourceEventKey', 'temperature', 'sourceObservedAt', 'validUntil', 'quality'])

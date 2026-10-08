@@ -37,7 +37,7 @@
     "stage6:migration:target": "node scripts/verify_native_v2_migration_target.mjs --stage6-customer-auth",
     "stage8:migration:target": "node scripts/verify_native_v2_migration_target.mjs --stage8-commissioning",
     "stage9:migration:target": "node scripts/verify_native_v2_migration_target.mjs --stage9-deregistration-guard",
-    "stage10:migration:target": "node scripts/verify_native_v2_migration_target.mjs --stage10-analytics-maintenance",
+    "stage10:migration:target": "node scripts/verify_native_v2_migration_target.mjs --stage10-analytics",
     "evidence:production-read-only": "node scripts/read_only_production_inventory.mjs",
     "foundation:target": "node scripts/assert_v2_target.mjs --mode local",
     "db:validate-target": "node scripts/assert_v2_target.mjs --mode \"${V2_ENVIRONMENT:-local}\"",

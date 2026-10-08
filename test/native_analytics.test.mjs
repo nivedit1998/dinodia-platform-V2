@@ -62,6 +62,19 @@ test('larger usage buckets average device-local-day samples, hourly buckets sum 
   assert.deepEqual(aggregateNativeUsage([], 'day', 'Europe/London'), []);
 });
 
+test('a closed first partial hour preserves exactly its observed 30-minute span', () => {
+  const row = { deviceId: 'device-partial', areaId: 'area-a', bucketStart: '2026-10-04T10:00:00.000Z',
+    coverageStartAt: '2026-10-04T10:30:00.000Z', coverageEndAt: '2026-10-04T11:00:00.000Z',
+    closedAt: '2026-10-04T11:00:00.000Z', onSeconds: 120, offSeconds: 0, unknownSeconds: 1680 };
+  const [hour] = aggregateNativeUsage([row], 'hour', 'Europe/London');
+  assert.equal(hour.coverageSeconds, 1800);
+  assert.equal(hour.onMinutes, 2);
+  assert.equal(hour.unknownMinutes, 28);
+  assert.equal(hour.isPartial, true);
+  assert.throws(() => aggregateNativeUsage([{ ...row, coverageStartAt: '2026-10-04T10:00:00.000Z' }], 'hour', 'Europe/London'), /coverage span/);
+  assert.throws(() => aggregateNativeUsage([{ ...row, coverageEndAt: '2026-10-04T11:00:00.001Z' }], 'hour', 'Europe/London'), /coverage span/);
+});
+
 test('temperature aggregation keeps point timestamps and reports current freshness without fabricating samples', () => {
   const rows = [{ deviceId: 'radiator-a', areaId: 'area-a', sourceObservedAt: '2026-10-08T10:00:00.000Z',
     validUntil: '2026-10-08T10:20:00.000Z', temperature: '20.25' }];
@@ -71,6 +84,21 @@ test('temperature aggregation keeps point timestamps and reports current freshne
   assert.equal(data[0].currentFresh, true);
   assert.equal(aggregateNativeTemperature(rows, 'hour', 'Europe/London', new Date('2026-10-08T10:20:00.000Z'))[0].currentFresh, false);
   assert.equal(aggregateNativeTemperature([], 'hour', 'Europe/London', new Date()).length, 0);
+});
+
+test('temperature validity intervals retain delayed history, weight only covered time, and preserve unknown gaps', () => {
+  const rows = [
+    { deviceId: 'radiator-a', areaId: 'area-a', sourceObservedAt: '2026-10-08T00:00:00.000Z', validUntil: '2026-10-08T00:30:00.000Z', temperature: 20 },
+    { deviceId: 'radiator-a', areaId: 'area-a', sourceObservedAt: '2026-10-08T04:00:00.000Z', validUntil: '2026-10-08T04:30:00.000Z', temperature: 22 },
+  ];
+  const [day] = aggregateNativeTemperature(rows, 'day', 'UTC', new Date('2026-10-08T05:00:00.000Z'));
+  assert.equal(day.celsius, 21);
+  assert.equal(day.coverageSeconds, 3600);
+  assert.equal(day.currentFresh, false);
+  assert.equal(day.segments.length, 2);
+  assert.equal(day.segments[0].end, '2026-10-08T00:30:00.000Z');
+  assert.equal(day.segments[1].start, '2026-10-08T04:00:00.000Z');
+  assert.equal(day.validUntil, '2026-10-08T04:30:00.000Z');
 });
 
 test('analytics request windows are canonical, bounded to retained data, and use a calendar-year cutoff', () => {

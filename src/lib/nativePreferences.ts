@@ -21,7 +21,9 @@ function documentValid(kind: MemberPreferenceKind, value: unknown): value is Rec
   const document = value as Record<string, unknown>;
   if (document.version !== 1) return false;
   if (kind === 'DASHBOARD_LAYOUT') {
-    if ((!exactKeys(document, ['version', 'tiles']) && !exactKeys(document, ['version', 'tiles', 'labelColours']))
+    const allowed = ['version', 'tiles', 'labelColours', 'analyticsTiles'];
+    if (Object.keys(document).some((key) => !allowed.includes(key))
+      || !Object.hasOwn(document, 'version') || !Object.hasOwn(document, 'tiles')
       || !Array.isArray(document.tiles) || document.tiles.length > 500) return false;
     if ('labelColours' in document) {
       if (!document.labelColours || typeof document.labelColours !== 'object' || Array.isArray(document.labelColours)) return false;
@@ -30,7 +32,7 @@ function documentValid(kind: MemberPreferenceKind, value: unknown): value is Rec
         label.length < 1 || label.length > 40 || label.trim() !== label || typeof colour !== 'string' || !/^#[0-9a-fA-F]{6}$/.test(colour))) return false;
     }
     const ids = new Set<string>();
-    return document.tiles.every((raw) => {
+    const deviceTilesValid = document.tiles.every((raw) => {
       if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return false;
       const tile = raw as Record<string, unknown>;
       const legacy = exactKeys(tile, ['deviceId', 'size']);
@@ -45,6 +47,21 @@ function documentValid(kind: MemberPreferenceKind, value: unknown): value is Rec
       ids.add(tile.deviceId);
       return true;
     });
+    if (!deviceTilesValid) return false;
+    if (Object.hasOwn(document, 'analyticsTiles')) {
+      if (!Array.isArray(document.analyticsTiles) || document.analyticsTiles.length !== 4) return false;
+      const analyticsIds = new Set<string>(); const positions = new Set<number>();
+      const permitted = new Set(['boilerUsage', 'radiatorUsage', 'homeTemperature', 'lightUsage']);
+      if (!document.analyticsTiles.every((raw) => {
+        if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return false;
+        const tile = raw as Record<string, unknown>;
+        if (!exactKeys(tile, ['id', 'size', 'position']) || typeof tile.id !== 'string' || !permitted.has(tile.id)
+          || analyticsIds.has(tile.id) || !['MINI', 'SMALL', 'MEDIUM', 'LARGE'].includes(String(tile.size))
+          || !Number.isSafeInteger(tile.position) || Number(tile.position) < 0 || Number(tile.position) > 3 || positions.has(Number(tile.position))) return false;
+        analyticsIds.add(tile.id); positions.add(Number(tile.position)); return true;
+      }) || analyticsIds.size !== permitted.size || positions.size !== 4) return false;
+    }
+    return true;
   }
   if (kind === 'FILTER_STATE') return exactKeys(document, ['version', 'areaIds', 'deviceIds']) && canonicalIdSet(document.areaIds) && canonicalIdSet(document.deviceIds);
   if (kind === 'QUIET_HOURS') {
@@ -80,6 +97,9 @@ function documentValid(kind: MemberPreferenceKind, value: unknown): value is Rec
 async function assertReferencesVisible(db: Prisma.TransactionClient, input: {
   homeId: string; membershipId: string; role: string; kind: MemberPreferenceKind; grantedAreaIds: readonly string[]; document: Record<string, unknown>;
 }) {
+  if (input.document && 'analyticsTiles' in input.document && !['OWNER', 'PROPERTY_MANAGER'].includes(input.role)) {
+    throw new NativePreferenceError('PREFERENCE_FORBIDDEN');
+  }
   if (input.role === 'TENANT' && input.document) {
     const enabled = input.document.enabledFamilies as unknown;
     if (Array.isArray(enabled) && enabled.some((family) => typeof family !== 'string' || !tenantFamilies.includes(family as typeof tenantFamilies[number]))) {

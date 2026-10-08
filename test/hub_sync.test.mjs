@@ -182,6 +182,14 @@ test('usage buckets carry bounded absolute counters, calendar retention and no a
   const counterOverflow = structuredClone(value);
   counterOverflow.events[0].payload.onSeconds = 3601;
   assert.equal(validateHubSyncEnvelope(counterOverflow), false);
+  const coveredPartial = structuredClone(value);
+  Object.assign(coveredPartial.events[0].payload, {
+    coverageStartAt: '2026-10-04T12:00:00.000Z', coverageEndAt: '2026-10-04T12:03:00.000Z',
+  });
+  assert.equal(validateHubSyncEnvelope(coveredPartial), true);
+  const subsecondMismatch = structuredClone(coveredPartial);
+  subsecondMismatch.events[0].payload.coverageEndAt = '2026-10-04T12:03:00.001Z';
+  assert.equal(validateHubSyncEnvelope(subsecondMismatch), false);
   const criticalTelemetry = structuredClone(value);
   criticalTelemetry.events[0].critical = true;
   assert.equal(validateHubSyncEnvelope(criticalTelemetry), false);

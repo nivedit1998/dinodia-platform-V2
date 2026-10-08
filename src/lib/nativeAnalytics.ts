@@ -3,6 +3,7 @@ export type NativeAnalyticsLevel = 'hour' | 'day' | 'week' | 'month' | 'year';
 
 export type NativeUsageRow = {
   deviceId: string; areaId: string; bucketStart: Date | string; closedAt: Date | string | null;
+  coverageStartAt?: Date | string | null; coverageEndAt?: Date | string | null;
   onSeconds: number; offSeconds: number; unknownSeconds: number;
 };
 
@@ -89,15 +90,26 @@ const rounded = (value: number) => Math.floor(value + 0.5);
  */
 export function aggregateNativeUsage(rows: readonly NativeUsageRow[], level: NativeAnalyticsLevel, timezone: string) {
   if (!validAnalyticsTimezone(timezone) || !['hour', 'day', 'week', 'month', 'year'].includes(level)) throw new TypeError('Invalid analytics period');
-  const byPeriod = new Map<string, { period: ReturnType<typeof usagePeriod>; samples: Map<string, { on: number; off: number; unknown: number; coverage: number; count: number }>; openBucket: boolean }>();
+  const byPeriod = new Map<string, { period: ReturnType<typeof usagePeriod>; samples: Map<string, { on: number; off: number; unknown: number; coverage: number; count: number }>; openBucket: boolean; partialCoverage: boolean }>();
   for (const row of rows) {
     const start = new Date(row.bucketStart);
     if (!Number.isFinite(start.getTime()) || ![row.onSeconds, row.offSeconds, row.unknownSeconds].every((n) => Number.isSafeInteger(n) && n >= 0)) throw new TypeError('Invalid usage row');
     const sum = row.onSeconds + row.offSeconds + row.unknownSeconds;
-    if (sum > 3600 || (row.closedAt !== null && sum !== 3600)) throw new TypeError('Invalid usage partition');
+    if (sum > 3600) throw new TypeError('Invalid usage partition');
+    const closed = row.closedAt === null ? null : new Date(row.closedAt);
+    const hasStart = row.coverageStartAt !== undefined && row.coverageStartAt !== null;
+    const hasEnd = row.coverageEndAt !== undefined && row.coverageEndAt !== null;
+    if (hasStart !== hasEnd) throw new TypeError('Incomplete usage coverage metadata');
+    const coverageEnd = hasEnd ? new Date(row.coverageEndAt!) : closed ?? new Date(start.getTime() + sum * 1000);
+    const coverageStart = hasStart ? new Date(row.coverageStartAt!) : new Date(coverageEnd.getTime() - sum * 1000);
+    if (!Number.isFinite(coverageStart.getTime()) || !Number.isFinite(coverageEnd.getTime())
+      || coverageStart < start || coverageEnd > new Date(start.getTime() + 3600000) || coverageEnd <= coverageStart
+      || coverageEnd.getTime() - coverageStart.getTime() !== sum * 1000
+      || (closed && (closed.getTime() !== start.getTime() + 3600000 || closed.getTime() !== coverageEnd.getTime()))) throw new TypeError('Invalid usage coverage span');
     const period = usagePeriod(row, level, timezone);
-    const result = byPeriod.get(period.key) ?? { period, samples: new Map(), openBucket: false };
+    const result = byPeriod.get(period.key) ?? { period, samples: new Map(), openBucket: false, partialCoverage: false };
     result.openBucket ||= row.closedAt === null;
+    result.partialCoverage ||= sum < 3600;
     const sampleKey = level === 'hour' ? row.deviceId : `${row.deviceId}:${period.localDay}`;
     const sample = result.samples.get(sampleKey) ?? { on: 0, off: 0, unknown: 0, coverage: 0, count: 0 };
     sample.on += row.onSeconds; sample.off += row.offSeconds; sample.unknown += row.unknownSeconds; sample.coverage += sum; sample.count += 1;
@@ -110,27 +122,65 @@ export function aggregateNativeUsage(rows: readonly NativeUsageRow[], level: Nat
     return { id, start: result.period.start, end: result.period.end, label: result.period.label,
       onMinutes: rounded(totals.on / 60 / divisor), offMinutes: rounded(totals.off / 60 / divisor), unknownMinutes: rounded(totals.unknown / 60 / divisor),
       coverageSeconds: totals.coverage, contributingDeviceDays: level === 'hour' ? samples.length : samples.length,
-      isPartial: result.openBucket,
+      isPartial: result.openBucket || result.partialCoverage,
     };
   });
 }
 
 export function aggregateNativeTemperature(rows: readonly NativeTemperatureRow[], level: NativeAnalyticsLevel, timezone: string, now: Date) {
   if (!validAnalyticsTimezone(timezone) || !Number.isFinite(now.getTime())) throw new TypeError('Invalid temperature query');
-  const grouped = new Map<string, { period: ReturnType<typeof usagePeriod>; values: number[]; sources: number[]; validUntil: number }>();
+  const grouped = new Map<string, { period: ReturnType<typeof usagePeriod>; rows: Array<{ deviceId: string; source: number; validUntil: number; value: number }> }>();
   for (const row of rows) {
     const source = new Date(row.sourceObservedAt); const validUntil = new Date(row.validUntil); const value = Number(row.temperature);
     if (!Number.isFinite(source.getTime()) || !Number.isFinite(validUntil.getTime()) || !Number.isFinite(value) || value < -50 || value > 80 || validUntil <= source) continue;
     const period = usagePeriod({ ...row, bucketStart: source, closedAt: null, onSeconds: 0, offSeconds: 0, unknownSeconds: 0 }, level, timezone);
-    const entry = grouped.get(period.key) ?? { period, values: [], sources: [], validUntil: 0 };
-    entry.values.push(value); entry.sources.push(source.getTime()); entry.validUntil = Math.max(entry.validUntil, validUntil.getTime()); grouped.set(period.key, entry);
+    const entry = grouped.get(period.key) ?? { period, rows: [] };
+    entry.rows.push({ deviceId: row.deviceId, source: source.getTime(), validUntil: validUntil.getTime(), value }); grouped.set(period.key, entry);
   }
-  return [...grouped.entries()].sort((a, b) => a[1].period.start.localeCompare(b[1].period.start)).map(([id, entry]) => ({
-    id, start: entry.period.start, end: entry.period.end, label: entry.period.label,
-    celsius: Math.round(entry.values.reduce((a, b) => a + b, 0) / entry.values.length * 100) / 100,
-    sampleCount: entry.values.length, sourceAt: new Date(entry.sources.reduce((latest, value) => Math.max(latest, value), Number.NEGATIVE_INFINITY)).toISOString(),
-    currentFresh: now.getTime() < entry.validUntil,
-  }));
+  return [...grouped.entries()].sort((a, b) => a[1].period.start.localeCompare(b[1].period.start)).map(([id, entry]) => {
+    const periodStart = Date.parse(entry.period.start), periodEnd = Date.parse(entry.period.end);
+    const events = new Map<number, { starts: number[]; ends: number[] }>();
+    entry.rows.forEach((row, rowIndex) => {
+      const start = Math.max(periodStart, row.source), end = Math.min(periodEnd, row.validUntil);
+      if (end <= start) return;
+      const atStart = events.get(start) ?? { starts: [], ends: [] }; atStart.starts.push(rowIndex); events.set(start, atStart);
+      const atEnd = events.get(end) ?? { starts: [], ends: [] }; atEnd.ends.push(rowIndex); events.set(end, atEnd);
+    });
+    const boundaries = [...events.keys()].sort((a, b) => a - b);
+    const active = new Map<string, Map<number, { source: number; value: number }>>();
+    const segments: Array<{ id: string; start: string; end: string; celsius: number }> = [];
+    let weighted = 0, covered = 0;
+    for (let index = 0; index < boundaries.length - 1; index += 1) {
+      const start = boundaries[index], end = boundaries[index + 1];
+      if (end <= start) continue;
+      const boundary = events.get(start);
+      for (const rowIndex of boundary?.ends ?? []) {
+        const row = entry.rows[rowIndex]; const values = active.get(row.deviceId);
+        values?.delete(rowIndex); if (values?.size === 0) active.delete(row.deviceId);
+      }
+      for (const rowIndex of boundary?.starts ?? []) {
+        const row = entry.rows[rowIndex]; const values = active.get(row.deviceId) ?? new Map();
+        values.set(rowIndex, { source: row.source, value: row.value }); active.set(row.deviceId, values);
+      }
+      const activeByDevice = new Map<string, { source: number; value: number }>();
+      for (const [deviceId, values] of active) {
+        const latest = [...values.values()].reduce((best, sample) => !best || sample.source > best.source ? sample : best, null as { source: number; value: number } | null);
+        if (latest) activeByDevice.set(deviceId, latest);
+      }
+      if (!activeByDevice.size) continue;
+      const celsius = [...activeByDevice.values()].reduce((sum, sample) => sum + sample.value, 0) / activeByDevice.size;
+      const roundedCelsius = Math.round(celsius * 100) / 100;
+      const previous = segments.at(-1);
+      if (previous && previous.end === new Date(start).toISOString() && previous.celsius === roundedCelsius) previous.end = new Date(end).toISOString();
+      else segments.push({ id: `${id}:${segments.length}`, start: new Date(start).toISOString(), end: new Date(end).toISOString(), celsius: roundedCelsius });
+      weighted += celsius * (end - start); covered += end - start;
+    }
+    const latest = entry.rows.reduce((candidate, row) => row.source > candidate.source ? row : candidate, entry.rows[0]);
+    return { id, start: entry.period.start, end: entry.period.end, label: entry.period.label,
+      celsius: Math.round((covered ? weighted / covered : latest.value) * 100) / 100,
+      sampleCount: entry.rows.length, sourceAt: new Date(latest.source).toISOString(), validUntil: new Date(latest.validUntil).toISOString(),
+      currentFresh: now.getTime() < latest.validUntil, coverageSeconds: Math.floor(covered / 1000), segments };
+  });
 }
 
 export function retentionStart(now: Date): Date {
@@ -143,7 +193,7 @@ export function retentionStart(now: Date): Date {
 export function parseAnalyticsWindow(input: { from?: string | null; to?: string | null }, now: Date) {
   const from = input.from ? new Date(input.from) : null; const to = input.to ? new Date(input.to) : now;
   if ((input.from && !Number.isFinite(from!.getTime())) || !Number.isFinite(to.getTime()) || (from && from.toISOString() !== input.from)
-    || (input.to && to.toISOString() !== input.to) || (from && from >= to) || to > now || to.getTime() - (from?.getTime() ?? to.getTime()) > 366 * 24 * 60 * 60 * 1000) {
+    || (input.to && to.toISOString() !== input.to) || (from && from >= to) || to > now) {
     throw Object.assign(new Error('Choose a valid analytics window of no more than 12 months'), { status: 400, code: 'VALIDATION_FAILED' });
   }
   const earliest = retentionStart(now);

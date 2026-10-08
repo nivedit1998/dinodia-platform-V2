@@ -78,6 +78,15 @@ const stage6CandidateFiles = new Set([
   'test/dinodia_contract.test.mjs', 'test/foundation_contracts.test.mjs', 'test/native_v1_error_boundary.test.mjs', 'test/native_v1_route_coverage.test.mjs', 'test/stage1_route_inventory.mjs', 'test/stage1_security.test.mjs', 'test/native_migration_bundle.test.mjs',
 ]);
 
+// Stage 10 measured-history work has its own reviewed runtime owners. Keep its
+// tracked production paths explicit while this historical manifest classifier
+// is retained for the shared release worktree.
+const stage10CandidateFiles = new Set([
+  'src/lib/hubSyncEnvelope.ts', 'src/lib/hubSyncIngestion.ts',
+  'src/lib/nativeAnalytics.ts', 'src/lib/nativeAnalyticsQueries.ts',
+  'src/lib/nativePreferences.ts', 'test/native_analytics.test.mjs',
+]);
+
 const addedFiles = [
   /^contracts(?:\/|$)/,
   /^public\/\.well-known(?:\/|$)/,
@@ -115,7 +124,7 @@ const classified = entries.map(({ status, file }) => {
     return { status, file, classification: 'INTENTIONAL_DELETE' };
   }
   if (status === ' M' || status === 'M ' || status === 'MM') {
-    if (!modifiedFiles.has(file) && !stage6CandidateFiles.has(file)) throw new Error(`unclassified modification: ${file}`);
+    if (!modifiedFiles.has(file) && !stage6CandidateFiles.has(file) && !stage10CandidateFiles.has(file)) throw new Error(`unclassified modification: ${file}`);
     return { status, file, classification: 'KEEP_MODIFIED' };
   }
   if (status === '??' || status === 'A ' || status === 'AM') {

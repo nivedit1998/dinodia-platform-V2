@@ -34,6 +34,16 @@ function oneCalendarYearAfter(source: Date): Date {
   return result;
 }
 
+function oneCalendarYearBefore(source: Date): Date {
+  const result = new Date(source);
+  const day = result.getUTCDate();
+  result.setUTCDate(1);
+  result.setUTCFullYear(result.getUTCFullYear() - 1);
+  const lastDay = new Date(Date.UTC(result.getUTCFullYear(), result.getUTCMonth() + 1, 0)).getUTCDate();
+  result.setUTCDate(Math.min(day, lastDay));
+  return result;
+}
+
 export async function applyHubSyncEvent(tx: Prisma.TransactionClient, input: {
   event: HubSyncEvent; homeId: string; hubInstallationId: string; identityGeneration?: number; now: Date;
 }) {
@@ -191,22 +201,39 @@ export async function applyHubSyncEvent(tx: Prisma.TransactionClient, input: {
       controlId: String(payload.controlId), bucketStart, sourceGeneration: Number(payload.sourceGeneration),
     } };
     const previous = await tx.nativeDeviceUsageBucket.findUnique({ where, select: {
-      id: true, revision: true, onSeconds: true, offSeconds: true, unknownSeconds: true, closedAt: true, purgeAt: true,
+      id: true, revision: true, onSeconds: true, offSeconds: true, unknownSeconds: true,
+      coverageStartAt: true, coverageEndAt: true, closedAt: true, purgeAt: true,
     } });
     const incomingRevision = Number(payload.revision);
     const closedAt = payload.closedAt === null ? null : strictDate(payload.closedAt, now);
     const purgeAt = new Date(String(payload.purgeAt));
     if (!Number.isFinite(purgeAt.getTime()) || purgeAt.getTime() !== oneCalendarYearAfter(bucketStart).getTime()) invalid('hub_sync_usage_purge_invalid', 'The usage bucket retention deadline is invalid');
-    const data = { onSeconds: Number(payload.onSeconds), offSeconds: Number(payload.offSeconds), unknownSeconds: Number(payload.unknownSeconds), closedAt, purgeAt, revision: incomingRevision };
+    const data: { onSeconds: number; offSeconds: number; unknownSeconds: number; coverageStartAt: Date; coverageEndAt: Date; closedAt: Date | null; purgeAt: Date; revision: number } = {
+      onSeconds: Number(payload.onSeconds), offSeconds: Number(payload.offSeconds), unknownSeconds: Number(payload.unknownSeconds),
+      coverageStartAt: bucketStart, coverageEndAt: bucketStart, closedAt, purgeAt, revision: incomingRevision,
+    };
     const totalSeconds = data.onSeconds + data.offSeconds + data.unknownSeconds;
-    if (closedAt && (closedAt.getTime() !== bucketStart.getTime() + 60 * 60 * 1000 || totalSeconds !== 3600)
+    const legacyEnd = closedAt ?? new Date(bucketStart.getTime() + totalSeconds * 1000);
+    const coverageStartAt = Object.hasOwn(payload, 'coverageStartAt') ? strictDate(payload.coverageStartAt, now)
+      : new Date(legacyEnd.getTime() - totalSeconds * 1000);
+    const coverageEndAt = Object.hasOwn(payload, 'coverageEndAt') ? strictDate(payload.coverageEndAt, now) : legacyEnd;
+    const coveredMilliseconds = coverageEndAt.getTime() - coverageStartAt.getTime();
+    if (coverageStartAt < bucketStart || coverageEndAt > new Date(bucketStart.getTime() + 3600000)
+      || coverageEndAt <= coverageStartAt || coveredMilliseconds !== totalSeconds * 1000
+      || closedAt && (closedAt.getTime() !== bucketStart.getTime() + 3600000 || coverageEndAt.getTime() !== closedAt.getTime())
       || !closedAt && totalSeconds >= 3600) {
-      invalid('hub_sync_usage_bucket_closure_invalid', 'A closed usage bucket must cover exactly its hour and an open bucket must remain incomplete');
+      invalid('hub_sync_usage_bucket_closure_invalid', 'Usage counters must partition exactly their bounded covered span; closed buckets must end at the hour boundary');
     }
+    data.coverageStartAt = coverageStartAt; data.coverageEndAt = coverageEndAt;
     if (previous) {
       if (previous.revision > incomingRevision) return;
       if (previous.revision === incomingRevision) {
+        const previousCoverageStart = previous.coverageStartAt ?? new Date((previous.closedAt ?? new Date(bucketStart.getTime() + totalSeconds * 1000)).getTime() - totalSeconds * 1000);
+        const previousCoverageEnd = previous.coverageEndAt ?? previous.closedAt ?? new Date(bucketStart.getTime() + totalSeconds * 1000);
         if (previous.onSeconds !== data.onSeconds || previous.offSeconds !== data.offSeconds || previous.unknownSeconds !== data.unknownSeconds
+          || previous.coverageStartAt && previous.coverageStartAt.getTime() !== coverageStartAt.getTime()
+          || previous.coverageEndAt && previous.coverageEndAt.getTime() !== coverageEndAt.getTime()
+          || previousCoverageStart.getTime() !== coverageStartAt.getTime() || previousCoverageEnd.getTime() !== coverageEndAt.getTime()
           || previous.closedAt?.getTime() !== closedAt?.getTime() || previous.purgeAt.getTime() !== purgeAt.getTime()) {
           invalid('hub_sync_usage_revision_conflict', 'A usage revision was reused with different absolute counters');
         }
@@ -246,8 +273,10 @@ export async function applyHubSyncEvent(tx: Prisma.TransactionClient, input: {
     const observedAt = strictDate(payload.sourceObservedAt, now);
     const validUntil = new Date(String(payload.validUntil));
     if (!Number.isFinite(validUntil.getTime())) invalid('hub_sync_temperature_validity_invalid', 'The temperature validity deadline is invalid');
-    if (validUntil <= observedAt || validUntil.getTime() > observedAt.getTime() + 30 * 60 * 1000
-      || observedAt > now || now >= validUntil) return;
+    const maximumValidityMs = Math.min(30 * 60 * 1000, Number(control.maxStateValiditySeconds) * 1000);
+    if (!Number.isSafeInteger(control.maxStateValiditySeconds) || maximumValidityMs <= 0
+      || validUntil <= observedAt || validUntil.getTime() > observedAt.getTime() + maximumValidityMs
+      || observedAt > now || observedAt < oneCalendarYearBefore(now) || now >= oneCalendarYearAfter(observedAt)) return;
     const existing = await tx.nativeTemperatureSample.findUnique({ where: { sourceEventKey: String(payload.sourceEventKey) }, select: { id: true, homeId: true, deviceId: true, temperature: true, sourceObservedAt: true, validUntil: true } });
     const expectedSourceEventKey = createHash('sha256').update([
       osDeviceId, String(payload.controlId), String(payload.sourceGeneration), observedAt.toISOString(),
@@ -271,7 +300,7 @@ export async function applyHubSyncEvent(tx: Prisma.TransactionClient, input: {
       temperature: Number(payload.temperature), sourceObservedAt: observedAt, validUntil,
       sourceGeneration: Number(payload.sourceGeneration), purgeAt: oneCalendarYearAfter(observedAt),
     } });
-    if (!recent) await tx.nativeDevice.update({ where: { id: device.id }, data: { radiatorTemperature: Number(payload.temperature), radiatorReadingAt: observedAt } });
+    if (!recent && now < validUntil) await tx.nativeDevice.update({ where: { id: device.id }, data: { radiatorTemperature: Number(payload.temperature), radiatorReadingAt: observedAt } });
     return;
   }
 

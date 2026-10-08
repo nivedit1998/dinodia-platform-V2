@@ -106,7 +106,8 @@ test('readiness accepts the exact Stage 3 head plus only reviewed additive Stage
   const stage9DeregistrationGuard = migration('20261008100000_stage9_deregister_redacted_support_guard');
   const stage9 = [stage9DeregistrationGuard, ...stage8];
   const stage10AnalyticsMaintenance = migration('20261008130000_stage10_analytics_maintenance_tasks');
-  const stage10 = [stage10AnalyticsMaintenance, ...stage9];
+  const stage10PartialUsageCoverage = migration('20261008150000_stage10_partial_usage_coverage');
+  const stage10 = [stage10PartialUsageCoverage, stage10AnalyticsMaintenance, ...stage9];
   assert.equal(isSchemaReady(stage3, REQUIRED_MODEL_COUNT, stage3Checksum), true);
   assert.equal(isSchemaReady(stage4, REQUIRED_MODEL_COUNT, stage3Checksum), true, 'the app rollback remains ready after the additive migration');
   assert.equal(isSchemaReady(stage5, REQUIRED_MODEL_COUNT + 1, stage3Checksum), true, 'the Stage 5 app and Stage 4 rollback remain ready on the additive Stage 5 schema');
@@ -114,6 +115,7 @@ test('readiness accepts the exact Stage 3 head plus only reviewed additive Stage
   assert.equal(isSchemaReady(stage8, REQUIRED_MODEL_COUNT + 2, stage3Checksum), true, 'Stage 8 adds only compatible columns and remains ready without changing the table-count contract');
   assert.equal(isSchemaReady(stage9, REQUIRED_MODEL_COUNT + 2, stage3Checksum), true, 'Stage 9 trigger-only compatibility fix preserves the established schema/table-count contract');
   assert.equal(isSchemaReady(stage10, REQUIRED_MODEL_COUNT + 2, stage3Checksum), true, 'Stage 10 task-registry migration is additive and keeps the existing application schema ready');
+  assert.equal(isSchemaReady([{ ...stage10PartialUsageCoverage, checksum: '0'.repeat(64) }, stage10AnalyticsMaintenance, ...stage9], REQUIRED_MODEL_COUNT + 2, stage3Checksum), false, 'an unreviewed Stage 10 coverage migration must fail closed');
   assert.equal(isSchemaReady([{ ...stage10AnalyticsMaintenance, checksum: '0'.repeat(64) }, ...stage9], REQUIRED_MODEL_COUNT + 2, stage3Checksum), false, 'an unreviewed Stage 10 migration checksum is not schema-ready');
   assert.equal(isSchemaReady([{ ...stage9DeregistrationGuard, checksum: '0'.repeat(64) }, ...stage8], REQUIRED_MODEL_COUNT + 2, stage3Checksum), false, 'an unreviewed Stage 9 migration checksum is not schema-ready');
   assert.equal(isSchemaReady(stage8, REQUIRED_MODEL_COUNT + 3, stage3Checksum), false, 'Stage 8 does not authorize an unexplained table-count change');
@@ -141,6 +143,16 @@ test('Stage 10 repairs the existing analytics BEFORE trigger to preserve valid r
   assert.match(sql, /temperature history requires a permanent Radiator device/);
   assert.match(sql, /RETURN NEW;/, 'a valid BEFORE-row-trigger observation must be inserted');
   assert.doesNotMatch(sql, /RETURN NULL;/, 'returning NULL silently cancels an otherwise valid analytics row');
+});
+
+test('Stage 10 partial-hour migration replaces the closed-hour constraint with exact bounded coverage', () => {
+  const sql = fs.readFileSync('prisma/migrations/20261008150000_stage10_partial_usage_coverage/migration.sql', 'utf8');
+  assert.match(sql, /ADD COLUMN "coverageStartAt" TIMESTAMP\(3\)/);
+  assert.match(sql, /ADD COLUMN "coverageEndAt" TIMESTAMP\(3\)/);
+  assert.match(sql, /DROP CONSTRAINT "NativeUsage_duration_check"/);
+  assert.match(sql, /"onSeconds" \+ "offSeconds" \+ "unknownSeconds" = 3600\s+OR \("coverageStartAt" IS NOT NULL AND "coverageEndAt" IS NOT NULL\)/);
+  assert.match(sql, /extract\(epoch FROM \("coverageEndAt" - "coverageStartAt"\)\) \* 1000\s+= \("onSeconds" \+ "offSeconds" \+ "unknownSeconds"\) \* 1000/);
+  assert.match(sql, /"closedAt" = "bucketStart" \+ INTERVAL '1 hour' AND "coverageEndAt" = "closedAt"/);
 });
 
 test('foundation and Stage 1 schema is exactly native and bounded', () => {

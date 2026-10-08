@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { migrationBundleIdentity, STAGE6_CUSTOMER_MIGRATIONS, STAGE9_DEREGISTRATION_GUARD_MIGRATION, unexpectedPendingMigrations } from '../scripts/native_migration_bundle.mjs';
+import { migrationBundleIdentity, STAGE6_CUSTOMER_MIGRATIONS, STAGE9_DEREGISTRATION_GUARD_MIGRATION, STAGE10_ANALYTICS_MAINTENANCE_MIGRATION, STAGE10_PARTIAL_USAGE_COVERAGE_MIGRATION, unexpectedPendingMigrations } from '../scripts/native_migration_bundle.mjs';
 
 test('Stage 6 migration bundle identity is stable, ordered and requires every reviewed checksum', () => {
   const checksums = new Map(STAGE6_CUSTOMER_MIGRATIONS.map((name, index) => [name, String(index + 1).repeat(64)]));
@@ -24,4 +24,15 @@ test('Stage 9 support-guard migration is a single reviewed additive target', () 
   assert.equal(bundle.migrations[0].name, STAGE9_DEREGISTRATION_GUARD_MIGRATION);
   assert.deepEqual(unexpectedPendingMigrations([STAGE9_DEREGISTRATION_GUARD_MIGRATION], [STAGE9_DEREGISTRATION_GUARD_MIGRATION]), []);
   assert.deepEqual(unexpectedPendingMigrations([STAGE9_DEREGISTRATION_GUARD_MIGRATION, 'unreviewed'], [STAGE9_DEREGISTRATION_GUARD_MIGRATION]), ['unreviewed']);
+});
+
+test('Stage 10 production migration bundle pins maintenance and partial-coverage migrations together', () => {
+  const stage10Migrations = [STAGE10_ANALYTICS_MAINTENANCE_MIGRATION, STAGE10_PARTIAL_USAGE_COVERAGE_MIGRATION];
+  const checksums = new Map(stage10Migrations.map((name, index) => [name, String(index + 4).repeat(64)]));
+  const bundle = migrationBundleIdentity(stage10Migrations, checksums);
+  assert.deepEqual(bundle.migrations.map(({ name }) => name), stage10Migrations);
+  assert.equal(bundle.migrations.length, 2);
+  assert.deepEqual(unexpectedPendingMigrations([STAGE10_PARTIAL_USAGE_COVERAGE_MIGRATION], stage10Migrations), []);
+  assert.deepEqual(unexpectedPendingMigrations([...stage10Migrations, 'unreviewed-stage10-migration'], stage10Migrations), ['unreviewed-stage10-migration']);
+  assert.throws(() => migrationBundleIdentity(stage10Migrations, new Map([[stage10Migrations[0], 'a'.repeat(64)]])), /missing reviewed checksum/);
 });
