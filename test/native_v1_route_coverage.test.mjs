@@ -86,7 +86,7 @@ test('every Native V2 route method has an explicit role-profile and AC cross-ref
   const indexed = new Set();
   for (const row of acRouteMatrix.routes) {
     assert.ok(Array.isArray(row.acceptanceCriteria) && row.acceptanceCriteria.length > 0, `AC cross-reference missing for ${row.file}`);
-    for (const criterion of row.acceptanceCriteria) assert.match(criterion, /^AC-(?:02\.(?:[1-9]|[1-3][0-9]|4[0-5])|06\.(?:[1-9]|[1-2][0-9]|3[0-5])|07\.(?:[1-9]|1[0-9]|2[0-3])|08\.(?:[1-9]|1[0-9]|2[0-2])|09\.(?:[1-9]|[1-3][0-9]))$/, `invalid AC reference ${criterion} in ${row.file}`);
+    for (const criterion of row.acceptanceCriteria) assert.match(criterion, /^AC-(?:02\.(?:[1-9]|[1-3][0-9]|4[0-5])|06\.(?:[1-9]|[1-2][0-9]|3[0-5])|07\.(?:[1-9]|1[0-9]|2[0-3])|08\.(?:[1-9]|1[0-9]|2[0-2])|09\.(?:[1-9]|[1-3][0-9])|10\.(?:[1-9]|1[0-9]))$/, `invalid AC reference ${criterion} in ${row.file}`);
     for (const method of row.methods) {
       const profile = typeof row.principalProfile === 'string' ? row.principalProfile : row.principalProfile?.[method];
       assert.ok(profile, `principal profile missing for ${method} ${routePath(row.file)}`);
