@@ -393,8 +393,8 @@ INSERT INTO "PermanentDeviceInstallationRequest" ("id","customerReference","home
 `;
   runWithInput('docker', ['exec', '-i', dockerName, 'psql', '-U', 'postgres', '-d', 'dinodia_v2_prior_stage8', '-v', 'ON_ERROR_STOP=1'], stage8PreservationSql);
   fs.cpSync(path.join(tempRoot, 'prisma/migrations', stage8MigrationName), path.join(stage8PriorMigrationsDirectory, stage8MigrationName), { recursive: true });
-  run(localPrisma, ['migrate', 'deploy', '--schema', stage8PriorSchema], { cwd: stage8PriorMigrationRoot, env: stage8PriorEnv });
-  run(localPrisma, ['migrate', 'deploy', '--schema', stage8PriorSchema], { cwd: stage8PriorMigrationRoot, env: stage8PriorEnv });
+  run(localPrisma, ['migrate', 'deploy', '--schema', stage8PriorSchema], { cwd: priorStage8MigrationRoot, env: stage8PriorEnv });
+  run(localPrisma, ['migrate', 'deploy', '--schema', stage8PriorSchema], { cwd: priorStage8MigrationRoot, env: stage8PriorEnv });
   const stage8AppliedCount = capture('docker', ['exec', dockerName, 'psql', '-U', 'postgres', '-d', 'dinodia_v2_prior_stage8', '-At', '-c', 'SELECT count(*) FROM "_prisma_migrations" WHERE "finished_at" IS NOT NULL AND "rolled_back_at" IS NULL']).trim();
   if (stage8AppliedCount !== '30') throw new Error(`Stage 8 schema proof did not land on its exact 30-migration head (observed ${stage8AppliedCount})`);
 
@@ -407,8 +407,8 @@ INSERT INTO "SupportTicket" ("id","publicReference","customerAccountId","homeId"
 `;
   runWithInput('docker', ['exec', '-i', dockerName, 'psql', '-U', 'postgres', '-d', 'dinodia_v2_prior_stage8', '-v', 'ON_ERROR_STOP=1'], stage9SupportTicketSql);
   fs.cpSync(path.join(tempRoot, 'prisma/migrations', stage9MigrationName), path.join(stage8PriorMigrationsDirectory, stage9MigrationName), { recursive: true });
-  run(localPrisma, ['migrate', 'deploy', '--schema', stage8PriorSchema], { cwd: stage8PriorMigrationRoot, env: stage8PriorEnv });
-  run(localPrisma, ['migrate', 'deploy', '--schema', stage8PriorSchema], { cwd: stage8PriorMigrationRoot, env: stage8PriorEnv });
+  run(localPrisma, ['migrate', 'deploy', '--schema', stage8PriorSchema], { cwd: priorStage8MigrationRoot, env: stage8PriorEnv });
+  run(localPrisma, ['migrate', 'deploy', '--schema', stage8PriorSchema], { cwd: priorStage8MigrationRoot, env: stage8PriorEnv });
   run('node', ['scripts/foundation_db_checks.mjs'], { cwd: tempRoot, env: stage8PriorEnv });
   const stage9RedactionSql = `
 UPDATE "SupportTicket" SET "status"='CLOSED',"customerAccountId"=NULL,"selectedMembershipId"=NULL,"description"='[Closed and redacted after full-home deregistration]',"title"=NULL,"closedAt"=CURRENT_TIMESTAMP WHERE "id"='${stage9TicketId}';
