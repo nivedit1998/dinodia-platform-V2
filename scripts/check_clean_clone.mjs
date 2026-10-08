@@ -20,8 +20,8 @@ const priorHeadMigrationRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'dinodia-v2
 const priorStage6MigrationRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'dinodia-v2-prior-stage6-migrations-'));
 const priorStage8MigrationRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'dinodia-v2-prior-stage8-migrations-'));
 const rollbackRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'dinodia-v2-schema-compatible-rollback-'));
-const schemaCompatibleRollbackCommit = '0708d8cd7ce5f77f8945543abb5eeaef5b012e37';
-const schemaCompatibleRollbackDeployment = 'dpl_F3EQaveSTAVcuYtzTPwWRDCmX1WR';
+const schemaCompatibleRollbackCommit = '9b6213cc2a8a26d1366dcb44f18dca2cadbc6652';
+const schemaCompatibleRollbackDeployment = 'dpl_2c1PCRGSkBNgrvgZJ3GdkrHgSJga';
 let dockerStarted = false;
 
 function safeProcessEnvironment() {
