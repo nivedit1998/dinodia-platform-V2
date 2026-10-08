@@ -499,7 +499,7 @@ END $$;
     membershipId: crypto.randomUUID(),
     trustedDeviceId: crypto.randomUUID(),
     sessionId: crypto.randomUUID(),
-    sessionToken: `schema-compatible-rollback-${crypto.randomBytes(24).toString('hex')}`,
+    sessionToken: `dno-customer-session-${crypto.randomBytes(32).toString('base64url')}`,
     privateHomeMarker: `rollback-private-home-${crypto.randomBytes(16).toString('hex')}`,
   };
   const refreshTokenHash = crypto.createHash('sha256').update(rollbackFixture.sessionToken).digest('hex');
