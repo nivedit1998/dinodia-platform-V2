@@ -145,6 +145,24 @@ function loadInstallationPushDispatcher() {
   new Function('require', 'module', 'exports', compiled)(localRequire, loaded, loaded.exports);
   return loaded.exports.dispatchInstallationPushReceipts;
 }
+function loadNativeAnalyticsIntegrityCheck() {
+  const require = createRequire(import.meta.url);
+  const ts = require('typescript');
+  const source = fs.readFileSync(path.join(root, 'src/lib/nativeOperations.ts'), 'utf8');
+  const compiled = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, esModuleInterop: true } }).outputText;
+  const loaded = { exports: {} };
+  const localRequire = (specifier) => {
+    if (specifier === './prisma') return { prisma };
+    if (specifier === './hubOperatorCredentials') return { reconcileCredentialLifecycle: async () => ({}) };
+    if (specifier === './stage1ClaimContract') return { releaseExpiredClaim: async () => ({ released: false }) };
+    if (specifier === './supportNotifications') return { createPropertySupportNotifications: async () => undefined };
+    if (specifier === './installationRequestDelivery') return { dispatchInstallationRequestNotifications: async () => ({}) };
+    if (specifier === './homeDeregistrationCleanup') return { resumeHomeDeregistrationAccountCleanup: async () => ({}) };
+    return require(specifier);
+  };
+  new Function('require', 'module', 'exports', compiled)(localRequire, loaded, loaded.exports);
+  return loaded.exports.inspectNativeAnalyticsIntegrity;
+}
 function encryptStage8PlatformToken(token, encodedKey) {
   const key = Buffer.from(encodedKey, 'base64');
   const iv = crypto.randomBytes(12);
@@ -3936,8 +3954,11 @@ async function pendingInvitationRouteChecks(deliveryEnv) {
     managementClass: 'PROPERTY_DEVICE', deviceType: 'radiator', manufacturer: 'Disposable integration fixture',
     model: 'Partial-hour route test', protocol: 'zigbee', lifecycle: 'INSTALLED', descriptorRevision: 1,
   } });
-  await prisma.deviceAreaAssignment.create({ data: { homeId: telemetryHomeId, deviceId: partialDevice.id, areaId: telemetryAreaId,
-    validFrom: new Date(partialObservedAt.getTime() - 86_400_000), source: 'STAGE10_PARTIAL_HOUR', actorType: 'SYSTEM' } });
+  const partialAssignment = await prisma.deviceAreaAssignment.create({ data: { homeId: telemetryHomeId, deviceId: partialDevice.id, areaId: telemetryAreaId,
+    // This first assignment begins at the actual first observation, halfway
+    // through its containing hour. Bucket identity remains 10:00; authority
+    // must be checked against coverageStartAt=10:30, not bucketStart=10:00.
+    validFrom: new Date(partialObservedAt.getTime() + 60_000), source: 'STAGE10_PARTIAL_HOUR', actorType: 'SYSTEM' } });
   const priorPartialPlatform = hub.store.getPlatform();
   await hub.store.savePlatform({ ...priorPartialPlatform, devicePolicies: { ...(priorPartialPlatform.devicePolicies || {}), [partialOsDeviceId]: {
     osDeviceId: partialOsDeviceId, managementClass: 'PROPERTY_DEVICE', analyticsCategory: 'RADIATOR',
@@ -3974,7 +3995,51 @@ async function pendingInvitationRouteChecks(deliveryEnv) {
   if (!partialBatch || !partialBatch.events.some((event) => event.type === 'usage.bucket' && event.payload?.osDeviceId === partialOsDeviceId)) {
     fail('The partial closed-hour usage event was not included in the bounded signed outbox batch');
   }
+  const partialOutboxBeforeDenial = hub.store.getSyncOutbox();
   const partialReceiptCountBefore = await prisma.hubSyncReceipt.count({ where: { hubInstallationId: telemetryHubId } });
+  const partialCursorBefore = await prisma.hubInstallation.findUniqueOrThrow({ where: { id: telemetryHubId }, select: { syncAcceptedSequence: true } });
+  const partialDenied = await machineRequest({ base, path: '/api/hub-agent/v2/sync', machineSecret: customerFixture.machineSecret,
+    body: { serial: customerFixture.identityOneSerial, identityGeneration: customerFixture.identityOneGeneration, ...partialBatch } });
+  const partialDeniedRows = await prisma.nativeDeviceUsageBucket.count({ where: { deviceId: partialDevice.id } });
+  const partialReceiptCountDenied = await prisma.hubSyncReceipt.count({ where: { hubInstallationId: telemetryHubId } });
+  const partialCursorDenied = await prisma.hubInstallation.findUniqueOrThrow({ where: { id: telemetryHubId }, select: { syncAcceptedSequence: true } });
+  const partialOutboxAfterDenial = hub.store.getSyncOutbox();
+  const exactPartialRetry = await hub.store.prepareSyncBatch(telemetryHubId, hub.pairing.runtime, Date.now());
+  if (partialDenied.response.status !== 409 || partialDenied.body?.errorCode !== 'hub_sync_area_assignment_invalid'
+    || partialDeniedRows !== 0 || partialReceiptCountDenied !== partialReceiptCountBefore
+    || Number(partialCursorDenied.syncAcceptedSequence) !== Number(partialCursorBefore.syncAcceptedSequence)
+    || partialOutboxAfterDenial.acknowledgedSequence !== partialOutboxBeforeDenial.acknowledgedSequence
+    || partialOutboxAfterDenial.nextSequence !== partialOutboxBeforeDenial.nextSequence
+    || partialOutboxAfterDenial.events.length !== partialOutboxBeforeDenial.events.length
+    || JSON.stringify(exactPartialRetry) !== JSON.stringify(partialBatch)) {
+    fail(`Usage beginning before its Area assignment was not denied without effects (${JSON.stringify({ status: partialDenied.response.status,
+      code: partialDenied.body?.errorCode, rows: partialDeniedRows, receiptsUnchanged: partialReceiptCountDenied === partialReceiptCountBefore,
+      cursorUnchanged: Number(partialCursorDenied.syncAcceptedSequence) === Number(partialCursorBefore.syncAcceptedSequence),
+      outboxAcknowledgementUnchanged: partialOutboxAfterDenial.acknowledgedSequence === partialOutboxBeforeDenial.acknowledgedSequence,
+      exactPersistedBatchPreserved: JSON.stringify(exactPartialRetry) === JSON.stringify(partialBatch) })})`);
+  }
+  // A movement boundary before coverage ends must also deny. The complete
+  // observed span cannot be attributed to the old Area after the device has
+  // moved, even though that Area was correct at the source timestamp.
+  await prisma.deviceAreaAssignment.update({ where: { id: partialAssignment.id }, data: {
+    validFrom: new Date(partialObservedAt.getTime() - 86_400_000), validUntil: new Date(partialObservedAt.getTime() + 60_000),
+  } });
+  const movedSpanDenied = await machineRequest({ base, path: '/api/hub-agent/v2/sync', machineSecret: customerFixture.machineSecret,
+    body: { serial: customerFixture.identityOneSerial, identityGeneration: customerFixture.identityOneGeneration, ...partialBatch } });
+  const movedSpanRows = await prisma.nativeDeviceUsageBucket.count({ where: { deviceId: partialDevice.id } });
+  const movedSpanReceiptCount = await prisma.hubSyncReceipt.count({ where: { hubInstallationId: telemetryHubId } });
+  const movedSpanCursor = await prisma.hubInstallation.findUniqueOrThrow({ where: { id: telemetryHubId }, select: { syncAcceptedSequence: true } });
+  if (movedSpanDenied.response.status !== 409 || movedSpanDenied.body?.errorCode !== 'hub_sync_area_assignment_invalid'
+    || movedSpanRows !== 0 || movedSpanReceiptCount !== partialReceiptCountBefore
+    || Number(movedSpanCursor.syncAcceptedSequence) !== Number(partialCursorBefore.syncAcceptedSequence)) {
+    fail(`Usage crossing an Area movement boundary was not denied without effects (${JSON.stringify({ status: movedSpanDenied.response.status,
+      code: movedSpanDenied.body?.errorCode, rows: movedSpanRows, receiptsUnchanged: movedSpanReceiptCount === partialReceiptCountBefore,
+      cursorUnchanged: Number(movedSpanCursor.syncAcceptedSequence) === Number(partialCursorBefore.syncAcceptedSequence) })})`);
+  }
+  // Retry the exact persisted event body/sequence after correcting the
+  // disposable assignment boundary. Re-signing transport authentication is
+  // expected; changing the accepted event envelope is not.
+  await prisma.deviceAreaAssignment.update({ where: { id: partialAssignment.id }, data: { validFrom: partialObservedAt, validUntil: null } });
   const partialAccepted = await machineRequest({ base, path: '/api/hub-agent/v2/sync', machineSecret: customerFixture.machineSecret,
     body: { serial: customerFixture.identityOneSerial, identityGeneration: customerFixture.identityOneGeneration, ...partialBatch } });
   if (partialAccepted.response.status !== 200) fail(`Platform rejected actual partial-hour producer data (${partialAccepted.response.status}/${partialAccepted.body?.errorCode || 'no-code'})`);
@@ -3996,7 +4061,320 @@ async function pendingInvitationRouteChecks(deliveryEnv) {
     || partialUsageRoute.response.status !== 200 || !partialUsageRoute.body.buckets?.some((bucket) => bucket.onMinutes === 2 && bucket.unknownMinutes === 28 && bucket.coverageSeconds === 1800 && bucket.isPartial === true)) {
     fail(`The signed Platform route did not persist and project the exact partial-hour span (${JSON.stringify({ rows: partialRows.map((row) => ({ on: row.onSeconds, off: row.offSeconds, unknown: row.unknownSeconds, coverageStartAt: row.coverageStartAt, coverageEndAt: row.coverageEndAt, closedAt: row.closedAt })), receiptAdvanced: partialReceiptCountAfter > partialReceiptCountBefore, cursor: Number(partialCursor.syncAcceptedSequence), through: Number(partialBatch.toSequence), usageStatus: partialUsageRoute.response.status, buckets: partialUsageRoute.body?.buckets?.map((bucket) => ({ onMinutes: bucket.onMinutes, unknownMinutes: bucket.unknownMinutes, coverageSeconds: bucket.coverageSeconds, isPartial: bucket.isPartial })) })})`);
   }
-  console.log('[stage10:integration] PASS: actual Store -> signed sync route -> durable receipt/cursor -> analytics API accepted one 1,800-second closed partial hour: 120 On, 1,680 Unknown, exact 10:30-to-11:00 coverage; no padded Off/Unknown hour');
+  const inspectNativeAnalyticsIntegrity = loadNativeAnalyticsIntegrityCheck();
+  const partialMaintenance = await inspectNativeAnalyticsIntegrity(new Date());
+  if (partialMaintenance.status !== 'OK' || partialMaintenance.invalidUsagePartitions !== 0
+    || partialMaintenance.usageRowsScanned < 1) {
+    fail(`The actual daily maintenance owner rejected a valid closed partial hour (${JSON.stringify(partialMaintenance)})`);
+  }
+  // The database check constraint must reject a duration/span mismatch. Then
+  // exercise a different malformed-but-schema-admissible state (a complete
+  // hour left open) so the actual maintenance integrity query proves it still
+  // detects corruption that can arise from legacy/runtime paths.
+  let malformedSpanRejected = false;
+  try {
+    await prisma.nativeDeviceUsageBucket.updateMany({ where: { deviceId: partialDevice.id },
+      data: { coverageEndAt: new Date(partialClosedAt.getTime() - 1_000) } });
+  } catch (error) {
+    malformedSpanRejected = String(error?.message || error).includes('NativeDeviceUsageBucket_coverage_span_check');
+  } finally {
+    await prisma.nativeDeviceUsageBucket.updateMany({ where: { deviceId: partialDevice.id }, data: {
+      onSeconds: partialRow.onSeconds, offSeconds: partialRow.offSeconds, unknownSeconds: partialRow.unknownSeconds,
+      closedAt: partialRow.closedAt, coverageStartAt: partialRow.coverageStartAt, coverageEndAt: partialRow.coverageEndAt,
+    } });
+  }
+  let malformedMaintenance;
+  try {
+    const malformed = await prisma.nativeDeviceUsageBucket.updateMany({ where: { deviceId: partialDevice.id }, data: {
+      onSeconds: 3600, offSeconds: 0, unknownSeconds: 0, closedAt: null,
+      coverageStartAt: new Date(partialClosedAt.getTime() - 3_600_000), coverageEndAt: partialClosedAt,
+    } });
+    if (malformed.count !== 1) fail('Could not construct the disposable open-full-hour maintenance regression');
+    malformedMaintenance = await inspectNativeAnalyticsIntegrity(new Date());
+  } finally {
+    await prisma.nativeDeviceUsageBucket.updateMany({ where: { deviceId: partialDevice.id }, data: {
+      onSeconds: partialRow.onSeconds, offSeconds: partialRow.offSeconds, unknownSeconds: partialRow.unknownSeconds,
+      closedAt: partialRow.closedAt, coverageStartAt: partialRow.coverageStartAt, coverageEndAt: partialRow.coverageEndAt,
+    } });
+  }
+  const restoredMaintenance = await inspectNativeAnalyticsIntegrity(new Date());
+  if (!malformedSpanRejected || malformedMaintenance?.status !== 'FAILED' || malformedMaintenance.invalidUsagePartitions < 1
+    || restoredMaintenance.status !== 'OK' || restoredMaintenance.invalidUsagePartitions !== 0) {
+    fail(`The database span constraint/actual maintenance owner did not reject malformed disposable coverage and recover after restoration (${JSON.stringify({ malformedSpanRejected,
+      malformed: malformedMaintenance,
+      restored: restoredMaintenance })})`);
+  }
+  // Exercise a real local Area move through Store, durable outbox and the
+  // signed ingestion route. Coverage must end at the move, and the old
+  // source snapshot must not be copied into the destination Area.
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    const beforeMovementOutbox = hub.store.getSyncOutbox();
+    if (!beforeMovementOutbox.inFlight && beforeMovementOutbox.acknowledgedSequence >= beforeMovementOutbox.nextSequence - 1) break;
+    await hub.pairing.syncNow();
+    await sleep(25);
+  }
+  const movedOsDeviceId = `stage10-area-move-${crypto.randomUUID()}`;
+  const movedUsageControlId = `stage10-move-heat-${crypto.randomUUID()}`;
+  const movedTemperatureControlId = `stage10-move-temp-${crypto.randomUUID()}`;
+  const movedSourceAt = new Date('2026-10-08T10:30:00.000Z');
+  const movedAt = new Date('2026-10-08T10:45:00.000Z');
+  const movedDestinationOsAreaId = `stage10-moved-area-${crypto.randomUUID()}`;
+  const destinationArea = await prisma.area.create({ data: { homeId: telemetryHomeId, osAreaId: movedDestinationOsAreaId,
+    originalName: 'Disposable moved destination' }, select: { id: true, originalName: true } });
+  await hub.store.saveArea({ name: destinationArea.originalName }, movedDestinationOsAreaId);
+  const movedPlatformDevice = await prisma.nativeDevice.create({ data: {
+    homeId: telemetryHomeId, hubInstallationId: telemetryHubId, osDeviceId: movedOsDeviceId,
+    originalName: 'Disposable moved radiator', technicalLabel: 'radiator', analyticsCategory: 'RADIATOR',
+    managementClass: 'PROPERTY_DEVICE', deviceType: 'radiator', manufacturer: 'Disposable integration fixture',
+    model: 'Area-movement attribution test', protocol: 'zigbee', lifecycle: 'INSTALLED', descriptorRevision: 1,
+  } });
+  const movedOldAssignment = await prisma.deviceAreaAssignment.create({ data: {
+    homeId: telemetryHomeId, deviceId: movedPlatformDevice.id, areaId: telemetryAreaId,
+    validFrom: movedSourceAt, source: 'STAGE10_AREA_MOVEMENT', actorType: 'SYSTEM',
+  } });
+  const movedPolicy = hub.store.getPlatform();
+  await hub.store.savePlatform({ ...movedPolicy, devicePolicies: { ...(movedPolicy.devicePolicies || {}), [movedOsDeviceId]: {
+    osDeviceId: movedOsDeviceId, managementClass: 'PROPERTY_DEVICE', analyticsCategory: 'RADIATOR', lifecycle: 'INSTALLED',
+    ownerMembershipId: null, descriptorRevision: 1, descriptorDigest: 'f'.repeat(64), osAreaIds: [telemetryOsAreaId, movedDestinationOsAreaId],
+  } } });
+  const movedDeviceSource = {
+    id: movedOsDeviceId, name: 'Disposable moved radiator', protocol: 'zigbee', deviceType: 'radiator', technicalLabel: 'radiator',
+    areaId: telemetryOsAreaId, setup: { status: 'ready', assignmentMode: 'device_inherited_v1', completedAt: movedSourceAt.toISOString() },
+    state: { heatDemand: 'on', ambientTemperature: 20.8 },
+    entities: {
+      heatDemand: { id: 'stage10-move-heat-entity', name: 'Heat demand', state: 'on', sourceObservedAt: movedSourceAt.toISOString(), domain: 'climate', category: 'control', capability: {
+        controlId: movedUsageControlId, kind: 'binary', category: 'control', readable: true, writable: false, observable: true, semanticRole: 'active_heat_demand',
+        maxStateValiditySeconds: 1800, bindings: [],
+      } },
+      ambientTemperature: { id: 'stage10-move-temperature-entity', name: 'Ambient temperature', state: 20.8, sourceObservedAt: movedSourceAt.toISOString(), domain: 'sensor', category: 'measurement', capability: {
+        controlId: movedTemperatureControlId, kind: 'number', category: 'measurement', readable: true, writable: false, observable: true, semanticRole: 'ambient_temperature',
+        maxStateValiditySeconds: 1800, bindings: [],
+      } },
+      setpoint: { id: 'stage10-move-setpoint-entity', name: 'Target temperature', state: 21, sourceObservedAt: movedSourceAt.toISOString(), domain: 'climate', capability: {
+        controlId: `stage10-move-target-${crypto.randomUUID()}`, kind: 'number', readable: true, writable: true, observable: true, semanticRole: 'target_temperature',
+        maxStateValiditySeconds: 1800, bindings: [{ serviceId: 'climate.set_temperature', parameter: { key: 'temperature', type: 'number', min: 5, max: 35, step: 0.5 } }],
+      } },
+    },
+  };
+  const movedInventorySource = { ...movedDeviceSource, entities: Object.fromEntries(Object.entries(movedDeviceSource.entities)
+    .map(([key, entity]) => [key, { ...entity, sourceObservedAt: undefined }])) };
+  await hub.store.upsertDevice(movedInventorySource);
+  await hub.pairing.syncNow();
+  const movedInitialPlatformDevice = await prisma.nativeDevice.findUniqueOrThrow({ where: { id: movedPlatformDevice.id }, select: { capabilitySummary: true } });
+  const movedInitialCatalog = movedInitialPlatformDevice.capabilitySummary?.controlCatalog;
+  if (Number(movedInitialCatalog?.revision) !== 1
+    || !movedInitialCatalog.controls?.some((control) => control.controlId === movedUsageControlId && control.semanticRole === 'active_heat_demand')
+    || !movedInitialCatalog.controls?.some((control) => control.controlId === movedTemperatureControlId && control.semanticRole === 'ambient_temperature')) {
+    fail(`The actual initial OS inventory/catalogue sync did not establish the producer authority required before telemetry (${JSON.stringify({
+      revision: movedInitialCatalog?.revision ?? null, controlRoles: movedInitialCatalog?.controls?.map((control) => control.semanticRole) ?? [],
+    })})`);
+  }
+  const movementSyncIdleDeadline = Date.now() + 8_000;
+  while ((hub.pairing.syncing || hub.pairing.queuedImmediateSync) && Date.now() < movementSyncIdleDeadline) await sleep(25);
+  if (hub.pairing.syncing || hub.pairing.queuedImmediateSync) fail('The initial catalogue sync did not settle before controlled Area-movement telemetry');
+  const movementPreviousRetryAt = hub.pairing.nextRetryAt;
+  // Keep the live fixture dispatcher from advancing this controlled source
+  // clock between the observation and move. The signed HTTP ingestion below
+  // remains the real loopback route; only its competing timer is deferred.
+  hub.pairing.nextRetryAt = Date.now() + 60_000;
+  await prisma.deviceAreaAssignment.update({ where: { id: movedOldAssignment.id }, data: { validUntil: movedAt } });
+  await prisma.deviceAreaAssignment.create({ data: {
+    homeId: telemetryHomeId, deviceId: movedPlatformDevice.id, areaId: destinationArea.id,
+    validFrom: movedAt, source: 'STAGE10_AREA_MOVEMENT', actorType: 'SYSTEM',
+  } });
+  await hub.store.upsertDevice(movedDeviceSource, { nowMs: movedSourceAt.getTime() });
+  await hub.store.upsertDevice({ ...movedDeviceSource, areaId: movedDestinationOsAreaId }, { nowMs: movedAt.getTime() });
+  const movedOldAreaBuckets = Object.values(hub.store.snapshot().syncUsage.buckets).filter((bucket) => bucket.osDeviceId === movedOsDeviceId);
+  const movedOldAreaBucket = movedOldAreaBuckets[0];
+  const movedOutbox = hub.store.getSyncOutbox();
+  const movedBatch = await hub.store.prepareSyncBatch(telemetryHubId, hub.pairing.runtime, Date.now());
+  const movedDeviceEvents = movedBatch?.events.filter((event) => event.payload?.osDeviceId === movedOsDeviceId) ?? [];
+  if (!['device.upsert', 'control.catalog.upsert', 'usage.bucket'].every((type) => movedDeviceEvents.some((event) => event.type === type))) {
+    fail(`Area movement batch omitted a required producer event or returned an older in-flight prefix (${JSON.stringify({
+      inFlight: movedOutbox.inFlight?.toSequence ?? null, acknowledgedSequence: movedOutbox.acknowledgedSequence,
+      nextSequence: movedOutbox.nextSequence, targetEvents: movedDeviceEvents.map((event) => event.type),
+    })})`);
+  }
+  if (movedOldAreaBuckets.length !== 1 || movedOldAreaBucket.osAreaId !== telemetryOsAreaId
+    || movedOldAreaBucket.coverageStartAt !== movedSourceAt.toISOString() || movedOldAreaBucket.coverageEndAt !== movedAt.toISOString()
+    || movedOldAreaBucket.onSeconds !== 900 || movedOldAreaBucket.offSeconds !== 0 || movedOldAreaBucket.unknownSeconds !== 0
+    || movedOutbox.events.some((event) => event.type === 'temperature.sample' && event.payload?.osDeviceId === movedOsDeviceId && event.payload.osAreaId === movedDestinationOsAreaId)
+    || !movedBatch?.events.some((event) => event.type === 'usage.bucket' && event.payload?.osDeviceId === movedOsDeviceId
+      && event.payload.osAreaId === telemetryOsAreaId && event.payload.coverageEndAt === movedAt.toISOString())) {
+    fail(`The OS producer did not stop old-Area coverage exactly at movement (${JSON.stringify({ bucket: movedOldAreaBucket ?? null,
+      newAreaTemperatureReattributed: movedOutbox.events.some((event) => event.type === 'temperature.sample' && event.payload?.osDeviceId === movedOsDeviceId && event.payload.osAreaId === movedDestinationOsAreaId),
+      hasSignedOldAreaEvent: Boolean(movedBatch?.events.some((event) => event.type === 'usage.bucket' && event.payload?.osDeviceId === movedOsDeviceId)) })})`);
+  }
+  const movedSync = await machineRequest({ base, path: '/api/hub-agent/v2/sync', machineSecret: customerFixture.machineSecret,
+    body: { serial: customerFixture.identityOneSerial, identityGeneration: customerFixture.identityOneGeneration, ...movedBatch } });
+  const movedStoredRows = await prisma.nativeDeviceUsageBucket.findMany({ where: { deviceId: movedPlatformDevice.id }, select: {
+    areaId: true, onSeconds: true, offSeconds: true, unknownSeconds: true, coverageStartAt: true, coverageEndAt: true,
+  } });
+  const movedStoredTemperature = await prisma.nativeTemperatureSample.findMany({ where: { deviceId: movedPlatformDevice.id }, select: { areaId: true, sourceObservedAt: true } });
+  const movedStoredDevice = await prisma.nativeDevice.findUniqueOrThrow({ where: { id: movedPlatformDevice.id }, select: { descriptorRevision: true, descriptorDigest: true, capabilitySummary: true } });
+  if (movedSync.response.status !== 200 || movedStoredRows.length !== 1 || movedStoredRows[0].areaId !== telemetryAreaId
+    || movedStoredRows[0].coverageEndAt.toISOString() !== movedAt.toISOString()
+    || movedStoredRows[0].onSeconds !== (movedAt.getTime() - movedSourceAt.getTime()) / 1_000
+    || movedStoredTemperature.length !== 1 || movedStoredTemperature[0].areaId !== telemetryAreaId
+    || movedStoredTemperature[0].sourceObservedAt.toISOString() !== movedSourceAt.toISOString()) {
+    fail(`The actual signed ingestion route misattributed movement-boundary evidence (${JSON.stringify({ status: movedSync.response.status,
+      rows: movedStoredRows.map((row) => ({ areaId: row.areaId, on: row.onSeconds, start: row.coverageStartAt, end: row.coverageEndAt })),
+      temperatureAreas: movedStoredTemperature.map((row) => row.areaId),
+      acceptedThrough: movedSync.body?.acceptedThroughSequence ?? null,
+      targetEvents: movedDeviceEvents.map((event) => event.type), descriptorRevision: movedStoredDevice.descriptorRevision,
+      hasCatalog: Boolean(movedStoredDevice.capabilitySummary?.controlCatalog) })})`);
+  }
+  const movedIntegrity = await inspectNativeAnalyticsIntegrity(new Date());
+  if (movedIntegrity?.status !== 'OK' || movedIntegrity.invalidUsagePartitions !== 0) {
+    fail(`The actual maintenance owner rejected valid exact-assignment partial-hour coverage (${JSON.stringify(movedIntegrity)})`);
+  }
+  const movedUsageTo = new Date(Date.now() - 1_000);
+  const movedUsageFrom = new Date(Math.floor(movedSourceAt.getTime() / 3_600_000) * 3_600_000);
+  const movedUsageUrl = (areaId) => `${base}/api/v2/homes/${telemetryHomeId}/analytics/usage?metric=radiator&level=hour&from=${encodeURIComponent(movedUsageFrom.toISOString())}&to=${encodeURIComponent(movedUsageTo.toISOString())}&areaIds=${encodeURIComponent(areaId)}&deviceIds=${encodeURIComponent(movedPlatformDevice.id)}`;
+  const [movedOldAreaProjection, movedNewAreaProjection] = await Promise.all([
+    fetchJson(movedUsageUrl(telemetryAreaId), { headers: telemetryHeaders }),
+    fetchJson(movedUsageUrl(destinationArea.id), { headers: telemetryHeaders }),
+  ]);
+  if (movedOldAreaProjection.response.status !== 200 || movedOldAreaProjection.body?.selectedDeviceCount !== 1
+    || movedOldAreaProjection.body.buckets?.[0]?.coverageSeconds !== 900 || movedOldAreaProjection.body.buckets?.[0]?.onMinutes !== 15
+    || movedNewAreaProjection.response.status !== 200 || movedNewAreaProjection.body?.selectedDeviceCount !== 0
+    || movedNewAreaProjection.body.buckets?.length !== 0) {
+    fail(`The authorized usage projections did not keep the movement-boundary minute only in its original Area (${JSON.stringify({
+      oldStatus: movedOldAreaProjection.response.status, oldCount: movedOldAreaProjection.body?.selectedDeviceCount,
+      oldBuckets: movedOldAreaProjection.body?.buckets?.map((bucket) => ({ coverageSeconds: bucket.coverageSeconds, onMinutes: bucket.onMinutes })),
+      newStatus: movedNewAreaProjection.response.status, newCount: movedNewAreaProjection.body?.selectedDeviceCount,
+      newBucketCount: movedNewAreaProjection.body?.buckets?.length })})`);
+  }
+  const movedAcceptedThrough = Number(movedSync.body.acceptedThroughSequence);
+  if (hub.store.getSyncOutbox().acknowledgedSequence < movedAcceptedThrough) {
+    try {
+      await hub.store.acknowledgeSyncBatch({ streamId: movedSync.body.streamId, acceptedThroughSequence: movedAcceptedThrough,
+        cloudRevision: Number(movedSync.body.cloudRevision), configurationAppliedRevision: Number(movedSync.body.configurationAppliedRevision) });
+    } catch (error) {
+      // The real background dispatcher may have reconciled the same accepted
+      // in-flight envelope while this test inspected the signed route result.
+      // Suppress only when durable local state proves that exact prefix is
+      // already acknowledged; all other mismatches remain failures.
+      if (hub.store.getSyncOutbox().acknowledgedSequence < movedAcceptedThrough) throw error;
+    }
+  }
+  if (hub.store.getSyncOutbox().acknowledgedSequence < movedAcceptedThrough) {
+    fail('The accepted Area-movement batch did not advance the durable local cursor');
+  }
+  hub.pairing.nextRetryAt = movementPreviousRetryAt;
+  // Keep this route fixture isolated from the later machine-configuration
+  // checks, which intentionally expect the original Home Area inventory.
+  await prisma.$transaction(async (tx) => {
+    await tx.nativeDeviceUsageBucket.deleteMany({ where: { deviceId: movedPlatformDevice.id } });
+    await tx.nativeTemperatureSample.deleteMany({ where: { deviceId: movedPlatformDevice.id } });
+    await tx.deviceAreaAssignment.deleteMany({ where: { deviceId: movedPlatformDevice.id } });
+    await tx.nativeDevice.delete({ where: { id: movedPlatformDevice.id } });
+  });
+  console.log('[stage10:integration] PASS: actual Store/route moved an exact 10:30–10:45 partial bucket across Areas, the assigned old-Area projection retained 900 seconds, maintenance accepted it, and source identity was preserved');
+
+  // F10-G: query a real, retained Radiator validity interval that starts ten
+  // minutes before UTC midnight. The row is disposable test data; the owner
+  // route must return the two calendar-day slices and a next-day-only query
+  // must find the bounded overlapping sample.
+  const midnightNow = new Date();
+  const telemetryHomeTimezone = (await prisma.home.findUniqueOrThrow({ where: { id: telemetryHomeId }, select: { timezone: true } })).timezone;
+  const targetLocalDate = new Date(midnightNow.getTime() - 36 * 60 * 60_000);
+  const localDateParts = new Intl.DateTimeFormat('en-US', { timeZone: telemetryHomeTimezone,
+    year: 'numeric', month: '2-digit', day: '2-digit' }).formatToParts(targetLocalDate);
+  const localDate = Object.fromEntries(localDateParts.filter((part) => part.type !== 'literal').map((part) => [part.type, Number(part.value)]));
+  const targetLocalMidnightAsUtc = Date.UTC(localDate.year, localDate.month - 1, localDate.day);
+  const localClock = new Intl.DateTimeFormat('en-US', { timeZone: telemetryHomeTimezone,
+    year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23' });
+  let midnightBoundaryMs = targetLocalMidnightAsUtc;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const parts = Object.fromEntries(localClock.formatToParts(new Date(midnightBoundaryMs))
+      .filter((part) => part.type !== 'literal').map((part) => [part.type, Number(part.value)]));
+    const representedLocalAsUtc = Date.UTC(parts.year, parts.month - 1, parts.day, parts.hour, parts.minute, parts.second);
+    midnightBoundaryMs += targetLocalMidnightAsUtc - representedLocalAsUtc;
+  }
+  const midnightBoundary = new Date(midnightBoundaryMs);
+  const midnightObservedAt = new Date(midnightBoundary.getTime() - 10 * 60_000);
+  const midnightValidUntil = new Date(midnightObservedAt.getTime() + 30 * 60_000);
+  const midnightDevice = await prisma.nativeDevice.create({ data: {
+    homeId: telemetryHomeId, hubInstallationId: telemetryHubId, osDeviceId: `stage10-midnight-${crypto.randomUUID()}`,
+    originalName: 'Disposable midnight Radiator', technicalLabel: 'radiator', analyticsCategory: 'RADIATOR',
+    managementClass: 'PROPERTY_DEVICE', deviceType: 'radiator', manufacturer: 'Disposable integration fixture',
+    model: 'Cross-period route test', protocol: 'zigbee', lifecycle: 'INSTALLED', descriptorRevision: 1,
+  } });
+  await prisma.deviceAreaAssignment.create({ data: { homeId: telemetryHomeId, deviceId: midnightDevice.id, areaId: telemetryAreaId,
+    validFrom: new Date(midnightObservedAt.getTime() - 86_400_000), source: 'STAGE10_TEMPERATURE_PERIOD', actorType: 'SYSTEM' } });
+  await prisma.nativeTemperatureSample.create({ data: {
+    homeId: telemetryHomeId, deviceId: midnightDevice.id, areaId: telemetryAreaId,
+    sourceEventKey: sha256(`stage10-midnight:${midnightDevice.id}:${midnightObservedAt.toISOString()}`), temperature: new Prisma.Decimal('20.00'),
+    sourceObservedAt: midnightObservedAt, validUntil: midnightValidUntil, sourceGeneration: customerFixture.identityOneGeneration,
+    purgeAt: new Date(Date.UTC(midnightObservedAt.getUTCFullYear() + 1, midnightObservedAt.getUTCMonth(), midnightObservedAt.getUTCDate(), midnightObservedAt.getUTCHours(), midnightObservedAt.getUTCMinutes())),
+  } });
+  const midnightUrl = (from, to) => `${base}/api/v2/homes/${telemetryHomeId}/analytics/temperature?level=day&from=${encodeURIComponent(from.toISOString())}&to=${encodeURIComponent(to.toISOString())}&deviceIds=${encodeURIComponent(midnightDevice.id)}`;
+  const [wholeSpan, beforeMidnight, afterMidnight] = await Promise.all([
+    fetchJson(midnightUrl(midnightObservedAt, midnightValidUntil), { headers: telemetryHeaders }),
+    fetchJson(midnightUrl(midnightObservedAt, midnightBoundary), { headers: telemetryHeaders }),
+    fetchJson(midnightUrl(midnightBoundary, midnightValidUntil), { headers: telemetryHeaders }),
+  ]);
+  const priorDayPoint = wholeSpan.body?.points?.find((point) => point.end === midnightBoundary.toISOString());
+  const currentDayPoint = wholeSpan.body?.points?.find((point) => point.start === midnightBoundary.toISOString());
+  const nextOnlyPoint = afterMidnight.body?.points?.find((point) => point.start === midnightBoundary.toISOString());
+  const periodSeconds = (response) => response.body?.points?.reduce((sum, point) => sum + point.coverageSeconds, 0) ?? 0;
+  if (wholeSpan.response.status !== 200 || beforeMidnight.response.status !== 200 || afterMidnight.response.status !== 200
+    || priorDayPoint?.coverageSeconds !== 600 || currentDayPoint?.coverageSeconds !== 1200
+    || currentDayPoint.segments?.[0]?.start !== midnightBoundary.toISOString()
+    || currentDayPoint.segments?.[0]?.end !== midnightValidUntil.toISOString()
+    || nextOnlyPoint?.coverageSeconds !== 1200 || nextOnlyPoint.sourceAt !== midnightObservedAt.toISOString()
+    || periodSeconds(beforeMidnight) + periodSeconds(afterMidnight) !== 1800
+    || currentDayPoint.currentFresh !== false) {
+    fail(`Temperature coverage was lost, extended, or duplicated across a query/calendar boundary (${JSON.stringify({
+      wholeStatus: wholeSpan.response.status, beforeStatus: beforeMidnight.response.status, afterStatus: afterMidnight.response.status,
+      wholePoints: wholeSpan.body?.points?.map((point) => ({ start: point.start, coverageSeconds: point.coverageSeconds, segments: point.segments })),
+      beforeSeconds: periodSeconds(beforeMidnight), afterSeconds: periodSeconds(afterMidnight), nextOnly: nextOnlyPoint ?? null,
+    })})`);
+  }
+  console.log('[stage10:integration] PASS: actual authenticated temperature API split a bounded 23:50–00:20 Radiator interval into 600/1,200 seconds, found the prior-source sample in a next-day-only query, reconciled adjacent windows to 1,800 seconds without duplication, and kept expired history non-current');
+
+  const movedTemperatureSourceAt = new Date(Date.now() - 15 * 60_000);
+  const movedTemperatureAssignmentEnd = new Date(Date.now() - 5 * 60_000);
+  const movedTemperatureNow = new Date();
+  const movedTemperatureValidUntil = new Date(movedTemperatureSourceAt.getTime() + 30 * 60_000);
+  const movedTemperatureDevice = await prisma.nativeDevice.create({ data: {
+    homeId: telemetryHomeId, hubInstallationId: telemetryHubId, osDeviceId: `stage10-moved-temperature-${crypto.randomUUID()}`,
+    originalName: 'Disposable moved Radiator', technicalLabel: 'radiator', analyticsCategory: 'RADIATOR',
+    managementClass: 'PROPERTY_DEVICE', deviceType: 'radiator', manufacturer: 'Disposable integration fixture',
+    model: 'Area-boundary temperature test', protocol: 'zigbee', lifecycle: 'INSTALLED', descriptorRevision: 1,
+  } });
+  await prisma.deviceAreaAssignment.createMany({ data: [
+    { homeId: telemetryHomeId, deviceId: movedTemperatureDevice.id, areaId: telemetryAreaId,
+      validFrom: new Date(movedTemperatureSourceAt.getTime() - 86_400_000), validUntil: movedTemperatureAssignmentEnd,
+      source: 'STAGE10_TEMPERATURE_MOVE', actorType: 'SYSTEM' },
+    { homeId: telemetryHomeId, deviceId: movedTemperatureDevice.id, areaId: destinationArea.id,
+      validFrom: movedTemperatureAssignmentEnd, source: 'STAGE10_TEMPERATURE_MOVE', actorType: 'SYSTEM' },
+  ] });
+  await prisma.nativeTemperatureSample.create({ data: {
+    homeId: telemetryHomeId, deviceId: movedTemperatureDevice.id, areaId: telemetryAreaId,
+    sourceEventKey: sha256(`stage10-moved-temperature:${movedTemperatureDevice.id}:${movedTemperatureSourceAt.toISOString()}`),
+    temperature: new Prisma.Decimal('20.50'), sourceObservedAt: movedTemperatureSourceAt, validUntil: movedTemperatureValidUntil,
+    sourceGeneration: customerFixture.identityOneGeneration,
+    purgeAt: new Date(movedTemperatureSourceAt.getTime() + 366 * 86_400_000),
+  } });
+  const movedTemperatureUrl = `${base}/api/v2/homes/${telemetryHomeId}/analytics/temperature?level=hour&from=${encodeURIComponent(movedTemperatureSourceAt.toISOString())}&to=${encodeURIComponent(movedTemperatureNow.toISOString())}&deviceIds=${encodeURIComponent(movedTemperatureDevice.id)}`;
+  const movedTemperatureProjection = await fetchJson(movedTemperatureUrl, { headers: telemetryHeaders });
+  const movedTemperaturePoint = movedTemperatureProjection.body?.points?.[0];
+  if (movedTemperatureProjection.response.status !== 200 || movedTemperatureProjection.body?.selectedDeviceCount !== 1
+    || movedTemperaturePoint?.coverageSeconds !== 600 || movedTemperaturePoint.currentFresh !== false
+    || movedTemperaturePoint.segments?.[0]?.end !== movedTemperatureAssignmentEnd.toISOString()) {
+    fail(`Temperature validity extended through an Area move or left the old assignment (${JSON.stringify({ status: movedTemperatureProjection.response.status,
+      selectedDeviceCount: movedTemperatureProjection.body?.selectedDeviceCount, point: movedTemperaturePoint ?? null,
+      expectedAssignmentEnd: movedTemperatureAssignmentEnd.toISOString() })})`);
+  }
+  console.log('[stage10:integration] PASS: actual temperature API clipped still-valid source evidence at the old Area assignment boundary and reported it non-current after the move');
+  await prisma.$transaction(async (tx) => {
+    await tx.nativeTemperatureSample.deleteMany({ where: { deviceId: movedTemperatureDevice.id } });
+    await tx.deviceAreaAssignment.deleteMany({ where: { deviceId: movedTemperatureDevice.id } });
+    await tx.nativeDevice.delete({ where: { id: movedTemperatureDevice.id } });
+    await tx.area.delete({ where: { id: destinationArea.id } });
+  });
 
   // F10-B: queue a second real Store-produced Radiator sample whose source
   // validity expired before this signed route delivery. It must be retained
@@ -6452,14 +6830,24 @@ async function osChecks() {
   // its earlier unpaired startup. This controlled test explicitly starts a
   // fresh, immediate machine-authenticated sync instead of silently reading
   // the stale row before that backoff expires.
+  const syncIdleDeadline = Date.now() + 8_000;
+  while ((hub.pairing.syncing || hub.pairing.queuedImmediateSync) && Date.now() < syncIdleDeadline) await sleep(25);
+  if (hub.pairing.syncing || hub.pairing.queuedImmediateSync) fail('The prior disposable sync did not settle before the token-state fixture');
   hub.pairing.nextRetryAt = 0;
+  const tokenStateHeartbeatCount = heartbeatReceipts.length;
   await hub.pairing.requestImmediateHeartbeat();
   const synchronizedAreaBindings = hub.store.getPlatform().areaBindings;
   const sortedAreaBindings = [...synchronizedAreaBindings].sort((left, right) => left.areaId.localeCompare(right.areaId));
   const expectedAreaBindings = [
     { areaId: customerFixture.areaOneId, hubAreaId: customerFixture.areaOneOsId },
   ].sort((left, right) => left.areaId.localeCompare(right.areaId));
-  if (JSON.stringify(sortedAreaBindings) !== JSON.stringify(expectedAreaBindings)) fail('Machine-authenticated token-state did not synchronize the canonical Area UUID to private OS alias mapping');
+  if (JSON.stringify(sortedAreaBindings) !== JSON.stringify(expectedAreaBindings) || heartbeatReceipts.length <= tokenStateHeartbeatCount
+    || heartbeatReceipts.at(-1)?.status !== 200) fail(`Machine-authenticated token-state did not synchronize the canonical Area UUID to private OS alias mapping (${JSON.stringify({
+      areaBindings: sortedAreaBindings, expectedAreaBindings, heartbeatCountDelta: heartbeatReceipts.length - tokenStateHeartbeatCount,
+      latestHeartbeatStatus: heartbeatReceipts.at(-1)?.status ?? null,
+      pairingSyncing: hub.pairing.syncing, queuedImmediateSync: hub.pairing.queuedImmediateSync,
+      lastErrorClass: String(hub.pairing.lastError || '').includes('HTTP 401') ? 'platform_401' : String(hub.pairing.lastError || '').includes('HTTP 409') ? 'platform_409' : hub.pairing.lastError ? 'other' : null,
+    })})`);
   let endpointRow = await waitForEndpointRevision('http://192.168.0.110:80', 1);
   const pairingErrorText = String(hub.pairing.lastError || '');
   const pairingErrorClass = pairingErrorText.includes('selected LAN endpoint') ? 'local_endpoint_validation' : pairingErrorText.includes('Platform returned HTTP 400') ? 'platform_400' : pairingErrorText.includes('Platform returned HTTP 401') ? 'platform_401' : pairingErrorText.includes('Platform returned HTTP 409') ? 'platform_409' : pairingErrorText ? 'other_pairing_error' : null;

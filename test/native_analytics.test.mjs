@@ -101,6 +101,40 @@ test('temperature validity intervals retain delayed history, weight only covered
   assert.equal(day.validUntil, '2026-10-08T04:30:00.000Z');
 });
 
+test('temperature validity is partitioned across calendar boundaries and clipped to adjacent request windows', () => {
+  const source = '2026-10-08T23:50:00.000Z';
+  const boundary = '2026-10-09T00:00:00.000Z';
+  const deadline = '2026-10-09T00:20:00.000Z';
+  const row = [{ deviceId: 'radiator-midnight', areaId: 'area-a', sourceObservedAt: source,
+    validUntil: deadline, temperature: 20 }];
+  const now = new Date('2026-10-09T02:00:00.000Z');
+  const whole = aggregateNativeTemperature(row, 'day', 'UTC', now);
+  assert.equal(whole.length, 2);
+  assert.equal(whole[0].coverageSeconds, 600);
+  assert.equal(whole[1].coverageSeconds, 1200);
+  assert.equal(whole.reduce((sum, point) => sum + point.coverageSeconds, 0), 1800);
+  assert.equal(whole[1].segments[0].start, boundary);
+  assert.equal(whole[1].segments[0].end, deadline);
+  assert.equal(whole[1].sourceAt, source, 'the next-day projection preserves the original source timestamp');
+  assert.equal(whole[1].currentFresh, false, 'expired historical validity never becomes current');
+
+  const before = aggregateNativeTemperature(row, 'day', 'UTC', now, {
+    from: new Date(source), to: new Date(boundary), retentionStart: new Date('2025-10-09T00:00:00.000Z'),
+  });
+  const after = aggregateNativeTemperature(row, 'day', 'UTC', now, {
+    from: new Date(boundary), to: new Date(deadline), retentionStart: new Date('2025-10-09T00:00:00.000Z'),
+  });
+  const nextDayOnly = aggregateNativeTemperature(row, 'day', 'UTC', now, {
+    from: new Date(boundary), to: new Date('2026-10-09T00:10:00.000Z'), retentionStart: new Date('2025-10-09T00:00:00.000Z'),
+  });
+  assert.equal(before.reduce((sum, point) => sum + point.coverageSeconds, 0), 600);
+  assert.equal(after.reduce((sum, point) => sum + point.coverageSeconds, 0), 1200);
+  assert.equal(nextDayOnly.reduce((sum, point) => sum + point.coverageSeconds, 0), 600);
+  assert.equal(before.reduce((sum, point) => sum + point.coverageSeconds, 0)
+    + after.reduce((sum, point) => sum + point.coverageSeconds, 0), 1800,
+  'adjacent half-open requests reconcile without double-counting');
+});
+
 test('analytics request windows are canonical, bounded to retained data, and use a calendar-year cutoff', () => {
   const now = new Date('2026-10-08T12:00:00.000Z');
   assert.equal(retentionStart(now).toISOString(), '2025-10-08T12:00:00.000Z');

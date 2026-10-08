@@ -12,6 +12,8 @@ export type NativeTemperatureRow = {
   validUntil: Date | string; temperature: number | string;
 };
 
+export const NATIVE_TEMPERATURE_MAX_VALIDITY_MS = 30 * 60 * 1000;
+
 export function validAnalyticsTimezone(value: string): boolean {
   try { new Intl.DateTimeFormat('en', { timeZone: value }).format(0); return true; } catch { return false; }
 }
@@ -127,21 +129,40 @@ export function aggregateNativeUsage(rows: readonly NativeUsageRow[], level: Nat
   });
 }
 
-export function aggregateNativeTemperature(rows: readonly NativeTemperatureRow[], level: NativeAnalyticsLevel, timezone: string, now: Date) {
+export function aggregateNativeTemperature(rows: readonly NativeTemperatureRow[], level: NativeAnalyticsLevel, timezone: string, now: Date,
+  window?: { from: Date; to: Date; retentionStart?: Date }) {
   if (!validAnalyticsTimezone(timezone) || !Number.isFinite(now.getTime())) throw new TypeError('Invalid temperature query');
-  const grouped = new Map<string, { period: ReturnType<typeof usagePeriod>; rows: Array<{ deviceId: string; source: number; validUntil: number; value: number }> }>();
+  const grouped = new Map<string, { period: ReturnType<typeof usagePeriod>; rows: Array<{ deviceId: string; source: number; validUntil: number; value: number; intervalStart: number; intervalEnd: number }> }>();
   for (const row of rows) {
     const source = new Date(row.sourceObservedAt); const validUntil = new Date(row.validUntil); const value = Number(row.temperature);
-    if (!Number.isFinite(source.getTime()) || !Number.isFinite(validUntil.getTime()) || !Number.isFinite(value) || value < -50 || value > 80 || validUntil <= source) continue;
-    const period = usagePeriod({ ...row, bucketStart: source, closedAt: null, onSeconds: 0, offSeconds: 0, unknownSeconds: 0 }, level, timezone);
-    const entry = grouped.get(period.key) ?? { period, rows: [] };
-    entry.rows.push({ deviceId: row.deviceId, source: source.getTime(), validUntil: validUntil.getTime(), value }); grouped.set(period.key, entry);
+    if (!Number.isFinite(source.getTime()) || !Number.isFinite(validUntil.getTime()) || !Number.isFinite(value) || value < -50 || value > 80
+      || validUntil <= source || validUntil.getTime() - source.getTime() > NATIVE_TEMPERATURE_MAX_VALIDITY_MS) continue;
+    const requestedStart = window?.from.getTime() ?? Number.NEGATIVE_INFINITY;
+    const requestedEnd = Math.min(window?.to.getTime() ?? now.getTime(), now.getTime());
+    const retentionStart = window?.retentionStart?.getTime() ?? Number.NEGATIVE_INFINITY;
+    let cursor = Math.max(source.getTime(), requestedStart, retentionStart);
+    const end = Math.min(validUntil.getTime(), requestedEnd);
+    // A valid observation may cross one or more calendar periods. Partition
+    // its original bounded validity interval rather than assigning all of it
+    // to the period containing sourceObservedAt. The window and maximum
+    // validity keep this expansion tightly bounded.
+    while (cursor < end) {
+      const period = usagePeriod({ ...row, bucketStart: new Date(cursor), closedAt: null, onSeconds: 0, offSeconds: 0, unknownSeconds: 0 }, level, timezone);
+      const periodEnd = Date.parse(period.end);
+      const clippedEnd = Math.min(end, periodEnd);
+      if (!Number.isFinite(periodEnd) || clippedEnd <= cursor) break;
+      const entry = grouped.get(period.key) ?? { period, rows: [] };
+      entry.rows.push({ deviceId: row.deviceId, source: source.getTime(), validUntil: validUntil.getTime(), value,
+        intervalStart: cursor, intervalEnd: clippedEnd });
+      grouped.set(period.key, entry);
+      cursor = clippedEnd;
+    }
   }
   return [...grouped.entries()].sort((a, b) => a[1].period.start.localeCompare(b[1].period.start)).map(([id, entry]) => {
     const periodStart = Date.parse(entry.period.start), periodEnd = Date.parse(entry.period.end);
     const events = new Map<number, { starts: number[]; ends: number[] }>();
     entry.rows.forEach((row, rowIndex) => {
-      const start = Math.max(periodStart, row.source), end = Math.min(periodEnd, row.validUntil);
+      const start = Math.max(periodStart, row.intervalStart), end = Math.min(periodEnd, row.intervalEnd);
       if (end <= start) return;
       const atStart = events.get(start) ?? { starts: [], ends: [] }; atStart.starts.push(rowIndex); events.set(start, atStart);
       const atEnd = events.get(end) ?? { starts: [], ends: [] }; atEnd.ends.push(rowIndex); events.set(end, atEnd);

@@ -24,6 +24,21 @@ async function requireAreaAssignmentAt(tx: Prisma.TransactionClient, input: {
   if (!assignment) invalid('hub_sync_area_assignment_invalid', 'The device was not assigned to this area at the source observation time');
 }
 
+async function requireAreaAssignmentForCoverage(tx: Prisma.TransactionClient, input: {
+  homeId: string; deviceId: string; areaId: string; start: Date; end: Date;
+}) {
+  // Usage is attributed to one canonical Area for its whole half-open covered
+  // interval. Checking the containing hour's bucketStart incorrectly rejects
+  // a device first assigned at (for example) 10:30, and can attribute earlier
+  // history to an Area after a move.
+  const assignment = await tx.deviceAreaAssignment.findFirst({ where: {
+    homeId: input.homeId, deviceId: input.deviceId, areaId: input.areaId,
+    validFrom: { lte: input.start },
+    OR: [{ validUntil: null }, { validUntil: { gte: input.end } }],
+  }, select: { id: true } });
+  if (!assignment) invalid('hub_sync_area_assignment_invalid', 'The device was not assigned to this area for the complete covered interval');
+}
+
 function oneCalendarYearAfter(source: Date): Date {
   const result = new Date(source);
   const day = result.getUTCDate();
@@ -195,7 +210,6 @@ export async function applyHubSyncEvent(tx: Prisma.TransactionClient, input: {
     const area = await tx.area.findUnique({ where: { homeId_osAreaId: { homeId, osAreaId: String(payload.osAreaId) } }, select: { id: true } });
     if (!area) invalid('hub_sync_usage_area_invalid', 'The usage bucket area is not part of this home');
     const bucketStart = strictDate(payload.bucketStart, now);
-    await requireAreaAssignmentAt(tx, { homeId, deviceId: device.id, areaId: area.id, at: bucketStart });
     const where = { deviceId_areaId_analyticsCategory_controlId_bucketStart_sourceGeneration: {
       deviceId: device.id, areaId: area.id, analyticsCategory: payload.analyticsCategory as 'LIGHT' | 'BOILER' | 'RADIATOR',
       controlId: String(payload.controlId), bucketStart, sourceGeneration: Number(payload.sourceGeneration),
@@ -224,6 +238,7 @@ export async function applyHubSyncEvent(tx: Prisma.TransactionClient, input: {
       || !closedAt && totalSeconds >= 3600) {
       invalid('hub_sync_usage_bucket_closure_invalid', 'Usage counters must partition exactly their bounded covered span; closed buckets must end at the hour boundary');
     }
+    await requireAreaAssignmentForCoverage(tx, { homeId, deviceId: device.id, areaId: area.id, start: coverageStartAt, end: coverageEndAt });
     data.coverageStartAt = coverageStartAt; data.coverageEndAt = coverageEndAt;
     if (previous) {
       if (previous.revision > incomingRevision) return;

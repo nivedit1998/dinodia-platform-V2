@@ -98,6 +98,47 @@ export async function runNativeOperations(now = new Date()) {
     homeDeregistrationAccountCleanup, installationDelivery, failedTasks: failures };
 }
 
+export async function inspectNativeAnalyticsIntegrity(now = new Date()) {
+  const cutoff = new Date(now.getTime() - 14 * 24 * 60 * 60 * 1000);
+  const [rows, temperatureRows] = await Promise.all([
+    prisma.$queryRaw<Array<{ scanned: bigint; invalidPartitions: bigint; onSeconds: bigint; offSeconds: bigint; unknownSeconds: bigint }>>`
+      WITH bounded_usage AS (
+        SELECT *, COALESCE("coverageStartAt", CASE WHEN "closedAt" IS NOT NULL
+            THEN "closedAt" - ("onSeconds" + "offSeconds" + "unknownSeconds") * INTERVAL '1 second'
+            ELSE "bucketStart" END) AS "effectiveCoverageStartAt",
+          COALESCE("coverageEndAt", "closedAt", "bucketStart" + ("onSeconds" + "offSeconds" + "unknownSeconds") * INTERVAL '1 second') AS "effectiveCoverageEndAt"
+        FROM (SELECT "onSeconds", "offSeconds", "unknownSeconds", "coverageStartAt", "coverageEndAt", "closedAt", "bucketStart"
+          FROM "NativeDeviceUsageBucket" WHERE "bucketStart" >= ${cutoff} AND "bucketStart" <= ${now}
+          ORDER BY "bucketStart" DESC LIMIT 10000) AS recent_usage
+      )
+      SELECT COUNT(*)::bigint AS scanned,
+        COUNT(*) FILTER (WHERE "onSeconds" < 0 OR "offSeconds" < 0 OR "unknownSeconds" < 0
+          OR "onSeconds" + "offSeconds" + "unknownSeconds" > 3600
+          OR EXTRACT(EPOCH FROM "bucketStart")::bigint % 3600 <> 0
+          OR (("coverageStartAt" IS NULL) <> ("coverageEndAt" IS NULL))
+          OR "effectiveCoverageStartAt" < "bucketStart"
+          OR "effectiveCoverageEndAt" > "bucketStart" + INTERVAL '1 hour'
+          OR "effectiveCoverageEndAt" <= "effectiveCoverageStartAt"
+          OR EXTRACT(EPOCH FROM ("effectiveCoverageEndAt" - "effectiveCoverageStartAt"))
+              <> "onSeconds" + "offSeconds" + "unknownSeconds"
+          OR ("closedAt" IS NOT NULL AND ("closedAt" <> "bucketStart" + INTERVAL '1 hour' OR "effectiveCoverageEndAt" <> "closedAt"))
+          OR ("closedAt" IS NULL AND "onSeconds" + "offSeconds" + "unknownSeconds" >= 3600))::bigint AS "invalidPartitions",
+        COALESCE(SUM("onSeconds"), 0)::bigint AS "onSeconds",
+        COALESCE(SUM("offSeconds"), 0)::bigint AS "offSeconds",
+        COALESCE(SUM("unknownSeconds"), 0)::bigint AS "unknownSeconds"
+      FROM bounded_usage`,
+    prisma.nativeTemperatureSample.count({ where: { sourceObservedAt: { gte: cutoff, lte: now }, purgeAt: { gt: now },
+      device: { is: { managementClass: 'PROPERTY_DEVICE', analyticsCategory: 'RADIATOR' } } } }),
+  ]);
+  const zero = BigInt(0);
+  const row = rows[0] ?? { scanned: zero, invalidPartitions: zero, onSeconds: zero, offSeconds: zero, unknownSeconds: zero };
+  return { checkedThrough: now.toISOString(), lookbackDays: 14, sampleLimit: 10000,
+    usageRowsScanned: Number(row.scanned), invalidUsagePartitions: Number(row.invalidPartitions),
+    sourceOnSeconds: Number(row.onSeconds), sourceOffSeconds: Number(row.offSeconds), sourceUnknownSeconds: Number(row.unknownSeconds),
+    temperatureSamplesInWindow: temperatureRows, aggregationMode: 'query_time_no_persisted_rollup',
+    status: Number(row.invalidPartitions) === 0 ? 'OK' : 'FAILED' };
+}
+
 export async function runNativeMaintenance(now = new Date()) {
   const taskIds = ['expired_dispatch_lease_cleanup', 'retentionCleanup', 'analyticsAndStorageMaintenance'];
   assertTaskRegistryOwner(taskIds, 'vercel_hobby_daily');
@@ -156,30 +197,8 @@ export async function runNativeMaintenance(now = new Date()) {
   });
 
   await isolate('analyticsAndStorageMaintenance', async () => {
-    const cutoff = new Date(now.getTime() - 14 * 24 * 60 * 60 * 1000);
-    const [rows, temperatureRows] = await Promise.all([
-      prisma.$queryRaw<Array<{ scanned: bigint; invalidPartitions: bigint; onSeconds: bigint; offSeconds: bigint; unknownSeconds: bigint }>>`
-        SELECT COUNT(*)::bigint AS scanned,
-          COUNT(*) FILTER (WHERE "onSeconds" < 0 OR "offSeconds" < 0 OR "unknownSeconds" < 0
-            OR "onSeconds" + "offSeconds" + "unknownSeconds" > 3600
-            OR ("closedAt" IS NOT NULL AND "onSeconds" + "offSeconds" + "unknownSeconds" <> 3600)
-            OR EXTRACT(EPOCH FROM "bucketStart")::bigint % 3600 <> 0)::bigint AS "invalidPartitions",
-          COALESCE(SUM("onSeconds"), 0)::bigint AS "onSeconds",
-          COALESCE(SUM("offSeconds"), 0)::bigint AS "offSeconds",
-          COALESCE(SUM("unknownSeconds"), 0)::bigint AS "unknownSeconds"
-        FROM (SELECT "onSeconds", "offSeconds", "unknownSeconds", "closedAt", "bucketStart"
-          FROM "NativeDeviceUsageBucket" WHERE "bucketStart" >= ${cutoff} AND "bucketStart" <= ${now}
-          ORDER BY "bucketStart" DESC LIMIT 10000) AS bounded_usage`,
-      prisma.nativeTemperatureSample.count({ where: { sourceObservedAt: { gte: cutoff, lte: now }, purgeAt: { gt: now },
-        device: { is: { managementClass: 'PROPERTY_DEVICE', analyticsCategory: 'RADIATOR' } } } }),
-    ]);
-    const zero = BigInt(0);
-    const row = rows[0] ?? { scanned: zero, invalidPartitions: zero, onSeconds: zero, offSeconds: zero, unknownSeconds: zero };
-    const report = { checkedThrough: now.toISOString(), lookbackDays: 14, sampleLimit: 10000,
-      usageRowsScanned: Number(row.scanned), invalidUsagePartitions: Number(row.invalidPartitions),
-      sourceOnSeconds: Number(row.onSeconds), sourceOffSeconds: Number(row.offSeconds), sourceUnknownSeconds: Number(row.unknownSeconds),
-      temperatureSamplesInWindow: temperatureRows, aggregationMode: 'query_time_no_persisted_rollup', status: Number(row.invalidPartitions) === 0 ? 'OK' : 'FAILED' };
-    if (Number(row.invalidPartitions) !== 0) throw new Error('Native usage duration integrity check failed');
+    const report = await inspectNativeAnalyticsIntegrity(now);
+    if (report.invalidUsagePartitions !== 0) throw new Error('Native usage duration integrity check failed');
     result.analyticsAndStorageMaintenance = report;
     (result as { taskCursors?: Record<string, unknown> }).taskCursors = {
       ...((result as { taskCursors?: Record<string, unknown> }).taskCursors ?? {}), analyticsAndStorageMaintenance: report,
