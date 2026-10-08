@@ -82,6 +82,64 @@ test('migration preservation permits live scheduler lease/cursor churn but prote
   }), /nonvolatile.*row counts changed/);
 });
 
+test('Stage 10 preservation permits only its two fixed maintenance task additions', () => {
+  const expectedAddedTaskRows = [
+    { taskId: 'retentionCleanup', dispatcher: 'MAINTENANCE' },
+    { taskId: 'analyticsAndStorageMaintenance', dispatcher: 'MAINTENANCE' },
+  ];
+  const before = {
+    rowCounts: { NativeBackgroundTaskState: '2' },
+    rowContentDigests: { NativeBackgroundTaskState: 'prior' },
+    columnContentDigests: { NativeBackgroundTaskState: {
+      taskId: 'prior-ids', dispatcher: 'prior-owners', cursor: 'prior-cursor', updatedAt: 't1',
+    } },
+    taskRegistryRows: [
+      { taskId: 'operator_credential_lifecycle', dispatcher: 'OPERATIONS' },
+      { taskId: 'support_expiry_and_revocation', dispatcher: 'OPERATIONS' },
+    ],
+  };
+  const after = {
+    rowCounts: { NativeBackgroundTaskState: '4' },
+    rowContentDigests: { NativeBackgroundTaskState: 'post' },
+    columnContentDigests: { NativeBackgroundTaskState: {
+      taskId: 'post-ids', dispatcher: 'post-owners', cursor: 'runtime-advanced', updatedAt: 't2',
+    } },
+    taskRegistryRows: [...before.taskRegistryRows, ...expectedAddedTaskRows],
+  };
+  assert.equal(compareExistingTablePreservation(before, after, { expectedAddedTaskRows }).expectedTaskRowsAdded, 2);
+  const alreadyApplied = {
+    ...after,
+    rowContentDigests: { NativeBackgroundTaskState: 'same' },
+    columnContentDigests: { NativeBackgroundTaskState: {
+      taskId: 'same-ids', dispatcher: 'same-owners', cursor: 'runtime-advanced-again', updatedAt: 't3',
+    } },
+  };
+  assert.equal(compareExistingTablePreservation(after, alreadyApplied, { expectedAddedTaskRows }).expectedTaskRowsAdded, 0);
+  assert.throws(() => compareExistingTablePreservation(before, {
+    ...after,
+    taskRegistryRows: [...after.taskRegistryRows, { taskId: 'unapproved', dispatcher: 'MAINTENANCE' }],
+    rowCounts: { NativeBackgroundTaskState: '5' },
+  }, { expectedAddedTaskRows }), /unexpected scheduler task addition/);
+  assert.throws(() => compareExistingTablePreservation(before, {
+    ...after,
+    taskRegistryRows: after.taskRegistryRows.filter((row) => row.taskId !== 'support_expiry_and_revocation'),
+    rowCounts: { NativeBackgroundTaskState: '3' },
+  }, { expectedAddedTaskRows }), /existing scheduler task identity or owner changed/);
+  assert.throws(() => compareExistingTablePreservation(before, {
+    ...after,
+    taskRegistryRows: after.taskRegistryRows.map((row) => row.taskId === 'retentionCleanup' ? { ...row, dispatcher: 'OPERATIONS' } : row),
+  }, { expectedAddedTaskRows }), /scheduler task addition or owner/);
+  assert.throws(() => compareExistingTablePreservation(before, {
+    ...after,
+    taskRegistryRows: after.taskRegistryRows.filter((row) => row.taskId !== 'analyticsAndStorageMaintenance'),
+    rowCounts: { NativeBackgroundTaskState: '3' },
+  }, { expectedAddedTaskRows }), /approved scheduler task is missing or has the wrong owner/);
+  assert.throws(() => compareExistingTablePreservation(before, {
+    ...after,
+    taskRegistryRows: after.taskRegistryRows.map((row) => row.taskId === 'operator_credential_lifecycle' ? { ...row, dispatcher: 'MAINTENANCE' } : row),
+  }, { expectedAddedTaskRows }), /existing scheduler task identity or owner changed/);
+});
+
 function loadTypeScriptModule(relativePath, overrides = {}) {
   const require = createRequire(import.meta.url);
   const ts = require('typescript');

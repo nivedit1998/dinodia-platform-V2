@@ -71,6 +71,7 @@ async function inventory(client, baselineColumns = undefined) {
     const rowContentDigests = {};
     const columnContentDigests = {};
     const columnsByTable = {};
+    let taskRegistryRows;
     for (const { table_name } of tables) {
       const identifier = `"${String(table_name).replaceAll('"', '""')}"`;
       const rows = await tx.$queryRawUnsafe(`SELECT count(*)::text AS count FROM public.${identifier}`);
@@ -93,6 +94,9 @@ async function inventory(client, baselineColumns = undefined) {
       });
       const columnContent = await tx.$queryRawUnsafe(`SELECT ${columnDigestExpressions.join(',')} FROM public.${identifier} AS row_record`);
       columnContentDigests[table_name] = columnContent[0];
+      if (table_name === 'NativeBackgroundTaskState') {
+        taskRegistryRows = await tx.$queryRawUnsafe('SELECT "taskId", "dispatcher" FROM public."NativeBackgroundTaskState" ORDER BY "taskId"');
+      }
     }
     const [labels, ownerCardinality, tenantOwners, activeAssignments, migrations, mismatchedDeviceHubs, mismatchedTenantGrants, mismatchedInvitationAreas, mismatchedRoomRequests, duplicateActiveRoomQrs, mismatchedClaimHubs, mismatchedClaimChallenges, mismatchedPendingSetups, mismatchedSupportMemberships, mismatchedSupportRequests, mismatchedSupportSessions, mismatchedSupportNotifications] = await Promise.all([
       tx.$queryRawUnsafe('SELECT count(*)::int AS count FROM public."NativeDevice" WHERE "customerLabel" IS NOT NULL AND char_length("customerLabel") > 40'),
@@ -131,7 +135,7 @@ async function inventory(client, baselineColumns = undefined) {
       supportSessionHomeMismatches: mismatchedSupportSessions[0].count,
       supportNotificationHomeMismatches: mismatchedSupportNotifications[0].count,
     };
-    return { rowCounts, rowContentDigests, columnContentDigests, columnsByTable, migrationRows: migrations, dataPreflight };
+    return { rowCounts, rowContentDigests, columnContentDigests, columnsByTable, taskRegistryRows, migrationRows: migrations, dataPreflight };
   }, { maxWait: 10000, timeout: 120000 });
 }
 
@@ -216,7 +220,11 @@ try {
     const afterFingerprint = runFingerprint(connectionEnv);
     const after = await inventory(client, before.columnsByTable);
     let preservation;
-    try { preservation = compareExistingTablePreservation(before, after); }
+    const expectedAddedTaskRows = stage10AnalyticsMaintenance ? [
+      { taskId: 'retentionCleanup', dispatcher: 'MAINTENANCE' },
+      { taskId: 'analyticsAndStorageMaintenance', dispatcher: 'MAINTENANCE' },
+    ] : undefined;
+    try { preservation = compareExistingTablePreservation(before, after, { expectedAddedTaskRows }); }
     catch (error) { fail(error instanceof Error ? error.message : 'existing Production rows changed'); }
     const { volatileChanges } = preservation;
     const appliedNow = after.migrationRows.filter((row) => row.finished_at && !row.rolled_back_at && migrationNames.includes(row.migration_name));
@@ -240,6 +248,7 @@ try {
       productionSchemaFingerprint: afterFingerprint,
       nonvolatileExistingTableRowCountsPreserved: true,
       volatileRuntimeTableChanges: volatileChanges,
+      approvedMaintenanceTaskRowsAdded: preservation.expectedTaskRowsAdded ?? 0,
       existingBaseTableCount: Object.keys(before.rowCounts).length,
       postMigrationBaseTableCount: Object.keys(after.rowCounts).length,
       migrationLedgerMatchesReviewedChecksum: checksumMatch,
