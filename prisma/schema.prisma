@@ -1852,6 +1852,8 @@ model NativeDeviceUsageBucket {
   onSeconds         Int                     @default(0)
   offSeconds        Int                     @default(0)
   unknownSeconds    Int                     @default(0)
+  coverageStartAt   DateTime?
+  coverageEndAt     DateTime?
   closedAt          DateTime?
   purgeAt           DateTime
   createdAt         DateTime                @default(now())

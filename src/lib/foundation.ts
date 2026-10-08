@@ -24,6 +24,7 @@ export const COMPATIBLE_ADDITIVE_MIGRATIONS: Readonly<Record<string, string>> = 
   '20261006180000_stage8_commissioning_and_installation': '2fbf09e82d82c8eca490738e288fc8e78f2bfba313fb895811514aa97a699044',
   '20261008100000_stage9_deregister_redacted_support_guard': '91823c54a80f39036cff929b8ab6420495cb8d0138b4b789864318a6201e42ff',
   '20261008130000_stage10_analytics_maintenance_tasks': '6c651d5b697c6ca295ed21dc9c646db7be2673bbb95e0a05fa29009123f4da2e',
+  '20261008150000_stage10_partial_usage_coverage': '85df08bf3f56a01edee6ebac68ac05d61375bed6ac0ffa28e052b791fbcf73b4',
 });
 export const CANONICAL_PRODUCTION_ORIGIN = 'https://dinodia-platform-v2.vercel.app';
 export function isRuntimeTargetValid(): boolean { return runtimeTargetIsValid(process.env); }
