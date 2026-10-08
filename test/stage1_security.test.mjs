@@ -116,6 +116,10 @@ test('native task registry dispatches business operations and daily lease cleanu
       nativeBackgroundTaskState: { updateMany: async (input) => { cleanupCalls.push(input); return { count: 3 }; } },
       hubSyncReceipt: { deleteMany: async (input) => { receiptCleanupCalls.push(input); return { count: 2 }; } },
       nativeDomainOutbox: { deleteMany: async (input) => { deregistrationReceiptCleanupCalls.push(input); return { count: 1 }; } },
+      $executeRaw: async () => 0,
+      $queryRaw: async () => [{ scanned: 0n, invalidPartitions: 0n, onSeconds: 0n, offSeconds: 0n, unknownSeconds: 0n }],
+      nativeDeviceUsageBucket: { findFirst: async () => null },
+      nativeTemperatureSample: { findFirst: async () => null, count: async () => 0 },
       $transaction: async (callback) => callback({ nativeBackgroundTaskState: { updateMany: async () => ({ count: 0 }) } }),
       supportSession: { findMany: async () => [] },
       supportAccessRequest: { findMany: async () => [], updateMany: async () => ({ count: 0 }) },
@@ -134,6 +138,8 @@ test('native task registry dispatches business operations and daily lease cleanu
     ['support_expiry_and_revocation', 'supabase_pg_cron_two_minute'],
     ['claim_reservation_expiry', 'supabase_pg_cron_two_minute'],
     ['expired_dispatch_lease_cleanup', 'vercel_hobby_daily'],
+    ['retentionCleanup', 'vercel_hobby_daily'],
+    ['analyticsAndStorageMaintenance', 'vercel_hobby_daily'],
   ]);
   const now = new Date('2026-09-27T12:00:00Z');
   const operations = await runNativeOperations(now);
@@ -142,7 +148,10 @@ test('native task registry dispatches business operations and daily lease cleanu
   assert.deepEqual(homeDeregistrationCleanupCalls, [[now, { limit: 24 }]], 'deregistration recovery reuses the existing two-minute operations dispatcher');
   assert.equal(cleanupCalls.length, 0);
   const maintenance = await runNativeMaintenance(now);
-  assert.deepEqual(maintenance.tasks, ['expired_dispatch_lease_cleanup']);
+  assert.deepEqual(maintenance.tasks, ['expired_dispatch_lease_cleanup', 'retentionCleanup', 'analyticsAndStorageMaintenance']);
+  assert.deepEqual(maintenance.failedTasks, []);
+  assert.equal(maintenance.retentionCleanup.backlogRemains, false);
+  assert.equal(maintenance.analyticsAndStorageMaintenance.status, 'OK');
   assert.equal(maintenance.expiredDispatcherLeases, 3);
   assert.equal(maintenance.expiredSyncReceipts, 2);
   assert.equal(maintenance.expiredDeregistrationCleanupReceipts, 1);
@@ -204,9 +213,9 @@ test('daily maintenance route is the separate GET owner and rejects wrong schedu
   const { GET } = loadTypeScriptModule('src/app/api/cron/native-maintenance/route.ts', {
     'next/server': { NextResponse: { json: (body, init) => Response.json(body, init) } },
     '@/lib/nativeOperations': {
-      acquireOperationsLease: async (name) => { assert.equal(name, 'native-maintenance'); leases += 1; return { owner: 'disposable-lease-owner', taskIds: ['expired_dispatch_lease_cleanup'] }; },
+      acquireOperationsLease: async (name) => { assert.equal(name, 'native-maintenance'); leases += 1; return { owner: 'disposable-lease-owner', taskIds: ['expired_dispatch_lease_cleanup', 'retentionCleanup', 'analyticsAndStorageMaintenance'] }; },
       completeOperationsLease: async () => true,
-      runNativeMaintenance: async () => { cleanup += 1; return { tasks: ['expired_dispatch_lease_cleanup'], expiredDispatcherLeases: 1 }; },
+      runNativeMaintenance: async () => { cleanup += 1; return { tasks: ['expired_dispatch_lease_cleanup', 'retentionCleanup', 'analyticsAndStorageMaintenance'], failedTasks: [], expiredDispatcherLeases: 1 }; },
     },
   });
   const previousSecret = process.env.CRON_SECRET;
@@ -283,13 +292,12 @@ test('native dispatcher uses one atomic bounded lease and isolates task failures
 });
 
 test('native dispatcher lease denies until the exact expiry and keeps the two owners isolated', async () => {
-  const taskIds = ['operator_credential_lifecycle', 'support_expiry_and_revocation', 'claim_reservation_expiry', 'expired_dispatch_lease_cleanup'];
+  const taskIds = ['operator_credential_lifecycle', 'support_expiry_and_revocation', 'claim_reservation_expiry', 'expired_dispatch_lease_cleanup', 'retentionCleanup', 'analyticsAndStorageMaintenance'];
   const taskRows = new Map(taskIds.map((taskId) => [taskId, { leaseOwner: null, leaseExpiresAt: null }]));
   const prisma = {
     nativeBackgroundTaskState: { updateMany: async ({ where, data }) => {
-      const eligible = [...taskRows].filter(([taskId, row]) => where.taskId.in.includes(taskId)
-        && taskId !== 'expired_dispatch_lease_cleanup' || where.taskId.in.includes(taskId) && taskId === 'expired_dispatch_lease_cleanup')
-        .filter(([taskId, row]) => where.dispatcher === (taskId === 'expired_dispatch_lease_cleanup' ? 'MAINTENANCE' : 'OPERATIONS')
+      const eligible = [...taskRows].filter(([taskId, row]) => where.taskId.in.includes(taskId))
+        .filter(([taskId, row]) => where.dispatcher === (['expired_dispatch_lease_cleanup', 'retentionCleanup', 'analyticsAndStorageMaintenance'].includes(taskId) ? 'MAINTENANCE' : 'OPERATIONS')
           && (row.leaseExpiresAt === null || where.OR?.some((condition) => condition.leaseExpiresAt?.lte && row.leaseExpiresAt <= condition.leaseExpiresAt.lte)));
       for (const [taskId] of eligible) taskRows.set(taskId, { leaseOwner: data.leaseOwner, leaseExpiresAt: data.leaseExpiresAt });
       return { count: eligible.length };
@@ -434,13 +442,15 @@ test('Stage 1 database migration includes durable privacy and authority objects'
   for (const marker of ['SupportAccessRequest_scope_guard', 'HubCredentialVersion_hub_purpose_state_idx', 'REVOKE ALL PRIVILEGES']) assert.match(migration, new RegExp(marker.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
 });
 
-test('readiness requires the exact Stage 3 schema plus reviewed additive Stage 4 and Stage 5 migrations', () => {
+test('readiness requires the exact Stage 3 schema plus reviewed additive Stage 4 through Stage 10 migrations', () => {
   assert.match(read('src/app/api/readiness/route.ts'), /isSchemaReady\(migration, Number\(modelCount\[0\]\?\.count \?\? 0\), expectedMigrationChecksum\)/);
   assert.match(read('src/lib/foundation.ts'), /20261003000000_native_v2_stage3_domain_schema/);
   assert.match(read('src/lib/foundation.ts'), /20261004050000_stage4_customer_lan_tls_identity/);
   assert.match(read('src/lib/foundation.ts'), /8b6f9a3ed68fb00805dbc54ba750fc339da3f375bb6c4a899e286c7b3844a5d1/);
   assert.match(read('src/lib/foundation.ts'), /20261004150000_stage5_hub_sync_v2/);
   assert.match(read('src/lib/foundation.ts'), /0043e8c7870c0afa7f4a5e5e4dd3d290387bc39514e4728f8c9a90fea8b33203/);
+  assert.match(read('src/lib/foundation.ts'), /20261008130000_stage10_analytics_maintenance_tasks/);
+  assert.match(read('src/lib/foundation.ts'), /6c651d5b697c6ca295ed21dc9c646db7be2673bbb95e0a05fa29009123f4da2e/);
   assert.match(read('src/lib/foundation.ts'), /20261005070000_stage5_hub_incident_deadline/);
   assert.match(read('src/lib/foundation.ts'), /f6c5fed31a31184e4c2ae42a98be8a89fe1628415ae4cfc1bef61033ab95b44e/);
   assert.match(read('src/lib/foundation.ts'), /20261005100000_stage5_incident_source_kind/);

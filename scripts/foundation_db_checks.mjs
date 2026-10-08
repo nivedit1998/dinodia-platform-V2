@@ -13,7 +13,9 @@ try {
   if (missing.length || extra.length) throw new Error(`table inventory mismatch; missing=${missing.join(',')} extra=${extra.join(',')}`);
   const grantRows = await prisma.$queryRaw`SELECT grantee, table_name, privilege_type FROM information_schema.role_table_grants WHERE table_schema = 'public' AND grantee IN ('anon', 'authenticated')`;
   if (grantRows.length) throw new Error(`anon/authenticated table grants are present (${grantRows.length})`);
-  const migration = await prisma.$queryRaw`SELECT migration_name, finished_at, rolled_back_at FROM _prisma_migrations ORDER BY finished_at DESC NULLS LAST`;
+  const migration = await prisma.$queryRaw`SELECT migration_name, checksum, finished_at, rolled_back_at FROM _prisma_migrations ORDER BY finished_at DESC NULLS LAST`;
+  const stage10Rows = await prisma.$queryRaw`SELECT migration_name, checksum, finished_at, rolled_back_at FROM _prisma_migrations WHERE migration_name = '20261008130000_stage10_analytics_maintenance_tasks'`;
+  if (stage10Rows.length > 1 || (stage10Rows.length === 1 && (stage10Rows[0].checksum !== '6c651d5b697c6ca295ed21dc9c646db7be2673bbb95e0a05fa29009123f4da2e' || !stage10Rows[0].finished_at || stage10Rows[0].rolled_back_at))) throw new Error('Stage 10 migration ledger checksum or completion state is not the reviewed additive migration');
   const migrations = new Map(migration.map((row) => [row.migration_name, row]));
   const required = [
     '00000000000000_native_v2_lean_foundation',
@@ -48,8 +50,15 @@ try {
     '20261006180000_stage8_commissioning_and_installation',
     '20261008100000_stage9_deregister_redacted_support_guard',
   ];
-  if (migration.length !== required.length || required.some((name) => !migrations.has(name)) || required.some((name) => !migrations.get(name).finished_at || migrations.get(name).rolled_back_at)) throw new Error('migration ledger is not exactly the completed native baseline with the reviewed Stage 8 and Stage 9 additive migrations');
-  console.log(`[test:stage9-schema] OK: ${names.size} tables, no direct anon/authenticated grants, native baseline and additive Stage 1 through Stage 9 migrations completed`);
+  if (stage10Rows.length > 1) throw new Error('Stage 10 migration ledger contains duplicate rows');
+  if (stage10Rows.length === 1) {
+    const stage10 = stage10Rows[0];
+    if (stage10.checksum !== '6c651d5b697c6ca295ed21dc9c646db7be2673bbb95e0a05fa29009123f4da2e'
+      || !stage10.finished_at || stage10.rolled_back_at) throw new Error('Stage 10 migration ledger checksum or completion state is not the reviewed additive migration');
+    required.push('20261008130000_stage10_analytics_maintenance_tasks');
+  }
+  if (migration.length !== required.length || required.some((name) => !migrations.has(name)) || required.some((name) => !migrations.get(name).finished_at || migrations.get(name).rolled_back_at)) throw new Error('migration ledger is not exactly the completed native baseline with the reviewed additive migrations');
+  console.log(`[test:stage9-schema] OK: ${names.size} tables, no direct anon/authenticated grants, native baseline and additive migrations through Stage ${stage10Rows.length ? '10' : '9'} completed`);
 } finally {
   await prisma.$disconnect();
 }

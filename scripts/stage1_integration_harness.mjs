@@ -325,6 +325,7 @@ function baseEnv() {
     JWT_SECRET: crypto.randomBytes(32).toString('base64url'), PLATFORM_DATA_ENCRYPTION_KEY: crypto.randomBytes(32).toString('base64'),
     CLAIM_REFERENCE_PEPPER: crypto.randomBytes(32).toString('base64url'), AUDIT_LOG_HASH_SALT: crypto.randomBytes(32).toString('base64url'),
     DINODIA_NATIVE_POLICY_VERSION: `harness-current-policy-${crypto.randomUUID()}`,
+    DINODIA_NATIVE_ANALYTICS_ENABLED: 'true',
     DINODIA_NATIVE_POLICY_TITLE: 'Disposable Stage 6 policy fixture',
     DINODIA_NATIVE_POLICY_TEXT: disposablePolicyText,
     DINODIA_NATIVE_POLICY_CONTENT_SHA256: sha256(disposablePolicyText),
@@ -3609,19 +3610,281 @@ async function pendingInvitationRouteChecks(deliveryEnv) {
   const homeownerPropertyDevice = await prisma.nativeDevice.create({ data: {
     homeId: inviter.homeId, hubInstallationId: customerFixture.hubTwoId, osDeviceId: `stage9-owner-info-${crypto.randomUUID()}`,
     originalName: 'Disposable property radiator', customerLabel: 'Hall heating', technicalLabel: 'radiator',
-    managementClass: 'PROPERTY_DEVICE', deviceType: 'radiator', manufacturer: 'Dinodia test fixture', model: 'Read-only test device',
+    analyticsCategory: 'RADIATOR', managementClass: 'PROPERTY_DEVICE', deviceType: 'radiator', manufacturer: 'Dinodia test fixture', model: 'Read-only test device',
     protocol: 'test', lifecycle: 'INSTALLED', descriptorRevision: 1,
   } });
   const privateTenantDevice = await prisma.nativeDevice.create({ data: {
     homeId: inviter.homeId, hubInstallationId: customerFixture.hubTwoId, osDeviceId: `stage9-tenant-private-${crypto.randomUUID()}`,
     originalName: 'Disposable tenant private lamp', customerLabel: 'Private bedside lamp', technicalLabel: 'tenant_device',
-    managementClass: 'TENANT_DEVICE', ownerMembershipId: privacyTenantMembership.id, deviceType: 'light',
+    analyticsCategory: 'LIGHT', managementClass: 'TENANT_DEVICE', ownerMembershipId: privacyTenantMembership.id, deviceType: 'light',
     protocol: 'test', lifecycle: 'DISCOVERED', descriptorRevision: 1,
   } });
+  const analyticsNow = new Date();
+  const analyticsHour = new Date(analyticsNow); analyticsHour.setUTCMinutes(0, 0, 0);
+  const analyticsPurgeAt = new Date(analyticsHour); analyticsPurgeAt.setUTCFullYear(analyticsPurgeAt.getUTCFullYear() + 1);
+  const analyticsObservedAt = new Date(analyticsNow.getTime() - 5 * 60_000);
+  const analyticsValidUntil = new Date(analyticsNow.getTime() + 20 * 60_000);
   await prisma.deviceAreaAssignment.createMany({ data: [homeownerPropertyDevice, privateTenantDevice].map((device) => ({
-    homeId: inviter.homeId, deviceId: device.id, areaId, source: 'STAGE9_DISPOSABLE_HOMEOWNER_PROJECTION', actorType: 'SYSTEM',
+    homeId: inviter.homeId, deviceId: device.id, areaId, validFrom: new Date(analyticsHour.getTime() - 86_400_000), source: 'STAGE10_DISPOSABLE_ANALYTICS', actorType: 'SYSTEM',
   })) });
+  await prisma.nativeDeviceUsageBucket.createMany({ data: [
+    { homeId: inviter.homeId, deviceId: homeownerPropertyDevice.id, areaId, analyticsCategory: 'RADIATOR', controlId: 'fixture-heat-demand', bucketStart: analyticsHour,
+      sourceGeneration: 1, revision: 1, onSeconds: 1200, offSeconds: 600, unknownSeconds: 0, closedAt: null, purgeAt: analyticsPurgeAt },
+  ] });
+  const propertyUsageHistoryCount = await prisma.nativeDeviceUsageBucket.count({ where: { homeId: inviter.homeId, deviceId: homeownerPropertyDevice.id } });
+  if (propertyUsageHistoryCount !== 1) fail(`The valid permanent-device activity bucket was not durably inserted (count=${propertyUsageHistoryCount})`);
+  const privateAnalyticsHistoryCount = await prisma.nativeDeviceUsageBucket.count({ where: { homeId: inviter.homeId, deviceId: privateTenantDevice.id } });
+  await prisma.nativeTemperatureSample.create({ data: { homeId: inviter.homeId, deviceId: homeownerPropertyDevice.id, areaId,
+    sourceEventKey: sha256(`stage10-temperature:${homeownerPropertyDevice.id}:${analyticsObservedAt.toISOString()}`), temperature: 20.5,
+    sourceObservedAt: analyticsObservedAt, validUntil: analyticsValidUntil, sourceGeneration: 1,
+    purgeAt: new Date(analyticsObservedAt.getTime() + 366 * 86_400_000) } });
+  const propertyTemperatureHistoryCount = await prisma.nativeTemperatureSample.count({ where: { homeId: inviter.homeId, deviceId: homeownerPropertyDevice.id } });
+  if (propertyTemperatureHistoryCount !== 1) fail(`The valid permanent Radiator temperature sample was not durably inserted (count=${propertyTemperatureHistoryCount})`);
   await prisma.nativeDevice.update({ where: { id: privateTenantDevice.id }, data: { lifecycle: 'INSTALLED' } });
+  const analyticsFrom = new Date(analyticsHour.getTime() - 60_000).toISOString();
+  const analyticsTo = analyticsNow.toISOString();
+  const analyticsBootstrap = await fetchJson(`${base}/api/v2/homes/${inviter.homeId}/analytics/bootstrap`, { headers: selectedHomeHeaders });
+  const analyticsUsage = await fetchJson(`${base}/api/v2/homes/${inviter.homeId}/analytics/usage?metric=radiator&level=hour&from=${encodeURIComponent(analyticsFrom)}&to=${encodeURIComponent(analyticsTo)}`, { headers: selectedHomeHeaders });
+  const analyticsTemperature = await fetchJson(`${base}/api/v2/homes/${inviter.homeId}/analytics/temperature?level=hour&from=${encodeURIComponent(analyticsFrom)}&to=${encodeURIComponent(analyticsTo)}`, { headers: selectedHomeHeaders });
+  const analyticsPrivateUsage = await fetchJson(`${base}/api/v2/homes/${inviter.homeId}/analytics/usage?metric=light&level=hour&from=${encodeURIComponent(analyticsFrom)}&to=${encodeURIComponent(analyticsTo)}`, { headers: selectedHomeHeaders });
+  const analyticsAnonymous = await fetchJson(`${base}/api/v2/homes/${inviter.homeId}/analytics/bootstrap`);
+  const analyticsWrongHomeId = crypto.randomUUID();
+  const analyticsWrongHome = await fetchJson(`${base}/api/v2/homes/${analyticsWrongHomeId}/analytics/bootstrap`, { headers: { ...selectedHomeHeaders, 'x-dinodia-home-id': analyticsWrongHomeId } });
+  const analyticsExport = await fetch(`${base}/api/v2/homes/${inviter.homeId}/analytics/export`, { headers: selectedHomeHeaders });
+  const privateUsageJson = JSON.stringify(analyticsPrivateUsage.body);
+  if (analyticsBootstrap.response.status !== 200 || analyticsBootstrap.body?.homeId !== inviter.homeId
+    || !analyticsBootstrap.body.devices?.some((device) => device.id === homeownerPropertyDevice.id)
+    || analyticsBootstrap.body.devices?.some((device) => device.id === privateTenantDevice.id || device.label === privateTenantDevice.originalName)
+    || analyticsUsage.response.status !== 200 || analyticsUsage.body?.selectedDeviceCount !== 1
+    || !analyticsUsage.body.buckets?.some((bucket) => bucket.onMinutes > 0)
+    || JSON.stringify(analyticsUsage.body).includes(privateTenantDevice.id)
+    || analyticsTemperature.response.status !== 200 || analyticsTemperature.body?.selectedDeviceCount !== 1
+    || !analyticsTemperature.body.points?.some((point) => point.celsius === 20.5 && point.currentFresh === true)
+    || analyticsPrivateUsage.response.status !== 200 || analyticsPrivateUsage.body?.selectedDeviceCount !== 0
+    || analyticsPrivateUsage.body?.buckets?.length !== 0 || privateUsageJson.includes(privateTenantDevice.id) || privateUsageJson.includes(privateTenantDevice.originalName)
+    || analyticsAnonymous.response.status !== 401 || analyticsWrongHome.response.status !== 404
+    || privateAnalyticsHistoryCount !== 0
+    || analyticsExport.status !== 404) {
+    fail(`Native analytics routes did not return only bounded selected-Home permanent-device evidence (${JSON.stringify({ bootstrap: analyticsBootstrap.response.status, usage: analyticsUsage.response.status, privateUsage: analyticsPrivateUsage.response.status, temperature: analyticsTemperature.response.status, anonymous: analyticsAnonymous.response.status, wrongHome: analyticsWrongHome.response.status, export: analyticsExport.status, privateDeviceExcluded: !privateUsageJson.includes(privateTenantDevice.id) })})`);
+  }
+  console.log('[stage10:integration] PASS: actual loopback analytics bootstrap, usage and temperature routes returned measured permanent-device data; tenant-private device had zero analytics rows and was absent from selectors, counts and results; anonymous/wrong-Home denied; no export route exists');
+
+  // Exercise the complete measured-data path with the real OS Store producer,
+  // durable outbox, machine-authenticated loopback sync route, ingestion owner,
+  // and owner-authorized analytics APIs. The preceding query fixture remains a
+  // route/projection privacy test; it is not used as evidence of ingestion.
+  const telemetryHomeId = customerFixture.homeOneId;
+  const telemetryAreaId = customerFixture.areaOneId;
+  const telemetryOsAreaId = customerFixture.areaOneOsId;
+  const telemetryHubId = customerFixture.hubOneId;
+  const telemetryOsDeviceId = `stage10-radiator-${crypto.randomUUID()}`;
+  const telemetryControlId = `stage10-heat-${crypto.randomUUID()}`;
+  const telemetryTemperatureControlId = `stage10-temp-${crypto.randomUUID()}`;
+  const telemetryNow = new Date();
+  const telemetryObservedAt = new Date(telemetryNow.getTime() - 60_000);
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    const priorOutbox = hub.store.getSyncOutbox();
+    if (!priorOutbox.inFlight && priorOutbox.acknowledgedSequence >= priorOutbox.nextSequence - 1) break;
+    await hub.pairing.syncNow();
+    await sleep(25);
+  }
+  const priorOutboxDrained = hub.store.getSyncOutbox();
+  if (priorOutboxDrained.inFlight || priorOutboxDrained.acknowledgedSequence < priorOutboxDrained.nextSequence - 1) fail('Could not drain prior disposable sync events before isolating the Stage 10 producer batch');
+  const telemetryDevice = await prisma.nativeDevice.create({ data: {
+    homeId: telemetryHomeId, hubInstallationId: telemetryHubId, osDeviceId: telemetryOsDeviceId,
+    originalName: 'Disposable measured radiator', technicalLabel: 'radiator', analyticsCategory: 'RADIATOR',
+    managementClass: 'PROPERTY_DEVICE', deviceType: 'radiator', manufacturer: 'Disposable integration fixture',
+    model: 'Route-ingested test device', protocol: 'zigbee', lifecycle: 'INSTALLED', descriptorRevision: 1,
+  } });
+  const telemetryPrivateDevice = await prisma.nativeDevice.create({ data: {
+    homeId: telemetryHomeId, hubInstallationId: telemetryHubId, osDeviceId: `stage10-private-${crypto.randomUUID()}`,
+    originalName: 'Disposable tenant private light', technicalLabel: 'tenant_device', analyticsCategory: 'LIGHT',
+    managementClass: 'TENANT_DEVICE', ownerMembershipId: customerFixture.tenantMembershipId,
+    deviceType: 'light', protocol: 'zigbee', lifecycle: 'DISCOVERED', descriptorRevision: 1,
+  } });
+  await prisma.deviceAreaAssignment.createMany({ data: [telemetryDevice, telemetryPrivateDevice].map((device) => ({
+    homeId: telemetryHomeId, deviceId: device.id, areaId: telemetryAreaId,
+    validFrom: new Date(telemetryObservedAt.getTime() - 86_400_000), source: 'STAGE10_DISPOSABLE_OS_SYNC', actorType: 'SYSTEM',
+  })) });
+  await prisma.nativeDevice.update({ where: { id: telemetryPrivateDevice.id }, data: { lifecycle: 'INSTALLED' } });
+  const telemetryPriorPlatform = hub.store.getPlatform();
+  await hub.store.saveIdentity({ serial: customerFixture.identityOneSerial, generation: customerFixture.identityOneGeneration });
+  await hub.store.saveArea({ name: 'Tenant area' }, telemetryOsAreaId);
+  await hub.store.savePlatform({
+    ...telemetryPriorPlatform,
+    paired: true, homeId: telemetryHomeId, hubInstallId: telemetryHubId,
+    areaBindings: [...(telemetryPriorPlatform.areaBindings || []).filter((binding) => binding.areaId !== telemetryAreaId), { areaId: telemetryAreaId, hubAreaId: telemetryOsAreaId }],
+    devicePolicies: { ...(telemetryPriorPlatform.devicePolicies || {}), [telemetryOsDeviceId]: {
+      osDeviceId: telemetryOsDeviceId, managementClass: 'PROPERTY_DEVICE', analyticsCategory: 'RADIATOR',
+      lifecycle: 'INSTALLED', ownerMembershipId: null, descriptorRevision: 1, descriptorDigest: 'a'.repeat(64), osAreaIds: [telemetryOsAreaId],
+    } },
+  });
+  const telemetryDeviceSnapshot = await hub.store.upsertDevice({
+    id: telemetryOsDeviceId, name: 'Disposable measured radiator', protocol: 'zigbee', deviceType: 'radiator',
+    technicalLabel: 'radiator', areaId: telemetryOsAreaId, setup: { status: 'ready', assignmentMode: 'device_inherited_v1', completedAt: telemetryObservedAt.toISOString() },
+    state: { heatDemand: 'on', ambientTemperature: 20.5 },
+    entities: {
+      heatDemand: { id: 'stage10-heat-entity', name: 'Heat demand', state: 'on', sourceObservedAt: telemetryObservedAt.toISOString(), domain: 'climate', category: 'control', capability: {
+        controlId: telemetryControlId, kind: 'binary', category: 'control', readable: true, writable: false, observable: true, primary: true,
+        semanticRole: 'active_heat_demand', maxStateValiditySeconds: 1800, bindings: [],
+      } },
+      ambientTemperature: { id: 'stage10-temperature-entity', name: 'Ambient temperature', state: 20.5, sourceObservedAt: telemetryObservedAt.toISOString(), domain: 'sensor', category: 'measurement', capability: {
+        controlId: telemetryTemperatureControlId, kind: 'number', category: 'measurement', readable: true, writable: false, observable: true, primary: true,
+        semanticRole: 'ambient_temperature', maxStateValiditySeconds: 1800, bindings: [],
+      } },
+    },
+  }, { nowMs: telemetryNow.getTime() });
+  const telemetryPending = hub.store.getSyncOutbox().events.filter((event) => event.sequence > hub.store.getSyncOutbox().acknowledgedSequence
+    && ['device.upsert', 'control.catalog.upsert', 'usage.bucket', 'temperature.sample'].includes(event.type)
+    && event.payload?.osDeviceId === telemetryOsDeviceId);
+  const telemetryCatalog = telemetryPending.find((event) => event.type === 'control.catalog.upsert')?.payload;
+  const telemetryTemperatureDescriptor = telemetryCatalog?.controls?.find((control) => control.controlId === telemetryTemperatureControlId);
+  const telemetryValiditySeconds = Number(telemetryTemperatureDescriptor?.maxStateValiditySeconds);
+  const telemetryExpectedValidUntil = Number.isSafeInteger(telemetryValiditySeconds) && telemetryValiditySeconds > 0
+    ? new Date(telemetryObservedAt.getTime() + Math.min(30 * 60_000, telemetryValiditySeconds * 1000))
+    : null;
+  const telemetryEventTypes = new Set(telemetryPending.map((event) => event.type));
+  if (!telemetryEventTypes.has('device.upsert') || !telemetryEventTypes.has('control.catalog.upsert')
+    || !telemetryEventTypes.has('usage.bucket') || !telemetryEventTypes.has('temperature.sample')
+    || Number(hub.store.getIdentity()?.generation) !== Number(customerFixture.identityOneGeneration)
+    || !telemetryDeviceSnapshot.presentation?.descriptorRevision || !telemetryExpectedValidUntil) {
+    fail(`The real OS observation producer did not enqueue bounded descriptor-bound telemetry (${JSON.stringify({ eventTypes: [...telemetryEventTypes].sort(), generationPresent: Number(hub.store.getIdentity()?.generation) > 0, descriptorReady: Boolean(telemetryDeviceSnapshot.presentation?.descriptorRevision) })})`);
+  }
+  const telemetryOutboxBefore = hub.store.getSyncOutbox();
+  const telemetryBatch = await hub.store.prepareSyncBatch(telemetryHubId, hub.pairing.runtime, Date.now());
+  const telemetryBatchDeviceEvents = telemetryBatch?.events?.filter((event) => event.payload?.osDeviceId === telemetryOsDeviceId) || [];
+  const telemetryRequiredSequence = Math.max(...telemetryPending.map((event) => Number(event.sequence)));
+  const telemetryReceiptCountBefore = await prisma.hubSyncReceipt.count({ where: { hubInstallationId: telemetryHubId } });
+  if (!telemetryBatch || telemetryBatch.events.some((event) => event.type === 'sync.compacted')
+    || !['device.upsert', 'control.catalog.upsert', 'usage.bucket', 'temperature.sample'].every((type) => telemetryBatchDeviceEvents.some((event) => event.type === type))
+    || Number(telemetryBatch.toSequence) < telemetryRequiredSequence) {
+    fail(`The prepared durable OS batch did not contain the exact Stage 10 producer events (${JSON.stringify({ eventTypes: telemetryBatch?.events?.map((event) => event.type) ?? [], targetEventTypes: telemetryBatchDeviceEvents.map((event) => event.type), through: telemetryBatch?.toSequence ?? null, requiredThrough: telemetryRequiredSequence })})`);
+  }
+  const telemetryAccepted = await machineRequest({ base, path: '/api/hub-agent/v2/sync', machineSecret: customerFixture.machineSecret,
+    body: { serial: customerFixture.identityOneSerial, identityGeneration: customerFixture.identityOneGeneration, ...telemetryBatch } });
+  if (telemetryAccepted.response.status !== 200 || Number(telemetryAccepted.body?.acceptedThroughSequence) < telemetryRequiredSequence
+    || telemetryAccepted.body?.duplicate === true) {
+    fail(`The actual signed sync route did not accept the OS-generated analytics batch (${telemetryAccepted.response.status}/${telemetryAccepted.body?.errorCode || 'no-code'})`);
+  }
+  await hub.store.acknowledgeSyncBatch({ streamId: telemetryAccepted.body.streamId, acceptedThroughSequence: Number(telemetryAccepted.body.acceptedThroughSequence),
+    cloudRevision: Number(telemetryAccepted.body.cloudRevision), configurationAppliedRevision: Number(telemetryAccepted.body.configurationAppliedRevision) });
+  const telemetryOutboxAfter = hub.store.getSyncOutbox();
+  const [telemetryUsageRows, telemetryTemperatureRows, telemetrySyncCursor, telemetryReceiptCount, telemetryPrivateRows, telemetryDeviceAfterSync] = await Promise.all([
+    prisma.nativeDeviceUsageBucket.findMany({ where: { homeId: telemetryHomeId, deviceId: telemetryDevice.id }, select: { revision: true, onSeconds: true, offSeconds: true, unknownSeconds: true, closedAt: true } }),
+    prisma.nativeTemperatureSample.findMany({ where: { homeId: telemetryHomeId, deviceId: telemetryDevice.id }, select: { temperature: true, sourceObservedAt: true, validUntil: true } }),
+    prisma.hubInstallation.findUniqueOrThrow({ where: { id: telemetryHubId }, select: { syncStreamId: true, syncAcceptedSequence: true } }),
+    prisma.hubSyncReceipt.count({ where: { hubInstallationId: telemetryHubId } }),
+    prisma.nativeDeviceUsageBucket.count({ where: { homeId: telemetryHomeId, deviceId: telemetryPrivateDevice.id } }),
+    prisma.nativeDevice.findUniqueOrThrow({ where: { id: telemetryDevice.id }, select: { managementClass: true, analyticsCategory: true, lifecycle: true, descriptorRevision: true, descriptorDigest: true, capabilitySummary: true } }),
+  ]);
+  if (telemetryUsageRows.length !== 1 || telemetryUsageRows[0].onSeconds <= 0
+    || telemetryTemperatureRows.length !== 1 || Number(telemetryTemperatureRows[0].temperature) !== 20.5
+    || telemetryTemperatureRows[0].sourceObservedAt.getTime() !== telemetryObservedAt.getTime()
+    || telemetryTemperatureRows[0].validUntil.getTime() !== telemetryExpectedValidUntil.getTime()
+    || telemetryOutboxAfter.acknowledgedSequence < telemetryOutboxBefore.nextSequence - 1
+    || Number(telemetrySyncCursor.syncAcceptedSequence) < telemetryOutboxAfter.acknowledgedSequence
+    || telemetryReceiptCount <= telemetryReceiptCountBefore || telemetryOutboxAfter.streamId !== telemetrySyncCursor.syncStreamId
+    || Number(telemetrySyncCursor.syncAcceptedSequence) < telemetryRequiredSequence || telemetryPrivateRows !== 0) {
+    const catalogEvent = telemetryPending.find((event) => event.type === 'control.catalog.upsert');
+    const usageEvent = telemetryPending.find((event) => event.type === 'usage.bucket');
+    const temperatureEvent = telemetryPending.find((event) => event.type === 'temperature.sample');
+    fail(`The signed OS outbox did not durably ingest and acknowledge its real measurements (${JSON.stringify({ usageRows: telemetryUsageRows.length, activitySeconds: telemetryUsageRows[0]?.onSeconds ?? 0, temperatureRows: telemetryTemperatureRows.length, temperature: telemetryTemperatureRows[0]?.temperature ?? null, observedAt: telemetryTemperatureRows[0]?.sourceObservedAt?.toISOString() ?? null, expectedObservedAt: telemetryObservedAt.toISOString(), validUntil: telemetryTemperatureRows[0]?.validUntil?.toISOString() ?? null, expectedValidUntil: telemetryExpectedValidUntil?.toISOString() ?? null, descriptorValiditySeconds: telemetryValiditySeconds, outboxAcknowledged: telemetryOutboxAfter.acknowledgedSequence >= telemetryRequiredSequence, cursorAdvanced: Number(telemetrySyncCursor.syncAcceptedSequence) >= telemetryRequiredSequence, receiptAdded: telemetryReceiptCount > telemetryReceiptCountBefore, streamMatches: telemetryOutboxAfter.streamId === telemetrySyncCursor.syncStreamId, privateRows: telemetryPrivateRows, deviceClass: telemetryDeviceAfterSync.managementClass, category: telemetryDeviceAfterSync.analyticsCategory, lifecycle: telemetryDeviceAfterSync.lifecycle, descriptorRevision: telemetryDeviceAfterSync.descriptorRevision, catalogRevision: telemetryDeviceAfterSync.capabilitySummary?.controlCatalog?.revision ?? null, catalogControls: (catalogEvent?.payload?.controls || []).map((control) => ({ controlId: control.controlId, semanticRole: control.semanticRole, observable: control.observable, valueType: control.valueType, maxStateValiditySeconds: control.maxStateValiditySeconds })), usageControl: usageEvent?.payload?.controlId ?? null, usageGeneration: usageEvent?.payload?.sourceGeneration ?? null, temperatureControl: temperatureEvent?.payload?.controlId ?? null, temperatureGeneration: temperatureEvent?.payload?.sourceGeneration ?? null, identityGeneration: hub.store.getIdentity()?.generation ?? null })})`);
+  }
+  await prisma.policyAcceptance.upsert({
+    where: { customerAccountId_policyKind_policyVersion: { customerAccountId: customerFixture.propertyAccountId, policyKind: 'DINODIA_NATIVE', policyVersion: deliveryEnv.DINODIA_NATIVE_POLICY_VERSION } },
+    create: { customerAccountId: customerFixture.propertyAccountId, policyKind: 'DINODIA_NATIVE', policyVersion: deliveryEnv.DINODIA_NATIVE_POLICY_VERSION, acceptedAt: new Date() }, update: {},
+  });
+  const analyticsOwnerPhone = keyPair();
+  const analyticsOwnerLogin = await fetchJson(`${base}/api/v2/mobile/session`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({
+    email: customerFixture.propertyEmail, password: customerFixture.propertyPassword,
+    deviceInstallationId: `stage10-owner-${crypto.randomUUID()}`, publicKey: analyticsOwnerPhone.publicKey,
+    deviceName: 'Disposable Stage 10 owner', model: 'integration-test', osFamily: 'test', osVersion: 'test',
+  }) });
+  if (analyticsOwnerLogin.response.status !== 200 || typeof analyticsOwnerLogin.body?.accessToken !== 'string') fail('The route-ingested Stage 10 sample requires a real disposable owner session');
+  const telemetryHeaders = { authorization: `Bearer ${analyticsOwnerLogin.body.accessToken}`, 'x-dinodia-home-id': telemetryHomeId };
+  const telemetryHourStart = new Date(telemetryObservedAt);
+  telemetryHourStart.setUTCMinutes(0, 0, 0);
+  const telemetryFrom = telemetryHourStart.toISOString();
+  // The API correctly rejects future-ended windows; leave a small past margin
+  // so HTTP/database scheduling cannot make the fixture's upper bound future.
+  const telemetryTo = new Date(Date.now() - 1_000).toISOString();
+  const [telemetryBootstrap, telemetryUsage, telemetryTemperature, telemetryWrongHome] = await Promise.all([
+    fetchJson(`${base}/api/v2/homes/${telemetryHomeId}/analytics/bootstrap`, { headers: telemetryHeaders }),
+    fetchJson(`${base}/api/v2/homes/${telemetryHomeId}/analytics/usage?metric=radiator&level=hour&from=${encodeURIComponent(telemetryFrom)}&to=${encodeURIComponent(telemetryTo)}`, { headers: telemetryHeaders }),
+    fetchJson(`${base}/api/v2/homes/${telemetryHomeId}/analytics/temperature?level=hour&from=${encodeURIComponent(telemetryFrom)}&to=${encodeURIComponent(telemetryTo)}`, { headers: telemetryHeaders }),
+    fetchJson(`${base}/api/v2/homes/${telemetryHomeId}/analytics/bootstrap`, { headers: { ...telemetryHeaders, 'x-dinodia-home-id': customerFixture.homeTwoId } }),
+  ]);
+  if (telemetryBootstrap.response.status !== 200 || !telemetryBootstrap.body.devices?.some((device) => device.id === telemetryDevice.id)
+    || telemetryBootstrap.body.devices?.some((device) => device.id === telemetryPrivateDevice.id || device.label === telemetryPrivateDevice.originalName)
+    || telemetryUsage.response.status !== 200 || telemetryUsage.body.selectedDeviceCount !== 1 || !telemetryUsage.body.buckets?.some((bucket) => bucket.onMinutes > 0)
+    || telemetryTemperature.response.status !== 200 || telemetryTemperature.body.selectedDeviceCount !== 1 || !telemetryTemperature.body.points?.some((point) => point.celsius === 20.5 && point.currentFresh === true)
+    || telemetryWrongHome.response.status !== 404) {
+    fail(`The actual signed ingestion-to-owner analytics path or its privacy boundary failed (${JSON.stringify({ bootstrap: telemetryBootstrap.response.status, usage: telemetryUsage.response.status, usageCount: telemetryUsage.body?.selectedDeviceCount, usageBuckets: telemetryUsage.body?.buckets?.map((bucket) => ({ onMinutes: bucket.onMinutes, coverageSeconds: bucket.coverageSeconds, isPartial: bucket.isPartial })), temperature: telemetryTemperature.response.status, temperatureCount: telemetryTemperature.body?.selectedDeviceCount, temperaturePoints: telemetryTemperature.body?.points?.map((point) => ({ celsius: point.celsius, currentFresh: point.currentFresh, sourceAt: point.sourceAt })), wrongHome: telemetryWrongHome.response.status, deviceVisible: Boolean(telemetryBootstrap.body?.devices?.some((device) => device.id === telemetryDevice.id)), privateAbsent: !JSON.stringify(telemetryBootstrap.body).includes(telemetryPrivateDevice.id) })})`);
+  }
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    const pendingOutbox = hub.store.getSyncOutbox();
+    if (!pendingOutbox.inFlight && pendingOutbox.acknowledgedSequence >= pendingOutbox.nextSequence - 1) break;
+    await hub.pairing.syncNow();
+    await sleep(25);
+  }
+  const drainedBeforeClosedTest = hub.store.getSyncOutbox();
+  if (drainedBeforeClosedTest.inFlight || drainedBeforeClosedTest.acknowledgedSequence < drainedBeforeClosedTest.nextSequence - 1) {
+    fail('The actual analytics telemetry outbox did not finish its bounded sync before the independent closed-history test');
+  }
+  // A valid closed bucket is accepted once; a later higher revision cannot
+  // rewrite closed history. This is an adversarial disposable event sent over
+  // the same machine-authenticated sync route, not a Production-device action.
+  const closedBucketStart = new Date(telemetryNow); closedBucketStart.setUTCMinutes(0, 0, 0); closedBucketStart.setUTCHours(closedBucketStart.getUTCHours() - 2);
+  const closedBucketEnd = new Date(closedBucketStart.getTime() + 60 * 60_000);
+  const closedPurgeAt = new Date(closedBucketStart); const closedOriginalDay = closedPurgeAt.getUTCDate();
+  closedPurgeAt.setUTCDate(1); closedPurgeAt.setUTCFullYear(closedPurgeAt.getUTCFullYear() + 1);
+  const closedLastDay = new Date(Date.UTC(closedPurgeAt.getUTCFullYear(), closedPurgeAt.getUTCMonth() + 1, 0)).getUTCDate();
+  closedPurgeAt.setUTCDate(Math.min(closedOriginalDay, closedLastDay));
+  const closedBucket = { osDeviceId: telemetryOsDeviceId, osAreaId: telemetryOsAreaId, analyticsCategory: 'RADIATOR', controlId: telemetryControlId,
+    sourceGeneration: customerFixture.identityOneGeneration, bucketStart: closedBucketStart.toISOString(), revision: 1,
+    onSeconds: 1200, offSeconds: 600, unknownSeconds: 1800, closedAt: closedBucketEnd.toISOString(), purgeAt: closedPurgeAt.toISOString() };
+  const closedAggregateId = sha256([closedBucket.osDeviceId, closedBucket.osAreaId, closedBucket.analyticsCategory, closedBucket.controlId,
+    String(closedBucket.sourceGeneration), String(closedBucketStart.getTime())].join('|'));
+  const closedEvent = await hub.store.queueSyncEvent('usage.bucket', closedAggregateId, closedBucket, { critical: false });
+  if (!closedEvent) fail('Disposable closed-history test could not enqueue the bounded history event');
+  const closedBatch = await hub.store.prepareSyncBatch(telemetryHubId, hub.pairing.runtime, Date.now());
+  if (!closedBatch || closedBatch.events.length !== 1 || closedBatch.events[0].type !== 'usage.bucket') fail('Closed-history test did not produce one contiguous signed outbox event');
+  const closedAccepted = await machineRequest({ base, path: '/api/hub-agent/v2/sync', machineSecret: customerFixture.machineSecret,
+    body: { serial: customerFixture.identityOneSerial, identityGeneration: customerFixture.identityOneGeneration, ...closedBatch } });
+  if (closedAccepted.response.status !== 200 || Number(closedAccepted.body?.acceptedThroughSequence) !== Number(closedBatch.toSequence)) fail(`A valid complete hourly history bucket was not accepted (${closedAccepted.response.status}/${closedAccepted.body?.errorCode || 'no-code'})`);
+  await hub.store.acknowledgeSyncBatch({ streamId: closedAccepted.body.streamId, acceptedThroughSequence: Number(closedAccepted.body.acceptedThroughSequence),
+    cloudRevision: Number(closedAccepted.body.cloudRevision), configurationAppliedRevision: Number(closedAccepted.body.configurationAppliedRevision) });
+  const closedRowWhere = { deviceId_areaId_analyticsCategory_controlId_bucketStart_sourceGeneration: {
+    deviceId: telemetryDevice.id, areaId: telemetryAreaId, analyticsCategory: 'RADIATOR', controlId: telemetryControlId,
+    bucketStart: closedBucketStart, sourceGeneration: customerFixture.identityOneGeneration,
+  } };
+  const closedRowBeforeConflict = await prisma.nativeDeviceUsageBucket.findUniqueOrThrow({ where: closedRowWhere });
+  if (!closedRowBeforeConflict.closedAt || closedRowBeforeConflict.onSeconds + closedRowBeforeConflict.offSeconds + closedRowBeforeConflict.unknownSeconds !== 3600) fail('Accepted closed history did not persist as a complete immutable hour');
+  const cloudCursorBeforeConflict = await prisma.hubInstallation.findUniqueOrThrow({ where: { id: telemetryHubId }, select: { syncAcceptedSequence: true } });
+  const receiptCountBeforeConflict = await prisma.hubSyncReceipt.count({ where: { hubInstallationId: telemetryHubId } });
+  const outboxBeforeConflict = hub.store.snapshot();
+  const conflictingClosedEvent = await hub.store.queueSyncEvent('usage.bucket', closedAggregateId, { ...closedBucket, revision: 2 }, { critical: false });
+  if (!conflictingClosedEvent) fail('Could not create the disposable higher-revision closed-bucket conflict');
+  const conflictBatch = await hub.store.prepareSyncBatch(telemetryHubId, hub.pairing.runtime, Date.now());
+  const closedConflict = await machineRequest({ base, path: '/api/hub-agent/v2/sync', machineSecret: customerFixture.machineSecret,
+    body: { serial: customerFixture.identityOneSerial, identityGeneration: customerFixture.identityOneGeneration, ...conflictBatch } });
+  const [closedRowAfterConflict, cloudCursorAfterConflict, receiptCountAfterConflict] = await Promise.all([
+    prisma.nativeDeviceUsageBucket.findUniqueOrThrow({ where: closedRowWhere }),
+    prisma.hubInstallation.findUniqueOrThrow({ where: { id: telemetryHubId }, select: { syncAcceptedSequence: true } }),
+    prisma.hubSyncReceipt.count({ where: { hubInstallationId: telemetryHubId } }),
+  ]);
+  hub.store.state = outboxBeforeConflict;
+  await hub.store.persist();
+  if (closedConflict.response.status !== 409 || closedConflict.body?.errorCode !== 'hub_sync_usage_bucket_closed'
+    || closedRowAfterConflict.revision !== closedRowBeforeConflict.revision
+    || closedRowAfterConflict.onSeconds !== closedRowBeforeConflict.onSeconds || closedRowAfterConflict.offSeconds !== closedRowBeforeConflict.offSeconds
+    || closedRowAfterConflict.unknownSeconds !== closedRowBeforeConflict.unknownSeconds
+    || Number(cloudCursorAfterConflict.syncAcceptedSequence) !== Number(cloudCursorBeforeConflict.syncAcceptedSequence)
+    || receiptCountAfterConflict !== receiptCountBeforeConflict) {
+    fail(`A higher revision altered or acknowledged closed analytics history (${JSON.stringify({ status: closedConflict.response.status, code: closedConflict.body?.errorCode || null, bucketUnchanged: closedRowAfterConflict.revision === closedRowBeforeConflict.revision && closedRowAfterConflict.onSeconds === closedRowBeforeConflict.onSeconds && closedRowAfterConflict.offSeconds === closedRowBeforeConflict.offSeconds && closedRowAfterConflict.unknownSeconds === closedRowBeforeConflict.unknownSeconds, cursorUnchanged: Number(cloudCursorAfterConflict.syncAcceptedSequence) === Number(cloudCursorBeforeConflict.syncAcceptedSequence), receiptUnchanged: receiptCountAfterConflict === receiptCountBeforeConflict })})`);
+  }
+  console.log('[stage10:integration] PASS: actual OS Store observations -> durable outbox -> machine-authenticated loopback sync receipt/cursor -> retained usage/temperature rows -> owner analytics APIs; tenant-private device produced zero rows and stayed out of selectors/results; wrong-home denied; higher-revision rewrite of a closed hour denied with unchanged history, cursor and receipt count');
+
   const homeownerContext = await fetchJson(`${base}/api/v2/homes/${inviter.homeId}/homeowner-context`, { headers: selectedHomeHeaders });
   const homeLifecycleBeforeDeferredActions = await prisma.home.findUniqueOrThrow({ where: { id: inviter.homeId }, select: { lifecycle: true, managementRevision: true, activeHubInstallationId: true, areas: { select: { id: true } } } });
   const deferredDeregPreview = await fetchJson(`${base}/api/v2/homes/${inviter.homeId}/deregister-full-home/preview`, { method: 'POST', headers: selectedHomeHeaders, body: JSON.stringify({}) });
@@ -3674,6 +3937,8 @@ async function pendingInvitationRouteChecks(deliveryEnv) {
       deviceInformationMatches: informationMatches,
       wrongHome: homeownerWrongHome.response.status, anonymous: homeownerAnonymous.response.status })})`);
   }
+  await prisma.nativeDeviceUsageBucket.deleteMany({ where: { deviceId: { in: [homeownerPropertyDevice.id, privateTenantDevice.id] }, homeId: inviter.homeId } });
+  await prisma.nativeTemperatureSample.deleteMany({ where: { deviceId: homeownerPropertyDevice.id, homeId: inviter.homeId } });
   await prisma.nativeDevice.deleteMany({ where: { id: { in: [homeownerPropertyDevice.id, privateTenantDevice.id] }, homeId: inviter.homeId } });
   await prisma.tenantAreaGrant.deleteMany({ where: { membershipId: privacyTenantMembership.id, homeId: inviter.homeId } });
   await prisma.homeMembership.delete({ where: { id: privacyTenantMembership.id } });

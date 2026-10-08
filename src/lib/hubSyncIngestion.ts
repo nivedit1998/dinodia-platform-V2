@@ -179,9 +179,9 @@ export async function applyHubSyncEvent(tx: Prisma.TransactionClient, input: {
     const catalog = summary.controlCatalog && typeof summary.controlCatalog === 'object' && !Array.isArray(summary.controlCatalog)
       ? summary.controlCatalog as Record<string, unknown> : null;
     const controls = Array.isArray(catalog?.controls) ? catalog.controls as Array<Record<string, unknown>> : [];
-    const role = payload.analyticsCategory === 'LIGHT' ? 'power' : payload.analyticsCategory === 'RADIATOR' ? 'active_heat_demand' : 'active_heat_production';
+    const roles = payload.analyticsCategory === 'LIGHT' ? ['power', 'brightness'] : payload.analyticsCategory === 'RADIATOR' ? ['active_heat_demand'] : ['active_heat_production'];
     if (Number(catalog?.revision) !== Number(device.descriptorRevision)
-      || !controls.some((control) => control.controlId === payload.controlId && control.semanticRole === role && control.observable === true)) return;
+      || !controls.some((control) => control.controlId === payload.controlId && roles.includes(String(control.semanticRole)) && control.observable === true)) return;
     const area = await tx.area.findUnique({ where: { homeId_osAreaId: { homeId, osAreaId: String(payload.osAreaId) } }, select: { id: true } });
     if (!area) invalid('hub_sync_usage_area_invalid', 'The usage bucket area is not part of this home');
     const bucketStart = strictDate(payload.bucketStart, now);
@@ -198,6 +198,11 @@ export async function applyHubSyncEvent(tx: Prisma.TransactionClient, input: {
     const purgeAt = new Date(String(payload.purgeAt));
     if (!Number.isFinite(purgeAt.getTime()) || purgeAt.getTime() !== oneCalendarYearAfter(bucketStart).getTime()) invalid('hub_sync_usage_purge_invalid', 'The usage bucket retention deadline is invalid');
     const data = { onSeconds: Number(payload.onSeconds), offSeconds: Number(payload.offSeconds), unknownSeconds: Number(payload.unknownSeconds), closedAt, purgeAt, revision: incomingRevision };
+    const totalSeconds = data.onSeconds + data.offSeconds + data.unknownSeconds;
+    if (closedAt && (closedAt.getTime() !== bucketStart.getTime() + 60 * 60 * 1000 || totalSeconds !== 3600)
+      || !closedAt && totalSeconds >= 3600) {
+      invalid('hub_sync_usage_bucket_closure_invalid', 'A closed usage bucket must cover exactly its hour and an open bucket must remain incomplete');
+    }
     if (previous) {
       if (previous.revision > incomingRevision) return;
       if (previous.revision === incomingRevision) {
@@ -207,6 +212,7 @@ export async function applyHubSyncEvent(tx: Prisma.TransactionClient, input: {
         }
         return;
       }
+      if (previous.closedAt) invalid('hub_sync_usage_bucket_closed', 'A closed historical usage bucket is immutable');
       if (data.onSeconds < previous.onSeconds || data.offSeconds < previous.offSeconds || data.unknownSeconds < previous.unknownSeconds) {
         invalid('hub_sync_usage_counter_regression', 'Absolute usage counters cannot move backwards');
       }

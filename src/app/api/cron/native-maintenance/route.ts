@@ -13,7 +13,8 @@ export async function GET(request: Request) {
   try {
     const result = await runNativeMaintenance(now);
     outcome = result;
-    return NextResponse.json({ ok: true, ...result }, { headers: { 'Cache-Control': 'no-store' } });
+    const ok = !Array.isArray(result.failedTasks) || result.failedTasks.length === 0;
+    return NextResponse.json({ ok, ...result }, { status: ok ? 200 : 503, headers: { 'Cache-Control': 'no-store' } });
   } catch { return NextResponse.json({ ok: false, error: 'Native maintenance failed' }, { status: 500, headers: { 'Cache-Control': 'no-store' } }); }
   finally { try { await completeOperationsLease('native-maintenance', lease, outcome); } catch { /* the bounded lease safely expires if recording fails */ } }
 }

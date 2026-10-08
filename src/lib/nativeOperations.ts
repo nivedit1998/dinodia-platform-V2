@@ -15,6 +15,8 @@ export const nativeTaskRegistry = Object.freeze([
   { taskId: 'support_expiry_and_revocation', owner: 'supabase_pg_cron_two_minute' },
   { taskId: 'claim_reservation_expiry', owner: 'supabase_pg_cron_two_minute' },
   { taskId: 'expired_dispatch_lease_cleanup', owner: 'vercel_hobby_daily' },
+  { taskId: 'retentionCleanup', owner: 'vercel_hobby_daily' },
+  { taskId: 'analyticsAndStorageMaintenance', owner: 'vercel_hobby_daily' },
 ] as const);
 
 const nativeTaskOwnerById = new Map<string, string>([
@@ -22,6 +24,8 @@ const nativeTaskOwnerById = new Map<string, string>([
   ['support_expiry_and_revocation', 'supabase_pg_cron_two_minute'],
   ['claim_reservation_expiry', 'supabase_pg_cron_two_minute'],
   ['expired_dispatch_lease_cleanup', 'vercel_hobby_daily'],
+  ['retentionCleanup', 'vercel_hobby_daily'],
+  ['analyticsAndStorageMaintenance', 'vercel_hobby_daily'],
 ]);
 
 export function validateNativeTaskRegistry(registry: readonly { taskId: string; owner: string }[] = nativeTaskRegistry): true {
@@ -95,24 +99,98 @@ export async function runNativeOperations(now = new Date()) {
 }
 
 export async function runNativeMaintenance(now = new Date()) {
-  const taskIds = ['expired_dispatch_lease_cleanup'];
+  const taskIds = ['expired_dispatch_lease_cleanup', 'retentionCleanup', 'analyticsAndStorageMaintenance'];
   assertTaskRegistryOwner(taskIds, 'vercel_hobby_daily');
-  const leases = await prisma.nativeBackgroundTaskState.updateMany({
-    where: { taskId: { not: 'expired_dispatch_lease_cleanup' }, leaseExpiresAt: { lte: now } },
-    data: { leaseOwner: null, leaseExpiresAt: null },
+  const failedTasks: string[] = [];
+  const result: Record<string, unknown> = { tasks: taskIds, failedTasks };
+  const isolate = async (taskId: string, run: () => Promise<void>) => {
+    try { await run(); } catch { failedTasks.push(taskId); }
+  };
+  await isolate('expired_dispatch_lease_cleanup', async () => {
+    const leases = await prisma.nativeBackgroundTaskState.updateMany({
+      where: { taskId: { not: 'expired_dispatch_lease_cleanup' }, leaseExpiresAt: { lte: now } },
+      data: { leaseOwner: null, leaseExpiresAt: null },
+    });
+    const receipts = await prisma.hubSyncReceipt.deleteMany({ where: { expiresAt: { lte: now } } });
+    const deregistrationCleanup = await prisma.nativeDomainOutbox.deleteMany({ where: {
+      aggregateType: 'FullHomeDeregistrationAccountCleanup', eventType: 'FULL_HOME_ACCOUNT_CLEANUP',
+      state: { in: ['DELIVERED', 'FAILED', 'CANCELLED'] }, expiresAt: { lte: now },
+    } });
+    Object.assign(result, { expiredDispatcherLeases: leases.count, expiredSyncReceipts: receipts.count,
+      expiredDeregistrationCleanupReceipts: deregistrationCleanup.count });
   });
-  const receipts = await prisma.hubSyncReceipt.deleteMany({ where: { expiresAt: { lte: now } } });
-  const deregistrationCleanup = await prisma.nativeDomainOutbox.deleteMany({ where: {
-    aggregateType: 'FullHomeDeregistrationAccountCleanup', eventType: 'FULL_HOME_ACCOUNT_CLEANUP',
-    state: { in: ['DELIVERED', 'FAILED', 'CANCELLED'] }, expiresAt: { lte: now },
-  } });
-  return { tasks: taskIds, expiredDispatcherLeases: leases.count, expiredSyncReceipts: receipts.count,
-    expiredDeregistrationCleanupReceipts: deregistrationCleanup.count };
+
+  await isolate('retentionCleanup', async () => {
+    const batchSize = 1000; const maxBatchesPerTable = 8;
+    let usageDeleted = 0; let temperatureDeleted = 0;
+    for (let batch = 0; batch < maxBatchesPerTable; batch += 1) {
+      const deleted = await prisma.$executeRaw`
+        WITH doomed AS (
+          SELECT "id" FROM "NativeDeviceUsageBucket" WHERE "purgeAt" <= ${now}
+          ORDER BY "purgeAt", "id" LIMIT ${batchSize} FOR UPDATE SKIP LOCKED
+        )
+        DELETE FROM "NativeDeviceUsageBucket" AS target USING doomed WHERE target."id" = doomed."id"`;
+      usageDeleted += Number(deleted);
+      if (Number(deleted) < batchSize) break;
+    }
+    for (let batch = 0; batch < maxBatchesPerTable; batch += 1) {
+      const deleted = await prisma.$executeRaw`
+        WITH doomed AS (
+          SELECT "id" FROM "NativeTemperatureSample" WHERE "purgeAt" <= ${now}
+          ORDER BY "purgeAt", "id" LIMIT ${batchSize} FOR UPDATE SKIP LOCKED
+        )
+        DELETE FROM "NativeTemperatureSample" AS target USING doomed WHERE target."id" = doomed."id"`;
+      temperatureDeleted += Number(deleted);
+      if (Number(deleted) < batchSize) break;
+    }
+    const [usageRemainder, temperatureRemainder] = await Promise.all([
+      prisma.nativeDeviceUsageBucket.findFirst({ where: { purgeAt: { lte: now } }, select: { id: true } }),
+      prisma.nativeTemperatureSample.findFirst({ where: { purgeAt: { lte: now } }, select: { id: true } }),
+    ]);
+    const checkpoint = { through: now.toISOString(), usageDeleted, temperatureDeleted,
+      backlogRemains: Boolean(usageRemainder || temperatureRemainder), batchLimitPerTable: batchSize * maxBatchesPerTable };
+    result.retentionCleanup = checkpoint;
+    (result as { taskCursors?: Record<string, unknown> }).taskCursors = {
+      ...((result as { taskCursors?: Record<string, unknown> }).taskCursors ?? {}), retentionCleanup: checkpoint,
+    };
+  });
+
+  await isolate('analyticsAndStorageMaintenance', async () => {
+    const cutoff = new Date(now.getTime() - 14 * 24 * 60 * 60 * 1000);
+    const [rows, temperatureRows] = await Promise.all([
+      prisma.$queryRaw<Array<{ scanned: bigint; invalidPartitions: bigint; onSeconds: bigint; offSeconds: bigint; unknownSeconds: bigint }>>`
+        SELECT COUNT(*)::bigint AS scanned,
+          COUNT(*) FILTER (WHERE "onSeconds" < 0 OR "offSeconds" < 0 OR "unknownSeconds" < 0
+            OR "onSeconds" + "offSeconds" + "unknownSeconds" > 3600
+            OR ("closedAt" IS NOT NULL AND "onSeconds" + "offSeconds" + "unknownSeconds" <> 3600)
+            OR EXTRACT(EPOCH FROM "bucketStart")::bigint % 3600 <> 0)::bigint AS "invalidPartitions",
+          COALESCE(SUM("onSeconds"), 0)::bigint AS "onSeconds",
+          COALESCE(SUM("offSeconds"), 0)::bigint AS "offSeconds",
+          COALESCE(SUM("unknownSeconds"), 0)::bigint AS "unknownSeconds"
+        FROM (SELECT "onSeconds", "offSeconds", "unknownSeconds", "closedAt", "bucketStart"
+          FROM "NativeDeviceUsageBucket" WHERE "bucketStart" >= ${cutoff} AND "bucketStart" <= ${now}
+          ORDER BY "bucketStart" DESC LIMIT 10000) AS bounded_usage`,
+      prisma.nativeTemperatureSample.count({ where: { sourceObservedAt: { gte: cutoff, lte: now }, purgeAt: { gt: now },
+        device: { is: { managementClass: 'PROPERTY_DEVICE', analyticsCategory: 'RADIATOR' } } } }),
+    ]);
+    const zero = BigInt(0);
+    const row = rows[0] ?? { scanned: zero, invalidPartitions: zero, onSeconds: zero, offSeconds: zero, unknownSeconds: zero };
+    const report = { checkedThrough: now.toISOString(), lookbackDays: 14, sampleLimit: 10000,
+      usageRowsScanned: Number(row.scanned), invalidUsagePartitions: Number(row.invalidPartitions),
+      sourceOnSeconds: Number(row.onSeconds), sourceOffSeconds: Number(row.offSeconds), sourceUnknownSeconds: Number(row.unknownSeconds),
+      temperatureSamplesInWindow: temperatureRows, aggregationMode: 'query_time_no_persisted_rollup', status: Number(row.invalidPartitions) === 0 ? 'OK' : 'FAILED' };
+    if (Number(row.invalidPartitions) !== 0) throw new Error('Native usage duration integrity check failed');
+    result.analyticsAndStorageMaintenance = report;
+    (result as { taskCursors?: Record<string, unknown> }).taskCursors = {
+      ...((result as { taskCursors?: Record<string, unknown> }).taskCursors ?? {}), analyticsAndStorageMaintenance: report,
+    };
+  });
+  return result;
 }
 
 const taskIdsByDispatcher = {
   'native-operations': { owner: 'OPERATIONS' as const, taskIds: ['operator_credential_lifecycle', 'support_expiry_and_revocation', 'claim_reservation_expiry'] },
-  'native-maintenance': { owner: 'MAINTENANCE' as const, taskIds: ['expired_dispatch_lease_cleanup'] },
+  'native-maintenance': { owner: 'MAINTENANCE' as const, taskIds: ['expired_dispatch_lease_cleanup', 'retentionCleanup', 'analyticsAndStorageMaintenance'] },
 };
 
 export type NativeDispatcherLease = { owner: string; taskIds: string[] };
@@ -137,7 +215,7 @@ export async function acquireOperationsLease(name: string, now = new Date()): Pr
 }
 
 export async function completeOperationsLease(name: string, lease: NativeDispatcherLease, outcome: {
-  failedTasks?: string[]; expiredSupport?: number; expiredRequests?: number; releasedClaims?: number; expiredDispatcherLeases?: number; expiredSyncReceipts?: number;
+  failedTasks?: string[]; expiredSupport?: number; expiredRequests?: number; releasedClaims?: number; expiredDispatcherLeases?: number; expiredSyncReceipts?: number; taskCursors?: Record<string, unknown>;
 }, now = new Date()): Promise<boolean> {
   const dispatcher = taskIdsByDispatcher[name as keyof typeof taskIdsByDispatcher];
   if (!dispatcher || !lease || !Number.isFinite(now.getTime()) || lease.taskIds.length !== dispatcher.taskIds.length || dispatcher.taskIds.some((id) => !lease.taskIds.includes(id))) return false;
@@ -156,6 +234,7 @@ export async function completeOperationsLease(name: string, lease: NativeDispatc
           leaseExpiresAt: null,
           lastCompletedAt: now,
           nextDueAt: new Date(now.getTime() + (dispatcher.owner === 'OPERATIONS' ? NATIVE_DISPATCH_LEASE_MS : 24 * 60 * 60 * 1000)),
+          ...(outcome.taskCursors?.[taskId] ? { cursor: outcome.taskCursors[taskId] as Prisma.InputJsonValue } : {}),
           lastOutcome: { status: failed ? 'FAILED' : 'SUCCEEDED', completedAt: now.toISOString(), summary } as Prisma.InputJsonValue,
           consecutiveFailures: failed ? { increment: 1 } : 0,
         },

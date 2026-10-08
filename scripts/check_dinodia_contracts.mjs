@@ -1197,6 +1197,8 @@ const expectedNativeTasks = [
   { taskId: "support_expiry_and_revocation", owner: "supabase_pg_cron_two_minute" },
   { taskId: "claim_reservation_expiry", owner: "supabase_pg_cron_two_minute" },
   { taskId: "expired_dispatch_lease_cleanup", owner: "vercel_hobby_daily" },
+  { taskId: "retentionCleanup", owner: "vercel_hobby_daily" },
+  { taskId: "analyticsAndStorageMaintenance", owner: "vercel_hobby_daily" },
 ];
 if (JSON.stringify(decisions.sync.nativeTaskRegistry) !== JSON.stringify(expectedNativeTasks))
   throw new Error("Native task registry is incomplete or assigns work to multiple schedule owners");
@@ -1213,9 +1215,16 @@ const expectedStage2Allocation = [
 ];
 if (JSON.stringify(decisions.sync.stage2TaskAllocation) !== JSON.stringify(expectedStage2Allocation))
   throw new Error("Stage 2 fixed task allocation is incomplete, reordered or has conflicting owners");
-if (decisions.sync.nativeTaskRegistry.some((task) =>
+if (decisions.sync.nativeTaskRegistry.filter((task) => !["retentionCleanup", "analyticsAndStorageMaintenance"].includes(task.taskId)).some((task) =>
   decisions.sync.stage2TaskAllocation.some((allocation) => allocation.taskId === task.taskId && allocation.implementationStage !== 1)))
   throw new Error("A later-stage task was activated in the Stage 1 runtime registry");
+for (const taskId of ["retentionCleanup", "analyticsAndStorageMaintenance"]) {
+  const task = decisions.sync.nativeTaskRegistry.find((item) => item.taskId === taskId);
+  const allocation = decisions.sync.stage2TaskAllocation.find((item) => item.taskId === taskId);
+  if (!task || !allocation || allocation.dispatcher !== "maintenance" || allocation.implementationStage > 10
+    || task.owner !== "vercel_hobby_daily")
+    throw new Error(`Stage 10 analytics maintenance task has no approved daily-maintenance allocation: ${taskId}`);
+}
 if (decisions.analytics.activityCategories.join(",") !== "light,radiator,boiler" || decisions.analytics.initialRollupTable !== false || decisions.analytics.usageUnits.join(",") !== "minutes_on,minutes_off,minutes_unknown" || decisions.analytics.temperature !== "radiator temperature only")
   throw new Error("Analytics activity, unit, or initial persistence decision drifted");
 if (decisions.transportPolicy.cloudFallbackAfterLanFailures !== decisions.mobile.cloudFallbackAfterLanFailures || decisions.transportPolicy.preferLanAfterSuccessfulProbes !== decisions.mobile.lanPreferAfterSuccesses || decisions.transportPolicy.preferLanAgainAfterSeconds !== decisions.mobile.preferLanAgainAfterSeconds)

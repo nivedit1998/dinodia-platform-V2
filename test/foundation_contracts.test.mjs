@@ -87,7 +87,7 @@ test('safe build identity prefers the real Vercel commit or deployment and never
   assert.equal(safeBuildId({ FOUNDATION_SOURCE_FINGERPRINT: 'not-a-fingerprint' }), 'local');
 });
 
-test('readiness accepts the exact Stage 3 head plus only reviewed additive Stage 4 through Stage 9 migrations', () => {
+test('readiness accepts the exact Stage 3 head plus only reviewed additive Stage 4 through Stage 10 migrations', () => {
   const { REQUIRED_MIGRATION, REQUIRED_MODEL_COUNT, COMPATIBLE_ADDITIVE_MIGRATIONS, isSchemaReady } = loadFoundationRuntime();
   const stage3Checksum = 'b'.repeat(64);
   const stage3 = [{ migration_name: REQUIRED_MIGRATION, checksum: stage3Checksum }];
@@ -105,12 +105,16 @@ test('readiness accepts the exact Stage 3 head plus only reviewed additive Stage
   const stage8 = [stage8Commissioning, ...stage6];
   const stage9DeregistrationGuard = migration('20261008100000_stage9_deregister_redacted_support_guard');
   const stage9 = [stage9DeregistrationGuard, ...stage8];
+  const stage10AnalyticsMaintenance = migration('20261008130000_stage10_analytics_maintenance_tasks');
+  const stage10 = [stage10AnalyticsMaintenance, ...stage9];
   assert.equal(isSchemaReady(stage3, REQUIRED_MODEL_COUNT, stage3Checksum), true);
   assert.equal(isSchemaReady(stage4, REQUIRED_MODEL_COUNT, stage3Checksum), true, 'the app rollback remains ready after the additive migration');
   assert.equal(isSchemaReady(stage5, REQUIRED_MODEL_COUNT + 1, stage3Checksum), true, 'the Stage 5 app and Stage 4 rollback remain ready on the additive Stage 5 schema');
   assert.equal(isSchemaReady(stage6, REQUIRED_MODEL_COUNT + 2, stage3Checksum), true, 'the Stage 6 app and compatible rollback remain ready on all reviewed additive Stage 6 schema');
   assert.equal(isSchemaReady(stage8, REQUIRED_MODEL_COUNT + 2, stage3Checksum), true, 'Stage 8 adds only compatible columns and remains ready without changing the table-count contract');
   assert.equal(isSchemaReady(stage9, REQUIRED_MODEL_COUNT + 2, stage3Checksum), true, 'Stage 9 trigger-only compatibility fix preserves the established schema/table-count contract');
+  assert.equal(isSchemaReady(stage10, REQUIRED_MODEL_COUNT + 2, stage3Checksum), true, 'Stage 10 task-registry migration is additive and keeps the existing application schema ready');
+  assert.equal(isSchemaReady([{ ...stage10AnalyticsMaintenance, checksum: '0'.repeat(64) }, ...stage9], REQUIRED_MODEL_COUNT + 2, stage3Checksum), false, 'an unreviewed Stage 10 migration checksum is not schema-ready');
   assert.equal(isSchemaReady([{ ...stage9DeregistrationGuard, checksum: '0'.repeat(64) }, ...stage8], REQUIRED_MODEL_COUNT + 2, stage3Checksum), false, 'an unreviewed Stage 9 migration checksum is not schema-ready');
   assert.equal(isSchemaReady(stage8, REQUIRED_MODEL_COUNT + 3, stage3Checksum), false, 'Stage 8 does not authorize an unexplained table-count change');
   assert.equal(isSchemaReady([stage8Commissioning, ...stage5], REQUIRED_MODEL_COUNT + 1, stage3Checksum), false, 'Stage 8 requires the Stage 6 and Stage 5 schema prerequisites');
@@ -128,6 +132,15 @@ test('readiness accepts the exact Stage 3 head plus only reviewed additive Stage
   assert.equal(isSchemaReady(stage5, REQUIRED_MODEL_COUNT, stage3Checksum), false);
   assert.equal(isSchemaReady(stage6, REQUIRED_MODEL_COUNT + 1, stage3Checksum), false, 'the prospective Room attempt table is included in the Stage 6 migration/table-count contract');
   assert.equal(isSchemaReady(stage4, REQUIRED_MODEL_COUNT, '0'.repeat(64)), false);
+});
+
+test('Stage 10 repairs the existing analytics BEFORE trigger to preserve valid rows', () => {
+  const sql = fs.readFileSync('prisma/migrations/20261008130000_stage10_analytics_maintenance_tasks/migration.sql', 'utf8');
+  assert.match(sql, /CREATE OR REPLACE FUNCTION "enforce_native_history_device_class"\(\)/);
+  assert.match(sql, /analytics history requires a matching permanent property-device category/);
+  assert.match(sql, /temperature history requires a permanent Radiator device/);
+  assert.match(sql, /RETURN NEW;/, 'a valid BEFORE-row-trigger observation must be inserted');
+  assert.doesNotMatch(sql, /RETURN NULL;/, 'returning NULL silently cancels an otherwise valid analytics row');
 });
 
 test('foundation and Stage 1 schema is exactly native and bounded', () => {
