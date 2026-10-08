@@ -147,7 +147,7 @@ try {
       try { await setTenantDeviceCustomerLabel(tx, { accountId: otherTenantAccount.id, membershipId: otherTenant.id, homeId: home.id, deviceId: tenantDevice.id, expectedInventoryRevision: 2, label: 'Not mine' }); } catch { wrongOwnerDenied = true; }
       invariant(wrongOwnerDenied, 'another tenant cannot rename the private device');
 
-      const changed = await replaceTenantAreaGrants(tx, { actorAccountId: ownerAccount.id, actorMembershipId: owner.id, tenantMembershipId: tenant.id, homeId: home.id, areaIds: [secondTenantArea.id], expectedManagementRevision: home.managementRevision, now });
+      const changed = await replaceTenantAreaGrants(tx, { actorAccountId: ownerAccount.id, actorMembershipId: owner.id, tenantMembershipId: tenant.id, homeId: home.id, areaIds: [secondTenantArea.id], expectedManagementRevision: home.managementRevision, expectedAccessRevision: tenant.accessRevision, now });
       invariant(changed.changed && changed.managementRevision === home.managementRevision + 1, 'owner grant replacement increments the authoritative revision');
       invariant(changed.decommissionTombstoneCount === 1, 'revoking the device assigned area queues its decommission even when an unrelated area grant remains');
       invariant(!(await tx.nativeDevice.findUnique({ where: { id: tenantDevice.id } })), 'grant removal erases the tenant device cloud projection in the same transaction');
@@ -157,7 +157,7 @@ try {
       const afterRevokeContext = await resolveNativeHomeContext(tx, { customerAccountId: tenantAccount.id, membershipId: tenant.id, homeId: home.id });
       invariant((await readNativeInventory(tx, afterRevokeContext)).devices.length === 0, 'revoked grant immediately removes inventory');
       let staleConflict = false;
-      try { await replaceTenantAreaGrants(tx, { actorAccountId: ownerAccount.id, actorMembershipId: owner.id, tenantMembershipId: tenant.id, homeId: home.id, areaIds: [area.id], expectedManagementRevision: home.managementRevision, now }); } catch { staleConflict = true; }
+      try { await replaceTenantAreaGrants(tx, { actorAccountId: ownerAccount.id, actorMembershipId: owner.id, tenantMembershipId: tenant.id, homeId: home.id, areaIds: [area.id], expectedManagementRevision: home.managementRevision, expectedAccessRevision: tenant.accessRevision, now }); } catch { staleConflict = true; }
       invariant(staleConflict, 'stale home-management revision is rejected');
       const areaPresentation = await setAreaOverrideName(tx, { accountId: ownerAccount.id, membershipId: owner.id, homeId: home.id, areaId: area.id, expectedAreaRevision: area.revision, expectedManagementRevision: changed.managementRevision, overrideName: 'Bedroom', now });
       invariant(areaPresentation.overrideName === 'Bedroom' && areaPresentation.originalName === 'Test area', 'area override preserves the OS source name');
