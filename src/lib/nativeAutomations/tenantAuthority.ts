@@ -29,7 +29,7 @@ export async function lockAndValidateTenantAutomationAuthority(
   // SERIALIZABLE transaction's pre-wait snapshot.
   await tx.$queryRaw`SELECT "id" FROM "TenantAreaGrant" WHERE "membershipId" = ${actor.membershipId}::uuid AND "homeId" = ${actor.homeId}::uuid ORDER BY "areaId" FOR UPDATE`;
 
-  const [account, session, trusted, membership, home, policy] = await Promise.all([
+  const [account, session, trusted, membership, home] = await Promise.all([
     tx.customerAccount.findUnique({ where: { id: actor.id }, select: { status: true, securityVersion: true } }),
     tx.customerSession.findUnique({ where: { id: actor.sessionId }, select: {
       customerAccountId: true, trustedDeviceId: true, refreshTokenHash: true, accessTokenHash: true,
@@ -48,7 +48,6 @@ export async function lockAndValidateTenantAutomationAuthority(
     tx.home.findFirst({ where: { id: actor.homeId, lifecycle: 'ACTIVE', installationStatus: 'COMPLETE' }, select: {
       id: true, activeHubInstallationId: true, managementRevision: true,
     } }),
-    Promise.resolve(currentCustomerPolicy()),
   ]);
 
   const currentCredentialHash = actor.credentialKind === 'account_access'
@@ -59,17 +58,20 @@ export async function lockAndValidateTenantAutomationAuthority(
     : session?.expiresAt;
   const selectedAreas = new Set(actor.areaIds);
   const currentAreas = new Set(membership?.tenantAreaGrants.map((grant) => grant.areaId) ?? []);
-  const policyAccepted = policy ? await tx.policyAcceptance.findUnique({ where: {
-    customerAccountId_policyKind_policyVersion: {
-      customerAccountId: actor.id, policyKind: 'DINODIA_NATIVE', policyVersion: policy.version,
-    },
-  }, select: { id: true } }) : null;
   if (home?.activeHubInstallationId) {
     await tx.$queryRaw`SELECT "id" FROM "HubInstallation" WHERE "id" = ${home.activeHubInstallationId}::uuid AND "homeId" = ${actor.homeId}::uuid FOR UPDATE`;
   }
   const hub = home?.activeHubInstallationId === actor.hubInstallationId ? await tx.hubInstallation.findFirst({ where: {
     id: actor.hubInstallationId, homeId: actor.homeId, lifecycleStatus: 'ACTIVE',
   }, select: { accessPolicyRevision: true } }) : null;
+  // Policy can be changed by a reviewed deployment while a request is waiting;
+  // resolve it only after all mutable authority locks have been acquired.
+  const policy = currentCustomerPolicy();
+  const policyAccepted = policy ? await tx.policyAcceptance.findUnique({ where: {
+    customerAccountId_policyKind_policyVersion: {
+      customerAccountId: actor.id, policyKind: 'DINODIA_NATIVE', policyVersion: policy.version,
+    },
+  }, select: { id: true } }) : null;
   // Deadline evaluation deliberately follows the final Hub lock and authority
   // reads. A wait there must not inherit a pre-wait timestamp.
   const now = new Date();
