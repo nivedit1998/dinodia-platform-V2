@@ -16,6 +16,7 @@ export type NativeAlexaCommandClaims = {
   commandId: string;
   idempotencyKey: string;
   valueDigest: string;
+  expectedObservationRevision?: number;
   policyRevision: number;
   issuedAt: number;
   expiresAt: number;
@@ -130,6 +131,7 @@ export function signNativeAlexaCommandToken(claims: NativeAlexaCommandClaims, pr
     || !/^dos_[A-Za-z0-9_-]{16,80}$/.test(claims.endpointId)
     || !/^[a-f0-9]{64}$/.test(claims.valueDigest)
     || !Number.isSafeInteger(claims.descriptorRevision) || claims.descriptorRevision < 0
+    || claims.expectedObservationRevision !== undefined && (!Number.isSafeInteger(claims.expectedObservationRevision) || claims.expectedObservationRevision < 0)
     || !Number.isSafeInteger(claims.policyRevision) || claims.policyRevision < 0
     || !Number.isSafeInteger(claims.issuedAt) || !Number.isSafeInteger(claims.expiresAt)
     || claims.expiresAt <= claims.issuedAt || claims.expiresAt - claims.issuedAt > 20) {
@@ -144,6 +146,7 @@ export function signNativeAlexaCommandToken(claims: NativeAlexaCommandClaims, pr
     deviceId: claims.deviceId, controlId: claims.controlId,
     descriptorRevision: claims.descriptorRevision, commandId: claims.commandId,
     idempotencyKey: claims.idempotencyKey, valueDigest: claims.valueDigest,
+    ...(claims.expectedObservationRevision !== undefined ? { expectedObservationRevision: claims.expectedObservationRevision } : {}),
     policyRevision: claims.policyRevision,
     jti: randomSecret(24), iat: claims.issuedAt, exp: claims.expiresAt,
   };

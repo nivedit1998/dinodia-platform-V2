@@ -167,7 +167,7 @@ export interface NativeControl { schemaVersion: 1; deviceId: OpaqueId; surfaceId
 export interface NativeDevice { id: OpaqueId; homeId: OpaqueId; managementClass: ManagementClass; ownerMembershipId: OpaqueId|null; lifecycle: 'commissioning'|'installed'|'view_only'|'retired'; technicalLabel: string; customerLabel: string|null; areaIds: OpaqueId[]; controls: NativeControl[]; descriptorRevision: number }
 export interface NativeControlState { deviceId: OpaqueId; controlId: OpaqueId; homeId: OpaqueId; descriptorRevision: number; revision: number; observedAt: string; receivedAt: string; validUntil: string; quality: StateQuality; value: unknown; deviceAvailability: 'online'|'offline'|'unknown'; analyticsActivity: 'on'|'off'|'unknown' }
 export interface NativeEnvelope<T> { schemaVersion: typeof DINODIA_V1; homeId: OpaqueId; streamId: OpaqueId; sequence: number; generatedAt: string; revision: number; data: T }
-export interface NativeCommand { commandId: OpaqueId; homeId: OpaqueId; homeMembershipId: OpaqueId; deviceId: OpaqueId; controlId: OpaqueId; descriptorRevision: number; value: unknown; issuedAt: string; idempotencyKey: string; stepUpOperationId?: string|null }
+export interface NativeCommand { commandId: OpaqueId; homeId: OpaqueId; homeMembershipId: OpaqueId; deviceId: OpaqueId; controlId: OpaqueId; descriptorRevision: number; value: unknown; issuedAt: string; idempotencyKey: string; stepUpOperationId?: string|null; expectedObservationRevision?: number }
 export interface NativeError { error: { code: string; message: string; requestId: OpaqueId; retryable?: boolean } }
 export interface NativeArea { id: OpaqueId; homeId: OpaqueId; originalName: string; overrideName?: string|null; revision: number; lifecycle: 'active'|'retired' }
 export interface LanEndpointObservation { version: 1; revision: number; state: 'CURRENT'|'UNAVAILABLE'; baseUrl?: string; discoveryHost: string }
@@ -1004,7 +1004,8 @@ function commandValueMatches(control: NativeControl, value: unknown): boolean {
   return control.valueType === 'invoke' && value === null;
 }
 export function validateCommandAgainstDevice(commandValue: unknown, device: NativeDevice, control: NativeControl, homeMembershipId: string): commandValue is NativeCommand {
-  if (!object(commandValue) || !hasOnlyKeys(commandValue, ['commandId','homeId','homeMembershipId','deviceId','controlId','descriptorRevision','value','issuedAt','idempotencyKey','stepUpOperationId'])) return false;
+  if (!object(commandValue) || !hasOnlyKeys(commandValue, ['commandId','homeId','homeMembershipId','deviceId','controlId','descriptorRevision','value','issuedAt','idempotencyKey','stepUpOperationId','expectedObservationRevision'])
+    || Object.hasOwn(commandValue, 'expectedObservationRevision') && (!Number.isSafeInteger(commandValue.expectedObservationRevision) || Number(commandValue.expectedObservationRevision) < 0)) return false;
   const currentControl = device.controls.find((candidate) => candidate.controlId === control.controlId && candidate.deviceId === control.deviceId);
   if (!validateNativeDevice(device) || !currentControl || !sameJsonValue(currentControl, control)) return false;
   const command = commandValue as unknown as NativeCommand;

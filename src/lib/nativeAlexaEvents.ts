@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import { prisma } from '@/lib/prisma';
+import type { Prisma } from '@prisma/client';
 import { currentCustomerPolicy } from '@/lib/customerPolicyConfig';
 import { decryptPlatformEnvelope, encryptPlatformEnvelope } from '@/lib/hubOperatorCredentials';
 import { serializableTransaction } from '@/lib/serializableTransaction';
@@ -117,6 +118,12 @@ async function deliverOne(id: string, nowHint: Date): Promise<'DELIVERED' | 'CAN
         await tx.nativeDomainOutbox.update({ where: { id }, data: { state: 'CANCELLED', updatedAt: now } });
         return 'CANCELLED' as const;
       }
+      const tenantOwnedEvent = payload.tenantOwned === true;
+      if (tenantOwnedEvent && (typeof payload.ownerMembershipId !== 'string' || payload.ownerMembershipId !== payload.membershipId
+        || !object(payload.tenantOwnedState))) {
+        await tx.nativeDomainOutbox.update({ where: { id }, data: { state: 'CANCELLED', updatedAt: now } });
+        return 'CANCELLED' as const;
+      }
       const linkHint = await tx.alexaNativeLink.findUnique({ where: { id: payload.linkId }, select: { customerAccountId: true } });
       if (!linkHint) {
         await tx.nativeDomainOutbox.update({ where: { id }, data: { state: 'CANCELLED', updatedAt: now } });
@@ -134,7 +141,14 @@ async function deliverOne(id: string, nowHint: Date): Promise<'DELIVERED' | 'CAN
       await tx.$queryRaw`SELECT "id" FROM "AlexaNativeEndpointProjection" WHERE "id" = ${payload.endpointProjectionId}::uuid FOR UPDATE`;
       await tx.$queryRaw`SELECT "id" FROM "NativeDevice" WHERE "id" = ${payload.deviceId}::uuid FOR UPDATE`;
       const policy = currentCustomerPolicy();
-      const current = await tx.alexaNativeEndpointProjection.findFirst({ where: {
+      const currentDeviceWhere: Prisma.NativeDeviceWhereInput = {
+        homeId: payload.homeId, hubInstallationId: row.hubInstallationId,
+        managementClass: tenantOwnedEvent ? 'TENANT_DEVICE' : 'PROPERTY_DEVICE',
+        ownerMembershipId: tenantOwnedEvent ? String(payload.ownerMembershipId) : null,
+        lifecycle: 'INSTALLED', descriptorRevision: Number(payload.descriptorRevision),
+        assignments: { some: { homeId: payload.homeId, areaId: payload.areaId, validFrom: { lte: now }, validUntil: null } },
+      };
+      const currentEndpointWhere: Prisma.AlexaNativeEndpointProjectionWhereInput = {
         id: payload.endpointProjectionId, linkId: payload.linkId, homeId: payload.homeId,
         membershipId: payload.membershipId, deviceId: payload.deviceId, areaId: payload.areaId,
         endpointId: row.aggregateId, status: 'ACTIVE', descriptorRevision: Number(payload.descriptorRevision),
@@ -151,14 +165,13 @@ async function deliverOne(id: string, nowHint: Date): Promise<'DELIVERED' | 'CAN
         membership: { role: 'TENANT', status: 'ACTIVE', customerAccountId: linkHint.customerAccountId,
           tenantAreaGrants: { some: { areaId: payload.areaId, revokedAt: null, area: { status: 'ACTIVE' } } } },
         area: { homeId: payload.homeId, status: 'ACTIVE' },
-        device: { homeId: payload.homeId, hubInstallationId: row.hubInstallationId,
-          managementClass: 'PROPERTY_DEVICE', ownerMembershipId: null, lifecycle: 'INSTALLED', descriptorRevision: Number(payload.descriptorRevision),
-          assignments: { some: { homeId: payload.homeId, areaId: payload.areaId, validFrom: { lte: now }, validUntil: null } } },
-      }, select: {
+        device: currentDeviceWhere,
+      };
+      const current = await tx.alexaNativeEndpointProjection.findFirst({ where: currentEndpointWhere, select: {
         id: true, endpointId: true, linkId: true, homeId: true, membershipId: true, areaId: true,
         descriptorRevision: true, capabilities: true,
         link: { select: { revision: true, accessTokenCiphertext: true, refreshTokenCiphertext: true, accessTokenExpiresAt: true } },
-        device: { select: { osDeviceId: true, descriptorDigest: true, capabilitySummary: true } },
+        device: { select: { osDeviceId: true, descriptorDigest: true, capabilitySummary: true, managementClass: true, ownerMembershipId: true } },
         area: { select: { id: true } },
         home: { select: { activeHubInstallation: { select: { accessPolicyRevision: true } } } },
         membership: { select: { accessRevision: true } },
@@ -175,11 +188,17 @@ async function deliverOne(id: string, nowHint: Date): Promise<'DELIVERED' | 'CAN
         await tx.nativeDomainOutbox.update({ where: { id }, data: { state: 'CANCELLED', updatedAt: now } });
         return 'CANCELLED' as const;
       }
+      const tenantOwned = current.device.managementClass === 'TENANT_DEVICE';
+      if (tenantOwned !== tenantOwnedEvent || tenantOwned && (current.device.ownerMembershipId !== current.membershipId || current.membershipId !== payload.membershipId)) {
+        await tx.nativeDomainOutbox.update({ where: { id }, data: { state: 'CANCELLED', updatedAt: now } });
+        return 'CANCELLED' as const;
+      }
       const summary = object(current.device.capabilitySummary);
       const catalog = object(summary?.controlCatalog);
       const catalogControls = Array.isArray(catalog?.controls) ? catalog.controls.map(object).filter((item): item is JsonObject => item !== null) : [];
       const stateMap = object(summary?.alexaStateByControl);
-      const currentState = object(stateMap?.[String(payload.controlId)]);
+      const privateState = tenantOwned ? object(payload.tenantOwnedState) : null;
+      const currentState = tenantOwned ? privateState : object(stateMap?.[String(payload.controlId)]);
       const endpointCapabilities = object(current.capabilities);
       const controls = Array.isArray(endpointCapabilities?.controls) ? endpointCapabilities.controls.map(object).filter((item): item is JsonObject => item !== null) : [];
       const control = controls.find((item) => item.controlId === payload.controlId);
@@ -189,6 +208,7 @@ async function deliverOne(id: string, nowHint: Date): Promise<'DELIVERED' | 'CAN
         || currentState.descriptorRevision !== current.descriptorRevision || currentState.revision !== payload.stateRevision
         || currentState.observedAt !== payload.observedAt || currentState.causeType !== payload.causeType
         || currentState.sourceGeneration !== Number(payload.sourceGeneration ?? currentState.sourceGeneration)
+        || currentState.controlId !== payload.controlId || currentState.revision !== payload.stateRevision
         || Date.parse(String(currentState.validUntil)) <= now.getTime()
         || currentCatalogControl.controlId !== control.controlId || currentCatalogControl.readable !== true || currentCatalogControl.observable !== true
         || currentCatalogControl.stepUpPolicy === 'required' || ['sensitive', 'critical'].includes(String(currentCatalogControl.riskLevel))) {

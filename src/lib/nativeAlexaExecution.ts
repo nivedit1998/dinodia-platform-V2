@@ -250,7 +250,10 @@ async function lockAndAuthorizeEndpoint(tokenHash: string, endpointId: string): 
   }, 3, { timeoutMs: 8000 });
 }
 
-function commandValue(directive: AlexaDirective, controls: JsonObject[]): { control: JsonObject; value: boolean | number; alexaNamespace: string; propertyName: string; propertyValue: unknown } {
+type AlexaCommandOperation = { control: JsonObject; value: boolean | number; alexaNamespace: string; propertyName: string; propertyValue: unknown;
+  adjustmentDelta?: number; expectedObservationRevision?: number };
+
+function commandValue(directive: AlexaDirective, controls: JsonObject[]): AlexaCommandOperation {
   const { namespace, name } = directive.header;
   let role: string;
   let value: boolean | number;
@@ -260,17 +263,37 @@ function commandValue(directive: AlexaDirective, controls: JsonObject[]): { cont
   let matchedControl: JsonObject | undefined;
   if (namespace === 'Alexa.PowerController' && (name === 'TurnOn' || name === 'TurnOff')) {
     role = 'power'; value = name === 'TurnOn'; alexaNamespace = namespace; propertyName = 'powerState'; propertyValue = value ? 'ON' : 'OFF';
-  } else if (namespace === 'Alexa.BrightnessController' && name === 'SetBrightness') {
-    role = 'brightness'; value = directive.payload.brightness as number; alexaNamespace = namespace; propertyName = 'brightness'; propertyValue = value;
-  } else if (namespace === 'Alexa.ThermostatController' && name === 'SetTargetTemperature') {
+  } else if (namespace === 'Alexa.BrightnessController' && (name === 'SetBrightness' || name === 'AdjustBrightness')) {
+    role = 'brightness'; value = name === 'SetBrightness' ? directive.payload.brightness as number : 0; alexaNamespace = namespace; propertyName = 'brightness'; propertyValue = value;
+    if (name === 'AdjustBrightness') {
+      const delta = directive.payload.brightnessDelta;
+      if (typeof delta !== 'number' || !Number.isInteger(delta) || delta === 0) throw new Stage1AuthError(400, 'alexa_value_invalid', 'The requested brightness change is invalid');
+      return adjustmentOperation(controls, role, delta, namespace, propertyName);
+    }
+  } else if (namespace === 'Alexa.ThermostatController' && (name === 'SetTargetTemperature' || name === 'AdjustTargetTemperature')) {
     role = 'target_temperature';
+    if (name === 'AdjustTargetTemperature') {
+      const delta = record(directive.payload.targetSetpointDelta);
+      if (!delta || !['CELSIUS', 'FAHRENHEIT'].includes(String(delta.scale)) || typeof delta.value !== 'number'
+        || !Number.isFinite(delta.value) || delta.value === 0) {
+        throw new Stage1AuthError(400, 'alexa_value_invalid', 'The requested temperature change is invalid');
+      }
+      const control = controls.find((candidate) => candidate.semanticRole === role && candidate.writable === true
+        && candidate.readable === true && candidate.observable === true && candidate.automatable === true
+        && candidate.idempotency === 'set_value' && candidate.stepUpPolicy !== 'required');
+      const unit = String(record(control?.constraints)?.unit ?? '').toLowerCase();
+      if (!control || !['celsius', 'fahrenheit'].includes(unit)) throw new Stage1AuthError(409, 'alexa_descriptor_changed', 'The current thermostat unit is unavailable');
+      const controlScale = unit === 'fahrenheit' ? 'FAHRENHEIT' : 'CELSIUS';
+      const convertedDelta = delta.scale === controlScale ? Number(delta.value) : controlScale === 'CELSIUS' ? Number(delta.value) * 5 / 9 : Number(delta.value) * 9 / 5;
+      return adjustmentOperation(controls, role, convertedDelta, namespace, 'targetSetpoint', control);
+    }
     const target = record(directive.payload.targetSetpoint);
     if (!target || !['CELSIUS', 'FAHRENHEIT'].includes(String(target.scale)) || typeof target.value !== 'number' || !Number.isFinite(target.value)) {
       throw new Stage1AuthError(400, 'alexa_value_invalid', 'The requested temperature is invalid');
     }
     value = target.scale === 'FAHRENHEIT' ? (target.value - 32) * 5 / 9 : target.value;
     alexaNamespace = namespace; propertyName = 'targetSetpoint'; propertyValue = { value, scale: 'CELSIUS' };
-  } else if (namespace === 'Alexa.RangeController' && name === 'SetRangeValue') {
+  } else if (namespace === 'Alexa.RangeController' && (name === 'SetRangeValue' || name === 'AdjustRangeValue')) {
     if (Object.hasOwn(directive.payload, 'instance') || !directive.header.instance) {
       throw new Stage1AuthError(400, 'alexa_directive_invalid', 'Range control identity must be supplied in the Alexa header');
     }
@@ -278,6 +301,17 @@ function commandValue(directive: AlexaDirective, controls: JsonObject[]): { cont
     matchedControl = controls.find((candidate) => instances.get(String(candidate.controlId)) === directive.header.instance);
     if (!matchedControl) throw new Stage1AuthError(404, 'alexa_control_unavailable', 'This range control is not currently available to Alexa');
     role = String(matchedControl.semanticRole);
+    if (name === 'AdjustRangeValue') {
+      const requestedDelta = directive.payload.rangeValueDelta;
+      const defaultDelta = directive.payload.rangeValueDeltaDefault;
+      const constraints = record(matchedControl.constraints);
+      if (typeof requestedDelta !== 'number' || !Number.isFinite(requestedDelta) || requestedDelta === 0 || typeof defaultDelta !== 'boolean'
+        || !constraints || typeof constraints.step !== 'number' || !Number.isFinite(constraints.step) || constraints.step <= 0) {
+        throw new Stage1AuthError(400, 'alexa_value_invalid', 'The requested range change is invalid');
+      }
+      const delta = defaultDelta ? Math.sign(requestedDelta) * constraints.step : requestedDelta;
+      return adjustmentOperation(controls, role, delta, namespace, 'rangeValue', matchedControl);
+    }
     value = directive.payload.rangeValue as number; alexaNamespace = namespace; propertyName = 'rangeValue'; propertyValue = value;
   } else {
     throw new Stage1AuthError(400, 'alexa_directive_unsupported', 'This Alexa control operation is not supported by the current Dinodia descriptor');
@@ -300,6 +334,41 @@ function commandValue(directive: AlexaDirective, controls: JsonObject[]): { cont
   }
   if (role === 'brightness' && (typeof value !== 'number' || value < 0 || value > 100)) throw new Stage1AuthError(400, 'alexa_value_invalid', 'Brightness must be between 0 and 100');
   return { control, value, alexaNamespace, propertyName, propertyValue };
+}
+
+function adjustmentOperation(controls: JsonObject[], role: string, adjustmentDelta: number, alexaNamespace: string,
+  propertyName: string, exactControl?: JsonObject): AlexaCommandOperation {
+  const control = exactControl ?? controls.find((candidate) => candidate.semanticRole === role && candidate.writable === true
+    && candidate.readable === true && candidate.observable === true && candidate.automatable === true
+    && candidate.idempotency === 'set_value' && candidate.stepUpPolicy !== 'required');
+  if (!control || control.writable !== true || control.readable !== true || control.observable !== true
+    || control.automatable !== true || control.idempotency !== 'set_value' || control.stepUpPolicy === 'required') {
+    throw new Stage1AuthError(404, 'alexa_control_unavailable', 'This control is not currently available to Alexa');
+  }
+  if (!Number.isFinite(adjustmentDelta) || adjustmentDelta === 0) throw new Stage1AuthError(400, 'alexa_value_invalid', 'The requested control change is invalid');
+  return { control, value: 0, alexaNamespace, propertyName, propertyValue: null, adjustmentDelta };
+}
+
+function resolveAdjustment(control: JsonObject, stateValue: unknown, adjustmentDelta: number, now: number) {
+  const state = record(stateValue);
+  if (!state || state.controlId !== control.controlId || state.descriptorRevision !== control.catalogRevision
+    || state.quality !== 'fresh' || typeof state.observedAt !== 'string' || typeof state.validUntil !== 'string'
+    || !Number.isSafeInteger(state.revision) || !Number.isFinite(Date.parse(state.observedAt)) || Date.parse(state.observedAt) > now
+    || !Number.isFinite(Date.parse(state.validUntil)) || Date.parse(state.validUntil) <= now
+    || typeof state.value !== 'number' || !Number.isFinite(state.value)) {
+    throw new Stage1AuthError(409, 'alexa_state_not_current', 'Current device state is unavailable; no adjustment was sent');
+  }
+  const bounds = record(control.constraints);
+  if (!bounds || typeof bounds.minimum !== 'number' || typeof bounds.maximum !== 'number'
+    || typeof bounds.step !== 'number' || bounds.step <= 0) {
+    throw new Stage1AuthError(409, 'alexa_descriptor_changed', 'The current control range is unavailable');
+  }
+  const value = state.value + adjustmentDelta;
+  const steps = (value - bounds.minimum) / bounds.step;
+  if (value < bounds.minimum || value > bounds.maximum || Math.abs(steps - Math.round(steps)) > 1e-7) {
+    throw new Stage1AuthError(400, 'alexa_value_invalid', 'The requested change is outside the current control range or step');
+  }
+  return { value: Number(value.toFixed(8)), expectedObservationRevision: Number(state.revision) };
 }
 
 function requestDigest(directive: AlexaDirective): string {
@@ -346,8 +415,49 @@ async function callHub(origin: string, path: string, token: string, body: JsonOb
   let bodyValue: unknown;
   try { bodyValue = JSON.parse(text); } catch { bodyValue = null; }
   const parsed = record(bodyValue);
-  if (!response.ok || !parsed) throw new Stage1AuthError(503, 'alexa_hub_unavailable', 'The selected Dinodia hub is unavailable');
+  if (!response.ok || !parsed) {
+    throw new Stage1AuthError(503, parsed ? `alexa_hub_http_${response.status}` : 'alexa_hub_response_invalid', 'The selected Dinodia hub is unavailable');
+  }
   return parsed;
+}
+
+async function currentAlexaControlState(endpoint: AuthorizedEndpoint, control: JsonObject): Promise<JsonObject> {
+  const now = tokenTime();
+  const controlId = String(control.controlId);
+  const stateToken = signNativeAlexaStateToken({ accountId: endpoint.accountId, linkId: endpoint.linkId,
+    endpointId: endpoint.endpointId, homeId: endpoint.homeId, membershipId: endpoint.membershipId,
+    hubInstallationId: endpoint.hubId, areaId: endpoint.areaId, deviceId: endpoint.osDeviceId,
+    controlIds: [controlId], descriptorRevision: endpoint.descriptorRevision,
+    policyRevision: Math.max(endpoint.accessRevision, endpoint.hubPolicyRevision), issuedAt: now.issuedAt, expiresAt: now.expiresAt,
+  }, platformPrivateKey());
+  const result = await callHub(cloudOrigin(endpoint), '/api/dinodia/v1/alexa/state', stateToken,
+    { deviceId: endpoint.osDeviceId, controlIds: [controlId] });
+  if (result.schemaVersion !== 'dinodia.v1' || result.endpointId !== endpoint.endpointId || result.homeId !== endpoint.homeId
+    || result.membershipId !== endpoint.membershipId || result.deviceId !== endpoint.osDeviceId
+    || result.descriptorRevision !== endpoint.descriptorRevision || !Array.isArray(result.states)) {
+    throw new Stage1AuthError(503, 'alexa_hub_response_invalid', 'Dinodia OS returned an invalid current state');
+  }
+  const state = result.states.map(record).find((candidate): candidate is JsonObject => candidate?.controlId === controlId);
+  if (!state || state.deviceId !== endpoint.osDeviceId || state.homeId !== endpoint.homeId
+    || state.descriptorRevision !== endpoint.descriptorRevision) {
+    throw new Stage1AuthError(409, 'alexa_state_not_current', 'Current device state is unavailable; no adjustment was sent');
+  }
+  return state;
+}
+
+function adjustmentReceiptMarker(value: number, revision: number): string {
+  const marker = `adjust:${revision}:${value}`;
+  if (marker.length > 120) throw new Stage1AuthError(503, 'alexa_receipt_invalid', 'The Alexa adjustment receipt is unavailable');
+  return marker;
+}
+
+function parseAdjustmentReceiptMarker(marker: string | null): { value: number; expectedObservationRevision: number } | null {
+  const match = /^adjust:(\d+):(-?\d+(?:\.\d+)?)$/.exec(String(marker ?? ''));
+  if (!match) return null;
+  const expectedObservationRevision = Number(match[1]);
+  const value = Number(match[2]);
+  return Number.isSafeInteger(expectedObservationRevision) && Number.isFinite(value)
+    ? { value, expectedObservationRevision } : null;
 }
 
 function alexaHeader(directive: AlexaDirective, namespace: string, name: string) {
@@ -377,7 +487,7 @@ function alexaErrorFor(error: unknown, directive: AlexaDirective) {
     if (error.status === 401) return alexaError(directive, 'INVALID_AUTHORIZATION_CREDENTIAL', 'Authorization is no longer valid. Relink Dinodia in the Alexa app.');
     if (error.status === 404) return alexaError(directive, 'NO_SUCH_ENDPOINT', 'This Dinodia endpoint is no longer available. Discover devices again.');
     if (error.status === 400) return alexaError(directive, 'INVALID_DIRECTIVE', 'This request is not supported by the current Dinodia device controls.');
-    if (error.status === 409) return alexaError(directive, 'INVALID_DIRECTIVE', 'This Alexa message identifier was already used for a different control request.');
+    if (error.status === 409 && error.code === 'alexa_directive_replay_conflict') return alexaError(directive, 'INVALID_DIRECTIVE', 'This Alexa message identifier was already used for a different control request.');
   }
   return alexaError(directive, 'ENDPOINT_UNREACHABLE', 'Dinodia could not confirm this request. Retry safely or check the Dinodia app.');
 }
@@ -444,9 +554,23 @@ export async function executeNativeAlexaDirective(input: unknown): Promise<objec
   const digest = requestDigest(directive);
   const commandId = `alexa-${sha256(`${endpoint.linkId}\n${directive.header.messageId}`)}`;
   const idempotencyKey = `alexa-${sha256(`${endpoint.linkId}\n${directive.header.messageId}`)}`;
+  let resolvedAdjustment: { value: number; expectedObservationRevision: number } | null = null;
+  if (operation.adjustmentDelta !== undefined) {
+    const prior = await prisma.alexaNativeDirectiveReceipt.findUnique({ where: { requestId }, select: {
+      linkId: true, requestDigest: true, responseStatus: true, responseDigest: true, expiresAt: true,
+    } });
+    if (prior && (prior.linkId !== endpoint.linkId || prior.requestDigest !== digest || prior.expiresAt <= new Date())) {
+      throw new Stage1AuthError(409, 'alexa_directive_replay_conflict', 'The Alexa request identifier was already used');
+    }
+    if (prior?.responseStatus === 200) return alexaResponse(directive);
+    resolvedAdjustment = prior
+      ? parseAdjustmentReceiptMarker(prior.responseDigest)
+      : resolveAdjustment(operation.control, await currentAlexaControlState(endpoint, operation.control), operation.adjustmentDelta, Date.now());
+    if (!resolvedAdjustment) throw new Stage1AuthError(503, 'alexa_receipt_invalid', 'The reserved Alexa adjustment cannot be reconciled safely');
+  }
   const receipt = await serializableTransaction(async (tx) => {
     await tx.$queryRaw`SELECT "id" FROM "AlexaNativeLink" WHERE "id" = ${endpoint.linkId}::uuid FOR UPDATE`;
-    const existing = await tx.alexaNativeDirectiveReceipt.findUnique({ where: { requestId }, select: { id: true, linkId: true, requestDigest: true, commandId: true, responseStatus: true, expiresAt: true } });
+    const existing = await tx.alexaNativeDirectiveReceipt.findUnique({ where: { requestId }, select: { id: true, linkId: true, requestDigest: true, commandId: true, responseStatus: true, responseDigest: true, expiresAt: true } });
     if (existing) {
       if (existing.linkId !== endpoint.linkId || existing.requestDigest !== digest || existing.expiresAt <= new Date()) {
         throw new Stage1AuthError(409, 'alexa_directive_replay_conflict', 'The Alexa request identifier was already used');
@@ -455,11 +579,20 @@ export async function executeNativeAlexaDirective(input: unknown): Promise<objec
     }
     return tx.alexaNativeDirectiveReceipt.create({ data: {
       linkId: endpoint.linkId, requestId, requestDigest: digest, commandId, eventTokenHash: sha256(token),
-      responseStatus: 202, expiresAt: new Date(Date.now() + RECEIPT_TTL_MS),
-    }, select: { id: true, linkId: true, requestDigest: true, commandId: true, responseStatus: true, expiresAt: true } });
+      responseStatus: 202, ...(resolvedAdjustment ? { responseDigest: adjustmentReceiptMarker(resolvedAdjustment.value, resolvedAdjustment.expectedObservationRevision) } : {}),
+      expiresAt: new Date(Date.now() + RECEIPT_TTL_MS),
+    }, select: { id: true, linkId: true, requestDigest: true, commandId: true, responseStatus: true, responseDigest: true, expiresAt: true } });
   }, 3, { timeoutMs: 5000 });
   if (!receipt.commandId) throw new Stage1AuthError(503, 'alexa_receipt_invalid', 'The Alexa command receipt is unavailable');
   if (receipt.responseStatus === 200) return alexaResponse(directive);
+
+  if (operation.adjustmentDelta !== undefined) {
+    resolvedAdjustment = parseAdjustmentReceiptMarker(receipt.responseDigest);
+    if (!resolvedAdjustment) throw new Stage1AuthError(503, 'alexa_receipt_invalid', 'The reserved Alexa adjustment cannot be reconciled safely');
+    operation.value = resolvedAdjustment.value;
+    operation.propertyValue = operation.propertyName === 'targetSetpoint' ? { value: operation.value, scale: 'CELSIUS' } : operation.value;
+    operation.expectedObservationRevision = resolvedAdjustment.expectedObservationRevision;
+  }
 
   const now = tokenTime();
   const commandToken = signNativeAlexaCommandToken({ accountId: endpoint.accountId, linkId: endpoint.linkId,
@@ -467,6 +600,7 @@ export async function executeNativeAlexaDirective(input: unknown): Promise<objec
     hubInstallationId: endpoint.hubId, areaId: endpoint.areaId, deviceId: endpoint.osDeviceId,
     controlId: String(operation.control.controlId), descriptorRevision: endpoint.descriptorRevision,
     commandId: receipt.commandId, idempotencyKey, valueDigest: sha256(JSON.stringify(operation.value)),
+    ...(operation.expectedObservationRevision !== undefined ? { expectedObservationRevision: operation.expectedObservationRevision } : {}),
     policyRevision: Math.max(endpoint.accessRevision, endpoint.hubPolicyRevision), issuedAt: now.issuedAt, expiresAt: now.expiresAt,
   }, platformPrivateKey());
   try {
@@ -475,12 +609,30 @@ export async function executeNativeAlexaDirective(input: unknown): Promise<objec
       commandId: receipt.commandId, homeId: endpoint.homeId, homeMembershipId: endpoint.membershipId,
       deviceId: endpoint.osDeviceId, controlId: String(operation.control.controlId),
       descriptorRevision: endpoint.descriptorRevision, value: operation.value,
+      ...(operation.expectedObservationRevision !== undefined ? { expectedObservationRevision: operation.expectedObservationRevision } : {}),
       issuedAt: new Date().toISOString(), idempotencyKey,
     }, idempotencyKey);
     const status = typeof result.status === 'string' ? result.status : '';
-    if (!['accepted', 'applied', 'succeeded'].includes(status)) throw new Stage1AuthError(503, 'alexa_command_not_acknowledged', 'Dinodia OS did not acknowledge the Alexa command');
+    if (!['accepted', 'applied', 'succeeded'].includes(status)) {
+      throw new Stage1AuthError(503, 'alexa_command_not_acknowledged', 'Dinodia OS has not confirmed the requested Alexa operation');
+    }
+    let adjustmentProperties: AlexaProperty[] = [];
+    if (resolvedAdjustment) {
+      const resultingState = await currentAlexaControlState(endpoint, operation.control);
+      if (resultingState.quality !== 'fresh' || resultingState.value !== resolvedAdjustment.value
+        || !Number.isSafeInteger(resultingState.revision) || Number(resultingState.revision) <= resolvedAdjustment.expectedObservationRevision) {
+        throw new Stage1AuthError(503, 'alexa_command_not_acknowledged', 'Dinodia OS has not confirmed the resulting device state');
+      }
+      adjustmentProperties = alexaPropertiesFromStates(endpoint, [operation.control], [resultingState]);
+      const matchingProperty = adjustmentProperties.filter((property) => property.namespace === operation.alexaNamespace
+        && property.name === operation.propertyName
+        && (operation.alexaNamespace !== 'Alexa.RangeController' || property.instance === directive.header.instance));
+      if (matchingProperty.length !== 1 || JSON.stringify(matchingProperty[0].value) !== JSON.stringify(operation.propertyValue)) {
+        throw new Stage1AuthError(503, 'alexa_command_not_acknowledged', 'Dinodia OS has not returned the requested current state');
+      }
+    }
     await prisma.alexaNativeDirectiveReceipt.update({ where: { id: receipt.id }, data: { responseStatus: 200, responseDigest: sha256(`${receipt.commandId}\n${status}`) } });
-    return alexaResponse(directive);
+    return alexaResponse(directive, adjustmentProperties);
   } catch (error) {
     // Keep the reserved command ID and receipt. A retry of this exact Alexa
     // message reuses the same OS idempotency key; it can reconcile an uncertain
@@ -513,7 +665,9 @@ async function reportNativeAlexaState(directive: AlexaDirective): Promise<object
     throw new Stage1AuthError(503, 'alexa_hub_response_invalid', 'Dinodia OS returned an invalid state response');
   }
   const properties = alexaPropertiesFromStates(endpoint, controls, result.states);
-  if (!properties.length) return alexaError(directive, 'ENDPOINT_UNREACHABLE', 'The current device state is unknown or out of date. Try again when the device is available.');
+  if (!properties.some((property) => property.name !== 'connectivity')) {
+    return alexaError(directive, 'ENDPOINT_UNREACHABLE', 'The current device state is unknown or out of date. Try again when the device is available.');
+  }
   return alexaStateReport(directive, properties);
 }
 
