@@ -33,6 +33,7 @@ for (const fixture of [
   'account-session-two-homes.json',
   'customer-hub-session-test-only.json',
   'account-relationship-lifecycle.json',
+  'automation-stage11-live.json',
   'automation-full-bundle.json',
   'automation-property-impact.json',
   'invalid/automation-property-target-extra-authority.json',

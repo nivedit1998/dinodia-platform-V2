@@ -500,7 +500,7 @@ test('Stage 1 database migration includes durable privacy and authority objects'
   for (const marker of ['SupportAccessRequest_scope_guard', 'HubCredentialVersion_hub_purpose_state_idx', 'REVOKE ALL PRIVILEGES']) assert.match(migration, new RegExp(marker.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
 });
 
-test('readiness requires the exact Stage 3 schema plus reviewed additive Stage 4 through Stage 10 migrations', () => {
+test('readiness requires the exact Stage 3 schema plus reviewed additive Stage 4 through Stage 11 migrations', () => {
   assert.match(read('src/app/api/readiness/route.ts'), /isSchemaReady\(migration, Number\(modelCount\[0\]\?\.count \?\? 0\), expectedMigrationChecksum\)/);
   assert.match(read('src/lib/foundation.ts'), /20261003000000_native_v2_stage3_domain_schema/);
   assert.match(read('src/lib/foundation.ts'), /20261004050000_stage4_customer_lan_tls_identity/);
@@ -509,12 +509,16 @@ test('readiness requires the exact Stage 3 schema plus reviewed additive Stage 4
   assert.match(read('src/lib/foundation.ts'), /0043e8c7870c0afa7f4a5e5e4dd3d290387bc39514e4728f8c9a90fea8b33203/);
   assert.match(read('src/lib/foundation.ts'), /20261008130000_stage10_analytics_maintenance_tasks/);
   assert.match(read('src/lib/foundation.ts'), /6c651d5b697c6ca295ed21dc9c646db7be2673bbb95e0a05fa29009123f4da2e/);
+  assert.match(read('src/lib/foundation.ts'), /20261009100000_stage11_automation_action_order/);
+  assert.match(read('src/lib/foundation.ts'), /4f0630406c83d5521a9921f9fab37d0b4d44798a8a5b43b9b61a79e8d956bee1/);
   assert.match(read('src/lib/foundation.ts'), /20261005070000_stage5_hub_incident_deadline/);
   assert.match(read('src/lib/foundation.ts'), /f6c5fed31a31184e4c2ae42a98be8a89fe1628415ae4cfc1bef61033ab95b44e/);
   assert.match(read('src/lib/foundation.ts'), /20261005100000_stage5_incident_source_kind/);
   assert.match(read('src/lib/foundation.ts'), /4b7763f5906566bba108196a4fa6ef37acb3623cb2dac33193b4ee836c6bec04/);
   assert.match(read('scripts/verify_native_v2_migration_target.mjs'), /--stage5-incident-source-kind/);
   assert.match(read('package.json'), /stage5:incident-source-kind:migration:target/);
+  assert.match(read('scripts/verify_native_v2_migration_target.mjs'), /--stage11-automation/);
+  assert.match(read('package.json'), /stage11:migration:target/);
   assert.match(read('src/lib/foundation.ts'), /REQUIRED_MODEL_COUNT = 65/);
   assert.match(read('src/lib/foundation.ts'), /REQUIRED_MODEL_COUNT \+ \(hasStage5 \? 1 : 0\) \+ \(hasProspectiveRoomAccess \? 1 : 0\)/);
 });

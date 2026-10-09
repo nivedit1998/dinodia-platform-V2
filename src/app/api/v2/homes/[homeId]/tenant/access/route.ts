@@ -11,6 +11,8 @@ import { sha256 } from '@/lib/stage1Crypto';
 import { serializableTransaction } from '@/lib/serializableTransaction';
 import { validateTenantMembershipRemovalPreview, validateTenantMembershipRemovalReceipt, validateTenantMembershipRemovalRequest } from '@/lib/contracts/dinodiaV1';
 import { deleteTenantPrivateDeviceCloudData } from '@/lib/nativeTenantDeviceCleanup';
+import { retireNativeAutomations } from '@/lib/nativeAutomations/lifecycle';
+import { refreshNativeAutomationCloudRevision } from '@/lib/nativeAutomations/delivery';
 
 export const dynamic = 'force-dynamic';
 
@@ -211,7 +213,8 @@ export async function DELETE(request: Request, context: { params: Promise<{ home
         status: 'CLOSED', closedAt: now, selectedMembershipId: null, description: '[Closed when tenant access was removed]',
         title: null, areaId: null, deviceId: null, safeDiagnostics: Prisma.DbNull, customerResolution: null, revision: { increment: 1 },
       } });
-      await tx.nativeAutomation.deleteMany({ where: { homeId, createdByMembershipId: membership.id } });
+      await retireNativeAutomations(tx, { homeId, createdByMembershipId: membership.id, now, actorId: selected.id, reason: 'tenant_self_removal' });
+      await refreshNativeAutomationCloudRevision(tx, { homeId, hubInstallationId: selected.hubInstallationId });
       await tx.memberPreferenceDocument.deleteMany({ where: { membershipId: membership.id } });
       await tx.alexaNativeEndpointProjection.deleteMany({ where: { homeId, membershipId: membership.id } });
       await tx.alexaNativeHomeScope.deleteMany({ where: { homeId, membershipId: membership.id } });

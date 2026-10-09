@@ -64,6 +64,7 @@ let installationCompletionEmailCount = 0;
 const installationEmailBodies = [];
 let capturedCustomerAuthPath;
 let customerFixture;
+let pendingStage11AutomationDisableAck = null;
 let fakePhysicalCommandCount = 0;
 let osHarnessNow = Date.now();
 let operatorHandoffFetchDelayMs = 0;
@@ -119,15 +120,27 @@ function loadNativeV1Contract() {
   return loaded.exports;
 }
 const nativeV1Contract = loadNativeV1Contract();
-function loadInstallationPushDispatcher() {
+function loadInstallationPushDispatcher(platformDataEncryptionKey = '') {
   const require = createRequire(import.meta.url);
   const ts = require('typescript');
+  const loadLocalTypeScript = (relative, localRequire = require) => {
+    const moduleSource = fs.readFileSync(path.join(root, relative), 'utf8');
+    const moduleCompiled = ts.transpileModule(moduleSource, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, esModuleInterop: true } }).outputText;
+    const moduleLoaded = { exports: {} };
+    new Function('require', 'module', 'exports', moduleCompiled)(localRequire, moduleLoaded, moduleLoaded.exports);
+    return moduleLoaded.exports;
+  };
+  const notificationPolicy = loadLocalTypeScript('src/lib/nativeAutomations/notificationPolicy.ts');
+  const failureNotifications = loadLocalTypeScript('src/lib/nativeAutomations/failureNotifications.ts', (specifier) => {
+    if (specifier === './notificationPolicy') return notificationPolicy;
+    return require(specifier);
+  });
   const source = fs.readFileSync(path.join(root, 'src/lib/installationRequestDelivery.ts'), 'utf8');
   const compiled = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, esModuleInterop: true } }).outputText;
   const loaded = { exports: {} };
   const decryptPlatformEnvelope = (serialized) => {
     const envelope = JSON.parse(serialized);
-    const key = Buffer.from(process.env.PLATFORM_DATA_ENCRYPTION_KEY || '', 'base64');
+    const key = Buffer.from(platformDataEncryptionKey, 'base64');
     const decipher = crypto.createDecipheriv('aes-256-gcm', key, Buffer.from(envelope.iv, 'base64'));
     decipher.setAuthTag(Buffer.from(envelope.tag, 'base64'));
     return Buffer.concat([decipher.update(Buffer.from(envelope.ciphertext, 'base64')), decipher.final()]).toString('utf8');
@@ -135,7 +148,13 @@ function loadInstallationPushDispatcher() {
   const localRequire = (specifier) => {
     if (specifier === './prisma') return { prisma };
     if (specifier === './hubOperatorCredentials') return { decryptPlatformEnvelope };
-    if (specifier === './apnsDelivery') return { readApnsConfig: () => null, sendInstallationCompletePush: async () => ({ outcome: 'RETRY' }) };
+    if (specifier === './nativeAutomations/notificationPolicy') return notificationPolicy;
+    if (specifier === './nativeAutomations/failureNotifications') return failureNotifications;
+    if (specifier === './apnsDelivery') return {
+      readApnsConfig: () => null,
+      sendInstallationCompletePush: async () => ({ outcome: 'RETRY' }),
+      sendTenantAutomationFailurePush: async () => ({ outcome: 'RETRY' }),
+    };
     if (specifier === '@aws-sdk/client-sesv2') return {
       SESv2Client: class { destroy() {} async send() { return { MessageId: 'stage8-test-message' }; } },
       SendEmailCommand: class { constructor(input) { this.input = input; } },
@@ -143,7 +162,10 @@ function loadInstallationPushDispatcher() {
     return require(specifier);
   };
   new Function('require', 'module', 'exports', compiled)(localRequire, loaded, loaded.exports);
-  return loaded.exports.dispatchInstallationPushReceipts;
+  return {
+    dispatchInstallationPushReceipts: loaded.exports.dispatchInstallationPushReceipts,
+    dispatchTenantAutomationFailureNotifications: loaded.exports.dispatchTenantAutomationFailureNotifications,
+  };
 }
 function loadNativeAnalyticsIntegrityCheck() {
   const require = createRequire(import.meta.url);
@@ -163,6 +185,25 @@ function loadNativeAnalyticsIntegrityCheck() {
   new Function('require', 'module', 'exports', compiled)(localRequire, loaded, loaded.exports);
   return loaded.exports.inspectNativeAnalyticsIntegrity;
 }
+function loadHubCloudConfigurationBuilder() {
+  const require = createRequire(import.meta.url);
+  const ts = require('typescript');
+  const compile = (file) => {
+    const source = fs.readFileSync(path.join(root, file), 'utf8');
+    const compiled = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, esModuleInterop: true } }).outputText;
+    const loaded = { exports: {} };
+    new Function('require', 'module', 'exports', compiled)(require, loaded, loaded.exports);
+    return loaded.exports;
+  };
+  const envelope = compile('src/lib/hubSyncEnvelope.ts');
+  const source = fs.readFileSync(path.join(root, 'src/lib/hubCloudConfiguration.ts'), 'utf8');
+  const compiled = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, esModuleInterop: true } }).outputText;
+  const loaded = { exports: {} };
+  const localRequire = (specifier) => specifier === './hubSyncEnvelope' ? envelope : require(specifier);
+  new Function('require', 'module', 'exports', compiled)(localRequire, loaded, loaded.exports);
+  return loaded.exports.buildHubCloudConfiguration;
+}
+const buildHubCloudConfiguration = loadHubCloudConfigurationBuilder();
 function encryptStage8PlatformToken(token, encodedKey) {
   const key = Buffer.from(encodedKey, 'base64');
   const iv = crypto.randomBytes(12);
@@ -345,6 +386,11 @@ function baseEnv() {
     CLAIM_REFERENCE_PEPPER: crypto.randomBytes(32).toString('base64url'), AUDIT_LOG_HASH_SALT: crypto.randomBytes(32).toString('base64url'),
     DINODIA_NATIVE_POLICY_VERSION: `harness-current-policy-${crypto.randomUUID()}`,
     DINODIA_NATIVE_ANALYTICS_ENABLED: 'true',
+    // Keep the real loopback HTTP server in the same fail-closed state as V2
+    // Production. The harness separately toggles the pure configuration
+    // builder around a disposable fixture to prove the Stage 13 gate without
+    // delivering a deliberately synthetic descriptor into the OS runtime.
+    DINODIA_NATIVE_AUTOMATIONS_ENABLED: 'false',
     DINODIA_NATIVE_POLICY_TITLE: 'Disposable Stage 6 policy fixture',
     DINODIA_NATIVE_POLICY_TEXT: disposablePolicyText,
     DINODIA_NATIVE_POLICY_CONTENT_SHA256: sha256(disposablePolicyText),
@@ -554,6 +600,10 @@ async function startPlatform(runEnv) {
       const lines = pending.split(/\r?\n/);
       pending = lines.pop() ?? '';
       for (const line of lines) {
+        // Keep the Stage 11 actual-route harness diagnosable without forwarding
+        // database values, request bodies, addresses, or full exception text.
+        const safePrismaCode = line.match(/\b(?:code|sqlState|sqlstate):\s*['"]?(P\d{4}|40P01|40001)['"]?\b/)?.[1];
+        if (safePrismaCode) console.log(`[stage11:integration] redacted Platform diagnostic code=${safePrismaCode}`);
         if (line.includes('[stage6:ownership-transfer] email submission was not accepted')) {
           const safeCode = line.match(/\bcode:\s*['"]?([A-Za-z0-9_-]{1,64})['"]?/)?.[1];
           if (safeCode) console.log(`[stage6:integration] ownership-transfer email handoff returned bounded code=${safeCode}`);
@@ -950,6 +1000,223 @@ async function customerAuthorizationChecks(deliveryEnv) {
     customerAccountId, policyKind: 'DINODIA_NATIVE', policyVersion: deliveryEnv.DINODIA_NATIVE_POLICY_VERSION,
   })), skipDuplicates: true });
   const preferenceHeaders = (raw, homeId) => ({ cookie: `dinodia_customer_session=${encodeURIComponent(raw)}`, 'x-dinodia-home-id': homeId, 'content-type': 'application/json' });
+  const automationDescriptorDigest = crypto.createHash('sha256').update(`stage11-${crypto.randomUUID()}`).digest('hex');
+  const automationDevice = await prisma.nativeDevice.create({ data: {
+    homeId: homeOne.id, hubInstallationId: hubOne.id, osDeviceId: `stage11-${crypto.randomUUID()}`,
+    originalName: 'Disposable automation light', technicalLabel: 'LIGHT', managementClass: 'PROPERTY_DEVICE',
+    deviceType: 'test.light', protocol: 'virtual', lifecycle: 'INSTALLED', descriptorRevision: 1, descriptorDigest: automationDescriptorDigest,
+    capabilitySummary: { protocol: 'virtual', descriptorDigest: automationDescriptorDigest, controlCatalog: { revision: 1, descriptorDigest: automationDescriptorDigest, controls: [
+      { controlId: 'power', label: 'Power', valueType: 'boolean', writable: true, automatable: true, idempotency: 'set_value', semanticRole: 'power', stepUpPolicy: 'none', riskLevel: 'normal', constraints: {}, catalogRevision: 1 },
+      { controlId: 'brightness', label: 'Brightness', valueType: 'number', writable: true, automatable: true, idempotency: 'set_value', semanticRole: 'brightness', stepUpPolicy: 'none', riskLevel: 'normal', constraints: { minimum: 0, maximum: 100, step: 1 }, catalogRevision: 1 },
+      { controlId: 'lock', label: 'Lock', valueType: 'invoke', writable: true, automatable: false, idempotency: 'none', semanticRole: 'security_lock', stepUpPolicy: 'required', riskLevel: 'critical', constraints: {}, catalogRevision: 1 },
+    ] } },
+  } });
+  await prisma.deviceAreaAssignment.create({ data: { homeId: homeOne.id, deviceId: automationDevice.id, areaId: areaOne.id, source: 'STAGE11_DISPOSABLE_TEST', validFrom: now } });
+  const automationHeaders = preferenceHeaders(rawSession, homeOne.id);
+  const automationBody = { name: 'Disposable morning routine', trigger: { minuteOfDay: 420, weekdays: [1, 2, 3, 4, 5] }, actions: [
+    { deviceId: automationDevice.id, areaId: areaOne.id, controlId: 'power', targetValue: { type: 'boolean', boolean: true } },
+    { deviceId: automationDevice.id, areaId: areaOne.id, controlId: 'brightness', targetValue: { type: 'number', number: 40 } },
+  ] };
+  const automationKey = crypto.randomUUID();
+  const automationCountBefore = await prisma.nativeAutomation.count({ where: { homeId: homeOne.id } });
+  const automationCreate = await fetchJson(`${base}/api/automations`, { method: 'POST', headers: { ...automationHeaders, 'idempotency-key': automationKey }, body: JSON.stringify(automationBody) });
+  const automationRetry = await fetchJson(`${base}/api/automations`, { method: 'POST', headers: { ...automationHeaders, 'idempotency-key': automationKey }, body: JSON.stringify(automationBody) });
+  const automationAfterCreate = automationCreate.body?.automationId ? await prisma.nativeAutomation.findUnique({ where: { id: automationCreate.body.automationId }, include: { actions: { orderBy: [{ sortOrder: 'asc' }, { id: 'asc' }] } } }) : null;
+  const automationConflict = await fetchJson(`${base}/api/automations`, { method: 'POST', headers: { ...automationHeaders, 'idempotency-key': crypto.randomUUID() }, body: JSON.stringify({ ...automationBody, name: 'Conflicting disposable routine', actions: [{ deviceId: automationDevice.id, areaId: areaOne.id, controlId: 'power', targetValue: { type: 'boolean', boolean: false } }] }) });
+  const appOnlyAutomation = await fetchJson(`${base}/api/automations`, { method: 'POST', headers: { ...automationHeaders, 'idempotency-key': crypto.randomUUID() }, body: JSON.stringify({ ...automationBody, name: 'Forbidden lock routine', actions: [{ deviceId: automationDevice.id, areaId: areaOne.id, controlId: 'lock', targetValue: { type: 'invoke' } }] }) });
+  const wrongHomeAutomation = await fetchJson(`${base}/api/automations`, { method: 'POST', headers: { ...preferenceHeaders(rawSession, homeTwo.id), 'idempotency-key': crypto.randomUUID() }, body: JSON.stringify(automationBody) });
+  const otherTenantUsername = `stage11-other-${crypto.randomUUID().slice(0, 8)}`;
+  const otherTenantEmail = `stage11-other-${crypto.randomUUID()}@invalid.test`;
+  const otherTenantAccount = await prisma.customerAccount.create({ data: { displayName: 'Other disposable tenant', username: otherTenantUsername, usernameNormalized: otherTenantUsername, email: otherTenantEmail, emailNormalized: otherTenantEmail, emailVerifiedAt: now, passwordHash: hashPassword(`stage11-${crypto.randomUUID()}`) } });
+  const otherTenantMembership = await prisma.homeMembership.create({ data: { customerAccountId: otherTenantAccount.id, homeId: homeOne.id, role: 'TENANT' } });
+  await prisma.tenantAreaGrant.create({ data: { membershipId: otherTenantMembership.id, areaId: areaOne.id, homeId: homeOne.id } });
+  const privateAutomationDevice = await prisma.$transaction(async (tx) => {
+    const device = await tx.nativeDevice.create({ data: { homeId: homeOne.id, hubInstallationId: hubOne.id, osDeviceId: `stage11-private-${crypto.randomUUID()}`, originalName: 'Private disposable device', technicalLabel: 'tenant_device', managementClass: 'TENANT_DEVICE', ownerMembershipId: otherTenantMembership.id, deviceType: 'test.light', protocol: 'virtual', lifecycle: 'INSTALLED', descriptorRevision: 1, descriptorDigest: automationDescriptorDigest, capabilitySummary: automationDevice.capabilitySummary } });
+    await tx.deviceAreaAssignment.create({ data: { homeId: homeOne.id, deviceId: device.id, areaId: areaOne.id, source: 'STAGE11_DISPOSABLE_TEST', validFrom: now } });
+    return device;
+  });
+  const otherTenantDeviceAttempt = await fetchJson(`${base}/api/automations`, { method: 'POST', headers: { ...automationHeaders, 'idempotency-key': crypto.randomUUID() }, body: JSON.stringify({ ...automationBody, name: 'Wrong tenant device routine', actions: [{ deviceId: privateAutomationDevice.id, areaId: areaOne.id, controlId: 'power', targetValue: { type: 'boolean', boolean: true } }] }) });
+  const automationAfterDenials = await prisma.nativeAutomation.count({ where: { homeId: homeOne.id } });
+  const automationList = await fetchJson(`${base}/api/automations`, { headers: automationHeaders });
+  const automationListOwnedIds = await prisma.nativeAutomation.findMany({ where: { homeId: homeOne.id, createdByMembershipId: tenantMembership.id }, select: { id: true } });
+  const listedAutomationIds = Array.isArray(automationList.body?.automations) ? automationList.body.automations.map((item) => item?.id) : [];
+  const priorAutomationActivation = process.env.DINODIA_NATIVE_AUTOMATIONS_ENABLED;
+  process.env.DINODIA_NATIVE_AUTOMATIONS_ENABLED = 'true';
+  const enabledAutomationConfiguration = await prisma.$transaction((tx) => buildHubCloudConfiguration(tx, { homeId: homeOne.id, hubInstallationId: hubOne.id }));
+  process.env.DINODIA_NATIVE_AUTOMATIONS_ENABLED = 'false';
+  const disabledAutomationConfiguration = await prisma.$transaction((tx) => buildHubCloudConfiguration(tx, { homeId: homeOne.id, hubInstallationId: hubOne.id }));
+  if (priorAutomationActivation === undefined) delete process.env.DINODIA_NATIVE_AUTOMATIONS_ENABLED;
+  else process.env.DINODIA_NATIVE_AUTOMATIONS_ENABLED = priorAutomationActivation;
+  if (automationCreate.response.status !== 201 || automationCreate.body?.deliveryState !== 'pending_delivery'
+    || automationRetry.response.status !== 201 || automationRetry.body?.automationId !== automationCreate.body?.automationId
+    || automationAfterCreate?.actions.length !== 2 || automationAfterCreate.actions[0].sortOrder !== 0 || automationAfterCreate.actions[1].sortOrder !== 1
+    || automationConflict.response.status !== 409 || automationConflict.body?.error?.code !== 'AUTOMATION_CONFLICT'
+    || appOnlyAutomation.response.status !== 400 || appOnlyAutomation.body?.error?.code !== 'AUTOMATION_CONTROL_APP_ONLY'
+    || wrongHomeAutomation.response.status !== 403 || otherTenantDeviceAttempt.response.status !== 400
+    || automationAfterDenials !== automationCountBefore + 1 || automationList.response.status !== 200
+    || listedAutomationIds.length !== automationListOwnedIds.length || automationListOwnedIds.some((row) => !listedAutomationIds.includes(row.id))
+    || listedAutomationIds.filter((id) => id === automationCreate.body?.automationId).length !== 1
+    || JSON.stringify(automationList.body).includes('Private disposable device')
+    || enabledAutomationConfiguration.automations.length !== 1 || enabledAutomationConfiguration.automations[0]?.actions.length !== 2
+    || disabledAutomationConfiguration.automations.length !== 0) {
+    fail(`Stage 11 tenant automation route did not preserve idempotency/scope/conflict safety (${JSON.stringify({ create: automationCreate.response.status, createCode: automationCreate.body?.error?.code, retry: automationRetry.response.status, retryCode: automationRetry.body?.error?.code, conflict: automationConflict.response.status, conflictCode: automationConflict.body?.error?.code, lock: appOnlyAutomation.response.status, wrongHome: wrongHomeAutomation.response.status, otherTenantDevice: otherTenantDeviceAttempt.response.status, countDelta: automationAfterDenials - automationCountBefore, list: automationList.response.status, listed: listedAutomationIds.length, expectedListed: automationListOwnedIds.length, privateLabelLeaked: JSON.stringify(automationList.body).includes('Private disposable device'), enabledCount: enabledAutomationConfiguration.automations.length, enabledActionCount: enabledAutomationConfiguration.automations[0]?.actions.length ?? 0, disabledCount: disabledAutomationConfiguration.automations.length })})`);
+  }
+  console.log('[stage11:integration] PASS: actual tenant automation routes persist ordered multi-action definitions with exact retry, conflict/app-only/wrong-home/private-device denials have no definition effect, and the real cloud bundle includes definitions only under the explicit Stage 13 activation switch');
+
+  // Two incompatible creates race on the same Home, local occurrence and
+  // permanent control. The real route's guarded transaction must serialize
+  // conflict evaluation with the definition write: exactly one rule may be
+  // committed, and the loser must receive a canonical conflict (not a second
+  // active rule or an opaque retry failure).
+  const concurrentAutomationCountBefore = await prisma.nativeAutomation.count({ where: { homeId: homeOne.id } });
+  const concurrentAutomationCandidates = [true, false].map((target, index) => ({
+    name: `Disposable concurrent routine ${index + 1}`,
+    // Keep this test occurrence disjoint from the later owner/manager
+    // oversight fixtures in the same disposable Home.
+    trigger: { minuteOfDay: 1430, weekdays: [7] },
+    actions: [{ deviceId: automationDevice.id, areaId: areaOne.id, controlId: 'power', targetValue: { type: 'boolean', boolean: target } }],
+  }));
+  const concurrentAutomationResults = await Promise.all(concurrentAutomationCandidates.map((definition) => fetchJson(`${base}/api/automations`, {
+    method: 'POST', headers: { ...automationHeaders, 'idempotency-key': crypto.randomUUID() }, body: JSON.stringify(definition),
+  })));
+  const concurrentAutomationCountAfter = await prisma.nativeAutomation.count({ where: { homeId: homeOne.id } });
+  const concurrentAutomationWinner = concurrentAutomationResults.filter((result) => result.response.status === 201);
+  const concurrentAutomationLoser = concurrentAutomationResults.filter((result) => result.response.status === 409 && result.body?.error?.code === 'AUTOMATION_CONFLICT');
+  if (concurrentAutomationWinner.length !== 1 || concurrentAutomationLoser.length !== 1
+    || concurrentAutomationCountAfter !== concurrentAutomationCountBefore + 1) {
+    fail(`Concurrent incompatible actual-route automation creates did not serialize to one winner and one conflict (${JSON.stringify({ statuses: concurrentAutomationResults.map((result) => result.response.status), codes: concurrentAutomationResults.map((result) => result.body?.error?.code), countDelta: concurrentAutomationCountAfter - concurrentAutomationCountBefore })})`);
+  }
+  console.log('[stage11:integration] PASS: concurrent actual-route saves for incompatible targets on the same Home/time/control serialize to one active rule and one canonical conflict');
+
+  // Exercise the real owner/manager property-oversight routes using current
+  // account-access sessions and operation-bound disposable trusted-phone
+  // signatures. Include a mixed rule and a private-only rule so the actual
+  // projection proves its privacy boundary rather than relying on a helper.
+  const mixedPrivateDevice = await prisma.$transaction(async (tx) => {
+    const device = await tx.nativeDevice.create({ data: { homeId: homeOne.id, hubInstallationId: hubOne.id,
+      osDeviceId: `stage11-mixed-private-${crypto.randomUUID()}`, originalName: 'Private automation device label',
+      technicalLabel: 'tenant_device', managementClass: 'TENANT_DEVICE', ownerMembershipId: tenantMembership.id,
+      deviceType: 'test.light', protocol: 'virtual', lifecycle: 'INSTALLED', descriptorRevision: 1,
+      descriptorDigest: automationDescriptorDigest, capabilitySummary: automationDevice.capabilitySummary } });
+    await tx.deviceAreaAssignment.create({ data: { homeId: homeOne.id, deviceId: device.id, areaId: areaOne.id,
+      source: 'STAGE11_DISPOSABLE_TEST', actorType: 'SYSTEM', validFrom: now } });
+    return device;
+  });
+  const mixedRuleBody = { name: 'Private bedtime mixed routine', trigger: { minuteOfDay: 480, weekdays: [1, 2, 3, 4, 5] }, actions: [
+    { deviceId: automationDevice.id, areaId: areaOne.id, controlId: 'power', targetValue: { type: 'boolean', boolean: true } },
+    { deviceId: mixedPrivateDevice.id, areaId: areaOne.id, controlId: 'power', targetValue: { type: 'boolean', boolean: true } },
+  ] };
+  const mixedRule = await fetchJson(`${base}/api/automations`, { method: 'POST', headers: { ...automationHeaders, 'idempotency-key': crypto.randomUUID() }, body: JSON.stringify(mixedRuleBody) });
+  const privateOnlyRule = await fetchJson(`${base}/api/automations`, { method: 'POST', headers: { ...automationHeaders, 'idempotency-key': crypto.randomUUID() }, body: JSON.stringify({
+    name: 'Secret private-only routine', trigger: { minuteOfDay: 600, weekdays: [1, 2, 3, 4, 5] }, actions: [
+      { deviceId: mixedPrivateDevice.id, areaId: areaOne.id, controlId: 'brightness', targetValue: { type: 'number', number: 35 } },
+    ],
+  }) });
+  if (mixedRule.response.status !== 201 || privateOnlyRule.response.status !== 201) fail(`Disposable mixed/private automation fixtures were not accepted through the tenant route (${mixedRule.response.status}/${privateOnlyRule.response.status})`);
+  const ownerAutomationLogin = await fetchJson(`${base}/api/v2/mobile/session`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({
+    email: propertyEmail, password: propertyPassword, deviceInstallationId: propertyInstallationId, publicKey: propertyPhone.publicKey,
+    deviceName: 'Disposable automation oversight owner', model: 'integration-test', osFamily: 'test', osVersion: 'test',
+  }) });
+  const managerAutomationLogin = await fetchJson(`${base}/api/v2/mobile/session`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({
+    email: managerEmail, password: managerPassword, deviceInstallationId: managerTrusted.deviceInstallationId, publicKey: managerPhone.publicKey,
+    deviceName: 'Disposable automation oversight manager', model: 'integration-test', osFamily: 'test', osVersion: 'test',
+  }) });
+  const tenantAutomationLogin = await fetchJson(`${base}/api/v2/mobile/session`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({
+    email, password: customerPassword, deviceInstallationId: trustedInstallationId, publicKey: phone.publicKey,
+    deviceName: 'Disposable automation oversight tenant', model: 'integration-test', osFamily: 'test', osVersion: 'test',
+  }) });
+  const ownerAutomationHeaders = { authorization: `Bearer ${ownerAutomationLogin.body?.accessToken ?? ''}`, 'x-dinodia-home-id': homeOne.id, 'content-type': 'application/json' };
+  const managerAutomationHeaders = { authorization: `Bearer ${managerAutomationLogin.body?.accessToken ?? ''}`, 'x-dinodia-home-id': homeOne.id, 'content-type': 'application/json' };
+  const tenantAutomationHeaders = { authorization: `Bearer ${tenantAutomationLogin.body?.accessToken ?? ''}`, 'x-dinodia-home-id': homeOne.id, 'content-type': 'application/json' };
+  const ownerOversight = await fetchJson(`${base}/api/v2/homes/${homeOne.id}/property-automations`, { headers: ownerAutomationHeaders });
+  const managerOversight = await fetchJson(`${base}/api/v2/homes/${homeOne.id}/property-automations`, { headers: managerAutomationHeaders });
+  const tenantOversight = await fetchJson(`${base}/api/v2/homes/${homeOne.id}/property-automations`, { headers: tenantAutomationHeaders });
+  const wrongHomeOversight = await fetchJson(`${base}/api/v2/homes/${homeTwo.id}/property-automations`, { headers: ownerAutomationHeaders });
+  const oversightText = JSON.stringify(ownerOversight.body ?? {});
+  const mixedSummary = ownerOversight.body?.automations?.find((item) => item.id === mixedRule.body?.automationId);
+  const privateOnlyVisible = ownerOversight.body?.automations?.some((item) => item.id === privateOnlyRule.body?.automationId);
+  if (ownerAutomationLogin.response.status !== 200 || managerAutomationLogin.response.status !== 200 || tenantAutomationLogin.response.status !== 200
+    || ownerOversight.response.status !== 200 || managerOversight.response.status !== 200
+    || tenantOversight.response.status !== 404 || wrongHomeOversight.response.status !== 404
+    || !mixedSummary || mixedSummary.name !== 'Tenant automation' || mixedSummary.actions.length !== 1
+    || mixedSummary.actions[0].deviceId !== automationDevice.id || privateOnlyVisible
+    || oversightText.includes('Private automation device label') || oversightText.includes('Private bedtime mixed routine')
+    || oversightText.includes('Secret private-only routine')) {
+    fail(`Property-automation oversight did not enforce selected owner/manager scope and mixed/private redaction (${JSON.stringify({ ownerLogin: ownerAutomationLogin.response.status, managerLogin: managerAutomationLogin.response.status, tenantLogin: tenantAutomationLogin.response.status, owner: ownerOversight.response.status, ownerCode: ownerOversight.body?.error?.code, manager: managerOversight.response.status, managerCode: managerOversight.body?.error?.code, tenant: tenantOversight.response.status, tenantCode: tenantOversight.body?.error?.code, wrongHome: wrongHomeOversight.response.status, wrongHomeCode: wrongHomeOversight.body?.error?.code, mixed: Boolean(mixedSummary), visiblePrivate: Boolean(privateOnlyVisible) })})`);
+  }
+  const propertyOnlyAutomation = ownerOversight.body.automations.find((item) => item.id === automationCreate.body.automationId);
+  const currentHomeManagementRevision = ownerOversight.body.managementRevision;
+  async function signedPropertyAutomationProof({ headers, privateKey, automationId, action, expectedAutomationRevision, expectedManagementRevision, reason }) {
+    const operationKind = action === 'disable' ? 'home.tenant_automation_disable' : 'home.tenant_automation_delete';
+    const value = { action, expectedAutomationRevision, expectedManagementRevision, reason };
+    const challenge = await fetchJson(`${base}/api/v2/security/step-up/challenge`, { method: 'POST', headers,
+      body: JSON.stringify({ operationKind, targetIds: [automationId], value }) });
+    if (challenge.response.status !== 200 || typeof challenge.body?.operationDigest !== 'string') fail(`Property automation ${action} proof challenge failed (${challenge.response.status}/${challenge.body?.error?.code ?? 'no-code'})`);
+    const signature = crypto.sign(null, stepUpChallengeMessage({ challengeId: challenge.body.challengeId, nonce: challenge.body.nonce,
+      operationDigest: challenge.body.operationDigest }), crypto.createPrivateKey(privateKey)).toString('base64url');
+    const issued = await fetchJson(`${base}/api/v2/security/step-up/issue`, { method: 'POST', headers,
+      body: JSON.stringify({ challengeId: challenge.body.challengeId, nonce: challenge.body.nonce, deviceSignature: signature }) });
+    if (issued.response.status !== 200 || typeof issued.body?.proof !== 'string') fail(`Property automation ${action} proof issue failed (${issued.response.status}/${issued.body?.error?.code ?? 'no-code'})`);
+    return issued.body.proof;
+  }
+  const proofBeforeDeniedAction = await signedPropertyAutomationProof({ headers: ownerAutomationHeaders, privateKey: propertyPhone.privateKey,
+    automationId: propertyOnlyAutomation.id, action: 'delete', expectedAutomationRevision: propertyOnlyAutomation.revision,
+    expectedManagementRevision: currentHomeManagementRevision, reason: 'safety' });
+  const beforeDeniedIntervention = await Promise.all([
+    prisma.nativeAutomation.findUniqueOrThrow({ where: { id: propertyOnlyAutomation.id }, select: { status: true, revision: true } }),
+    prisma.home.findUniqueOrThrow({ where: { id: homeOne.id }, select: { managementRevision: true } }),
+    prisma.nativeDomainOutbox.count({ where: { homeId: homeOne.id, eventType: 'TENANT_AUTOMATION_MANAGEMENT_NOTICE' } }),
+  ]);
+  const operationMismatch = await fetchJson(`${base}/api/v2/homes/${homeOne.id}/property-automations/${propertyOnlyAutomation.id}/disable`, {
+    method: 'POST', headers: { ...ownerAutomationHeaders, 'idempotency-key': `stage11-mismatch-${crypto.randomUUID()}` },
+    body: JSON.stringify({ expectedAutomationRevision: propertyOnlyAutomation.revision,
+      expectedManagementRevision: currentHomeManagementRevision, reason: 'safety', proof: proofBeforeDeniedAction }),
+  });
+  const afterDeniedIntervention = await Promise.all([
+    prisma.nativeAutomation.findUniqueOrThrow({ where: { id: propertyOnlyAutomation.id }, select: { status: true, revision: true } }),
+    prisma.home.findUniqueOrThrow({ where: { id: homeOne.id }, select: { managementRevision: true } }),
+    prisma.nativeDomainOutbox.count({ where: { homeId: homeOne.id, eventType: 'TENANT_AUTOMATION_MANAGEMENT_NOTICE' } }),
+  ]);
+  if (operationMismatch.response.status !== 403 || JSON.stringify(afterDeniedIntervention[0]) !== JSON.stringify(beforeDeniedIntervention[0])
+    || afterDeniedIntervention[1].managementRevision !== beforeDeniedIntervention[1].managementRevision
+    || afterDeniedIntervention[2] !== beforeDeniedIntervention[2]) fail('Mismatched operation proof changed the rule, Home revision or tenant-notice outbox');
+  const disableReason = 'safety';
+  const disableProof = await signedPropertyAutomationProof({ headers: managerAutomationHeaders, privateKey: managerPhone.privateKey,
+    automationId: propertyOnlyAutomation.id, action: 'disable', expectedAutomationRevision: propertyOnlyAutomation.revision,
+    expectedManagementRevision: currentHomeManagementRevision, reason: disableReason });
+  const disableKey = `stage11-disable-${crypto.randomUUID()}`;
+  const disableBody = { expectedAutomationRevision: propertyOnlyAutomation.revision, expectedManagementRevision: currentHomeManagementRevision,
+    reason: disableReason, proof: disableProof };
+  const disableUrl = `${base}/api/v2/homes/${homeOne.id}/property-automations/${propertyOnlyAutomation.id}/disable`;
+  const disableResult = await fetchJson(disableUrl, { method: 'POST', headers: { ...managerAutomationHeaders, 'idempotency-key': disableKey }, body: JSON.stringify(disableBody) });
+  const disabledRow = await prisma.nativeAutomation.findUniqueOrThrow({ where: { id: propertyOnlyAutomation.id }, select: { status: true, revision: true } });
+  const revisionAfterDisable = await prisma.home.findUniqueOrThrow({ where: { id: homeOne.id }, select: { managementRevision: true } });
+  const noticeAfterDisable = await prisma.nativeDomainOutbox.findMany({ where: { homeId: homeOne.id, eventType: 'TENANT_AUTOMATION_MANAGEMENT_NOTICE' }, select: { idempotencyKey: true, payload: true } });
+  const disableRetry = await fetchJson(disableUrl, { method: 'POST', headers: { ...managerAutomationHeaders, 'idempotency-key': disableKey }, body: JSON.stringify(disableBody) });
+  const disabledAfterRetry = await prisma.nativeAutomation.findUniqueOrThrow({ where: { id: propertyOnlyAutomation.id }, select: { status: true, revision: true } });
+  const noticeAfterRetryCount = await prisma.nativeDomainOutbox.count({ where: { homeId: homeOne.id, eventType: 'TENANT_AUTOMATION_MANAGEMENT_NOTICE' } });
+  if (disableResult.response.status !== 200 || !['disabled_waiting_for_hub', 'disabled'].includes(disableResult.body?.status)
+    || disabledRow.status !== 'PAUSED' || disabledRow.revision !== propertyOnlyAutomation.revision + 1
+    || revisionAfterDisable.managementRevision !== currentHomeManagementRevision + 1
+    || noticeAfterDisable.length <= beforeDeniedIntervention[2]
+    || noticeAfterDisable.some((notice) => JSON.stringify(notice.payload).includes('Private automation device label') || JSON.stringify(notice.payload).includes('Private bedtime mixed routine'))
+    || disableRetry.response.status !== 200 || JSON.stringify(disabledAfterRetry) !== JSON.stringify(disabledRow)
+    || noticeAfterRetryCount !== noticeAfterDisable.length) fail('Property manager Disable was not proof-bound, idempotent, generic-notified and reflected in the durable full-Home revision');
+  const managerDeleteView = await fetchJson(`${base}/api/v2/homes/${homeOne.id}/property-automations/${mixedRule.body.automationId}`, { method: 'DELETE', headers: managerAutomationHeaders });
+  if (managerDeleteView.response.status !== 400 && managerDeleteView.response.status !== 404 && managerDeleteView.response.status !== 405) fail('A direct unauthorised delete path unexpectedly mutated a property automation');
+  const pendingOwnerOverview = await fetchJson(`${base}/api/v2/homes/${homeOne.id}/property-automations`, { headers: ownerAutomationHeaders });
+  const pendingDisabledOverview = pendingOwnerOverview.body?.automations?.find((item) => item.id === propertyOnlyAutomation.id);
+  if (pendingOwnerOverview.response.status !== 200 || pendingDisabledOverview?.status !== 'disabled_waiting_for_hub'
+    || pendingOwnerOverview.body?.delivery?.state !== 'activation_disabled'
+    || pendingOwnerOverview.body?.delivery?.appliedRevision >= pendingOwnerOverview.body?.delivery?.cloudRevision
+    || pendingDisabledOverview?.revision !== propertyOnlyAutomation.revision + 1) {
+    fail('The owner/manager overview did not truthfully show the disabled rule awaiting the hub configuration acknowledgement');
+  }
+  const expectedDisabledConfigurationRevision = Number(pendingOwnerOverview.body.delivery.cloudRevision);
+  pendingStage11AutomationDisableAck = { homeId: homeOne.id, automationId: propertyOnlyAutomation.id,
+    expectedRevision: expectedDisabledConfigurationRevision, ownerAccessToken: ownerAutomationLogin.body.accessToken };
+  console.log('[stage11:integration] PASS: actual owner/manager property-automation routes enforce access-proof scope, hide private-only rules and private details in mixed rules, deny mismatched proof with zero protected effects, and persist one generic-noticed Disable as waiting for the paired-hub acknowledgement');
+
   const ownerAssignments = await fetchJson(`${base}/api/v2/homes/${homeOne.id}/preferences`, { method: 'PUT', headers: preferenceHeaders(propertyRawSession, homeOne.id), body: JSON.stringify({ kind: 'MANAGER_NOTIFICATION_ASSIGNMENT', expectedRevision: 0, document: { version: 1, assignments: [{ membershipId: managerMembership.id, enabledFamilies: ['hub_availability', 'installation_updates'] }] } }) });
   const managerFamilyChoice = await fetchJson(`${base}/api/v2/homes/${homeOne.id}/preferences`, { method: 'PUT', headers: preferenceHeaders(managerRawSession, homeOne.id), body: JSON.stringify({ kind: 'NOTIFICATION_PREFERENCES', expectedRevision: 0, document: { version: 1, enabledFamilies: ['hub_availability'] } }) });
   const managerUnassignedChoice = await fetchJson(`${base}/api/v2/homes/${homeOne.id}/preferences`, { method: 'PUT', headers: preferenceHeaders(managerRawSession, homeOne.id), body: JSON.stringify({ kind: 'NOTIFICATION_PREFERENCES', expectedRevision: 1, document: { version: 1, enabledFamilies: ['automation_activity'] } }) });
@@ -1598,8 +1865,8 @@ async function customerAuthorizationChecks(deliveryEnv) {
     // The authenticated Room-request endpoint lives under /api/public only
     // because its QR reference is public; the operation itself is a native
     // customer-session route and must retain the canonical Native V2 error.
-    if (route.startsWith('/api/v2/') || route === '/api/public/areas/request-access') {
-      if (response.body?.error?.code !== expectedCode || !response.body?.error?.requestId || Object.hasOwn(response.body || {}, 'errorCode')) fail(`${label}: Native V2 denial did not return canonical 401 ${expectedCode} (${response.response.status}/${response.body?.error?.code || 'no_code'})`);
+    if (route.startsWith('/api/v2/') || route.startsWith('/api/automations') || route === '/api/public/areas/request-access') {
+      if (response.body?.error?.code !== expectedCode || !response.body?.error?.requestId || Object.hasOwn(response.body || {}, 'errorCode')) fail(`${label}: Native V1 denial did not return canonical 401 ${expectedCode} (${response.response.status}/${response.body?.error?.code || 'no_code'})`);
     } else if (response.body?.errorCode !== expectedCode || typeof response.body?.error !== 'string' || response.body?.error?.code) {
       fail(`${label}: Stage 1 employee boundary did not retain its bounded employee-authentication denial (${response.response.status}/${response.body?.errorCode || 'no_code'})`);
     }
@@ -2192,6 +2459,83 @@ async function customerAuthorizationChecks(deliveryEnv) {
     const finalOutbox = hub.store.getSyncOutbox();
     fail(`The bounded initial OS snapshot did not drain through the real sync route before the isolated event proof (${JSON.stringify({ queueDepth: finalOutbox.events.filter((event) => event.sequence > finalOutbox.acknowledgedSequence).length, acknowledgedSequence: finalOutbox.acknowledgedSequence, nextSequence: finalOutbox.nextSequence, inFlight: Boolean(finalOutbox.inFlight), lastErrorCode: finalOutbox.lastErrorCode, queuedTypes: [...new Set(finalOutbox.events.filter((event) => event.sequence > finalOutbox.acknowledgedSequence).map((event) => event.type))] })})`);
   }
+  // Exercise the OS Store's durable automation outcome producer through the
+  // actual machine-signed sync route, then dispatch the optional failure push
+  // through the real Platform dispatcher with only its APNs transport mocked.
+  // The execution is disposable and points at the tenant-created route row;
+  // no Production rule, account or physical device is touched.
+  const automationOccurrenceId = `${automationCreate.body.automationId}:1:2026-10-09:10:00:+0100`;
+  const automationStart = new Date(Date.now() - 2_000).toISOString();
+  const automationComplete = new Date(Date.now() - 1_000).toISOString();
+  const automationPushToken = crypto.randomBytes(32).toString('hex');
+  const automationPushKeyPair = keyPair();
+  const automationPushThumbprint = crypto.createHash('sha256').update(crypto.createPublicKey(automationPushKeyPair.publicKey).export({ type: 'spki', format: 'der' })).digest('hex');
+  const automationPushDevice = await prisma.trustedDevice.create({ data: {
+    customerAccountId: account.id, deviceInstallationId: `stage11-automation-push-${crypto.randomUUID()}`,
+    publicKey: automationPushKeyPair.publicKey, publicKeyThumbprint: automationPushThumbprint,
+    deviceName: 'Disposable automation notice phone', pushEnabledAt: new Date(), apnsTokenCiphertext: encryptStage8PlatformToken(automationPushToken, deliveryEnv.PLATFORM_DATA_ENCRYPTION_KEY),
+    apnsTokenDigest: sha256(automationPushToken), apnsEnvironment: 'DEVELOPMENT', apnsKeyVersion: 1, apnsTokenRevision: 1,
+  } });
+  await prisma.memberPreferenceDocument.upsert({
+    where: { membershipId_kind: { membershipId: tenantMembership.id, kind: 'NOTIFICATION_PREFERENCES' } },
+    create: { membershipId: tenantMembership.id, kind: 'NOTIFICATION_PREFERENCES', document: { version: 1, enabledFamilies: ['own_tenant_device_outages', 'automation_failure_or_skipped_run'] } },
+    update: { document: { version: 1, enabledFamilies: ['own_tenant_device_outages', 'automation_failure_or_skipped_run'] }, revision: { increment: 1 } },
+  });
+  hub.store.state.automationExecutions = [{ occurrenceId: automationOccurrenceId, automationId: automationCreate.body.automationId,
+    revision: 1, source: 'platform_sync', status: 'partial', startedAt: automationStart, completedAt: automationComplete,
+    actionOutcomes: [{ actionId: 'disposable-applied', deviceId: 'disposable-device-a', controlId: 'power', status: 'applied' },
+      { actionId: 'disposable-failed', deviceId: 'disposable-device-b', controlId: 'power', status: 'failed' }] }];
+  if (await hub.store.ensureAutomationOutcomeEvents(Date.now()) !== 1 || await hub.store.ensureAutomationOutcomeEvents(Date.now()) !== 0) {
+    fail('The durable OS automation outcome producer did not create exactly one idempotent sync event');
+  }
+  const automationOutcomeBatch = await hub.store.prepareSyncBatch(hubOne.id, hub.pairing.runtime, Date.now());
+  if (!automationOutcomeBatch?.events.some((event) => event.type === 'automation.outcome' && event.payload.occurrenceId === automationOccurrenceId)) {
+    fail('The durable OS automation outcome was not included in the current signed sync batch');
+  }
+  const automationOutcomeResponse = await machineRequest({ base: platformBase, path: '/api/hub-agent/v2/sync', machineSecret, body: {
+    serial: identityOne.serialNumber, identityGeneration: identityOne.identityGeneration, ...automationOutcomeBatch,
+  } });
+  const automationExecutionKey = `hub:${hubOne.id}:${automationOccurrenceId}`;
+  const acceptedAutomationExecution = await prisma.nativeAutomationExecution.findUnique({ where: { idempotencyKey: automationExecutionKey }, select: { status: true, safeOutcome: true } });
+  const tenantFailureReceipts = await prisma.nativeNotificationDeliveryReceipt.findMany({ where: {
+    homeId: homeOne.id, family: 'TENANT_AUTOMATION_FAILURE', idempotencyKey: { startsWith: `automation-failure:${automationCreate.body.automationId}:` },
+  }, select: { id: true, customerAccountId: true, trustedDeviceId: true, membershipId: true, status: true, expiresAt: true } });
+  if (automationOutcomeResponse.response.status !== 200 || acceptedAutomationExecution?.status !== 'PARTIAL'
+    || tenantFailureReceipts.length !== 1 || tenantFailureReceipts[0].customerAccountId !== account.id
+    || tenantFailureReceipts[0].membershipId !== tenantMembership.id || tenantFailureReceipts[0].trustedDeviceId !== automationPushDevice.id
+    || tenantFailureReceipts[0].status !== 'PENDING' || tenantFailureReceipts[0].expiresAt.getTime() <= Date.now()) {
+    fail(`The signed automation outcome did not create one bounded failure receipt for the owning tenant (${automationOutcomeResponse.response.status}/${acceptedAutomationExecution?.status || 'no-execution'}; receipts=${tenantFailureReceipts.length})`);
+  }
+  const ownerManagerFailureReceipts = await prisma.nativeNotificationDeliveryReceipt.count({ where: {
+    homeId: homeOne.id, family: 'TENANT_AUTOMATION_FAILURE', customerAccountId: { in: [propertyAccount.id, managerAccount.id] },
+  } });
+  if (ownerManagerFailureReceipts !== 0) fail('A tenant-only automation failure notice was projected to an owner or manager');
+  const automationOutcomeRetry = await machineRequest({ base: platformBase, path: '/api/hub-agent/v2/sync', machineSecret, body: {
+    serial: identityOne.serialNumber, identityGeneration: identityOne.identityGeneration, ...automationOutcomeBatch,
+  } });
+  const executionCountAfterOutcomeRetry = await prisma.nativeAutomationExecution.count({ where: { idempotencyKey: automationExecutionKey } });
+  const failureReceiptCountAfterOutcomeRetry = await prisma.nativeNotificationDeliveryReceipt.count({ where: {
+    homeId: homeOne.id, family: 'TENANT_AUTOMATION_FAILURE', idempotencyKey: { startsWith: `automation-failure:${automationCreate.body.automationId}:` },
+  } });
+  if (automationOutcomeRetry.response.status !== 200 || automationOutcomeRetry.body?.duplicate !== true
+    || executionCountAfterOutcomeRetry !== 1 || failureReceiptCountAfterOutcomeRetry !== 1) {
+    fail('An exact signed retry duplicated an automation outcome, execution, or tenant notice receipt');
+  }
+  await hub.store.acknowledgeSyncBatch({ streamId: automationOutcomeResponse.body.streamId,
+    acceptedThroughSequence: Number(automationOutcomeResponse.body.acceptedThroughSequence), cloudRevision: Number(automationOutcomeResponse.body.cloudRevision),
+    configurationAppliedRevision: Number(automationOutcomeResponse.body.configurationAppliedRevision), resnapshotRequired: automationOutcomeResponse.body.resnapshotRequired === true });
+  const deliveredAutomationTokens = [];
+  const automationPushDispatch = await loadInstallationPushDispatcher(deliveryEnv.PLATFORM_DATA_ENCRYPTION_KEY).dispatchTenantAutomationFailureNotifications(new Date(Date.now() + 1_000), {
+    config: { teamId: 'DISPOSABLE', keyId: 'DISPOSABLE', privateKey: 'not-used-by-the-injected-transport' },
+    send: async ({ deviceToken, requestId }) => { deliveredAutomationTokens.push({ deviceToken, requestId }); return { outcome: 'ACCEPTED' }; },
+  });
+  const deliveredAutomationReceipt = await prisma.nativeNotificationDeliveryReceipt.findUniqueOrThrow({ where: { id: tenantFailureReceipts[0].id }, select: { status: true, attemptCount: true, lastErrorCode: true } });
+  if (automationPushDispatch.accepted !== 1 || deliveredAutomationTokens.length !== 1
+    || deliveredAutomationTokens[0].deviceToken !== automationPushToken || deliveredAutomationTokens[0].requestId !== tenantFailureReceipts[0].id
+    || deliveredAutomationReceipt.status !== 'SENT' || deliveredAutomationReceipt.attemptCount !== 1 || deliveredAutomationReceipt.lastErrorCode !== null) {
+    fail(`The actual bounded notification dispatcher did not revalidate and send one opted-in tenant failure notice through the injected APNs transport (${JSON.stringify({ dispatch: automationPushDispatch, sends: deliveredAutomationTokens.length, matchingToken: deliveredAutomationTokens.length === 1 && deliveredAutomationTokens[0].deviceToken === automationPushToken, matchingReceipt: deliveredAutomationTokens.length === 1 && deliveredAutomationTokens[0].requestId === tenantFailureReceipts[0].id, receiptStatus: deliveredAutomationReceipt.status, attempts: deliveredAutomationReceipt.attemptCount, errorCode: deliveredAutomationReceipt.lastErrorCode })})`);
+  }
+  console.log('[stage11:integration] PASS: durable OS outcome entered the actual signed sync route once; one bounded failure receipt went only to the owning opted-in tenant, exact replay had zero duplicate effects, and dispatcher acceptance is recorded without claiming device delivery');
   // Reproduce the real installation backlog shape: multiple critical
   // integration incidents can retain successive revisions in one contiguous
   // batch. Revisions of a stable incident key must update one projection, not
@@ -2661,17 +3005,13 @@ async function installationRequestRouteChecks(deliveryEnv) {
     membershipId: fixture.managerMembershipId, homeId: fixture.homeOneId, family: 'OWNER_INSTALLATION_UPDATE', channel: 'PUSH',
     idempotencyKey: managerPushReceiptId, deliverAfter: new Date(), expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000), status: 'PENDING',
   }, select: { id: true } });
-  const previousEncryptionKey = process.env.PLATFORM_DATA_ENCRYPTION_KEY;
-  process.env.PLATFORM_DATA_ENCRYPTION_KEY = deliveryEnv.PLATFORM_DATA_ENCRYPTION_KEY;
   let acceptedPushes = 0;
   let acceptedPushTokenMatches = 0;
   const testPushKey = crypto.generateKeyPairSync('ec', { namedCurve: 'prime256v1' }).privateKey;
-  const pushResult = await loadInstallationPushDispatcher()(new Date(), {
+  const pushResult = await loadInstallationPushDispatcher(deliveryEnv.PLATFORM_DATA_ENCRYPTION_KEY).dispatchInstallationPushReceipts(new Date(), {
     config: { teamId: 'ABCDEFGHIJ', keyId: 'KLMNOPQRST', privateKey: testPushKey },
     send: async (input) => { acceptedPushes += 1; if (input.deviceToken === completionPushToken && input.requestId === createdId) acceptedPushTokenMatches += 1; return { outcome: 'ACCEPTED' }; },
   });
-  if (previousEncryptionKey === undefined) delete process.env.PLATFORM_DATA_ENCRYPTION_KEY;
-  else process.env.PLATFORM_DATA_ENCRYPTION_KEY = previousEncryptionKey;
   const acceptedPushReceipt = await prisma.nativeNotificationDeliveryReceipt.findFirst({ where: { idempotencyKey: { startsWith: `installation-request:${createdId}:completion:push:${fixture.propertyAccountId}:` } }, select: { status: true, lastErrorCode: true } });
   const suppressedManagerReceipt = await prisma.nativeNotificationDeliveryReceipt.findUnique({ where: { id: managerPushReceipt.id }, select: { status: true, lastErrorCode: true } });
   if (pushResult.accepted !== 1 || pushResult.suppressed !== 1 || pushResult.failed !== 0 || acceptedPushes !== 1 || acceptedPushTokenMatches !== 1
@@ -3513,11 +3853,29 @@ async function fullHomeDeregistrationChecks(deliveryEnv) {
   // second scheduler or a home/customer mutation from the caller.
   await stopPlatform();
   await startPlatform(enabledEnv);
-  const cleanupDispatch = await fetchJson(`${base}/api/cron/native-operations`, { method: 'POST',
-    headers: { authorization: `Bearer ${deliveryEnv.CRON_SECRET}` } });
-  const deregistrationCheckpointRows = await prisma.nativeDomainOutbox.findMany({ where: {
-    homeId, aggregateType: 'FullHomeDeregistrationAccountCleanup', eventType: 'FULL_HOME_ACCOUNT_CLEANUP',
-  }, orderBy: [{ createdAt: 'asc' }, { id: 'asc' }], select: { aggregateId: true, state: true, attempts: true } });
+  const cleanupDeadline = Date.now() + 60_000;
+  let cleanupDispatch;
+  let deregistrationCheckpointRows = [];
+  // A transient cleanup error is persisted with the existing bounded backoff.
+  // Restarting the process does not make a not-yet-due checkpoint immediately
+  // eligible; exercise the same existing dispatcher again when its recorded
+  // nextAttemptAt arrives instead of incorrectly treating the truthful PENDING
+  // state as lost work. This adds no scheduler and does not bypass backoff.
+  for (let dispatchAttempt = 0; dispatchAttempt < 6; dispatchAttempt += 1) {
+    cleanupDispatch = await fetchJson(`${base}/api/cron/native-operations`, { method: 'POST',
+      headers: { authorization: `Bearer ${deliveryEnv.CRON_SECRET}` } });
+    deregistrationCheckpointRows = await prisma.nativeDomainOutbox.findMany({ where: {
+      homeId, aggregateType: 'FullHomeDeregistrationAccountCleanup', eventType: 'FULL_HOME_ACCOUNT_CLEANUP',
+    }, orderBy: [{ createdAt: 'asc' }, { id: 'asc' }], select: { aggregateId: true, state: true, attempts: true, nextAttemptAt: true } });
+    if (cleanupDispatch.response.status !== 200 || deregistrationCheckpointRows.every((row) => row.state === 'DELIVERED')) break;
+    if (deregistrationCheckpointRows.some((row) => row.state === 'FAILED' || row.state === 'PROCESSING')) break;
+    const pendingRows = deregistrationCheckpointRows.filter((row) => row.state === 'PENDING');
+    if (!pendingRows.length || Date.now() >= cleanupDeadline) break;
+    const nextDueAt = Math.min(...pendingRows.map((row) => row.nextAttemptAt?.getTime?.() ?? Date.now()));
+    const waitMs = Math.max(0, nextDueAt - Date.now()) + 25;
+    if (Date.now() + waitMs > cleanupDeadline) break;
+    if (waitMs > 0) await sleep(waitMs);
+  }
   if (cleanupDispatch.response.status !== 200 || cleanupDispatch.body?.homeDeregistrationAccountCleanup?.pending !== 0
     || cleanupDispatch.body?.homeDeregistrationAccountCleanup?.failed !== 0
     || deregistrationCheckpointRows.length < 2 || deregistrationCheckpointRows.some((row) => row.state !== 'DELIVERED')) {
@@ -4796,7 +5154,9 @@ async function pendingInvitationRouteChecks(deliveryEnv) {
   const grantsRestored = await grantRequest([areaId], restoreProof, `stage9-grant-restore-${crypto.randomUUID()}`,
     selectedHomeHeaders, targetAfterGrant.accessRevision, homeAfterGrant.managementRevision);
   const targetAfterRestore = await prisma.homeMembership.findUniqueOrThrow({ where: { id: newTenantMembershipAfterAccept.id }, select: { tenantAreaGrants: { where: { revokedAt: null }, select: { areaId: true } } } });
-  const automationAfterRestore = await prisma.nativeAutomation.findMany({ where: { id: { in: [grantAffectedAutomation.id, grantUnaffectedAutomation.id] } }, select: { id: true } });
+  const automationAfterRestore = await prisma.nativeAutomation.findMany({ where: { id: { in: [grantAffectedAutomation.id, grantUnaffectedAutomation.id] } }, select: {
+    id: true, status: true, actions: { select: { id: true } }, triggers: { select: { id: true } },
+  } });
   const grantDeviceAfterRestore = await prisma.nativeDevice.findUnique({ where: { id: grantTestDevice.id }, select: { id: true } });
   const grantCleanupOutbox = await prisma.nativeDomainOutbox.findFirst({ where: { aggregateType: 'NativeDevice', aggregateId: grantTestDevice.id,
     eventType: 'TENANT_DEVICE_DECOMMISSION' }, select: { id: true, payload: true } });
@@ -4810,7 +5170,10 @@ async function pendingInvitationRouteChecks(deliveryEnv) {
     || grantReplay.response.status !== 200 || grantReplay.body?.managementRevision !== grantSaved.body?.managementRevision
     || grantConflict.response.status !== 409 || targetAfterGrant.tenantAreaGrants.map((row) => row.areaId).sort().join(',') !== desiredGrantAreaIds.join(',')
     || grantsRestored.response.status !== 200 || targetAfterRestore.tenantAreaGrants.map((row) => row.areaId).join(',') !== areaId
-    || automationAfterRestore.some((row) => row.id === grantAffectedAutomation.id)
+    || automationAfterRestore.find((row) => row.id === grantAffectedAutomation.id)?.status !== 'RETIRED'
+    || automationAfterRestore.find((row) => row.id === grantAffectedAutomation.id)?.actions.length !== 0
+    || automationAfterRestore.find((row) => row.id === grantAffectedAutomation.id)?.triggers.length !== 0
+    || automationAfterRestore.find((row) => row.id === grantUnaffectedAutomation.id)?.status === 'RETIRED'
     || !automationAfterRestore.some((row) => row.id === grantUnaffectedAutomation.id)
     || grantDeviceAfterRestore || !grantCleanupOutbox) {
     fail(`Proof-bound tenant Area grant route failed exact target, denial or replay checks (${JSON.stringify({ mismatch: grantMismatch.response.status,
@@ -4973,6 +5336,35 @@ async function pendingInvitationRouteChecks(deliveryEnv) {
     || dashboardLayoutRow?.document?.labelColours?.Lights !== '#f2c94c') {
     fail(`Actual tenant dashboard context/layout/device-presentation routes did not enforce selected membership, private-device isolation, exact retries and the OS/cloud authority split (${JSON.stringify({ context: tenantDashboard.response.status, ownDeviceVisible: tenantDashboardIds.includes(dashboardDevices[0].id), otherTenantDeviceHidden: !tenantDashboardIds.includes(dashboardDevices[1].id), propertyDeviceReadOnly: propertyDashboardDevice?.canManage === false, ownerDeviceInformation: propertyDeviceInformation.response.status, privateInformationDenied: tenantPrivateInformationDenied.response.status, ownDeviceManageable: ownDashboardDevice?.canManage === true, wrongSelectedHome: wrongSelectedTenantHome.response.status, otherHome: foreignHomeTenantContext.response.status, owner: ownerDashboardContext.response.status, anonymous: anonymousDashboardContext.response.status, layoutWrite: layoutWrite.response.status, layoutFourSizeStatuses: layoutFourSizeWrites.map((result) => result.response.status), foreignLayoutWrite: layoutWrongOwnerWrite.response.status, rename: ownDeviceRename.response.status, renameRetry: ownDeviceRenameRetry.response.status, keyConflict: renameKeyConflict.response.status, otherTenantMutation: otherTenantDeviceMutation.response.status, propertyMutation: permanentDeviceMutation.response.status, relabel: relabelOwnDevice.response.status, privateDeviceRevision: ownerDeviceAfterMutations?.inventoryRevision, layoutRevision: dashboardLayoutRow?.revision })})`);
   }
+  // Seed one already-active, disposable rule on this tenant's private device.
+  // The next real removal request must withdraw the complete rule and publish
+  // the decommission through the existing full-home configuration revision.
+  const removalRuleDigest = sha256(`stage11-removal-rule:${crypto.randomUUID()}`);
+  await prisma.nativeDevice.update({ where: { id: dashboardDevices[0].id }, data: { capabilitySummary: {
+    controlCatalog: { revision: dashboardDevices[0].descriptorRevision, descriptorDigest: dashboardDevices[0].descriptorDigest, controls: [
+      { controlId: 'power', valueType: 'boolean', writable: true, automatable: true, idempotency: 'set_value', semanticRole: 'power', stepUpPolicy: 'none', riskLevel: 'normal', constraints: {}, catalogRevision: dashboardDevices[0].descriptorRevision },
+    ] },
+  } } });
+  const privateRemovalRule = await prisma.nativeAutomation.create({ data: {
+    homeId: inviter.homeId, createdByMembershipId: newTenantMembershipAfterAccept.id,
+    name: 'Disposable private-device routine', status: 'ACTIVE', revision: 1, definitionChecksum: removalRuleDigest,
+    timezone: 'Europe/London', enabledAt: new Date(),
+    triggers: { create: { kind: 'SCHEDULE', configuration: { minuteOfDay: 420, weekdays: [1, 2, 3, 4, 5] }, revision: 1 } },
+    actions: { create: { homeId: inviter.homeId, deviceId: dashboardDevices[0].id, areaId: grantedMoveArea.id,
+      controlId: 'power', sortOrder: 0, descriptorRevision: dashboardDevices[0].descriptorRevision, actionValue: { type: 'boolean', boolean: true } } },
+  }, select: { id: true } });
+  const priorAutomationFlag = process.env.DINODIA_NATIVE_AUTOMATIONS_ENABLED;
+  process.env.DINODIA_NATIVE_AUTOMATIONS_ENABLED = 'true';
+  const beforePrivateRemovalBundle = await prisma.$transaction((tx) => buildHubCloudConfiguration(tx, { homeId: inviter.homeId, hubInstallationId: selectedHome.activeHubInstallationId }));
+  if (!beforePrivateRemovalBundle.automations.some((automation) => automation.id === privateRemovalRule.id && automation.status === 'ACTIVE' && automation.actions.length === 1)) {
+    if (priorAutomationFlag === undefined) delete process.env.DINODIA_NATIVE_AUTOMATIONS_ENABLED;
+    else process.env.DINODIA_NATIVE_AUTOMATIONS_ENABLED = priorAutomationFlag;
+    fail('The disposable pre-removal full-home configuration did not contain its active tenant rule');
+  }
+  if (priorAutomationFlag === undefined) delete process.env.DINODIA_NATIVE_AUTOMATIONS_ENABLED;
+  else process.env.DINODIA_NATIVE_AUTOMATIONS_ENABLED = priorAutomationFlag;
+  await stopPlatform();
+  await startPlatform({ ...deliveryEnv, DINODIA_NATIVE_AUTOMATIONS_ENABLED: 'true' });
   const removalChallengeValue = { operation: 'remove_tenant_device', descriptorRevision: ownDashboardDevice.descriptorRevision };
   const removalChallenge = await fetchJson(`${base}/api/v2/security/step-up/challenge`, { method: 'POST', headers: { ...tenantDashboardHeaders, 'content-type': 'application/json' }, body: JSON.stringify({ operationKind: 'tenant_device_remove', targetIds: [ownDashboardDevice.osDeviceId], value: removalChallengeValue }) });
   if (removalChallenge.response.status !== 200 || !removalChallenge.body.challengeId) fail(`Exact own-device removal step-up was not issued (${removalChallenge.response.status})`);
@@ -4982,6 +5374,7 @@ async function pendingInvitationRouteChecks(deliveryEnv) {
   const proofRowKey = { customerAccountId_nonceHash: { customerAccountId: newTenantAccount.id, nonceHash: sha256(removalProof.body.proof) } };
   const removalBefore = await prisma.nativeDevice.findUniqueOrThrow({ where: { id: dashboardDevices[0].id }, select: { lifecycle: true, inventoryRevision: true, ownerMembershipId: true, managementClass: true } });
   const removalHomeRevisionBefore = await prisma.home.findUniqueOrThrow({ where: { id: inviter.homeId }, select: { managementRevision: true } });
+  const removalHubBefore = await prisma.hubInstallation.findUniqueOrThrow({ where: { id: selectedHome.activeHubInstallationId }, select: { cloudConfigurationRevision: true, acknowledgedCloudRevision: true } });
   const removalProofBefore = await prisma.stepUpAuthorization.findUniqueOrThrow({ where: proofRowKey, select: { consumedAt: true } });
   const removalKey = crypto.randomUUID();
   const removalBody = { expectedDescriptorRevision: ownDashboardDevice.descriptorRevision, expectedInventoryRevision: removalBefore.inventoryRevision, proof: removalProof.body.proof };
@@ -4996,6 +5389,18 @@ async function pendingInvitationRouteChecks(deliveryEnv) {
   const ownRemovalRetry = await fetchJson(`${base}/api/v2/homes/${inviter.homeId}/tenant-devices/${dashboardDevices[0].id}/remove`, { method: 'POST', headers: removalHeaders, body: JSON.stringify(removalBody) });
   const ownDeviceAfterRemoval = await prisma.nativeDevice.findUniqueOrThrow({ where: { id: dashboardDevices[0].id }, select: { lifecycle: true, inventoryRevision: true, ownerMembershipId: true, managementClass: true } });
   const removalProofAfterSuccess = await prisma.stepUpAuthorization.findUniqueOrThrow({ where: proofRowKey, select: { consumedAt: true } });
+  const [removedRule, removalHubAfter] = await Promise.all([
+    prisma.nativeAutomation.findUnique({ where: { id: privateRemovalRule.id }, select: { status: true, revision: true, actions: { select: { id: true } }, triggers: { select: { id: true } } } }),
+    prisma.hubInstallation.findUniqueOrThrow({ where: { id: selectedHome.activeHubInstallationId }, select: { cloudConfigurationRevision: true, acknowledgedCloudRevision: true } }),
+  ]);
+  const priorBundleFlag = process.env.DINODIA_NATIVE_AUTOMATIONS_ENABLED;
+  process.env.DINODIA_NATIVE_AUTOMATIONS_ENABLED = 'true';
+  const removalBundle = await prisma.$transaction((tx) => buildHubCloudConfiguration(tx, { homeId: inviter.homeId, hubInstallationId: selectedHome.activeHubInstallationId }));
+  if (priorBundleFlag === undefined) delete process.env.DINODIA_NATIVE_AUTOMATIONS_ENABLED;
+  else process.env.DINODIA_NATIVE_AUTOMATIONS_ENABLED = priorBundleFlag;
+  const removalDeliveryPublished = removalHubAfter.cloudConfigurationRevision > removalHubBefore.cloudConfigurationRevision;
+  const removedRuleIsMinimal = removedRule?.status === 'RETIRED' && removedRule.actions.length === 0 && removedRule.triggers.length === 0;
+  const removedRuleAbsentFromBundle = !removalBundle.automations.some((automation) => automation.id === privateRemovalRule.id);
   if (wrongOwnerRemoval.response.status !== 409 || permanentRemoval.response.status !== 409 || noProofRemoval.response.status !== 400
     || JSON.stringify(removalBefore) !== JSON.stringify(removalAfterDenials)
     || removalHomeRevisionBefore.managementRevision !== removalHomeRevisionAfterDenials.managementRevision
@@ -5004,9 +5409,12 @@ async function pendingInvitationRouteChecks(deliveryEnv) {
     || ownRemovalRetry.response.status !== 202 || ownRemovalRetry.body?.inventoryRevision !== ownRemoval.body?.inventoryRevision
     || ownDeviceAfterRemoval.lifecycle !== 'REMOVAL_PENDING' || ownDeviceAfterRemoval.inventoryRevision !== removalBefore.inventoryRevision + 1
     || ownDeviceAfterRemoval.ownerMembershipId !== newTenantMembershipAfterAccept.id || ownDeviceAfterRemoval.managementClass !== 'TENANT_DEVICE'
-    || !removalProofAfterSuccess.consumedAt) {
-    fail(`Actual tenant-owned removal did not enforce fresh proof, ownership, zero-effect denial, pending hub cleanup and exact retry (${JSON.stringify({ wrongOwner: wrongOwnerRemoval.response.status, permanent: permanentRemoval.response.status, missingProof: noProofRemoval.response.status, allowed: ownRemoval.response.status, retry: ownRemovalRetry.response.status, lifecycle: ownDeviceAfterRemoval.lifecycle })})`);
+    || !removalProofAfterSuccess.consumedAt || !removedRuleIsMinimal || !removalDeliveryPublished || !removedRuleAbsentFromBundle
+    || removalHubAfter.acknowledgedCloudRevision >= removalHubAfter.cloudConfigurationRevision) {
+    fail(`Actual tenant-owned removal did not enforce fresh proof, ownership, zero-effect denial, whole-rule retirement, full-bundle publication and exact retry (${JSON.stringify({ wrongOwner: wrongOwnerRemoval.response.status, permanent: permanentRemoval.response.status, missingProof: noProofRemoval.response.status, allowed: ownRemoval.response.status, retry: ownRemovalRetry.response.status, lifecycle: ownDeviceAfterRemoval.lifecycle, retiredRuleMinimal: removedRuleIsMinimal, cloudRevisionAdvanced: removalDeliveryPublished, retiredRuleAbsentFromBundle: removedRuleAbsentFromBundle, hubStillPending: removalHubAfter.acknowledgedCloudRevision < removalHubAfter.cloudConfigurationRevision })})`);
   }
+  await stopPlatform();
+  await startPlatform(deliveryEnv);
   console.log('[stage7:integration] PASS: actual tenant context/layout and owned-device rename/relabel/move/remove routes preserve selected-membership privacy; denied wrong-owner/permanent/missing-proof removal has zero Home/device/proof effects; authorized removal consumes exact proof once and remains pending until hub enforcement; exact retry does not repeat effects');
   console.log('[stage6:integration] PASS: actual mobile sign-in accepts the recipient-only one-time credential (proving email possession), returns V2 access/refresh credentials, gates password replacement and username choice, then grants exactly the invited Area only after explicit acceptance');
   const headers = { cookie: `dinodia_customer_session=${encodeURIComponent(rawSession)}` };
@@ -5770,7 +6178,11 @@ async function pendingInvitationRouteChecks(deliveryEnv) {
     prisma.nativeDevice.findUnique({ where: { id: tenantBPrivateDevice.id }, select: { id: true } }),
     prisma.nativeDeviceOutageIncident.findUnique({ where: { id: tenantBOtherIncident.id }, select: { id: true, causedByHubIncidentId: true } }),
   ]);
-  const removedAutomation = await prisma.nativeAutomation.findUnique({ where: { id: tenantAutomation.id }, select: { id: true } });
+  const removedAutomation = await prisma.nativeAutomation.findUnique({ where: { id: tenantAutomation.id }, select: { id: true, status: true, name: true } });
+  const retiredAutomationChildren = await Promise.all([
+    prisma.nativeAutomationTrigger.count({ where: { automationId: tenantAutomation.id } }),
+    prisma.nativeAutomationAction.count({ where: { automationId: tenantAutomation.id } }),
+  ]);
   const tenantDeviceTombstone = await prisma.nativeDomainOutbox.findFirst({ where: { aggregateType: 'NativeDevice', aggregateId: tenantPrivateDevice.id,
     eventType: 'TENANT_DEVICE_DECOMMISSION' }, select: { id: true } });
   const tenantHomeAfter = await prisma.home.findUniqueOrThrow({ where: { id: inviter.homeId }, select: { managementRevision: true } });
@@ -5784,14 +6196,15 @@ async function pendingInvitationRouteChecks(deliveryEnv) {
     || tenantRemovalConflict.response.status !== 409 || tenantHomeAfter.managementRevision !== tenantHomeBefore.managementRevision + 1
     || removedTenantMembership.status !== 'REMOVED' || removedTenantMembership.accessRevision !== tenantTargetBefore.accessRevision + 1
     || !preservedTenantLink || !preservedTenantAccount || preservedTenantDevice?.revokedAt || preservedTenantSession?.revokedAt
-    || removedPrivateDevice || removedAutomation || !tenantDeviceTombstone || privateDataAfterRemoval.some((count) => count !== 0)
+    || removedPrivateDevice || removedAutomation?.status !== 'RETIRED' || removedAutomation.name !== 'Removed automation'
+    || retiredAutomationChildren.some((count) => count !== 0) || !tenantDeviceTombstone || privateDataAfterRemoval.some((count) => count !== 0)
     || !otherTenantDataAfterRemoval[0] || !otherTenantDataAfterRemoval[1]
     || otherTenantDataAfterRemoval[1].causedByHubIncidentId !== null) {
     fail(`Owner/manager tenant removal failed proof, exact-scope cleanup, replay or relationship-preservation checks (${JSON.stringify({ wrongRole: wrongRoleTenantRemoval.response.status,
       wrongHome: wrongHomeTenantRemoval.response.status, mismatch: mismatchedTenantRemoval.response.status,
       remove: tenantRemoval.response.status, replay: tenantRemovalReplay.response.status, conflict: tenantRemovalConflict.response.status,
       accountPreserved: Boolean(preservedTenantAccount), otherHome: preservedTenantLink?.status, privateDeviceRemoved: !removedPrivateDevice,
-      tombstone: Boolean(tenantDeviceTombstone), hub: tenantRemoval.body?.hubEnforcement })})`);
+      tombstone: Boolean(tenantDeviceTombstone), automation: removedAutomation?.status, automationChildren: retiredAutomationChildren, hub: tenantRemoval.body?.hubEnforcement })})`);
   }
   const tenantBHomeBefore = await prisma.home.findUniqueOrThrow({ where: { id: inviter.homeId }, select: { managementRevision: true } });
   const tenantBTargetBefore = await prisma.homeMembership.findUniqueOrThrow({ where: { id: removalTenantMembershipB.id }, select: { accessRevision: true } });
@@ -7432,6 +7845,40 @@ async function osChecks() {
     socket.on('error', (error) => { clearTimeout(timer); reject(error); });
   });
 }
+async function verifyStage11PropertyDisableAcknowledgement() {
+  if (!pendingStage11AutomationDisableAck || !customerFixture) fail('The property-automation disable acknowledgement scenario was not prepared');
+  const expected = pendingStage11AutomationDisableAck.expectedRevision;
+  const url = `http://127.0.0.1:${appPort}/api/v2/homes/${pendingStage11AutomationDisableAck.homeId}/property-automations`;
+  const ownerHeaders = { authorization: `Bearer ${pendingStage11AutomationDisableAck.ownerAccessToken}`, 'x-dinodia-home-id': pendingStage11AutomationDisableAck.homeId };
+  const beforeSync = await fetchJson(url, { headers: ownerHeaders });
+  const target = Number(beforeSync.body?.delivery?.cloudRevision);
+  if (beforeSync.response.status !== 200 || !Number.isSafeInteger(target) || target < expected) fail(`Current owner delivery projection lost the persisted property-automation Disable revision (${JSON.stringify({ status: beforeSync.response.status, code: beforeSync.body?.error?.code, target, expected })})`);
+  const deadline = Date.now() + 10_000;
+  while (Number(hub.store.getSyncOutbox?.()?.configurationAppliedRevision || 0) < target && Date.now() < deadline) {
+    while (hub.pairing.syncing && Date.now() < deadline) await sleep(20);
+    if (Number(hub.store.getSyncOutbox?.()?.configurationAppliedRevision || 0) >= target) break;
+    if (hub.store.getPlatform?.()?.paired) {
+      hub.pairing.nextRetryAt = 0;
+      await hub.pairing.syncNow();
+    } else {
+      await sleep(20);
+    }
+  }
+  const outbox = hub.store.getSyncOutbox?.() || {};
+  if (Number(outbox.configurationAppliedRevision || 0) < target) {
+    const code = String(hub.pairing.status?.().sync?.lastErrorCode || outbox.lastErrorCode || 'sync_error');
+    fail(`Paired OS did not durably apply the property-automation disable configuration (${/^[a-z0-9_.:-]{1,80}$/i.test(code) ? code : 'sync_error'}; paired=${Boolean(hub.store.getPlatform?.()?.paired)}; applied=${Number(outbox.configurationAppliedRevision || 0)}; cloud=${Number(outbox.cloudRevision || 0)}; target=${target}; syncing=${Boolean(hub.pairing.syncing)})`);
+  }
+  const ownerOverview = await fetchJson(url, { headers: ownerHeaders });
+  const automation = ownerOverview.body?.automations?.find((item) => item.id === pendingStage11AutomationDisableAck.automationId);
+  if (ownerOverview.response.status !== 200 || automation?.status !== 'disabled'
+    || ownerOverview.body?.delivery?.appliedRevision < ownerOverview.body?.delivery?.cloudRevision
+    || Number(ownerOverview.body?.delivery?.cloudRevision) !== target
+    || Number(ownerOverview.body?.delivery?.cloudRevision) < expected) {
+    fail('The live owner projection did not reconcile the management Disable after the real OS configuration acknowledgement');
+  }
+  console.log('[stage11:integration] PASS: the paired OS applied the exact current full-home configuration revision; the actual owner projection advanced the management Disable from waiting-for-hub to acknowledged-disabled');
+}
 async function cleanup() {
   if (hub) await hub.stop().catch(() => {});
   if (platformProcess) { platformProcess.kill('SIGTERM'); await sleep(500); if (!platformProcess.killed) platformProcess.kill('SIGKILL'); }
@@ -7567,6 +8014,7 @@ try {
     await mobileSessionContractChecks();
     await installationBootstrapChecks();
     await osChecks();
+    await verifyStage11PropertyDisableAcknowledgement();
     await operatorMutationChecks();
     await tenantMembershipRemovalChecks();
     await ownershipTransferChecks(deliveryEnv);

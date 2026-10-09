@@ -86,6 +86,20 @@ export async function sendHomeAccessChangedPush(input: {
   return sendBoundedApnsAlert(input, { title: 'Home access changed', body: 'Access to a Dinodia Smart Living home has changed. Sign in to review your homes.' }, poster);
 }
 
+/** Mandatory, content-minimal automation intervention notice. */
+export async function sendTenantAutomationManagementPush(input: {
+  config: ApnsConfig; environment: ApnsEnvironment; deviceToken: string; requestId: string; expiresAt: Date;
+}, poster: ApnsPoster = postHttp2): Promise<ApnsResult> {
+  return sendBoundedApnsAlert(input, { title: 'Automation updated', body: 'A property manager changed an automation. Sign in to review its current status.' }, poster);
+}
+
+/** Optional, preference-controlled tenant-only execution result. No Home/rule/device detail is included. */
+export async function sendTenantAutomationFailurePush(input: {
+  config: ApnsConfig; environment: ApnsEnvironment; deviceToken: string; requestId: string; expiresAt: Date;
+}, poster: ApnsPoster = postHttp2): Promise<ApnsResult> {
+  return sendBoundedApnsAlert(input, { title: 'Automation update', body: 'An automation did not complete as expected. Sign in to review its status.' }, poster);
+}
+
 async function sendBoundedApnsAlert(input: {
   config: ApnsConfig; environment: ApnsEnvironment; deviceToken: string; requestId: string; expiresAt: Date;
 }, alert: { title: string; body: string }, poster: ApnsPoster): Promise<ApnsResult> {

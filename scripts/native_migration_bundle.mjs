@@ -13,6 +13,7 @@ export const STAGE8_COMMISSIONING_MIGRATION = '20261006180000_stage8_commissioni
 export const STAGE9_DEREGISTRATION_GUARD_MIGRATION = '20261008100000_stage9_deregister_redacted_support_guard';
 export const STAGE10_ANALYTICS_MAINTENANCE_MIGRATION = '20261008130000_stage10_analytics_maintenance_tasks';
 export const STAGE10_PARTIAL_USAGE_COVERAGE_MIGRATION = '20261008150000_stage10_partial_usage_coverage';
+export const STAGE11_AUTOMATION_ACTION_ORDER_MIGRATION = '20261009100000_stage11_automation_action_order';
 
 export function migrationBundleIdentity(names, checksums) {
   const migrations = [...new Set(names)].sort().map((name) => {

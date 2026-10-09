@@ -58,6 +58,29 @@ export async function POST(request: Request) {
       }, select: { id: true } });
       if (!roomRequest) throw new Stage1AuthError(409, 'REVISION_CONFLICT', 'This Room request changed. Refresh before confirming.');
     }
+    if (operationKind === 'home.tenant_automation_disable' || operationKind === 'home.tenant_automation_delete') {
+      const intervention = value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null;
+      const expectedAction = operationKind.endsWith('_disable') ? 'disable' : 'delete';
+      if (!['OWNER', 'PROPERTY_MANAGER'].includes(customer.role) || customer.credentialKind !== 'account_access' || targetIds.length !== 1
+        || !intervention || Object.keys(intervention).sort().join(',') !== 'action,expectedAutomationRevision,expectedManagementRevision,reason'
+        || intervention.action !== expectedAction || !['safety', 'conflict', 'access', 'other'].includes(String(intervention.reason))
+        || !Number.isSafeInteger(intervention.expectedAutomationRevision) || Number(intervention.expectedAutomationRevision) < 1
+        || !Number.isSafeInteger(intervention.expectedManagementRevision) || Number(intervention.expectedManagementRevision) < 1) {
+        throw new Stage1AuthError(403, 'AUTOMATION_INTERVENTION_DENIED', 'A current property-impacting automation action must be confirmed');
+      }
+      const [actor, home, automation] = await Promise.all([
+        prisma.homeMembership.findFirst({ where: { id: customer.membershipId, customerAccountId: customer.id, homeId: customer.homeId,
+          role: customer.role as 'OWNER' | 'PROPERTY_MANAGER', status: 'ACTIVE', customerAccount: { status: 'ACTIVE' } }, select: { id: true } }),
+        prisma.home.findFirst({ where: { id: customer.homeId, lifecycle: 'ACTIVE', installationStatus: 'COMPLETE' }, select: { managementRevision: true } }),
+        prisma.nativeAutomation.findFirst({ where: { id: targetIds[0], homeId: customer.homeId, propertyImpact: true,
+          status: expectedAction === 'disable' ? 'ACTIVE' : { not: 'RETIRED' },
+          actions: { some: { device: { managementClass: 'PROPERTY_DEVICE' } } } }, select: { revision: true } }),
+      ]);
+      if (!actor || !home || !automation || automation.revision !== intervention.expectedAutomationRevision
+        || home.managementRevision !== intervention.expectedManagementRevision) {
+        throw new Stage1AuthError(409, 'REVISION_CONFLICT', 'The property automation changed. Refresh before confirming.');
+      }
+    }
     if (operationKind === 'home.transfer') {
       if (customer.role !== 'OWNER' || targetIds.length < 2 || targetIds[0] !== customer.homeId || targetIds[1] !== customer.membershipId
         || !value || typeof value !== 'object' || Array.isArray(value)) {

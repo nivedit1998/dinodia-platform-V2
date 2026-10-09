@@ -4,6 +4,10 @@ import { canonicalSyncJson, hashSyncConfiguration } from './hubSyncEnvelope';
 const MAX_CONFIGURATION_BYTES = 1024 * 1024;
 
 export async function buildHubCloudConfiguration(db: Prisma.TransactionClient, input: { homeId: string; hubInstallationId: string }) {
+  // Stage 11 ships the executor and its complete configuration contract, but
+  // customer execution stays opt-in until the Stage 13 activation decision.
+  // Unset/anything other than the exact string "true" fails closed.
+  const automationActivationEnabled = process.env.DINODIA_NATIVE_AUTOMATIONS_ENABLED === 'true';
   const [home, areas, memberships, devices, automations] = await Promise.all([
     db.home.findUnique({ where: { id: input.homeId }, select: { id: true, managementRevision: true } }),
     db.area.findMany({ where: { homeId: input.homeId, status: 'ACTIVE' }, orderBy: { id: 'asc' }, select: { id: true, osAreaId: true, originalName: true, overrideName: true, revision: true } }),
@@ -13,8 +17,9 @@ export async function buildHubCloudConfiguration(db: Prisma.TransactionClient, i
     }),
     db.nativeDevice.findMany({ where: { homeId: input.homeId, hubInstallationId: input.hubInstallationId }, orderBy: { id: 'asc' }, take: 2000,
       select: { osDeviceId: true, managementClass: true, ownerMembershipId: true, analyticsCategory: true, lifecycle: true, customerLabel: true, overrideName: true, descriptorRevision: true, descriptorDigest: true, assignments: { where: { validUntil: null, area: { status: 'ACTIVE' } }, orderBy: { areaId: 'asc' }, take: 8, select: { areaId: true, area: { select: { osAreaId: true } } } } } }),
-    db.nativeAutomation.findMany({ where: { homeId: input.homeId, status: { not: 'RETIRED' } }, orderBy: { id: 'asc' }, take: 100,
-      select: { id: true, name: true, status: true, revision: true, definitionChecksum: true, timezone: true, triggers: { orderBy: { id: 'asc' }, select: { id: true, kind: true, configuration: true, revision: true } }, actions: { orderBy: { id: 'asc' }, select: { id: true, device: { select: { osDeviceId: true } }, area: { select: { osAreaId: true } }, controlId: true, descriptorRevision: true, actionValue: true, needsAttention: true } } } }),
+    automationActivationEnabled ? db.nativeAutomation.findMany({ where: { homeId: input.homeId, status: { not: 'RETIRED' } }, orderBy: { id: 'asc' }, take: 100,
+      select: { id: true, name: true, status: true, revision: true, definitionChecksum: true, timezone: true, triggers: { orderBy: { id: 'asc' }, select: { id: true, kind: true, configuration: true, revision: true } }, actions: { orderBy: [{ sortOrder: 'asc' }, { id: 'asc' }], select: { id: true, device: { select: { osDeviceId: true } }, area: { select: { osAreaId: true } }, controlId: true, sortOrder: true, descriptorRevision: true, actionValue: true, needsAttention: true } } } })
+      : Promise.resolve([]),
   ]);
   if (!home) throw new Error('Hub home is no longer available');
   const unsigned = {

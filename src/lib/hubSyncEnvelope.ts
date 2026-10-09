@@ -206,10 +206,12 @@ function validEvent(event: unknown): event is HubSyncEvent {
         && payload.quality === 'fresh' && !event.critical && event.aggregateId === payload.sourceEventKey;
     case 'automation.outcome':
       return exactKeys(payload, ['occurrenceId', 'automationId', 'automationRevision', 'status', 'startedAt', 'completedAt', 'actionCount', 'actionStatuses'])
-        && boundedText(payload.occurrenceId, 160) && /^[A-Za-z0-9:_-]+$/.test(String(payload.occurrenceId))
+        // OS occurrence IDs include the signed local UTC offset (for example
+        // +0100/-0500) so repeated wall-clock times remain distinct at DST.
+        && boundedText(payload.occurrenceId, 160) && /^[A-Za-z0-9:_+\-]+$/.test(String(payload.occurrenceId))
         && /^[0-9a-f-]{36}$/i.test(String(payload.automationId)) && event.aggregateId === payload.occurrenceId
         && Number.isSafeInteger(payload.automationRevision) && Number(payload.automationRevision) >= 1
-        && ['succeeded', 'partial', 'failed', 'interrupted'].includes(String(payload.status))
+        && ['succeeded', 'partial', 'failed', 'interrupted', 'skipped'].includes(String(payload.status))
         && validUtc(payload.startedAt) && validUtc(payload.completedAt) && Date.parse(String(payload.completedAt)) >= Date.parse(String(payload.startedAt))
         && Number.isSafeInteger(payload.actionCount) && Number(payload.actionCount) >= 0 && Number(payload.actionCount) <= 32
         && object(payload.actionStatuses) && exactKeys(payload.actionStatuses, ['applied', 'failed', 'uncertain', 'skipped'])

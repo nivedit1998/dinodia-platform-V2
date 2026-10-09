@@ -1,5 +1,7 @@
 import type { Prisma } from '@prisma/client';
 import { canonicalPublicId } from './nativeSchemaValidation';
+import { retireNativeAutomations } from './nativeAutomations/lifecycle';
+import { refreshNativeAutomationCloudRevision } from './nativeAutomations/delivery';
 
 export class NativeAreaAccessError extends Error {
   constructor(readonly code: 'MEMBERSHIP_FORBIDDEN' | 'AREA_FORBIDDEN' | 'REVISION_CONFLICT' | 'INVALID_GRANT_SET') { super(code); }
@@ -27,17 +29,11 @@ export async function replaceTenantAreaGrants(db: Prisma.TransactionClient, inpu
   const currentIds = current.map((grant) => grant.areaId).sort();
   if (currentIds.length === areaIds.length && currentIds.every((id, index) => id === areaIds[index])) return { changed: false, managementRevision: home.managementRevision, accessRevision: tenant.accessRevision };
   const removedAreaIds = currentIds.filter((id) => !areaIds.includes(id));
-  // A tenant-authored automation that targets an Area losing its grant must
-  // not survive with an action that can no longer be authorised. Delete only
-  // that tenant's automations with an action in a removed canonical Area;
-  // unrelated memberships and automations remain untouched.
-  if (removedAreaIds.length) {
-    await db.nativeAutomation.deleteMany({ where: {
-      homeId: input.homeId,
-      createdByMembershipId: tenant.id,
-      actions: { some: { homeId: input.homeId, areaId: { in: removedAreaIds } } },
-    } });
-  }
+  // Any rule which loses one granted Area is retired as a whole. Its action
+  // bodies are removed immediately; only a minimal bounded tombstone remains
+  // until the current full Home configuration is acknowledged.
+  if (removedAreaIds.length) await retireNativeAutomations(db, { homeId: input.homeId,
+    createdByMembershipId: tenant.id, losingAreaIds: removedAreaIds, now, actorId: input.actorAccountId, reason: 'area_grant_removed' });
   const affectedTenantDevices = removedAreaIds.length ? await db.nativeDevice.findMany({
     where: {
       homeId: input.homeId, ownerMembershipId: tenant.id, managementClass: 'TENANT_DEVICE', lifecycle: { notIn: ['RETIRED', 'REMOVED'] },
@@ -78,6 +74,7 @@ export async function replaceTenantAreaGrants(db: Prisma.TransactionClient, inpu
     await db.nativeDevice.deleteMany({ where: { id: { in: affectedTenantDevices.map((device) => device.id) }, homeId: input.homeId, ownerMembershipId: tenant.id, managementClass: 'TENANT_DEVICE' } });
   }
   const membership = await db.homeMembership.update({ where: { id: tenant.id }, data: { accessRevision: { increment: 1 } }, select: { accessRevision: true } });
+  if (home.activeHubInstallationId) await refreshNativeAutomationCloudRevision(db, { homeId: input.homeId, hubInstallationId: home.activeHubInstallationId });
   await db.auditEvent.create({ data: { homeId: input.homeId, actorType: 'CUSTOMER', actorId: input.actorAccountId, category: 'ACCESS', action: 'tenant_area_grants_replaced', targetType: 'HomeMembership', targetId: tenant.id, metadata: { grantCount: areaIds.length, removedAreaCount: removedAreaIds.length, decommissionTombstoneCount: affectedTenantDevices.length, managementRevision: nextRevision }, purgeAt: new Date(now.getTime() + 365 * 24 * 60 * 60 * 1000) } });
   return { changed: true, managementRevision: nextRevision, accessRevision: membership.accessRevision, decommissionTombstoneCount: affectedTenantDevices.length };
 }

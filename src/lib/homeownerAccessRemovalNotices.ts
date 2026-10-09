@@ -48,3 +48,42 @@ export async function queueHomeownerAccessRemovalNotices(tx: Prisma.TransactionC
   if (entries.length) await tx.nativeDomainOutbox.createMany({ data: entries, skipDuplicates: true });
   return { queued: entries.length };
 }
+
+/** Mandatory, content-minimal notice for owner/manager automation intervention.
+ * It bypasses notification preferences and quiet hours, and is delivered by
+ * the existing two-minute access-notice dispatcher. */
+export async function queueTenantAutomationManagementNotice(tx: Prisma.TransactionClient, input: {
+  homeId: string; automationId: string; membershipId: string; customerAccountId: string; revision: number; now: Date;
+}) {
+  const [membership, account, devices] = await Promise.all([
+    tx.homeMembership.findFirst({ where: { id: input.membershipId, homeId: input.homeId, customerAccountId: input.customerAccountId,
+      role: 'TENANT', status: 'ACTIVE', customerAccount: { status: 'ACTIVE' } }, select: { id: true } }),
+    tx.customerAccount.findUnique({ where: { id: input.customerAccountId }, select: { email: true, emailVerifiedAt: true, status: true } }),
+    tx.trustedDevice.findMany({ where: { customerAccountId: input.customerAccountId, revokedAt: null,
+      apnsTokenCiphertext: { not: null }, apnsTokenDigest: { not: null }, apnsEnvironment: { not: null }, apnsKeyVersion: 1 },
+      select: { id: true, apnsTokenCiphertext: true, apnsEnvironment: true } }),
+  ]);
+  if (!membership) return { queued: 0 };
+  const expiresAt = new Date(input.now.getTime() + EXPIRY_MS);
+  const entries: Prisma.NativeDomainOutboxCreateManyInput[] = [];
+  if (account?.status === 'ACTIVE' && account.emailVerifiedAt && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(account.email)) {
+    const sealed = encryptPlatformEnvelope(JSON.stringify({ version: 1, channel: 'EMAIL', recipient: account.email }));
+    entries.push({ homeId: input.homeId, aggregateType: 'HomeownerAccessRemovalNotice', aggregateId: input.automationId,
+      eventType: 'TENANT_AUTOMATION_MANAGEMENT_NOTICE', idempotencyKey: `tenant-automation-management:${input.automationId}:${input.revision}:email`,
+      payload: { noticeId: crypto.randomUUID(), sealed }, expiresAt });
+  }
+  for (const device of devices) {
+    if (!device.apnsTokenCiphertext || !device.apnsEnvironment) continue;
+    try {
+      const token = decryptPlatformEnvelope(device.apnsTokenCiphertext);
+      if (!APNS_TOKEN.test(token)) continue;
+      const sealed = encryptPlatformEnvelope(JSON.stringify({ version: 1, channel: 'PUSH', deviceToken: token,
+        environment: device.apnsEnvironment, trustedDeviceId: device.id }));
+      entries.push({ homeId: input.homeId, aggregateType: 'HomeownerAccessRemovalNotice', aggregateId: input.automationId,
+        eventType: 'TENANT_AUTOMATION_MANAGEMENT_NOTICE', idempotencyKey: `tenant-automation-management:${input.automationId}:${input.revision}:push:${device.id}`,
+        payload: { noticeId: crypto.randomUUID(), sealed }, expiresAt });
+    } catch { /* No raw notification credential is ever persisted. */ }
+  }
+  if (entries.length) await tx.nativeDomainOutbox.createMany({ data: entries, skipDuplicates: true });
+  return { queued: entries.length };
+}

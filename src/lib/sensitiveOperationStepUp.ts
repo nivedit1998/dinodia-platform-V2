@@ -33,7 +33,7 @@ export function operationDigest(input: { operationKind?: string; operation?: str
   }), 'utf8').digest('hex');
 }
 
-export const ALLOWED_OPERATIONS = new Set(['trusted_device_remove', 'customer_password_change', 'customer_profile_change', 'customer_email_change', 'tenant_membership_remove', 'home_tenant_remove', 'home_property_manager_remove', 'tenant_device_remove', 'tenant_area_grants_replace', 'home.transfer', 'home.deregister', 'home_room_access_decision', 'support_ticket_close', 'support_access_approve', 'support_access_revoke', 'alexa_unlink', 'heating_sensitive_command', 'device_sensitive_command']);
+export const ALLOWED_OPERATIONS = new Set(['trusted_device_remove', 'customer_password_change', 'customer_profile_change', 'customer_email_change', 'tenant_membership_remove', 'home_tenant_remove', 'home_property_manager_remove', 'home.tenant_automation_disable', 'home.tenant_automation_delete', 'tenant_device_remove', 'tenant_area_grants_replace', 'home.transfer', 'home.deregister', 'home_room_access_decision', 'support_ticket_close', 'support_access_approve', 'support_access_revoke', 'alexa_unlink', 'heating_sensitive_command', 'device_sensitive_command']);
 
 function platformPrivateKey(): crypto.KeyObject {
   const pem = String(process.env.DINODIA_APP_SESSION_PRIVATE_KEY ?? '').replaceAll('\\n', '\n');

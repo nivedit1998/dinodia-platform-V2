@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url';
 import dotenv from 'dotenv';
 import { PrismaClient } from '@prisma/client';
 import { assertMigrationDoesNotReferenceVolatileRuntimeTables, compareExistingTablePreservation } from './native_migration_preservation.mjs';
-import { migrationBundleIdentity, STAGE6_CUSTOMER_MIGRATIONS, STAGE8_COMMISSIONING_MIGRATION, STAGE9_DEREGISTRATION_GUARD_MIGRATION, STAGE10_ANALYTICS_MAINTENANCE_MIGRATION, STAGE10_PARTIAL_USAGE_COVERAGE_MIGRATION, unexpectedPendingMigrations } from './native_migration_bundle.mjs';
+import { migrationBundleIdentity, STAGE6_CUSTOMER_MIGRATIONS, STAGE8_COMMISSIONING_MIGRATION, STAGE9_DEREGISTRATION_GUARD_MIGRATION, STAGE10_ANALYTICS_MAINTENANCE_MIGRATION, STAGE10_PARTIAL_USAGE_COVERAGE_MIGRATION, STAGE11_AUTOMATION_ACTION_ORDER_MIGRATION, unexpectedPendingMigrations } from './native_migration_bundle.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const projectRef = 'fppzzesvukjbsfmxmfxe';
@@ -23,9 +23,10 @@ const stage6CustomerAuth = flags.has('--stage6-customer-auth');
 const stage8Commissioning = flags.has('--stage8-commissioning');
 const stage9DeregistrationGuard = flags.has('--stage9-deregistration-guard');
 const stage10Analytics = flags.has('--stage10-analytics') || flags.has('--stage10-analytics-maintenance');
+const stage11Automation = flags.has('--stage11-automation');
 const stage5Target = stage5Sync || stage5IncidentDeadlines || stage5IncidentSourceKind;
-const selectedStage = stage10Analytics ? 10 : stage9DeregistrationGuard ? 9 : stage8Commissioning ? 8 : stage6CustomerAuth ? 6 : stage5Target ? 5 : stage4LanTls ? 4 : 3;
-const migrationNames = stage10Analytics ? [STAGE10_ANALYTICS_MAINTENANCE_MIGRATION, STAGE10_PARTIAL_USAGE_COVERAGE_MIGRATION] : stage9DeregistrationGuard ? [STAGE9_DEREGISTRATION_GUARD_MIGRATION] : stage8Commissioning ? [STAGE8_COMMISSIONING_MIGRATION] : stage6CustomerAuth ? [...STAGE6_CUSTOMER_MIGRATIONS] : [stage5IncidentSourceKind
+const selectedStage = stage11Automation ? 11 : stage10Analytics ? 10 : stage9DeregistrationGuard ? 9 : stage8Commissioning ? 8 : stage6CustomerAuth ? 6 : stage5Target ? 5 : stage4LanTls ? 4 : 3;
+const migrationNames = stage11Automation ? [STAGE11_AUTOMATION_ACTION_ORDER_MIGRATION] : stage10Analytics ? [STAGE10_ANALYTICS_MAINTENANCE_MIGRATION, STAGE10_PARTIAL_USAGE_COVERAGE_MIGRATION] : stage9DeregistrationGuard ? [STAGE9_DEREGISTRATION_GUARD_MIGRATION] : stage8Commissioning ? [STAGE8_COMMISSIONING_MIGRATION] : stage6CustomerAuth ? [...STAGE6_CUSTOMER_MIGRATIONS] : [stage5IncidentSourceKind
   ? '20261005100000_stage5_incident_source_kind'
   : stage5IncidentDeadlines
   ? '20261005070000_stage5_hub_incident_deadline'
@@ -142,8 +143,8 @@ async function inventory(client, baselineColumns = undefined) {
 let client;
 try {
   const args = process.argv.slice(2);
-  if ([stage4LanTls, stage5Sync, stage5IncidentDeadlines, stage5IncidentSourceKind, stage6CustomerAuth, stage8Commissioning, stage9DeregistrationGuard, stage10Analytics, flags.has('--stage3-domain-schema')].filter(Boolean).length > 1) fail('select exactly one reviewed migration target');
-  if (!args.includes(confirm) || args.some((arg) => ![confirm, '--apply', '--confirm-additive-forward-migration', '--stage4-lan-tls', '--stage5-sync', '--stage5-incident-deadlines', '--stage5-incident-source-kind', '--stage6-customer-auth', '--stage8-commissioning', '--stage9-deregistration-guard', '--stage10-analytics', '--stage10-analytics-maintenance', '--stage3-domain-schema'].includes(arg) && !arg.startsWith('--expected-migration-sha256=') && !arg.startsWith('--expected-migrations-sha256='))) fail(`pass ${confirm}; apply additionally requires the explicit additive-forward-migration confirmation`);
+  if ([stage4LanTls, stage5Sync, stage5IncidentDeadlines, stage5IncidentSourceKind, stage6CustomerAuth, stage8Commissioning, stage9DeregistrationGuard, stage10Analytics, stage11Automation, flags.has('--stage3-domain-schema')].filter(Boolean).length > 1) fail('select exactly one reviewed migration target');
+  if (!args.includes(confirm) || args.some((arg) => ![confirm, '--apply', '--confirm-additive-forward-migration', '--stage4-lan-tls', '--stage5-sync', '--stage5-incident-deadlines', '--stage5-incident-source-kind', '--stage6-customer-auth', '--stage8-commissioning', '--stage9-deregistration-guard', '--stage10-analytics', '--stage10-analytics-maintenance', '--stage11-automation', '--stage3-domain-schema'].includes(arg) && !arg.startsWith('--expected-migration-sha256=') && !arg.startsWith('--expected-migrations-sha256='))) fail(`pass ${confirm}; apply additionally requires the explicit additive-forward-migration confirmation`);
   if (target.supabaseProjectRef !== projectRef) fail('checked-in V2 target manifest does not match the authorized project');
   if (envFile.SUPABASE_PROJECT_REF !== projectRef || envFile.VERCEL_PROJECT_ID !== target.vercelProjectId) fail('project-local environment identity does not match the authorized V2 Production target');
   const db = parseUrl(databaseUrl, 'DATABASE_URL');
@@ -190,7 +191,7 @@ try {
     mode: apply ? 'production-additive-apply' : 'read-only-production-preflight',
     targetProjectRef: projectRef,
     databaseHostClass: db.hostname === direct.hostname ? 'same-approved-host' : 'approved-pooler-and-direct-hosts',
-    migrationName: stage6CustomerAuth ? 'stage6-customer-auth-bundle' : stage10Analytics ? 'stage10-analytics-bundle' : migrationName,
+    migrationName: stage11Automation ? 'stage11-automation-action-order' : stage6CustomerAuth ? 'stage6-customer-auth-bundle' : stage10Analytics ? 'stage10-analytics-bundle' : migrationName,
     selectedMigrations: bundle.migrations,
     migrationBundleSha256: bundle.sha256,
     migrationSha256: migrationSha,
@@ -235,12 +236,21 @@ try {
     if (!checksumMatch) fail('Production migration ledger does not contain the exact reviewed migration checksum');
     const postflightViolations = Object.entries(after.dataPreflight).filter(([, count]) => Number(count) > 0).map(([name]) => name);
     if (postflightViolations.length) fail(`post-migration integrity checks found violations (${postflightViolations.join(', ')})`);
+    if (stage11Automation) {
+      const [invalidActionOrder, duplicateActionOrder, incorrectImpactMarker] = await Promise.all([
+        client.$queryRaw`SELECT count(*)::int AS count FROM "NativeAutomationAction" WHERE "sortOrder" IS NULL OR "sortOrder" < 0`,
+        client.$queryRaw`SELECT count(*)::int AS count FROM (SELECT "automationId", "sortOrder" FROM "NativeAutomationAction" GROUP BY "automationId", "sortOrder" HAVING count(*) > 1) duplicate_order`,
+        client.$queryRaw`SELECT count(*)::int AS count FROM "NativeAutomation" automation WHERE automation."propertyImpact" <> EXISTS (SELECT 1 FROM "NativeAutomationAction" action JOIN "NativeDevice" device ON device."id" = action."deviceId" WHERE action."automationId" = automation."id" AND device."managementClass" = 'PROPERTY_DEVICE')`,
+      ]);
+      const stage11Counts = [invalidActionOrder[0].count, duplicateActionOrder[0].count, incorrectImpactMarker[0].count].map(Number);
+      if (stage11Counts.some((count) => count !== 0)) fail(`Stage 11 migration postflight found invalid ordering/impact markers (${stage11Counts.join(',')})`);
+    }
     console.log(JSON.stringify({
       ok: true,
       stage: selectedStage,
       migrationApplied: true,
       targetProjectRef: projectRef,
-      migrationName: stage6CustomerAuth ? 'stage6-customer-auth-bundle' : stage10Analytics ? 'stage10-analytics-bundle' : migrationName,
+      migrationName: stage11Automation ? 'stage11-automation-action-order' : stage6CustomerAuth ? 'stage6-customer-auth-bundle' : stage10Analytics ? 'stage10-analytics-bundle' : migrationName,
       selectedMigrations: bundle.migrations,
       migrationBundleSha256: bundle.sha256,
       migrationSha256: migrationSha,

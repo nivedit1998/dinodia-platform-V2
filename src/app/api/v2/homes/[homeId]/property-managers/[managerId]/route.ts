@@ -9,6 +9,8 @@ import { cleanupCustomerAccountIfOrphaned } from '@/lib/customerRelationshipClea
 import { queueHomeownerAccessRemovalNotices } from '@/lib/homeownerAccessRemovalNotices';
 import { serializableTransaction } from '@/lib/serializableTransaction';
 import { sha256 } from '@/lib/stage1Crypto';
+import { retireNativeAutomations } from '@/lib/nativeAutomations/lifecycle';
+import { refreshNativeAutomationCloudRevision } from '@/lib/nativeAutomations/delivery';
 
 export const dynamic = 'force-dynamic';
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -120,7 +122,8 @@ export async function DELETE(request: Request, context: { params: Promise<{ home
       await tx.alexaNativeEndpointProjection.deleteMany({ where: { homeId, membershipId: managerId } });
       await tx.alexaNativeHomeScope.deleteMany({ where: { homeId, membershipId: managerId } });
       await tx.memberPreferenceDocument.deleteMany({ where: { membershipId: managerId } });
-      await tx.nativeAutomation.deleteMany({ where: { homeId, createdByMembershipId: managerId } });
+      await retireNativeAutomations(tx, { homeId, createdByMembershipId: managerId, now, actorId: principal.id, reason: 'property_manager_membership_removed' });
+      await refreshNativeAutomationCloudRevision(tx, { homeId, hubInstallationId: hub.id });
       const ownerMembership = await tx.homeMembership.findFirst({ where: { homeId, role: 'OWNER', status: 'ACTIVE' }, select: { id: true } });
       if (ownerMembership) {
         const assignment = await tx.memberPreferenceDocument.findUnique({ where: { membershipId_kind: { membershipId: ownerMembership.id, kind: 'MANAGER_NOTIFICATION_ASSIGNMENT' } },

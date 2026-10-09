@@ -163,7 +163,7 @@ export async function runNativeMaintenance(now = new Date()) {
 
   await isolate('retentionCleanup', async () => {
     const batchSize = 1000; const maxBatchesPerTable = 8;
-    let usageDeleted = 0; let temperatureDeleted = 0;
+    let usageDeleted = 0; let temperatureDeleted = 0; let automationTombstonesDeleted = 0;
     for (let batch = 0; batch < maxBatchesPerTable; batch += 1) {
       const deleted = await prisma.$executeRaw`
         WITH doomed AS (
@@ -184,11 +184,30 @@ export async function runNativeMaintenance(now = new Date()) {
       temperatureDeleted += Number(deleted);
       if (Number(deleted) < batchSize) break;
     }
+    // Retain only the minimal automation tombstone for 12 months, then purge
+    // it (and its bounded execution receipts) only after the current hub has
+    // acknowledged a full configuration which excludes the retired rule.
+    for (let batch = 0; batch < maxBatchesPerTable; batch += 1) {
+      const deleted = await prisma.$executeRaw`
+        WITH doomed AS (
+          SELECT automation."id" FROM "NativeAutomation" automation
+          JOIN "Home" home ON home."id" = automation."homeId"
+          JOIN "HubInstallation" hub ON hub."id" = home."activeHubInstallationId"
+          WHERE automation."status" = 'RETIRED' AND automation."purgeAt" <= ${now}
+            AND hub."acknowledgedCloudRevision" >= hub."cloudConfigurationRevision"
+          ORDER BY automation."purgeAt", automation."id"
+          LIMIT ${batchSize} FOR UPDATE OF automation SKIP LOCKED
+        )
+        DELETE FROM "NativeAutomation" automation USING doomed
+        WHERE automation."id" = doomed."id"`;
+      automationTombstonesDeleted += Number(deleted);
+      if (Number(deleted) < batchSize) break;
+    }
     const [usageRemainder, temperatureRemainder] = await Promise.all([
       prisma.nativeDeviceUsageBucket.findFirst({ where: { purgeAt: { lte: now } }, select: { id: true } }),
       prisma.nativeTemperatureSample.findFirst({ where: { purgeAt: { lte: now } }, select: { id: true } }),
     ]);
-    const checkpoint = { through: now.toISOString(), usageDeleted, temperatureDeleted,
+    const checkpoint = { through: now.toISOString(), usageDeleted, temperatureDeleted, automationTombstonesDeleted,
       backlogRemains: Boolean(usageRemainder || temperatureRemainder), batchLimitPerTable: batchSize * maxBatchesPerTable };
     result.retentionCleanup = checkpoint;
     (result as { taskCursors?: Record<string, unknown> }).taskCursors = {

@@ -68,11 +68,38 @@ export async function cleanupCustomerAccountIfOrphaned(
       data: { state: 'REVOKED', revokedAt: now } });
     cleanupPhase = 'purge_membership_invitations';
     await tx.membershipInvitation.deleteMany({ where: { inviterMembershipId: { in: removedMembershipIds } } });
-    cleanupPhase = 'purge_membership_owned_automations';
-    await tx.nativeAutomation.deleteMany({ where: { createdByMembershipId: { in: removedMembershipIds } } });
+    // Definitions must already have been retired by their membership/grant
+    // owner. Preserve only minimal bounded tombstones; the optional creator
+    // relation becomes NULL when the account cascade removes memberships.
+    cleanupPhase = 'preserve_retired_automation_receipts';
     cleanupPhase = 'detach_membership_commissioning_history';
     await tx.nativeCommissioningSession.updateMany({ where: { requestingMembershipId: { in: removedMembershipIds } },
       data: { requestingMembershipId: null } });
+    // The Stage 3 composite creator/Home foreign key remains RESTRICT even
+    // after the Stage 11 single-column relation became nullable/SET NULL.
+    // Keep only retired minimal automation receipts, detach their former
+    // membership explicitly, and refuse account deletion if any executable
+    // definition or child body remains. This preserves the bounded receipt
+    // without retaining private rule content or violating that composite FK.
+    cleanupPhase = 'validate_retired_automation_receipts';
+    const automationReceipts = await tx.nativeAutomation.findMany({
+      where: { createdByMembershipId: { in: removedMembershipIds } },
+      select: { id: true, status: true, _count: { select: { triggers: true, actions: true } } },
+    });
+    const minimalReceipts = automationReceipts.filter((row) => row.status === 'RETIRED'
+      && row._count.triggers === 0 && row._count.actions === 0);
+    if (minimalReceipts.length !== automationReceipts.length) {
+      throw new Error('Cannot remove an orphaned account while an automation definition or child action remains');
+    }
+    if (minimalReceipts.length) {
+      cleanupPhase = 'detach_retired_automation_receipts';
+      const detached = await tx.nativeAutomation.updateMany({
+        where: { id: { in: minimalReceipts.map(({ id }) => id) }, createdByMembershipId: { in: removedMembershipIds }, status: 'RETIRED',
+          triggers: { none: {} }, actions: { none: {} } },
+        data: { createdByMembershipId: null },
+      });
+      if (detached.count !== minimalReceipts.length) throw new Error('Retired automation receipt changed during account cleanup');
+    }
   }
   cleanupPhase = 'delete_orphaned_customer_account';
   await tx.customerAccount.delete({ where: { id: accountId } });

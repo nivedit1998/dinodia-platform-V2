@@ -239,6 +239,15 @@ test('temperature samples retain source freshness and automation outcomes are ag
   };
   outcome.events[0].aggregateId = outcome.events[0].payload.occurrenceId;
   assert.equal(validateHubSyncEnvelope(outcome), true);
+  for (const offsetOccurrenceId of [
+    'automation-55555555:3:2026-10-25:01:30:+0100',
+    'automation-55555555:3:2026-10-25:01:30:-0100',
+  ]) {
+    const offsetOutcome = structuredClone(outcome);
+    offsetOutcome.events[0].aggregateId = offsetOccurrenceId;
+    offsetOutcome.events[0].payload.occurrenceId = offsetOccurrenceId;
+    assert.equal(validateHubSyncEnvelope(offsetOutcome), true, `signed DST occurrence offset ${offsetOccurrenceId.slice(-5)} is valid`);
+  }
   const leaked = structuredClone(outcome);
   leaked.events[0].payload.actionValue = { private: true };
   assert.equal(validateHubSyncEnvelope(leaked), false);

@@ -87,6 +87,16 @@ const stage10CandidateFiles = new Set([
   'src/lib/nativePreferences.ts', 'test/native_analytics.test.mjs',
 ]);
 
+// Stage 11 extends the existing native configuration and actual tenant route
+// boundary. Keep these reviewed runtime owners explicit in the legacy manifest.
+const stage11CandidateFiles = new Set([
+  'src/lib/hubCloudConfiguration.ts', 'src/lib/nativeAreaAccess.ts', 'src/lib/nativeOperations.ts',
+  'src/lib/installationRequestDelivery.ts', 'src/lib/apnsDelivery.ts', 'src/lib/homeownerAccessRemovalNotices.ts',
+  'src/lib/customerRelationshipCleanup.ts', 'src/app/api/v2/homes/[homeId]/tenant/access/route.ts',
+  'src/app/api/v2/homes/[homeId]/tenants/[tenantId]/route.ts',
+  'src/app/api/v2/homes/[homeId]/property-managers/[managerId]/route.ts',
+]);
+
 const addedFiles = [
   /^contracts(?:\/|$)/,
   /^public\/\.well-known(?:\/|$)/,
@@ -94,14 +104,17 @@ const addedFiles = [
   /^(SECURITY_CHECKLIST|phase8-acceptance)\.md$/,
   /^docs\/(FOUNDATION_INTENDED_FILE_MANIFEST|NATIVE_V2_SCHEMA_OWNERSHIP|native-schema-classification)\.md$/,
   /^prisma\/migrations\/\d+_[^/]+\//,
+  /^prisma\/migrations\/migration_lock\.toml$/,
   /^prisma\/stage3_invariants\.sql$/,
   /^scripts\/(audit_native_schema|check_aasa_runtime|check_clean_clone|check_dinodia_contracts|check_foundation|check_foundation_manifest|check_stage1_security|dinodia_stage2_decisions|enrol_manufactured_hub|foundation_db_checks|foundation_invariants|local_database|native_migration_bundle|native_migration_preservation|prepare_stage3_migration|read_only_production_inventory|reset_rc_database|schema_fingerprint|stage1_db_checks|stage1_integration_harness|stage3_backfill_checks|stage3_domain_checks|sync_dinodia_contract_fixtures|verify_native_schema|verify_native_v2_migration_target|verify_native_v2_upgrade_path)\.mjs$/,
   /^scripts\/stage1_loopback_guard\.mjs$/,
   /^src\/app\/api\/(health|readiness|public)(?:\/|$)/,
+  /^src\/app\/api\/automations(?:\/|$)/,
   /^src\/app\/api\/(company|cron|hub-agent|installer|internal|v2)(?:\/|$)/,
   /^src\/app\/(app|company|customer|installer)(?:\/|$)/,
   /^src\/lib\/(apnsDelivery|installationRequestDelivery|nativeInstallationRequests|buildIdentity|customerAuthChallenges|customerAuthEmail|customerHomeClaim|customerInvitation|customerInvitationEmail|customerInvitationIssue|customerInvitationRegistration|customerPendingRelationships|customerPolicy|customerPolicyConfig|customerRoomAccess|customerSelectedHome|foundation|foundationContracts|initialCxoInvitation|manufacturingEnrollment|mobileCustomerSession|mobileSessionHttp|publicSupport|runtimeDatabaseUrl|runtimeTarget|hubOperatorCredentials|idempotentOperatorMutation|operatorRateLimitPolicy|nativeOperations|nativeHomeContext|nativeInventory|nativeAreaAccess|nativeDisplayNames|nativePresentation|nativePreferences|nativeHomeDocuments|nativeSourceAliases|nativeSupportTickets|hubReplacementReconciliation|exceptionalOwnershipTransfer|homeDeregistration|homeDeregistrationCleanup|homeTransferIdentity|nativeSchemaValidation|nativeHubProvisioning|nativeInstallationSyncMode|ownershipTransfer|stage1ClaimResolver|passwords|rateLimit|serializableTransaction|sensitiveOperationStepUp|stepUpProofCodec|stage1Auth|stage1ClaimContract|stage1Crypto|stage1HubAuth|stage1Operator|supportNotifications|internalOperatorDaySession|lanEndpoint|hubCloudConfiguration|hubSyncEnvelope|hubSyncIngestion|tenantDeviceDashboard|tenantDeviceMutations)\.(mjs|ts)$/,
   /^src\/lib\/contracts(?:\/|$)/,
+  /^src\/lib\/nativeAutomations(?:\/|$)/,
   /^test(?:\/|$)/,
   /^vercel\.json$/,
 ];
@@ -124,7 +137,7 @@ const classified = entries.map(({ status, file }) => {
     return { status, file, classification: 'INTENTIONAL_DELETE' };
   }
   if (status === ' M' || status === 'M ' || status === 'MM') {
-    if (!modifiedFiles.has(file) && !stage6CandidateFiles.has(file) && !stage10CandidateFiles.has(file)) throw new Error(`unclassified modification: ${file}`);
+    if (!modifiedFiles.has(file) && !stage6CandidateFiles.has(file) && !stage10CandidateFiles.has(file) && !stage11CandidateFiles.has(file)) throw new Error(`unclassified modification: ${file}`);
     return { status, file, classification: 'KEEP_MODIFIED' };
   }
   if (status === '??' || status === 'A ' || status === 'AM') {

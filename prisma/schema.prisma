@@ -1893,7 +1893,7 @@ model NativeTemperatureSample {
 model NativeAutomation {
   id                    String                 @id @default(uuid()) @db.Uuid
   homeId                String                 @db.Uuid
-  createdByMembershipId String                 @db.Uuid
+  createdByMembershipId String?                @db.Uuid
   name                  String                 @db.VarChar(120)
   status                NativeAutomationStatus @default(DRAFT)
   revision              Int                    @default(1)
@@ -1902,11 +1902,12 @@ model NativeAutomation {
   enabledAt             DateTime?
   retiredAt             DateTime?
   purgeAt               DateTime?
+  propertyImpact        Boolean                @default(false)
   createdAt             DateTime               @default(now())
   updatedAt             DateTime               @updatedAt
 
   home       Home                        @relation(fields: [homeId], references: [id], onDelete: Cascade)
-  createdBy  HomeMembership              @relation(fields: [createdByMembershipId], references: [id], onDelete: Restrict)
+  createdBy  HomeMembership?             @relation(fields: [createdByMembershipId], references: [id], onDelete: SetNull)
   triggers   NativeAutomationTrigger[]
   actions    NativeAutomationAction[]
   executions NativeAutomationExecution[]
@@ -1937,6 +1938,7 @@ model NativeAutomationAction {
   deviceId           String    @db.Uuid
   areaId             String    @db.Uuid
   controlId          String    @db.VarChar(160)
+  sortOrder          Int       @default(0)
   descriptorRevision Int
   actionValue        Json
   needsAttention     Boolean   @default(false)
@@ -1950,6 +1952,7 @@ model NativeAutomationAction {
 
   @@index([homeId, deviceId, controlId])
   @@index([automationId, needsAttention])
+  @@index([automationId, sortOrder])
 }
 
 model NativeAutomationExecution {

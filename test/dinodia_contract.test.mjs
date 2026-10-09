@@ -534,6 +534,13 @@ test('active Native V2 security routes validate their canonical request and resp
   assert.equal(native.validateStepUpChallengeRequest(challenge), true);
   assert.equal(native.validateStepUpChallengeRequest({ ...challenge, targetIds: ['ticket:1', 'ticket:1'] }), false);
   assert.equal(native.validateStepUpChallengeRequest({ ...challenge, extraAuthority: true }), false);
+  for (const operationKind of ['home.tenant_automation_disable', 'home.tenant_automation_delete']) {
+    const automationIntervention = { operationKind, targetIds: ['123e4567-e89b-42d3-a456-426614174000'],
+      value: { action: operationKind.endsWith('_disable') ? 'disable' : 'delete', expectedAutomationRevision: 1,
+        expectedManagementRevision: 1, reason: 'safety' } };
+    schema('stepUpChallengeRequest', automationIntervention);
+    assert.equal(native.validateStepUpChallengeRequest(automationIntervention), true, `${operationKind} must be supported by the shared request validator`);
+  }
   const descriptor = { version: 1, serial: 'serial:1', identityGeneration: 2, actorId: 'account:1', customerSessionId: 'session:1', trustedDeviceId: 'trusted:1', homeId: 'home:1', membershipId: 'membership:1', hubInstallId: 'hub:1', operationKind: 'device_sensitive_command', targetIds: ['device:1'], controlId: 'control:1', descriptorRevision: 5, descriptorDigest: null, operationDigest: 'a'.repeat(64), nonce: 'n'.repeat(24), issuedAt: 1790000000000, hubSignature: 's'.repeat(64) };
   const descriptorChallenge = { operationKind: 'device_sensitive_command', targetIds: ['device:1'], value: true, descriptorAttestation: descriptor };
   schema('stepUpChallengeRequest', descriptorChallenge);

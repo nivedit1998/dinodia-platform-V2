@@ -2,6 +2,9 @@ import { createHash } from 'node:crypto';
 import type { Prisma } from '@prisma/client';
 import { Stage1AuthError } from './stage1Auth';
 import type { HubSyncEvent } from './hubSyncEnvelope';
+import { queueAutomationFailureNotices } from './nativeAutomations/failureNotifications';
+import { suspendAutomationsForDeviceChange } from './nativeAutomations/revalidation';
+import { retireNativeAutomations } from './nativeAutomations/lifecycle';
 
 function invalid(code: string, message: string): never {
   throw new Stage1AuthError(409, code, message);
@@ -82,6 +85,7 @@ export async function applyHubSyncEvent(tx: Prisma.TransactionClient, input: {
     const osAreaId = String(payload.osAreaId);
     const area = await tx.area.findUnique({ where: { homeId_osAreaId: { homeId, osAreaId } }, select: { id: true, status: true } });
     if (!area || area.status === 'RETIRED') return;
+    await retireNativeAutomations(tx, { homeId, losingAreaIds: [area.id], now, actorId: null, reason: 'original_area_retired' });
     await tx.area.update({ where: { id: area.id }, data: { status: 'RETIRED', retiredAt: strictDate(payload.removedAt, now), revision: { increment: 1 } } });
     await tx.deviceAreaAssignment.updateMany({ where: { homeId, areaId: area.id, validUntil: null }, data: { validUntil: now } });
     await tx.areaSourceAlias.updateMany({ where: { homeId, areaId: area.id, retiredAt: null }, data: { retiredAt: now } });
@@ -111,6 +115,12 @@ export async function applyHubSyncEvent(tx: Prisma.TransactionClient, input: {
       areaId = area.id;
     }
     const observedAt = payload.observedAt === null ? null : strictDate(payload.observedAt, now);
+    const descriptorChanged = descriptorRevision !== device.descriptorRevision || descriptorDigest !== String(device.descriptorDigest || '');
+    const currentAreaIds = device.assignments.map((assignment) => assignment.areaId).sort();
+    const nextAreaIds = areaId === null ? [] : [areaId];
+    const areaChanged = currentAreaIds.length !== nextAreaIds.length || currentAreaIds.some((id, index) => id !== nextAreaIds[index]);
+    if (descriptorChanged || areaChanged) await suspendAutomationsForDeviceChange(tx, { homeId, deviceId: device.id, now,
+      reason: descriptorChanged ? 'descriptor_changed' : 'area_changed' });
     await tx.nativeDevice.update({ where: { id: device.id }, data: {
       originalName: String(payload.name), technicalLabel: String(payload.technicalLabel), protocol: String(payload.protocol),
       deviceType: String(payload.deviceType), descriptorRevision, descriptorDigest,
@@ -131,6 +141,7 @@ export async function applyHubSyncEvent(tx: Prisma.TransactionClient, input: {
     const device = await tx.nativeDevice.findUnique({ where: { hubInstallationId_osDeviceId: { hubInstallationId, osDeviceId: String(payload.osDeviceId) } }, select: { id: true, homeId: true, lifecycle: true } });
     if (!device || device.homeId !== homeId) return;
     if (device.lifecycle === 'REMOVED') return;
+    await suspendAutomationsForDeviceChange(tx, { homeId, deviceId: device.id, now, reason: 'device_removed' });
     await tx.nativeDevice.update({ where: { id: device.id }, data: { lifecycle: 'REMOVED', retiredAt: strictDate(payload.removedAt, now), cleanupDeadlineAt: now } });
     await tx.deviceAreaAssignment.updateMany({ where: { deviceId: device.id, validUntil: null }, data: { validUntil: now } });
     return;
@@ -181,6 +192,7 @@ export async function applyHubSyncEvent(tx: Prisma.TransactionClient, input: {
     const priorControls = Array.isArray(priorCatalog.controls) ? priorCatalog.controls as Array<Record<string, unknown>> : [];
     const controls = priorControls.filter((control) => !removed.has(String(control.controlId)));
     if (Number(priorCatalog.revision) === revision && controls.length === priorControls.length) return;
+    await suspendAutomationsForDeviceChange(tx, { homeId, deviceId: device.id, now, reason: 'control_removed', controlIds: [...removed] });
     await tx.nativeDevice.update({ where: { id: device.id }, data: {
       capabilitySummary: { ...summary, controlCatalog: { revision, descriptorDigest: payload.descriptorDigest, controls } } as Prisma.InputJsonValue,
     } });
@@ -320,11 +332,11 @@ export async function applyHubSyncEvent(tx: Prisma.TransactionClient, input: {
   }
 
   if (event.type === 'automation.outcome') {
-    const automation = await tx.nativeAutomation.findUnique({ where: { id: String(payload.automationId) }, select: { id: true, homeId: true, revision: true } });
+    const automation = await tx.nativeAutomation.findUnique({ where: { id: String(payload.automationId) }, select: { id: true, homeId: true, revision: true, createdByMembershipId: true } });
     if (!automation || automation.homeId !== homeId) invalid('hub_sync_automation_invalid', 'The automation outcome does not belong to this enrolled home');
     if (Number(payload.automationRevision) > automation.revision) invalid('hub_sync_automation_revision_invalid', 'The automation outcome is ahead of the current Platform definition');
     const idempotencyKey = `hub:${hubInstallationId}:${String(payload.occurrenceId)}`;
-    const status = payload.status === 'succeeded' ? 'SUCCEEDED' : payload.status === 'partial' ? 'PARTIAL' : payload.status === 'interrupted' ? 'INTERRUPTED' : 'FAILED';
+    const status = payload.status === 'succeeded' ? 'SUCCEEDED' : payload.status === 'partial' ? 'PARTIAL' : payload.status === 'interrupted' ? 'INTERRUPTED' : payload.status === 'skipped' ? 'SKIPPED' : 'FAILED';
     const safeOutcome = { actionCount: Number(payload.actionCount), actionStatuses: payload.actionStatuses } as Prisma.InputJsonValue;
     const existing = await tx.nativeAutomationExecution.findUnique({ where: { idempotencyKey }, select: { automationId: true, homeId: true, status: true, safeOutcome: true, startedAt: true, completedAt: true } });
     if (existing) {
@@ -336,11 +348,15 @@ export async function applyHubSyncEvent(tx: Prisma.TransactionClient, input: {
       }
       return;
     }
-    await tx.nativeAutomationExecution.create({ data: {
+    const execution = await tx.nativeAutomationExecution.create({ data: {
       automationId: automation.id, homeId, idempotencyKey, status,
       startedAt: strictDate(payload.startedAt, now), completedAt: strictDate(payload.completedAt, now), safeOutcome,
       purgeAt: new Date(now.getTime() + 90 * 24 * 60 * 60 * 1000),
     } });
+    if (['PARTIAL', 'FAILED', 'SKIPPED', 'INTERRUPTED'].includes(execution.status)) {
+      await queueAutomationFailureNotices(tx, { homeId, automationId: automation.id,
+        membershipId: automation.createdByMembershipId, occurrenceKey: idempotencyKey, now });
+    }
     return;
   }
 

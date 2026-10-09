@@ -8,6 +8,8 @@ import { Stage1AuthError } from '@/lib/stage1Auth';
 import { operationDigest, targetDigest } from '@/lib/sensitiveOperationStepUp';
 import { sha256 } from '@/lib/stage1Crypto';
 import { readTenantDeviceDashboard } from '@/lib/tenantDeviceDashboard';
+import { retireNativeAutomations } from '@/lib/nativeAutomations/lifecycle';
+import { refreshNativeAutomationCloudRevision } from '@/lib/nativeAutomations/delivery';
 
 export const dynamic = 'force-dynamic';
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -98,9 +100,10 @@ export async function POST(request: Request, context: { params: Promise<{ homeId
       }
       if (actionRows.length) {
         const automationIds = [...new Set(actionRows.map((row) => row.automationId))];
-        await tx.nativeAutomationAction.deleteMany({ where: { deviceId: device.id, homeId } });
-        await tx.nativeAutomation.updateMany({ where: { id: { in: automationIds }, homeId, status: { not: 'RETIRED' } },
-          data: { status: 'NEEDS_ATTENTION', revision: { increment: 1 } } });
+        // Removing an owned target must not trim a multi-action rule into a
+        // different schedule or leave an editable fragment. Retire each whole
+        // affected definition and strip its executable children atomically.
+        await retireNativeAutomations(tx, { homeId, automationIds, now, actorId: selected.id, reason: 'tenant_device_removed' });
       }
       await Promise.all([
         tx.nativeDeviceUsageBucket.deleteMany({ where: { deviceId: device.id, homeId } }),
@@ -117,6 +120,12 @@ export async function POST(request: Request, context: { params: Promise<{ homeId
         status: 'CLOSED', closedAt: now, selectedMembershipId: null, description: '[Device removed by its tenant owner]', title: null,
         areaId: null, deviceId: null, safeDiagnostics: Prisma.DbNull, customerResolution: null, revision: { increment: 1 },
       } });
+
+      // The existing Stage 5 full-home configuration is also the delivery
+      // channel for private-device decommission and automation tombstones.
+      // Publish its new revision in this same transaction so the UI can
+      // distinguish cloud removal from hub-enforced removal.
+      await refreshNativeAutomationCloudRevision(tx, { homeId, hubInstallationId: selected.hubInstallationId });
 
       const receipt = { schemaVersion: 'dinodia.v1', ok: true, homeId, deviceId,
         osDeviceId: device.osDeviceId, state: 'REMOVAL_PENDING', inventoryRevision: device.inventoryRevision + 1,
