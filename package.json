@@ -39,6 +39,7 @@
     "stage9:migration:target": "node scripts/verify_native_v2_migration_target.mjs --stage9-deregistration-guard",
     "stage10:migration:target": "node scripts/verify_native_v2_migration_target.mjs --stage10-analytics",
     "stage11:migration:target": "node scripts/verify_native_v2_migration_target.mjs --stage11-automation",
+    "stage12:migration:target": "node scripts/verify_native_v2_migration_target.mjs --stage12-alexa",
     "evidence:production-read-only": "node scripts/read_only_production_inventory.mjs",
     "foundation:target": "node scripts/assert_v2_target.mjs --mode local",
     "db:validate-target": "node scripts/assert_v2_target.mjs --mode \"${V2_ENVIRONMENT:-local}\"",

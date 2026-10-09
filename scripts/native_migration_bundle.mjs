@@ -14,6 +14,7 @@ export const STAGE9_DEREGISTRATION_GUARD_MIGRATION = '20261008100000_stage9_dere
 export const STAGE10_ANALYTICS_MAINTENANCE_MIGRATION = '20261008130000_stage10_analytics_maintenance_tasks';
 export const STAGE10_PARTIAL_USAGE_COVERAGE_MIGRATION = '20261008150000_stage10_partial_usage_coverage';
 export const STAGE11_AUTOMATION_ACTION_ORDER_MIGRATION = '20261009100000_stage11_automation_action_order';
+export const STAGE12_ALEXA_OAUTH_SCOPE_MIGRATION = '20261009110000_stage12_alexa_oauth_scope';
 
 export function migrationBundleIdentity(names, checksums) {
   const migrations = [...new Set(names)].sort().map((name) => {

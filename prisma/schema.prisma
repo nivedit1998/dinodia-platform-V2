@@ -412,6 +412,8 @@ model CustomerAccount {
   homeClaimReferences    HomeClaimReference[]
   supportNotifications   SupportAccessNotification[]
   alexaNativeLinks       AlexaNativeLink[]
+  alexaOAuthCodes        AlexaOAuthAuthorizationCode[]
+  alexaConnectIntents    AlexaNativeConnectIntent[]
   notificationDeliveries NativeNotificationDeliveryReceipt[]
 
   @@index([status])
@@ -615,6 +617,7 @@ model Home {
   temperatureSamples         NativeTemperatureSample[]
   automations                NativeAutomation[]
   alexaHomeScopes            AlexaNativeHomeScope[]
+  alexaConnectIntents        AlexaNativeConnectIntent[]
   notificationDeliveries     NativeNotificationDeliveryReceipt[]
   outageIncidents            NativeDeviceOutageIncident[]
   supportTimeline            NativeSupportTicketTimeline[]
@@ -654,6 +657,7 @@ model HomeMembership {
   commissioningSessions  NativeCommissioningSession[]
   createdAutomations     NativeAutomation[]
   alexaHomeScopes        AlexaNativeHomeScope[]
+  alexaConnectIntents    AlexaNativeConnectIntent[]
   notificationDeliveries NativeNotificationDeliveryReceipt[]
   alexaEndpoints         AlexaNativeEndpointProjection[]
   tenantDeviceRecoveries NativeTenantDeviceRecovery[]
@@ -690,6 +694,8 @@ model Area {
   temperatureSamples        NativeTemperatureSample[]
   automationActions         NativeAutomationAction[]
   alexaEndpoints            AlexaNativeEndpointProjection[]
+  alexaAreaSelections       AlexaNativeAreaSelection[]
+  alexaConnectIntentAreas   AlexaNativeConnectIntentArea[]
   roomAccessEmailAttempts   RoomAccessEmailAttempt[]
 
   @@unique([homeId, osAreaId])
@@ -1977,11 +1983,12 @@ model AlexaNativeLink {
   id                     String                @id @default(uuid()) @db.Uuid
   customerAccountId      String                @db.Uuid
   providerSubjectHash    String                @unique @db.VarChar(128)
-  accessTokenCiphertext  String                @db.Text
-  refreshTokenCiphertext String                @db.Text
+  /// Alexa Event Gateway tokens are absent until the skill receives AcceptGrant.
+  accessTokenCiphertext  String?               @db.Text
+  refreshTokenCiphertext String?               @db.Text
   encryptionKeyVersion   Int
   status                 AlexaNativeLinkStatus @default(ACTIVE)
-  accessTokenExpiresAt   DateTime
+  accessTokenExpiresAt   DateTime?
   revokedAt              DateTime?
   revision               Int                   @default(1)
   createdAt              DateTime              @default(now())
@@ -1991,6 +1998,7 @@ model AlexaNativeLink {
   homeScopes      AlexaNativeHomeScope[]
   endpoints       AlexaNativeEndpointProjection[]
   directives      AlexaNativeDirectiveReceipt[]
+  oauthFamilies   AlexaOAuthTokenFamily[]
 
   @@index([customerAccountId, status])
 }
@@ -2000,18 +2008,70 @@ model AlexaNativeHomeScope {
   linkId             String    @db.Uuid
   homeId             String    @db.Uuid
   membershipId       String    @db.Uuid
+  /// Deprecated compatibility cache only. Authorization uses AlexaNativeAreaSelection rows.
   areaIds            Json
   exposureGeneration Int       @default(1)
   revokedAt          DateTime?
   createdAt          DateTime  @default(now())
   updatedAt          DateTime  @updatedAt
 
-  link       AlexaNativeLink @relation(fields: [linkId], references: [id], onDelete: Cascade)
-  home       Home            @relation(fields: [homeId], references: [id], onDelete: Cascade)
-  membership HomeMembership  @relation(fields: [membershipId], references: [id], onDelete: Cascade)
+  link           AlexaNativeLink            @relation(fields: [linkId], references: [id], onDelete: Cascade)
+  home           Home                       @relation(fields: [homeId], references: [id], onDelete: Cascade)
+  membership     HomeMembership             @relation(fields: [membershipId], references: [id], onDelete: Cascade)
+  areaSelections AlexaNativeAreaSelection[]
 
   @@unique([linkId, membershipId])
   @@index([homeId, membershipId, revokedAt])
+}
+
+model AlexaNativeAreaSelection {
+  id                 String    @id @default(uuid()) @db.Uuid
+  homeScopeId        String    @db.Uuid
+  areaId             String    @db.Uuid
+  exposureGeneration Int       @default(1)
+  revokedAt          DateTime?
+  createdAt          DateTime  @default(now())
+  updatedAt          DateTime  @updatedAt
+
+  homeScope AlexaNativeHomeScope @relation(fields: [homeScopeId], references: [id], onDelete: Cascade)
+  area      Area                 @relation(fields: [areaId], references: [id], onDelete: Cascade)
+
+  @@unique([homeScopeId, areaId, exposureGeneration])
+  @@index([homeScopeId, revokedAt])
+  @@index([areaId, revokedAt])
+}
+
+model AlexaNativeConnectIntent {
+  id                String    @id @default(uuid()) @db.Uuid
+  customerAccountId String    @db.Uuid
+  homeId            String    @db.Uuid
+  membershipId      String    @db.Uuid
+  intentHash        String    @unique @db.VarChar(64)
+  expiresAt         DateTime
+  consumedAt        DateTime?
+  revokedAt         DateTime?
+  createdAt         DateTime  @default(now())
+
+  customerAccount    CustomerAccount                     @relation(fields: [customerAccountId], references: [id], onDelete: Cascade)
+  home               Home                                @relation(fields: [homeId], references: [id], onDelete: Cascade)
+  membership         HomeMembership                      @relation(fields: [membershipId], references: [id], onDelete: Cascade)
+  areas              AlexaNativeConnectIntentArea[]
+  authorizationCodes AlexaOAuthAuthorizationCodeIntent[]
+
+  @@index([customerAccountId, expiresAt, consumedAt])
+  @@index([homeId, membershipId, expiresAt])
+}
+
+model AlexaNativeConnectIntentArea {
+  intentId  String   @db.Uuid
+  areaId    String   @db.Uuid
+  createdAt DateTime @default(now())
+
+  intent AlexaNativeConnectIntent @relation(fields: [intentId], references: [id], onDelete: Cascade)
+  area   Area                     @relation(fields: [areaId], references: [id], onDelete: Cascade)
+
+  @@id([intentId, areaId])
+  @@index([areaId])
 }
 
 model AlexaNativeEndpointProjection {
@@ -2044,6 +2104,8 @@ model AlexaNativeDirectiveReceipt {
   id             String   @id @default(uuid()) @db.Uuid
   linkId         String   @db.Uuid
   requestId      String   @unique @db.VarChar(180)
+  requestDigest  String?  @db.VarChar(64)
+  commandId      String?  @db.VarChar(160)
   eventTokenHash String?  @db.VarChar(128)
   responseStatus Int
   responseDigest String?  @db.VarChar(128)
@@ -2053,6 +2115,81 @@ model AlexaNativeDirectiveReceipt {
   link AlexaNativeLink @relation(fields: [linkId], references: [id], onDelete: Cascade)
 
   @@index([linkId, expiresAt])
+}
+
+model AlexaOAuthAuthorizationCode {
+  id                  String    @id @default(uuid()) @db.Uuid
+  customerAccountId   String    @db.Uuid
+  clientId            String    @db.VarChar(160)
+  redirectUri         String    @db.VarChar(500)
+  codeChallenge       String    @db.VarChar(128)
+  codeChallengeMethod String    @default("S256") @db.VarChar(8)
+  codeHash            String    @unique @db.VarChar(128)
+  expiresAt           DateTime
+  consumedAt          DateTime?
+  createdAt           DateTime  @default(now())
+
+  customerAccount CustomerAccount                     @relation(fields: [customerAccountId], references: [id], onDelete: Cascade)
+  intents         AlexaOAuthAuthorizationCodeIntent[]
+
+  @@index([customerAccountId, expiresAt])
+  @@index([expiresAt, consumedAt])
+}
+
+model AlexaOAuthAuthorizationCodeIntent {
+  authorizationCodeId String   @db.Uuid
+  intentId            String   @db.Uuid
+  createdAt           DateTime @default(now())
+
+  authorizationCode AlexaOAuthAuthorizationCode @relation(fields: [authorizationCodeId], references: [id], onDelete: Cascade)
+  intent            AlexaNativeConnectIntent    @relation(fields: [intentId], references: [id], onDelete: Cascade)
+
+  @@id([authorizationCodeId, intentId])
+  @@index([intentId])
+}
+
+model AlexaOAuthTokenFamily {
+  id                  String    @id @default(uuid()) @db.Uuid
+  linkId              String    @db.Uuid
+  createdAt           DateTime  @default(now())
+  absoluteExpiresAt   DateTime
+  inactivityExpiresAt DateTime
+  lastUsedAt          DateTime  @default(now())
+  revokedAt           DateTime?
+  revokeReason        String?   @db.VarChar(80)
+
+  link          AlexaNativeLink          @relation(fields: [linkId], references: [id], onDelete: Cascade)
+  accessTokens  AlexaOAuthAccessToken[]
+  refreshTokens AlexaOAuthRefreshToken[]
+
+  @@index([linkId, revokedAt, absoluteExpiresAt])
+}
+
+model AlexaOAuthAccessToken {
+  id        String    @id @default(uuid()) @db.Uuid
+  familyId  String    @db.Uuid
+  tokenHash String    @unique @db.VarChar(128)
+  expiresAt DateTime
+  revokedAt DateTime?
+  createdAt DateTime  @default(now())
+
+  family AlexaOAuthTokenFamily @relation(fields: [familyId], references: [id], onDelete: Cascade)
+
+  @@index([familyId, expiresAt, revokedAt])
+}
+
+model AlexaOAuthRefreshToken {
+  id        String    @id @default(uuid()) @db.Uuid
+  familyId  String    @db.Uuid
+  tokenHash String    @unique @db.VarChar(128)
+  expiresAt DateTime
+  usedAt    DateTime?
+  revokedAt DateTime?
+  createdAt DateTime  @default(now())
+
+  family AlexaOAuthTokenFamily @relation(fields: [familyId], references: [id], onDelete: Cascade)
+
+  @@index([familyId, expiresAt, usedAt, revokedAt])
 }
 
 model NativeBackgroundTaskState {

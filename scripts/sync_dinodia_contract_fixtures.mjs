@@ -31,6 +31,7 @@ const iosPrototypeFixtures = path.join(iosPrototype, 'DinodiaV1/fixtures');
 fs.mkdirSync(iosPrototypeFixtures, { recursive: true });
 for (const fixture of [
   'account-session-two-homes.json',
+  'alexa-discovery-projection.json',
   'customer-hub-session-test-only.json',
   'account-relationship-lifecycle.json',
   'automation-stage11-live.json',
@@ -74,6 +75,18 @@ for (const fixture of [
   'updater-maintenance-status-unprovisioned.json',
   'invalid/updater-maintenance-status-exposes-authority.json',
 ]) {
+  const target = path.join(iosPrototypeFixtures, fixture);
+  fs.mkdirSync(path.dirname(target), { recursive: true });
+  fs.copyFileSync(path.join(source, 'fixtures', fixture), target);
+}
+// Keep every indexed DEBUG screen fixture in lock-step with the contract
+// index. A hand-maintained subset silently leaves the app bundle stale when a
+// consumer adds a legitimate screen fixture.
+const debugScreenIndex = JSON.parse(fs.readFileSync(path.join(source, 'fixtures/index.json'), 'utf8'));
+const debugScreenFixturePaths = [...new Set(Object.values(debugScreenIndex.screenFixtures ?? {}).flat())]
+  .filter((fixture) => typeof fixture === 'string' && fixture.startsWith('fixtures/') && !fixture.split('/').includes('..'))
+  .map((fixture) => fixture.slice('fixtures/'.length));
+for (const fixture of debugScreenFixturePaths) {
   const target = path.join(iosPrototypeFixtures, fixture);
   fs.mkdirSync(path.dirname(target), { recursive: true });
   fs.copyFileSync(path.join(source, 'fixtures', fixture), target);

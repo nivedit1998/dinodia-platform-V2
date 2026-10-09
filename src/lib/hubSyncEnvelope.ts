@@ -121,6 +121,29 @@ function validEvent(event: unknown): event is HubSyncEvent {
       return (exactKeys(payload, ['osDeviceId', 'removedAt']) || exactKeys(payload, ['osDeviceId', 'removedAt', 'replacementOsDeviceId']))
         && boundedText(payload.osDeviceId, 160) && validUtc(payload.removedAt)
         && (payload.replacementOsDeviceId === undefined || boundedText(payload.replacementOsDeviceId, 160));
+    case 'device.state': {
+      const stateKeys = ['osDeviceId', 'osAreaId', 'controlId', 'sourceGeneration', 'descriptorRevision', 'revision',
+        'observedAt', 'receivedAt', 'validUntil', 'quality', 'value', 'deviceAvailability'];
+      const changeCauses = ['APP_INTERACTION', 'PERIODIC_POLL', 'PHYSICAL_INTERACTION', 'VOICE_INTERACTION'];
+      if (!(exactKeys(payload, stateKeys) || exactKeys(payload, [...stateKeys, 'causeType']))
+        || !boundedText(payload.osDeviceId, 160) || !boundedText(payload.osAreaId, 160) || !boundedText(payload.controlId, 160)
+        || !Number.isSafeInteger(payload.sourceGeneration) || Number(payload.sourceGeneration) < 1
+        || !Number.isSafeInteger(payload.descriptorRevision) || Number(payload.descriptorRevision) < 1
+        || !Number.isSafeInteger(payload.revision) || Number(payload.revision) < 0
+        || !validUtc(payload.observedAt) || !validUtc(payload.receivedAt) || !validUtc(payload.validUntil)
+        || Date.parse(String(payload.receivedAt)) < Date.parse(String(payload.observedAt))
+        || Date.parse(String(payload.validUntil)) <= Date.parse(String(payload.observedAt))
+        || !['fresh', 'stale', 'unknown', 'unavailable'].includes(String(payload.quality))
+        || !['online', 'offline', 'unknown'].includes(String(payload.deviceAvailability))
+        || payload.causeType !== undefined && !changeCauses.includes(String(payload.causeType))
+        || !(payload.value === null || typeof payload.value === 'boolean'
+          || typeof payload.value === 'number' && Number.isFinite(payload.value)
+          || typeof payload.value === 'string' && boundedText(payload.value, 160, true))
+        || payload.value === null && !['unknown', 'unavailable'].includes(String(payload.quality))
+        || event.critical) return false;
+      const expectedAggregate = createHash('sha256').update(`${String(payload.osDeviceId)}\n${String(payload.controlId)}`, 'utf8').digest('hex');
+      return event.aggregateId === expectedAggregate;
+    }
     case 'control.catalog.upsert':
       return exactKeys(payload, ['osDeviceId', 'catalogRevision', 'descriptorDigest', 'controls'])
         && boundedText(payload.osDeviceId, 160) && Number.isSafeInteger(payload.catalogRevision) && Number(payload.catalogRevision) >= 1

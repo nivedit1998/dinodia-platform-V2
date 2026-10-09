@@ -107,10 +107,8 @@ if (!alexaSchema || !alexaSchema(alexaProjection))
   throw new Error(
     `Alexa projection fixture failed canonical schema: ${JSON.stringify(alexaSchema?.errors)}`,
   );
-const malformedAlexa = {
-  ...alexaProjection,
-  membership: { ...alexaProjection.membership, role: "OWNER" },
-};
+const malformedAlexa = structuredClone(alexaProjection);
+malformedAlexa.properties[0].membership.role = "OWNER";
 if (alexaSchema(malformedAlexa))
   throw new Error("Alexa discovery must be tenant-membership scoped");
 const fixtureFiles = [];
@@ -403,10 +401,11 @@ duplicateControlTarget.controlId = duplicateControlCase.duplicateControlId;
 if (!definitionValidator("device")(duplicateControlDevice) || platformContractRuntime.validateNativeDevice(duplicateControlDevice) || osContractRuntime.validateDevice(duplicateControlDevice, { homeId: duplicateControlDevice.homeId, homeMembershipId: duplicateControlSource.context.homeMembershipId, role: "OWNER", areaIds: duplicateControlDevice.areaIds }))
   throw new Error("Schema must accept distinct descriptor objects while Platform and OS reject duplicate canonical control IDs");
 const duplicateAlexaProjection = JSON.parse(fs.readFileSync(path.join(fixtureRoot, "alexa-discovery-projection.json"), "utf8"));
-const duplicateAlexaDevice = structuredClone(duplicateAlexaProjection.data[0]);
+const duplicateAlexaPayload = structuredClone(duplicateAlexaProjection);
+const duplicateAlexaDevice = duplicateAlexaPayload.properties[0].data[0];
 if (duplicateAlexaDevice.controls.length < 2) throw new Error("Alexa duplicate-control projection fixture must have at least two controls");
 duplicateAlexaDevice.controls[1].controlId = duplicateAlexaDevice.controls[0].controlId;
-if (alexaContractRuntime.decodeNativeAlexaDevices({ schemaVersion: "dinodia.v1", homeId: duplicateAlexaProjection.homeId, streamId: "stream:duplicate-control", sequence: 1, generatedAt: "2026-09-27T10:00:00Z", revision: 1, data: [duplicateAlexaDevice] }, { homeId: duplicateAlexaProjection.homeId, homeMembershipId: duplicateAlexaProjection.membership.homeMembershipId, role: "TENANT", authorisedAreaIds: duplicateAlexaProjection.selectedAreaIds }) !== null)
+if (alexaContractRuntime.decodeNativeAlexaDiscovery(duplicateAlexaPayload) !== null)
   throw new Error("Alexa adapter must reject duplicate canonical control IDs before exposure projection");
 const unknownSafeFixture = JSON.parse(fs.readFileSync(path.join(fixtureRoot, "unknown-interaction-kind.json"), "utf8"));
 if (!definitionValidator("device")(unknownSafeFixture.device) || !platformContractRuntime.validateNativeDevice(unknownSafeFixture.device) || !osContractRuntime.validateDevice(unknownSafeFixture.device, { homeId: unknownSafeFixture.device.homeId, homeMembershipId: "membership:owner-a", role: "OWNER", areaIds: unknownSafeFixture.device.areaIds }))
@@ -1364,8 +1363,17 @@ const runAlexaFixture = (relativePath, fixture) => {
     return alexaContractRuntime.decodeNativeAlexaDevices(envelope([device], projectionContext(device)), projectionContext(device)) === null;
   };
   switch (relativePath) {
-    case "alexa-discovery-projection.json":
-      return alexaContractRuntime.decodeNativeAlexaDiscovery(fixture);
+    case "alexa-discovery-projection.json": {
+      const projection = alexaContractRuntime.decodeNativeAlexaDiscovery(fixture);
+      return projection !== null
+        && projection.devices.length === 2
+        && projection.devices[0].id === "device:opaque-1"
+        && projection.devices[0].managementClass === "property_device"
+        && projection.devices[0].controls.map((control) => control.controlId).join(",") === "control:power,control:brightness"
+        && projection.devices[1].id === "device:tenant-owned"
+        && projection.devices[1].managementClass === "tenant_device"
+        && projection.devices[1].ownerMembershipId === "membership:tenant-a";
+    }
     case "invalid/impossible-calendar-date-envelope.json":
       return alexaContractRuntime.decodeNativeAlexaDevices(fixture, { homeId: fixture.homeId, homeMembershipId: "membership:tenant-a", role: "TENANT", authorisedAreaIds: [] }) === null;
     case "invalid/device-missing-step-up-policy.json":

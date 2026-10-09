@@ -87,7 +87,7 @@ test('safe build identity prefers the real Vercel commit or deployment and never
   assert.equal(safeBuildId({ FOUNDATION_SOURCE_FINGERPRINT: 'not-a-fingerprint' }), 'local');
 });
 
-test('readiness accepts the exact Stage 3 head plus only reviewed additive Stage 4 through Stage 11 migrations', () => {
+test('readiness accepts the exact Stage 3 head plus only reviewed additive migrations through Stage 12', () => {
   const { REQUIRED_MIGRATION, REQUIRED_MODEL_COUNT, COMPATIBLE_ADDITIVE_MIGRATIONS, isSchemaReady } = loadFoundationRuntime();
   const stage3Checksum = 'b'.repeat(64);
   const stage3 = [{ migration_name: REQUIRED_MIGRATION, checksum: stage3Checksum }];
@@ -110,6 +110,8 @@ test('readiness accepts the exact Stage 3 head plus only reviewed additive Stage
   const stage10 = [stage10PartialUsageCoverage, stage10AnalyticsMaintenance, ...stage9];
   const stage11ActionOrder = migration('20261009100000_stage11_automation_action_order');
   const stage11 = [stage11ActionOrder, ...stage10];
+  const stage12Alexa = migration('20261009110000_stage12_alexa_oauth_scope');
+  const stage12 = [stage12Alexa, ...stage11];
   assert.equal(isSchemaReady(stage3, REQUIRED_MODEL_COUNT, stage3Checksum), true);
   assert.equal(isSchemaReady(stage4, REQUIRED_MODEL_COUNT, stage3Checksum), true, 'the app rollback remains ready after the additive migration');
   assert.equal(isSchemaReady(stage5, REQUIRED_MODEL_COUNT + 1, stage3Checksum), true, 'the Stage 5 app and Stage 4 rollback remain ready on the additive Stage 5 schema');
@@ -118,6 +120,9 @@ test('readiness accepts the exact Stage 3 head plus only reviewed additive Stage
   assert.equal(isSchemaReady(stage9, REQUIRED_MODEL_COUNT + 2, stage3Checksum), true, 'Stage 9 trigger-only compatibility fix preserves the established schema/table-count contract');
   assert.equal(isSchemaReady(stage10, REQUIRED_MODEL_COUNT + 2, stage3Checksum), true, 'Stage 10 task-registry migration is additive and keeps the existing application schema ready');
   assert.equal(isSchemaReady(stage11, REQUIRED_MODEL_COUNT + 2, stage3Checksum), true, 'Stage 11 action ordering remains ready on the additive schema');
+  assert.equal(isSchemaReady(stage12, REQUIRED_MODEL_COUNT + 10, stage3Checksum), true, 'Stage 12 Alexa tables remain ready with the previous runtime on the additive schema');
+  assert.equal(isSchemaReady([{ ...stage12Alexa, checksum: '0'.repeat(64) }, ...stage11], REQUIRED_MODEL_COUNT + 10, stage3Checksum), false, 'an unreviewed Stage 12 migration checksum fails closed');
+  assert.equal(isSchemaReady(stage12, REQUIRED_MODEL_COUNT + 9, stage3Checksum), false, 'Stage 12 requires exactly eight additional tables');
   assert.equal(isSchemaReady([{ ...stage11ActionOrder, checksum: '0'.repeat(64) }, ...stage10], REQUIRED_MODEL_COUNT + 2, stage3Checksum), false, 'an unreviewed Stage 11 migration checksum fails closed');
   assert.equal(isSchemaReady([{ ...stage10PartialUsageCoverage, checksum: '0'.repeat(64) }, stage10AnalyticsMaintenance, ...stage9], REQUIRED_MODEL_COUNT + 2, stage3Checksum), false, 'an unreviewed Stage 10 coverage migration must fail closed');
   assert.equal(isSchemaReady([{ ...stage10AnalyticsMaintenance, checksum: '0'.repeat(64) }, ...stage9], REQUIRED_MODEL_COUNT + 2, stage3Checksum), false, 'an unreviewed Stage 10 migration checksum is not schema-ready');
@@ -159,7 +164,7 @@ test('Stage 10 partial-hour migration replaces the closed-hour constraint with e
   assert.match(sql, /"closedAt" = "bucketStart" \+ INTERVAL '1 hour' AND "coverageEndAt" = "closedAt"/);
 });
 
-test('foundation and Stage 1 schema is exactly native and bounded', () => {
+test('foundation, Stage 1 and additive Stage 12 Alexa schema remain native and bounded', () => {
   const schema = fs.readFileSync('prisma/schema.prisma', 'utf8');
   const modelNames = [...schema.matchAll(/^model\s+(\w+)/gm)].map((match) => match[1]);
   const stage3Models = [
@@ -170,10 +175,16 @@ test('foundation and Stage 1 schema is exactly native and bounded', () => {
     'NativeDomainOutbox', 'NativeNotificationDeliveryReceipt', 'NativeDeviceOutageIncident',
     'NativeSupportTicketTimeline', 'ExceptionalOwnershipTransfer', 'NativeTenantDeviceRecovery',
   ];
-  assert.equal(modelNames.length, 67);
+  const stage12AlexaModels = [
+    'AlexaNativeAreaSelection', 'AlexaNativeConnectIntent', 'AlexaNativeConnectIntentArea',
+    'AlexaOAuthAuthorizationCode', 'AlexaOAuthAuthorizationCodeIntent', 'AlexaOAuthTokenFamily',
+    'AlexaOAuthAccessToken', 'AlexaOAuthRefreshToken',
+  ];
+  assert.equal(modelNames.length, 75);
   assert.equal(modelNames.filter((name) => name === 'HubSyncReceipt').length, 1);
   assert.deepEqual(modelNames.filter((name) => stage3Models.includes(name)).sort(), [...stage3Models].sort());
-  assert.equal(modelNames.length - stage3Models.length, 46, 'Stage 1/foundation, Stage 5 receipt and Stage 6 private Room verification tables remain intact; Stage 3 is additive');
+  assert.deepEqual(modelNames.filter((name) => stage12AlexaModels.includes(name)).sort(), [...stage12AlexaModels].sort());
+  assert.equal(modelNames.length - stage3Models.length - stage12AlexaModels.length, 46, 'Stage 1/foundation, Stage 5 receipt and Stage 6 private Room verification tables remain intact; later Stage 3 and Stage 12 models are additive');
   assert.doesNotMatch(schema, /HaConnection|HomeAssistant|SupportRequest|AlexaRefreshToken/);
   assert.match(schema, /model HomeMembership/);
   assert.match(schema, /model TenantAreaGrant/);

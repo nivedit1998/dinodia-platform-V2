@@ -66,6 +66,18 @@ const nextConfig: NextConfig = {
         source: '/:path*',
         headers,
       },
+      {
+        // The OAuth consent document is deliberately static and has no
+        // scripts. Next's catch-all header above would otherwise replace the
+        // stricter Response CSP with the site's general inline-script policy.
+        source: '/api/v2/alexa/oauth/authorize',
+        headers: [
+          {
+            key: 'Content-Security-Policy',
+            value: "default-src 'none'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
+          },
+        ],
+      },
     ];
   },
 };

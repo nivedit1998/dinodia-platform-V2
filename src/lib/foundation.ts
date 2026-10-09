@@ -26,6 +26,7 @@ export const COMPATIBLE_ADDITIVE_MIGRATIONS: Readonly<Record<string, string>> = 
   '20261008130000_stage10_analytics_maintenance_tasks': '6c651d5b697c6ca295ed21dc9c646db7be2673bbb95e0a05fa29009123f4da2e',
   '20261008150000_stage10_partial_usage_coverage': '85df08bf3f56a01edee6ebac68ac05d61375bed6ac0ffa28e052b791fbcf73b4',
   '20261009100000_stage11_automation_action_order': '4f0630406c83d5521a9921f9fab37d0b4d44798a8a5b43b9b61a79e8d956bee1',
+  '20261009110000_stage12_alexa_oauth_scope': 'b3e1523009008bcd04b11172150e0d2112b881b03d8f3f137ca2ef81b9b94593',
 });
 export const CANONICAL_PRODUCTION_ORIGIN = 'https://dinodia-platform-v2.vercel.app';
 export function isRuntimeTargetValid(): boolean { return runtimeTargetIsValid(process.env); }
@@ -53,5 +54,6 @@ export function isSchemaReady(migrations: readonly CompletedMigration[], modelCo
   if (hasStage5 && !newer.some((migration) => migration.migration_name === '20261004050000_stage4_customer_lan_tls_identity')) return false;
   const hasStage8 = newer.some((migration) => migration.migration_name === '20261006180000_stage8_commissioning_and_installation');
   if (hasStage8 && (!hasStage5 || !hasProspectiveRoomAccess || !hasMobileAccess)) return false;
-  return modelCount === REQUIRED_MODEL_COUNT + (hasStage5 ? 1 : 0) + (hasProspectiveRoomAccess ? 1 : 0);
+  const hasStage12Alexa = newer.some((migration) => migration.migration_name === '20261009110000_stage12_alexa_oauth_scope');
+  return modelCount === REQUIRED_MODEL_COUNT + (hasStage5 ? 1 : 0) + (hasProspectiveRoomAccess ? 1 : 0) + (hasStage12Alexa ? 8 : 0);
 }

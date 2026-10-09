@@ -2,6 +2,29 @@ import crypto from 'node:crypto';
 
 export type Stage1TokenKind = 'employee' | 'customer';
 
+export type NativeAlexaCommandClaims = {
+  accountId: string;
+  linkId: string;
+  endpointId: string;
+  homeId: string;
+  membershipId: string;
+  hubInstallationId: string;
+  areaId: string;
+  deviceId: string;
+  controlId: string;
+  descriptorRevision: number;
+  commandId: string;
+  idempotencyKey: string;
+  valueDigest: string;
+  policyRevision: number;
+  issuedAt: number;
+  expiresAt: number;
+};
+
+export type NativeAlexaStateClaims = Omit<NativeAlexaCommandClaims, 'controlId' | 'commandId' | 'idempotencyKey' | 'valueDigest'> & {
+  controlIds: string[];
+};
+
 export type Stage1Principal = {
   kind: Stage1TokenKind;
   issuer: string;
@@ -91,6 +114,76 @@ export function signStage1Token(
   const input = `${encodedHeader}.${encodedPayload}`;
   const signature = crypto.sign(null, Buffer.from(input), privateKey).toString('base64url');
   return `${kind === 'employee' ? 'dno-employee-1' : 'dno-app-1'}.${input}.${signature}`;
+}
+
+/**
+ * Sign a single, short-lived Alexa command delegation. This is deliberately a
+ * different token type from an app session and is accepted by Dinodia OS only
+ * on its Native Alexa command endpoint. It contains no reusable household
+ * session credential and is cryptographically bound to one exact command.
+ */
+export function signNativeAlexaCommandToken(claims: NativeAlexaCommandClaims, privateKey: crypto.KeyObject): string {
+  const required = [claims.accountId, claims.linkId, claims.endpointId, claims.homeId, claims.membershipId,
+    claims.hubInstallationId, claims.areaId, claims.deviceId, claims.controlId, claims.commandId,
+    claims.idempotencyKey, claims.valueDigest];
+  if (required.some((value) => typeof value !== 'string' || !value.trim() || value.length > 180)
+    || !/^dos_[A-Za-z0-9_-]{16,80}$/.test(claims.endpointId)
+    || !/^[a-f0-9]{64}$/.test(claims.valueDigest)
+    || !Number.isSafeInteger(claims.descriptorRevision) || claims.descriptorRevision < 0
+    || !Number.isSafeInteger(claims.policyRevision) || claims.policyRevision < 0
+    || !Number.isSafeInteger(claims.issuedAt) || !Number.isSafeInteger(claims.expiresAt)
+    || claims.expiresAt <= claims.issuedAt || claims.expiresAt - claims.issuedAt > 20) {
+    throw new Error('Native Alexa command delegation claims are invalid');
+  }
+  const header = { alg: 'EdDSA', typ: 'DNO-ALEXA-CMD-1', v: 1 };
+  const payload = {
+    iss: 'dinodia-platform-v2', aud: `dinodia-hub:${claims.hubInstallationId}`,
+    sub: claims.accountId, linkId: claims.linkId, endpointId: claims.endpointId,
+    homeId: claims.homeId, membershipId: claims.membershipId,
+    hubInstallationId: claims.hubInstallationId, areaId: claims.areaId,
+    deviceId: claims.deviceId, controlId: claims.controlId,
+    descriptorRevision: claims.descriptorRevision, commandId: claims.commandId,
+    idempotencyKey: claims.idempotencyKey, valueDigest: claims.valueDigest,
+    policyRevision: claims.policyRevision,
+    jti: randomSecret(24), iat: claims.issuedAt, exp: claims.expiresAt,
+  };
+  const encodedHeader = encode(header);
+  const encodedPayload = encode(payload);
+  const input = `${encodedHeader}.${encodedPayload}`;
+  const signature = crypto.sign(null, Buffer.from(input), privateKey).toString('base64url');
+  return `dno-alexa-command-1.${input}.${signature}`;
+}
+
+/** Sign a short-lived Alexa-only state read, scoped to one endpoint and controls. */
+export function signNativeAlexaStateToken(claims: NativeAlexaStateClaims, privateKey: crypto.KeyObject): string {
+  const required = [claims.accountId, claims.linkId, claims.endpointId, claims.homeId, claims.membershipId,
+    claims.hubInstallationId, claims.areaId, claims.deviceId];
+  if (required.some((value) => typeof value !== 'string' || !value.trim() || value.length > 180)
+    || !/^dos_[A-Za-z0-9_-]{16,80}$/.test(claims.endpointId)
+    || !Array.isArray(claims.controlIds) || claims.controlIds.length < 1 || claims.controlIds.length > 32
+    || claims.controlIds.some((id) => typeof id !== 'string' || !id.trim() || id.length > 160)
+    || new Set(claims.controlIds).size !== claims.controlIds.length
+    || !Number.isSafeInteger(claims.descriptorRevision) || claims.descriptorRevision < 0
+    || !Number.isSafeInteger(claims.policyRevision) || claims.policyRevision < 0
+    || !Number.isSafeInteger(claims.issuedAt) || !Number.isSafeInteger(claims.expiresAt)
+    || claims.expiresAt <= claims.issuedAt || claims.expiresAt - claims.issuedAt > 20) {
+    throw new Error('Native Alexa state delegation claims are invalid');
+  }
+  const header = { alg: 'EdDSA', typ: 'DNO-ALEXA-STATE-1', v: 1 };
+  const payload = {
+    iss: 'dinodia-platform-v2', aud: `dinodia-hub:${claims.hubInstallationId}`,
+    sub: claims.accountId, linkId: claims.linkId, endpointId: claims.endpointId,
+    homeId: claims.homeId, membershipId: claims.membershipId,
+    hubInstallationId: claims.hubInstallationId, areaId: claims.areaId,
+    deviceId: claims.deviceId, controlIds: [...claims.controlIds],
+    descriptorRevision: claims.descriptorRevision, policyRevision: claims.policyRevision,
+    jti: randomSecret(24), iat: claims.issuedAt, exp: claims.expiresAt,
+  };
+  const encodedHeader = encode(header);
+  const encodedPayload = encode(payload);
+  const input = `${encodedHeader}.${encodedPayload}`;
+  const signature = crypto.sign(null, Buffer.from(input), privateKey).toString('base64url');
+  return `dno-alexa-state-1.${input}.${signature}`;
 }
 
 export function verifyStage1Token(

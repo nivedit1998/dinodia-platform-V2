@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url';
 import dotenv from 'dotenv';
 import { PrismaClient } from '@prisma/client';
 import { assertMigrationDoesNotReferenceVolatileRuntimeTables, compareExistingTablePreservation } from './native_migration_preservation.mjs';
-import { migrationBundleIdentity, STAGE6_CUSTOMER_MIGRATIONS, STAGE8_COMMISSIONING_MIGRATION, STAGE9_DEREGISTRATION_GUARD_MIGRATION, STAGE10_ANALYTICS_MAINTENANCE_MIGRATION, STAGE10_PARTIAL_USAGE_COVERAGE_MIGRATION, STAGE11_AUTOMATION_ACTION_ORDER_MIGRATION, unexpectedPendingMigrations } from './native_migration_bundle.mjs';
+import { migrationBundleIdentity, STAGE6_CUSTOMER_MIGRATIONS, STAGE8_COMMISSIONING_MIGRATION, STAGE9_DEREGISTRATION_GUARD_MIGRATION, STAGE10_ANALYTICS_MAINTENANCE_MIGRATION, STAGE10_PARTIAL_USAGE_COVERAGE_MIGRATION, STAGE11_AUTOMATION_ACTION_ORDER_MIGRATION, STAGE12_ALEXA_OAUTH_SCOPE_MIGRATION, unexpectedPendingMigrations } from './native_migration_bundle.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const projectRef = 'fppzzesvukjbsfmxmfxe';
@@ -24,9 +24,10 @@ const stage8Commissioning = flags.has('--stage8-commissioning');
 const stage9DeregistrationGuard = flags.has('--stage9-deregistration-guard');
 const stage10Analytics = flags.has('--stage10-analytics') || flags.has('--stage10-analytics-maintenance');
 const stage11Automation = flags.has('--stage11-automation');
+const stage12AlexaScope = flags.has('--stage12-alexa');
 const stage5Target = stage5Sync || stage5IncidentDeadlines || stage5IncidentSourceKind;
-const selectedStage = stage11Automation ? 11 : stage10Analytics ? 10 : stage9DeregistrationGuard ? 9 : stage8Commissioning ? 8 : stage6CustomerAuth ? 6 : stage5Target ? 5 : stage4LanTls ? 4 : 3;
-const migrationNames = stage11Automation ? [STAGE11_AUTOMATION_ACTION_ORDER_MIGRATION] : stage10Analytics ? [STAGE10_ANALYTICS_MAINTENANCE_MIGRATION, STAGE10_PARTIAL_USAGE_COVERAGE_MIGRATION] : stage9DeregistrationGuard ? [STAGE9_DEREGISTRATION_GUARD_MIGRATION] : stage8Commissioning ? [STAGE8_COMMISSIONING_MIGRATION] : stage6CustomerAuth ? [...STAGE6_CUSTOMER_MIGRATIONS] : [stage5IncidentSourceKind
+const selectedStage = stage12AlexaScope ? 12 : stage11Automation ? 11 : stage10Analytics ? 10 : stage9DeregistrationGuard ? 9 : stage8Commissioning ? 8 : stage6CustomerAuth ? 6 : stage5Target ? 5 : stage4LanTls ? 4 : 3;
+const migrationNames = stage12AlexaScope ? [STAGE12_ALEXA_OAUTH_SCOPE_MIGRATION] : stage11Automation ? [STAGE11_AUTOMATION_ACTION_ORDER_MIGRATION] : stage10Analytics ? [STAGE10_ANALYTICS_MAINTENANCE_MIGRATION, STAGE10_PARTIAL_USAGE_COVERAGE_MIGRATION] : stage9DeregistrationGuard ? [STAGE9_DEREGISTRATION_GUARD_MIGRATION] : stage8Commissioning ? [STAGE8_COMMISSIONING_MIGRATION] : stage6CustomerAuth ? [...STAGE6_CUSTOMER_MIGRATIONS] : [stage5IncidentSourceKind
   ? '20261005100000_stage5_incident_source_kind'
   : stage5IncidentDeadlines
   ? '20261005070000_stage5_hub_incident_deadline'
@@ -99,7 +100,7 @@ async function inventory(client, baselineColumns = undefined) {
         taskRegistryRows = await tx.$queryRawUnsafe('SELECT "taskId", "dispatcher" FROM public."NativeBackgroundTaskState" ORDER BY "taskId"');
       }
     }
-    const [labels, ownerCardinality, tenantOwners, activeAssignments, migrations, mismatchedDeviceHubs, mismatchedTenantGrants, mismatchedInvitationAreas, mismatchedRoomRequests, duplicateActiveRoomQrs, mismatchedClaimHubs, mismatchedClaimChallenges, mismatchedPendingSetups, mismatchedSupportMemberships, mismatchedSupportRequests, mismatchedSupportSessions, mismatchedSupportNotifications] = await Promise.all([
+  const [labels, ownerCardinality, tenantOwners, activeAssignments, migrations, mismatchedDeviceHubs, mismatchedTenantGrants, mismatchedInvitationAreas, mismatchedRoomRequests, duplicateActiveRoomQrs, mismatchedClaimHubs, mismatchedClaimChallenges, mismatchedPendingSetups, mismatchedSupportMemberships, mismatchedSupportRequests, mismatchedSupportSessions, mismatchedSupportNotifications, duplicateActiveAlexaAccountLinks, invalidActiveAlexaAreaScopes] = await Promise.all([
       tx.$queryRawUnsafe('SELECT count(*)::int AS count FROM public."NativeDevice" WHERE "customerLabel" IS NOT NULL AND char_length("customerLabel") > 40'),
       tx.$queryRawUnsafe("SELECT count(*)::int AS count FROM public.\"Home\" h WHERE h.\"lifecycle\" = 'ACTIVE' AND (SELECT count(*) FROM public.\"HomeMembership\" m WHERE m.\"homeId\" = h.\"id\" AND m.\"role\" = 'OWNER' AND m.\"status\" = 'ACTIVE') <> 1"),
       tx.$queryRawUnsafe("SELECT count(*)::int AS count FROM public.\"NativeDevice\" d LEFT JOIN public.\"HomeMembership\" m ON m.\"id\" = d.\"ownerMembershipId\" AND m.\"homeId\" = d.\"homeId\" WHERE (d.\"managementClass\" = 'PROPERTY_DEVICE' AND d.\"ownerMembershipId\" IS NOT NULL) OR (d.\"managementClass\" = 'TENANT_DEVICE' AND (m.\"id\" IS NULL OR m.\"role\" <> 'TENANT' OR m.\"status\" <> 'ACTIVE'))"),
@@ -117,6 +118,21 @@ async function inventory(client, baselineColumns = undefined) {
       tx.$queryRawUnsafe('SELECT count(*)::int AS count FROM public."SupportAccessRequest" r LEFT JOIN public."SupportTicket" t ON t."id" = r."ticketId" AND t."homeId" = r."homeId" LEFT JOIN public."HubInstallation" h ON h."id" = r."hubInstallationId" AND h."homeId" = r."homeId" LEFT JOIN public."HomeMembership" target ON target."id" = r."targetMembershipId" AND target."homeId" = r."homeId" LEFT JOIN public."HomeMembership" approver ON approver."id" = r."approvedByMembershipId" AND approver."homeId" = r."homeId" WHERE t."id" IS NULL OR h."id" IS NULL OR (r."targetMembershipId" IS NOT NULL AND target."id" IS NULL) OR (r."approvedByMembershipId" IS NOT NULL AND approver."id" IS NULL)'),
       tx.$queryRawUnsafe('SELECT count(*)::int AS count FROM public."SupportSession" s LEFT JOIN public."SupportAccessRequest" r ON r."id" = s."accessRequestId" AND r."homeId" = s."homeId" LEFT JOIN public."SupportTicket" t ON t."id" = s."ticketId" AND t."homeId" = s."homeId" LEFT JOIN public."HubInstallation" h ON h."id" = s."hubInstallationId" AND h."homeId" = s."homeId" LEFT JOIN public."HomeMembership" m ON m."id" = s."targetMembershipId" AND m."homeId" = s."homeId" WHERE r."id" IS NULL OR t."id" IS NULL OR h."id" IS NULL OR (s."targetMembershipId" IS NOT NULL AND m."id" IS NULL)'),
       tx.$queryRawUnsafe('SELECT count(*)::int AS count FROM public."SupportAccessNotification" n LEFT JOIN public."SupportTicket" t ON t."id" = n."ticketId" AND t."homeId" = n."homeId" LEFT JOIN public."SupportAccessRequest" r ON r."id" = n."accessRequestId" AND r."homeId" = n."homeId" LEFT JOIN public."SupportSession" s ON s."id" = n."sessionId" AND s."homeId" = n."homeId" WHERE t."id" IS NULL OR r."id" IS NULL OR (n."sessionId" IS NOT NULL AND s."id" IS NULL)'),
+      tx.$queryRawUnsafe('SELECT count(*)::int AS count FROM (SELECT "customerAccountId" FROM public."AlexaNativeLink" WHERE "status" = \'ACTIVE\' AND "revokedAt" IS NULL GROUP BY "customerAccountId" HAVING count(*) > 1) duplicate_active_links'),
+      tx.$queryRawUnsafe(`SELECT count(*)::int AS count FROM public."AlexaNativeHomeScope" scope
+        JOIN public."AlexaNativeLink" link ON link."id" = scope."linkId" AND link."status" = 'ACTIVE' AND link."revokedAt" IS NULL
+        LEFT JOIN public."HomeMembership" member ON member."id" = scope."membershipId" AND member."homeId" = scope."homeId"
+        WHERE scope."revokedAt" IS NULL AND (
+          member."id" IS NULL OR member."customerAccountId" <> link."customerAccountId" OR member."role" <> 'TENANT' OR member."status" <> 'ACTIVE'
+          OR jsonb_typeof(scope."areaIds") <> 'array'
+          OR EXISTS (
+            SELECT 1 FROM jsonb_array_elements_text(CASE WHEN jsonb_typeof(scope."areaIds") = 'array' THEN scope."areaIds" ELSE '[]'::jsonb END) selected(area_id)
+            LEFT JOIN public."TenantAreaGrant" grant_row ON grant_row."membershipId" = member."id" AND grant_row."homeId" = scope."homeId" AND grant_row."areaId"::text = selected.area_id AND grant_row."revokedAt" IS NULL
+            LEFT JOIN public."Area" area ON area."id"::text = selected.area_id AND area."homeId" = scope."homeId" AND area."status" = 'ACTIVE'
+            WHERE grant_row."id" IS NULL OR area."id" IS NULL
+          )
+          OR EXISTS (SELECT selected.area_id FROM jsonb_array_elements_text(CASE WHEN jsonb_typeof(scope."areaIds") = 'array' THEN scope."areaIds" ELSE '[]'::jsonb END) selected(area_id) GROUP BY selected.area_id HAVING count(*) > 1)
+        )`),
     ]);
     const dataPreflight = {
       customerLabelsOver40: labels[0].count,
@@ -135,6 +151,8 @@ async function inventory(client, baselineColumns = undefined) {
       supportRequestHomeMismatches: mismatchedSupportRequests[0].count,
       supportSessionHomeMismatches: mismatchedSupportSessions[0].count,
       supportNotificationHomeMismatches: mismatchedSupportNotifications[0].count,
+      duplicateActiveAlexaAccountLinks: duplicateActiveAlexaAccountLinks[0].count,
+      invalidActiveAlexaAreaScopes: invalidActiveAlexaAreaScopes[0].count,
     };
     return { rowCounts, rowContentDigests, columnContentDigests, columnsByTable, taskRegistryRows, migrationRows: migrations, dataPreflight };
   }, { maxWait: 10000, timeout: 120000 });
@@ -143,8 +161,8 @@ async function inventory(client, baselineColumns = undefined) {
 let client;
 try {
   const args = process.argv.slice(2);
-  if ([stage4LanTls, stage5Sync, stage5IncidentDeadlines, stage5IncidentSourceKind, stage6CustomerAuth, stage8Commissioning, stage9DeregistrationGuard, stage10Analytics, stage11Automation, flags.has('--stage3-domain-schema')].filter(Boolean).length > 1) fail('select exactly one reviewed migration target');
-  if (!args.includes(confirm) || args.some((arg) => ![confirm, '--apply', '--confirm-additive-forward-migration', '--stage4-lan-tls', '--stage5-sync', '--stage5-incident-deadlines', '--stage5-incident-source-kind', '--stage6-customer-auth', '--stage8-commissioning', '--stage9-deregistration-guard', '--stage10-analytics', '--stage10-analytics-maintenance', '--stage11-automation', '--stage3-domain-schema'].includes(arg) && !arg.startsWith('--expected-migration-sha256=') && !arg.startsWith('--expected-migrations-sha256='))) fail(`pass ${confirm}; apply additionally requires the explicit additive-forward-migration confirmation`);
+  if ([stage4LanTls, stage5Sync, stage5IncidentDeadlines, stage5IncidentSourceKind, stage6CustomerAuth, stage8Commissioning, stage9DeregistrationGuard, stage10Analytics, stage11Automation, stage12AlexaScope, flags.has('--stage3-domain-schema')].filter(Boolean).length > 1) fail('select exactly one reviewed migration target');
+  if (!args.includes(confirm) || args.some((arg) => ![confirm, '--apply', '--confirm-additive-forward-migration', '--stage4-lan-tls', '--stage5-sync', '--stage5-incident-deadlines', '--stage5-incident-source-kind', '--stage6-customer-auth', '--stage8-commissioning', '--stage9-deregistration-guard', '--stage10-analytics', '--stage10-analytics-maintenance', '--stage11-automation', '--stage12-alexa', '--stage3-domain-schema'].includes(arg) && !arg.startsWith('--expected-migration-sha256=') && !arg.startsWith('--expected-migrations-sha256='))) fail(`pass ${confirm}; apply additionally requires the explicit additive-forward-migration confirmation`);
   if (target.supabaseProjectRef !== projectRef) fail('checked-in V2 target manifest does not match the authorized project');
   if (envFile.SUPABASE_PROJECT_REF !== projectRef || envFile.VERCEL_PROJECT_ID !== target.vercelProjectId) fail('project-local environment identity does not match the authorized V2 Production target');
   const db = parseUrl(databaseUrl, 'DATABASE_URL');
@@ -191,7 +209,7 @@ try {
     mode: apply ? 'production-additive-apply' : 'read-only-production-preflight',
     targetProjectRef: projectRef,
     databaseHostClass: db.hostname === direct.hostname ? 'same-approved-host' : 'approved-pooler-and-direct-hosts',
-    migrationName: stage11Automation ? 'stage11-automation-action-order' : stage6CustomerAuth ? 'stage6-customer-auth-bundle' : stage10Analytics ? 'stage10-analytics-bundle' : migrationName,
+    migrationName: stage12AlexaScope ? 'stage12-alexa-oauth-scope' : stage11Automation ? 'stage11-automation-action-order' : stage6CustomerAuth ? 'stage6-customer-auth-bundle' : stage10Analytics ? 'stage10-analytics-bundle' : migrationName,
     selectedMigrations: bundle.migrations,
     migrationBundleSha256: bundle.sha256,
     migrationSha256: migrationSha,
@@ -250,7 +268,7 @@ try {
       stage: selectedStage,
       migrationApplied: true,
       targetProjectRef: projectRef,
-      migrationName: stage11Automation ? 'stage11-automation-action-order' : stage6CustomerAuth ? 'stage6-customer-auth-bundle' : stage10Analytics ? 'stage10-analytics-bundle' : migrationName,
+      migrationName: stage12AlexaScope ? 'stage12-alexa-oauth-scope' : stage11Automation ? 'stage11-automation-action-order' : stage6CustomerAuth ? 'stage6-customer-auth-bundle' : stage10Analytics ? 'stage10-analytics-bundle' : migrationName,
       selectedMigrations: bundle.migrations,
       migrationBundleSha256: bundle.sha256,
       migrationSha256: migrationSha,

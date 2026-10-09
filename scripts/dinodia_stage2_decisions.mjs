@@ -686,16 +686,15 @@ function executeSemanticFixture(path, value, adapters) {
       return deniedWithNoEffects(actual.decision === "DENIED_NO_PROJECTION", path);
     }
     case "alexa-discovery-projection.json": {
-      const member = value.membership;
-      assert(schema("alexaDiscoveryProjection", value) && member.role === "TENANT" &&
-        Number.isSafeInteger(value.exposureGeneration) && value.exposureGeneration >= 0 &&
-        value.data.every((device) => device.homeId === value.homeId &&
-          device.areaIds.every((areaId) => value.selectedAreaIds.includes(areaId)) &&
-          (device.managementClass !== "tenant_device" || device.ownerMembershipId === member.homeMembershipId) &&
-          device.controls.every((control) => !["security_lock", "lock_state"].includes(control.semanticRole) ||
-            control.automatable === false && control.stepUpPolicy === "required")),
-      "Alexa discovery must remain selected-tenant/area scoped and exclude app-only security authority");
-      return result("accepted", { devices: value.data.length });
+      const properties = value.properties ?? [];
+      assert(schema("alexaDiscoveryProjection", value) && properties.every((property) =>
+        property.membership.role === "TENANT" && Number.isSafeInteger(property.exposureGeneration) && property.exposureGeneration >= 1 &&
+        property.data.every((device) => device.homeId === property.homeId && /^dos_[A-Za-z0-9_-]{16,80}$/.test(device.endpointId) &&
+          device.areaIds.every((areaId) => property.selectedAreaIds.includes(areaId)) &&
+          (device.managementClass !== "tenant_device" || device.ownerMembershipId === property.membership.homeMembershipId) &&
+          device.controls.every((control) => !["security_lock", "lock_state"].includes(control.semanticRole)))),
+      "Alexa discovery must return per-property tenant scopes, opaque endpoints and selected-Area data without app-only security authority");
+      return result("accepted", { properties: properties.length, devices: properties.reduce((count, property) => count + property.data.length, 0) });
     }
     case "notification-security-mandatory.json": {
       assert(schema("notification", value) && value.kind === "security" && value.mandatory === true &&

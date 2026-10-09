@@ -58,6 +58,23 @@ export async function POST(request: Request) {
       }, select: { id: true } });
       if (!roomRequest) throw new Stage1AuthError(409, 'REVISION_CONFLICT', 'This Room request changed. Refresh before confirming.');
     }
+    if (operationKind === 'alexa_unlink') {
+      const unlink = value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null;
+      if (customer.role !== 'TENANT' || customer.credentialKind !== 'account_access' || targetIds.length !== 1
+        || !unlink || Object.keys(unlink).sort().join(',') !== 'expectedLinkRevision,expectedScopeRevision,homeMembershipId'
+        || unlink.homeMembershipId !== customer.membershipId
+        || !Number.isSafeInteger(unlink.expectedLinkRevision) || Number(unlink.expectedLinkRevision) < 1
+        || !Number.isSafeInteger(unlink.expectedScopeRevision) || Number(unlink.expectedScopeRevision) < 1) {
+        throw new Stage1AuthError(403, 'alexa_unlink_denied', 'A fresh unlink confirmation for the selected tenant Home is required');
+      }
+      const [link, scope] = await Promise.all([
+        prisma.alexaNativeLink.findFirst({ where: { id: targetIds[0], customerAccountId: customer.id, status: 'ACTIVE', revokedAt: null }, select: { id: true, revision: true } }),
+        prisma.alexaNativeHomeScope.findFirst({ where: { linkId: targetIds[0], membershipId: customer.membershipId, homeId: customer.homeId, revokedAt: null }, select: { id: true, exposureGeneration: true } }),
+      ]);
+      if (!link || !scope || link.revision !== unlink.expectedLinkRevision || scope.exposureGeneration !== unlink.expectedScopeRevision) {
+        throw new Stage1AuthError(409, 'REVISION_CONFLICT', 'Alexa access changed. Refresh before confirming unlink');
+      }
+    }
     if (operationKind === 'home.tenant_automation_disable' || operationKind === 'home.tenant_automation_delete') {
       const intervention = value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null;
       const expectedAction = operationKind.endsWith('_disable') ? 'disable' : 'delete';

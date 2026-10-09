@@ -12,7 +12,7 @@ const acRouteMatrix = coverage;
 const yaml = createRequire(import.meta.url)('js-yaml');
 const openApi = yaml.load(fs.readFileSync(path.join(root, 'contracts/dinodia-v1/openapi.yaml'), 'utf8'));
 const methodNames = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS', 'HEAD'];
-const acceptanceCriterionPattern = /^AC-(?:02\.(?:[1-9]|[1-3][0-9]|4[0-5])|06\.(?:[1-9]|[1-2][0-9]|3[0-5])|07\.(?:[1-9]|1[0-9]|2[0-3])|08\.(?:[1-9]|1[0-9]|2[0-2])|09\.(?:[1-9]|[1-3][0-9])|10\.(?:[1-9]|1[0-9])|11\.(?:[1-9]|1[0-9]|2[0-5]))$/;
+const acceptanceCriterionPattern = /^AC-(?:02\.(?:[1-9]|[1-3][0-9]|4[0-5])|06\.(?:[1-9]|[1-2][0-9]|3[0-5])|07\.(?:[1-9]|1[0-9]|2[0-3])|08\.(?:[1-9]|1[0-9]|2[0-2])|09\.(?:[1-9]|[1-3][0-9])|10\.(?:[1-9]|1[0-9])|11\.(?:[1-9]|1[0-9]|2[0-5])|12\.(?:[1-9]|1[0-9]|20))$/;
 const authEntries = new Map(stage1RouteInventory.map(([method, route, auth]) => [`${method} ${route}`, auth]));
 
 function routePath(file) {
@@ -69,12 +69,18 @@ test('every executable Platform Native V2 route method has an explicit contract-
   for (const [methodAndRoute, row] of entries) {
     assert.ok(authEntries.has(methodAndRoute), `runtime auth inventory omits ${methodAndRoute}`);
     const authClass = authEntries.get(methodAndRoute);
+    const source = fs.readFileSync(path.join(root, row.file), 'utf8');
     if (row.boundary === 'explicit_feature_disabled') {
       assert.equal(authClass, 'public-disabled-feature', `${methodAndRoute} must remain an explicit disabled boundary`);
-      const source = fs.readFileSync(path.join(root, row.file), 'utf8');
       assert.match(source, /nativeFeatureNotEnabled/, `${methodAndRoute} must use the canonical disabled response`);
     } else if (authClass !== 'public-login') {
-      assert.ok(['customer', 'employee'].includes(authClass), `${methodAndRoute} lacks an explicit principal class`);
+      if (authClass === 'public-oauth-intent') {
+        assert.equal(row.principalProfile, 'public_oauth_intent', `${methodAndRoute} must use the one-use tenant-connect-intent profile`);
+        assert.match(source, /lockAndValidateAlexaConnectIntent/, `${methodAndRoute} must revalidate its one-use tenant connect intent`);
+      } else if (authClass === 'public-oauth-client') {
+        assert.equal(row.principalProfile, 'public_oauth_client', `${methodAndRoute} must use the OAuth-client-authenticated profile`);
+        assert.match(source, /alexaOAuthClientAuthenticated/, `${methodAndRoute} must validate the exact OAuth client`);
+      } else assert.ok(['customer', 'employee'].includes(authClass), `${methodAndRoute} lacks an explicit principal class`);
       const harness = fs.readFileSync(path.join(root, 'scripts/stage1_integration_harness.mjs'), 'utf8');
       assert.match(harness, /stage1RouteInventory\.filter\(/, 'integration harness must execute the protected-route inventory');
     }
@@ -145,7 +151,7 @@ test('support approval inbox has an explicit selected-membership privacy contrac
 });
 
 test('all active Native V2 non-Alexa routes preserve the canonical Native V1 error adapter', () => {
-  for (const row of coverage.routes.filter((item) => !['explicit_feature_disabled', 'delegates_to_canonical_customer_session_handlers'].includes(item.boundary))) {
+  for (const row of coverage.routes.filter((item) => !item.file.includes('/alexa/') && !['explicit_feature_disabled', 'delegates_to_canonical_customer_session_handlers'].includes(item.boundary))) {
     const source = fs.readFileSync(path.join(root, row.file), 'utf8');
     if (/nativeV1ErrorResponse/.test(source)) continue;
     // A small compatibility path may delegate to the canonical route handler;
@@ -159,6 +165,19 @@ test('all active Native V2 non-Alexa routes preserve the canonical Native V1 err
     const target = targets.find((candidate) => fs.existsSync(candidate));
     assert.ok(target, `${row.file} delegation target must exist`);
     assert.match(fs.readFileSync(target, 'utf8'), /nativeV1ErrorResponse/, `${row.file} delegated handler must map errors through the canonical envelope`);
+  }
+});
+
+test('customer-facing Alexa management routes preserve the canonical Native V1 error adapter', () => {
+  const customerRoutes = [
+    ['src/app/api/v2/alexa/home-scope/route.ts', 1],
+    ['src/app/api/v2/alexa/home-scope/unlink/route.ts', 1],
+    ['src/app/api/v2/alexa/link-status/route.ts', 2],
+  ];
+  for (const [file, expectedCatches] of customerRoutes) {
+    const source = fs.readFileSync(path.join(root, file), 'utf8');
+    assert.match(source, /import\s+\{\s*nativeV1ErrorResponse\s*\}\s+from\s+['"]@\/lib\/contracts\/nativeV1Error['"]/);
+    assert.equal([...source.matchAll(/return nativeV1ErrorResponse\(error\)/g)].length, expectedCatches, `${file} must map each customer route error through the canonical envelope`);
   }
 });
 

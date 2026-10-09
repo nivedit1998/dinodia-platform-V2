@@ -1,10 +1,11 @@
 import { createHash } from 'node:crypto';
 import type { Prisma } from '@prisma/client';
 import { Stage1AuthError } from './stage1Auth';
-import type { HubSyncEvent } from './hubSyncEnvelope';
+import { canonicalSyncJson, type HubSyncEvent } from './hubSyncEnvelope';
 import { queueAutomationFailureNotices } from './nativeAutomations/failureNotifications';
 import { suspendAutomationsForDeviceChange } from './nativeAutomations/revalidation';
 import { retireNativeAutomations } from './nativeAutomations/lifecycle';
+import { currentCustomerPolicy } from './customerPolicyConfig';
 
 function invalid(code: string, message: string): never {
   throw new Stage1AuthError(409, code, message);
@@ -96,6 +97,7 @@ export async function applyHubSyncEvent(tx: Prisma.TransactionClient, input: {
     const osDeviceId = String(payload.osDeviceId);
     const device = await tx.nativeDevice.findUnique({ where: { hubInstallationId_osDeviceId: { hubInstallationId, osDeviceId } }, select: {
       id: true, homeId: true, managementClass: true, lifecycle: true, descriptorRevision: true, descriptorDigest: true, protocol: true, originalName: true,
+      capabilitySummary: true,
       assignments: { where: { validUntil: null }, select: { id: true, areaId: true } },
     } });
     // OS discovery is not itself authority to decide whether an unknown device
@@ -121,10 +123,17 @@ export async function applyHubSyncEvent(tx: Prisma.TransactionClient, input: {
     const areaChanged = currentAreaIds.length !== nextAreaIds.length || currentAreaIds.some((id, index) => id !== nextAreaIds[index]);
     if (descriptorChanged || areaChanged) await suspendAutomationsForDeviceChange(tx, { homeId, deviceId: device.id, now,
       reason: descriptorChanged ? 'descriptor_changed' : 'area_changed' });
+    const priorSummary = device.capabilitySummary && typeof device.capabilitySummary === 'object' && !Array.isArray(device.capabilitySummary)
+      ? device.capabilitySummary as Record<string, unknown> : {};
+    const nextSummary: Record<string, unknown> = { ...priorSummary, protocol: payload.protocol, technicalLabel: payload.technicalLabel, descriptorDigest };
+    if (descriptorChanged) {
+      delete nextSummary.controlCatalog;
+      delete nextSummary.alexaStateByControl;
+    }
     await tx.nativeDevice.update({ where: { id: device.id }, data: {
       originalName: String(payload.name), technicalLabel: String(payload.technicalLabel), protocol: String(payload.protocol),
       deviceType: String(payload.deviceType), descriptorRevision, descriptorDigest,
-      capabilitySummary: { protocol: payload.protocol, technicalLabel: payload.technicalLabel, descriptorDigest } as Prisma.InputJsonValue,
+      capabilitySummary: nextSummary as Prisma.InputJsonValue,
       onlineState: payload.available === true ? 'ONLINE' : 'OFFLINE',
       ...(observedAt ? { lastSeenAt: observedAt } : {}),
     } });
@@ -163,7 +172,11 @@ export async function applyHubSyncEvent(tx: Prisma.TransactionClient, input: {
     const controls = payload.controls as unknown[];
     if (priorCatalog && Number(priorCatalog.revision) > revision) invalid('hub_sync_catalog_stale', 'A newer control catalogue is already stored');
     if (priorCatalog && Number(priorCatalog.revision) === revision) {
-      if (JSON.stringify(priorCatalog.controls) !== JSON.stringify(controls) || priorCatalog.descriptorDigest !== payload.descriptorDigest) {
+      // PostgreSQL JSONB may return object keys in a different order from the
+      // signed OS payload. Compare canonical structure while retaining array
+      // order, so an exact descriptor retry is idempotent but changed controls
+      // at the same revision still conflict.
+      if (canonicalSyncJson(priorCatalog.controls) !== canonicalSyncJson(controls) || priorCatalog.descriptorDigest !== payload.descriptorDigest) {
         invalid('hub_sync_catalog_conflict', 'This catalogue revision was already used for different controls');
       }
       return;
@@ -196,6 +209,135 @@ export async function applyHubSyncEvent(tx: Prisma.TransactionClient, input: {
     await tx.nativeDevice.update({ where: { id: device.id }, data: {
       capabilitySummary: { ...summary, controlCatalog: { revision, descriptorDigest: payload.descriptorDigest, controls } } as Prisma.InputJsonValue,
     } });
+    return;
+  }
+
+  if (event.type === 'device.state') {
+    const changeCauses = new Set(['APP_INTERACTION', 'PERIODIC_POLL', 'PHYSICAL_INTERACTION', 'VOICE_INTERACTION']);
+    const causeType = changeCauses.has(String(payload.causeType ?? '')) ? String(payload.causeType) : null;
+    const osDeviceId = String(payload.osDeviceId);
+    const device = await tx.nativeDevice.findUnique({ where: { hubInstallationId_osDeviceId: { hubInstallationId, osDeviceId } }, select: {
+      id: true, homeId: true, osDeviceId: true, managementClass: true, ownerMembershipId: true, lifecycle: true,
+      descriptorRevision: true, descriptorDigest: true, capabilitySummary: true,
+    } });
+    // State from a tenant-owned device is intentionally consumed without
+    // creating a property projection, receipt, or Alexa notification.
+    if (!device || device.homeId !== homeId) invalid('hub_sync_state_device_invalid', 'The state observation does not belong to this enrolled Home');
+    if (device.managementClass !== 'PROPERTY_DEVICE' || device.ownerMembershipId !== null
+      || ['RETIRED', 'REMOVED', 'REMOVAL_PENDING'].includes(device.lifecycle)
+      || Number(payload.sourceGeneration) !== Number(input.identityGeneration)) return;
+    const summary = device.capabilitySummary && typeof device.capabilitySummary === 'object' && !Array.isArray(device.capabilitySummary)
+      ? device.capabilitySummary as Record<string, unknown> : {};
+    const catalog = summary.controlCatalog && typeof summary.controlCatalog === 'object' && !Array.isArray(summary.controlCatalog)
+      ? summary.controlCatalog as Record<string, unknown> : null;
+    const controls = Array.isArray(catalog?.controls) ? catalog.controls as Array<Record<string, unknown>> : [];
+    const control = controls.find((candidate) => candidate.controlId === payload.controlId);
+    const safeRoles = new Set(['power', 'brightness', 'target_temperature', 'ambient_temperature', 'opening_percentage', 'position']);
+    if (Number(catalog?.revision) !== device.descriptorRevision || catalog?.descriptorDigest !== device.descriptorDigest
+      || Number(payload.descriptorRevision) !== device.descriptorRevision || !control
+      || !safeRoles.has(String(control.semanticRole)) || control.readable !== true || control.observable !== true
+      || control.stepUpPolicy === 'required' || ['sensitive', 'critical'].includes(String(control.riskLevel))
+      || control.interactionKind === 'momentary_action') return;
+    const observedAt = strictDate(payload.observedAt, now);
+    const receivedAt = strictDate(payload.receivedAt, now);
+    // validUntil is intentionally in the future. Validate its calendar value
+    // here, then constrain it against observedAt and the live descriptor below;
+    // strictDate's two-minute future-observation guard is for source/receipt
+    // timestamps, not a descriptor-authorized validity deadline.
+    const validUntil = new Date(String(payload.validUntil));
+    if (!Number.isFinite(validUntil.getTime())) invalid('hub_sync_state_validity_invalid', 'The state validity deadline is invalid');
+    const maximumValidity = Number(control.maxStateValiditySeconds) * 1000;
+    if (!Number.isSafeInteger(control.maxStateValiditySeconds) || maximumValidity <= 0
+      || validUntil <= observedAt || validUntil.getTime() > observedAt.getTime() + maximumValidity
+      || receivedAt < observedAt) invalid('hub_sync_state_validity_invalid', 'The state observation validity does not match its current descriptor');
+    const expectedAggregate = createHash('sha256').update(`${osDeviceId}\n${String(payload.controlId)}`, 'utf8').digest('hex');
+    if (event.aggregateId !== expectedAggregate) invalid('hub_sync_state_identity_invalid', 'The state observation identity is invalid');
+    const area = await tx.area.findUnique({ where: { homeId_osAreaId: { homeId, osAreaId: String(payload.osAreaId) } }, select: { id: true, status: true } });
+    if (!area || area.status !== 'ACTIVE') return;
+    await requireAreaAssignmentAt(tx, { homeId, deviceId: device.id, areaId: area.id, at: observedAt });
+    const activeAssignment = await tx.deviceAreaAssignment.findFirst({ where: {
+      homeId, deviceId: device.id, areaId: area.id, validUntil: null, area: { status: 'ACTIVE' },
+    }, select: { id: true } });
+    if (!activeAssignment) return;
+    const allowedValue = payload.value === null || typeof payload.value === 'boolean'
+      || typeof payload.value === 'number' && Number.isFinite(payload.value)
+      || typeof payload.value === 'string' && [...payload.value].length <= 160;
+    const valueMatches = payload.value === null
+      ? ['unknown', 'unavailable'].includes(String(payload.quality))
+      : control.valueType === 'boolean' ? typeof payload.value === 'boolean'
+        : control.valueType === 'number' ? typeof payload.value === 'number'
+          : control.valueType === 'option' ? ['string', 'number', 'boolean'].includes(typeof payload.value) : false;
+    if (!allowedValue || !valueMatches) invalid('hub_sync_state_value_invalid', 'The state value does not match its current descriptor');
+    const priorStates = summary.alexaStateByControl && typeof summary.alexaStateByControl === 'object' && !Array.isArray(summary.alexaStateByControl)
+      ? summary.alexaStateByControl as Record<string, unknown> : {};
+    const prior = priorStates[String(payload.controlId)] && typeof priorStates[String(payload.controlId)] === 'object'
+      ? priorStates[String(payload.controlId)] as Record<string, unknown> : null;
+    const nextState: Record<string, unknown> = {
+      deviceId: device.osDeviceId, controlId: String(payload.controlId), homeId,
+      descriptorRevision: device.descriptorRevision,
+      sourceGeneration: Number(payload.sourceGeneration), revision: Number(payload.revision),
+      observedAt: observedAt.toISOString(), receivedAt: receivedAt.toISOString(), validUntil: validUntil.toISOString(),
+      quality: String(payload.quality), value: payload.value,
+      deviceAvailability: String(payload.deviceAvailability),
+    };
+    if (causeType) nextState.causeType = causeType;
+    if (prior) {
+      const priorObserved = Date.parse(String(prior.observedAt ?? ''));
+      const priorRevision = Number(prior.revision);
+      if (Number.isFinite(priorObserved) && (priorObserved > observedAt.getTime() || priorRevision > Number(payload.revision))) return;
+      if (priorObserved === observedAt.getTime() && priorRevision === Number(payload.revision)) {
+        if (JSON.stringify(prior) !== JSON.stringify(nextState)) invalid('hub_sync_state_replay_conflict', 'A state observation revision was reused with different content');
+        return;
+      }
+    }
+    const nextStates = { ...priorStates, [String(payload.controlId)]: nextState };
+    const boundedStates = Object.fromEntries(Object.entries(nextStates).slice(-64));
+    await tx.nativeDevice.update({ where: { id: device.id }, data: {
+      capabilitySummary: { ...summary, alexaStateByControl: boundedStates } as Prisma.InputJsonValue,
+    } });
+
+    // Only queue a proactive report while its source observation can still be
+    // considered current. The operations dispatcher performs full authority
+    // revalidation again immediately before delivery.
+    const policy = currentCustomerPolicy();
+    if (!causeType || process.env.DINODIA_NATIVE_ALEXA_ENABLED !== 'true' || !policy
+      || observedAt.getTime() < now.getTime() - 120_000 || validUntil <= now) return;
+    const endpoints = await tx.alexaNativeEndpointProjection.findMany({ where: {
+      homeId, deviceId: device.id, areaId: area.id, status: 'ACTIVE', descriptorRevision: device.descriptorRevision,
+    }, select: { id: true, endpointId: true, linkId: true, homeId: true, membershipId: true, areaId: true } });
+    for (const endpoint of endpoints) {
+      const link = await tx.alexaNativeLink.findFirst({ where: {
+        id: endpoint.linkId, status: 'ACTIVE', revokedAt: null,
+        accessTokenCiphertext: { not: null }, refreshTokenCiphertext: { not: null },
+        customerAccount: { status: 'ACTIVE', emailVerifiedAt: { not: null }, policyAcceptances: { some: {
+          policyKind: 'DINODIA_NATIVE', policyVersion: policy.version,
+        } } },
+      }, select: { id: true, customerAccountId: true } });
+      if (!link) continue;
+      const membership = await tx.homeMembership.findFirst({ where: {
+        id: endpoint.membershipId, homeId, customerAccountId: link.customerAccountId, role: 'TENANT', status: 'ACTIVE',
+        tenantAreaGrants: { some: { areaId: area.id, revokedAt: null, area: { status: 'ACTIVE' } } },
+      }, select: { id: true } });
+      if (!membership) continue;
+      const scope = await tx.alexaNativeHomeScope.findFirst({ where: {
+        linkId: link.id, homeId, membershipId: membership.id, revokedAt: null,
+        areaSelections: { some: { areaId: area.id, revokedAt: null } },
+      }, select: { id: true } });
+      if (!scope) continue;
+      const observationKey = createHash('sha256').update([
+        endpoint.id, event.id, String(payload.controlId), String(payload.revision), observedAt.toISOString(),
+      ].join('\n'), 'utf8').digest('hex');
+      await tx.nativeDomainOutbox.createMany({ data: [{
+        homeId, hubInstallationId, aggregateType: 'AlexaChangeReport', aggregateId: endpoint.endpointId,
+        eventType: 'ALEXA_CHANGE_REPORT', idempotencyKey: `alexa-change:${observationKey}`,
+        payload: { endpointProjectionId: endpoint.id, linkId: link.id, homeId, membershipId: membership.id,
+          areaId: area.id, deviceId: device.id, controlId: String(payload.controlId),
+          descriptorRevision: device.descriptorRevision, sourceGeneration: Number(payload.sourceGeneration),
+          stateRevision: Number(payload.revision), observedAt: observedAt.toISOString(), causeType } as Prisma.InputJsonValue,
+        state: 'PENDING', attempts: 0, nextAttemptAt: now,
+        expiresAt: new Date(Math.min(validUntil.getTime(), now.getTime() + 24 * 60 * 60 * 1000)),
+      }], skipDuplicates: true });
+    }
     return;
   }
 

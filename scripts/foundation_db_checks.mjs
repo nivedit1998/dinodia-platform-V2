@@ -6,6 +6,12 @@ const expected = new Set([
   'AreaSourceAlias', 'NativeDeviceSourceAlias', 'PermanentDeviceInstallationRequest', 'NativeCommissioningSession', 'NativeDeviceUsageBucket', 'NativeTemperatureSample', 'NativeAutomation', 'NativeAutomationTrigger', 'NativeAutomationAction', 'NativeAutomationExecution', 'AlexaNativeLink', 'AlexaNativeHomeScope', 'AlexaNativeEndpointProjection', 'AlexaNativeDirectiveReceipt', 'NativeBackgroundTaskState', 'NativeDomainOutbox', 'NativeNotificationDeliveryReceipt', 'NativeDeviceOutageIncident', 'NativeSupportTicketTimeline', 'ExceptionalOwnershipTransfer', 'NativeTenantDeviceRecovery', 'HubSyncReceipt', 'RoomAccessEmailAttempt',
 ]);
 try {
+  const migration = await prisma.$queryRaw`SELECT migration_name, checksum, finished_at, rolled_back_at FROM _prisma_migrations ORDER BY finished_at DESC NULLS LAST`;
+  const stage12Rows = await prisma.$queryRaw`SELECT migration_name, checksum, finished_at, rolled_back_at FROM _prisma_migrations WHERE migration_name = '20261009110000_stage12_alexa_oauth_scope'`;
+  if (stage12Rows.length > 1 || (stage12Rows.length === 1 && (stage12Rows[0].checksum !== 'b3e1523009008bcd04b11172150e0d2112b881b03d8f3f137ca2ef81b9b94593' || !stage12Rows[0].finished_at || stage12Rows[0].rolled_back_at))) throw new Error('Stage 12 Alexa migration ledger checksum or completion state is not the reviewed additive migration');
+  if (stage12Rows.length === 1) {
+    for (const name of ['AlexaNativeAreaSelection','AlexaNativeConnectIntent','AlexaNativeConnectIntentArea','AlexaOAuthAuthorizationCode','AlexaOAuthAuthorizationCodeIntent','AlexaOAuthTokenFamily','AlexaOAuthAccessToken','AlexaOAuthRefreshToken']) expected.add(name);
+  }
   const tables = await prisma.$queryRaw`SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE' AND table_name <> '_prisma_migrations' ORDER BY table_name`;
   const names = new Set(tables.map((row) => row.table_name));
   const missing = [...expected].filter((name) => !names.has(name));
@@ -13,7 +19,6 @@ try {
   if (missing.length || extra.length) throw new Error(`table inventory mismatch; missing=${missing.join(',')} extra=${extra.join(',')}`);
   const grantRows = await prisma.$queryRaw`SELECT grantee, table_name, privilege_type FROM information_schema.role_table_grants WHERE table_schema = 'public' AND grantee IN ('anon', 'authenticated')`;
   if (grantRows.length) throw new Error(`anon/authenticated table grants are present (${grantRows.length})`);
-  const migration = await prisma.$queryRaw`SELECT migration_name, checksum, finished_at, rolled_back_at FROM _prisma_migrations ORDER BY finished_at DESC NULLS LAST`;
   const stage10Rows = await prisma.$queryRaw`SELECT migration_name, checksum, finished_at, rolled_back_at FROM _prisma_migrations WHERE migration_name = '20261008130000_stage10_analytics_maintenance_tasks'`;
   const stage10CoverageRows = await prisma.$queryRaw`SELECT migration_name, checksum, finished_at, rolled_back_at FROM _prisma_migrations WHERE migration_name = '20261008150000_stage10_partial_usage_coverage'`;
   const stage11Rows = await prisma.$queryRaw`SELECT migration_name, checksum, finished_at, rolled_back_at FROM _prisma_migrations WHERE migration_name = '20261009100000_stage11_automation_action_order'`;
@@ -63,8 +68,9 @@ try {
   }
   if (stage10CoverageRows.length === 1) required.push('20261008150000_stage10_partial_usage_coverage');
   if (stage11Rows.length === 1) required.push('20261009100000_stage11_automation_action_order');
+  if (stage12Rows.length === 1) required.push('20261009110000_stage12_alexa_oauth_scope');
   if (migration.length !== required.length || required.some((name) => !migrations.has(name)) || required.some((name) => !migrations.get(name).finished_at || migrations.get(name).rolled_back_at)) throw new Error('migration ledger is not exactly the completed native baseline with the reviewed additive migrations');
-  console.log(`[test:stage9-schema] OK: ${names.size} tables, no direct anon/authenticated grants, native baseline and additive migrations through Stage ${stage11Rows.length ? '11' : stage10Rows.length || stage10CoverageRows.length ? '10' : '9'} completed`);
+  console.log(`[test:stage9-schema] OK: ${names.size} tables, no direct anon/authenticated grants, native baseline and additive migrations through Stage ${stage12Rows.length ? '12' : stage11Rows.length ? '11' : stage10Rows.length || stage10CoverageRows.length ? '10' : '9'} completed`);
 } finally {
   await prisma.$disconnect();
 }
