@@ -178,7 +178,7 @@ for (const required of [
 const exampleChecks = [
   ["area", "empty-area.json", (fixture) => fixture.data],
   ["automationPropertyImpactProjection", "automation-property-impact.json", (fixture) => fixture.cases.find((item) => item.expectedDecision === "PROJECTED")?.expectedProjection],
-  ["tenantAutomationDefinition", "automation-stage11-live.json", (fixture) => fixture.definition],
+  ["tenantAutomationCreateDefinition", "automation-stage11-live.json", (fixture) => fixture.definition],
   ["tenantAutomationProjection", "automation-stage11-live.json", (fixture) => fixture.tenantProjection],
   ["propertyAutomationLiveProjection", "automation-stage11-live.json", (fixture) => fixture.propertyProjection],
   ["propertyAutomationInterventionRequest", "automation-stage11-live.json", (fixture) => fixture.propertyInterventionRequest],
@@ -250,7 +250,7 @@ const fixtureCases = [
   ["analytics-unknown-on-expiry.json", "analyticsObservation", (v) => v, true],
   ["automation-full-bundle.json", "automation", (v) => v, true],
   ["automation-property-impact.json", "automationPropertyImpactProjection", (v) => v.cases.find((item) => item.expectedDecision === "PROJECTED")?.expectedProjection, true],
-  ["automation-stage11-live.json", "tenantAutomationDefinition", (v) => v.definition, true],
+  ["automation-stage11-live.json", "tenantAutomationCreateDefinition", (v) => v.definition, true],
   ["automation-stage11-live.json", "tenantAutomationProjection", (v) => v.tenantProjection, true],
   ["automation-stage11-live.json", "propertyAutomationLiveProjection", (v) => v.propertyProjection, true],
   ["automation-stage11-live.json", "propertyAutomationInterventionRequest", (v) => v.propertyInterventionRequest, true],

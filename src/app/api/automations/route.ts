@@ -9,6 +9,7 @@ import { homeownerIdempotencyIdentity, homeownerRequestHash, runIdempotentHomeMu
 import { automationDefinitionChecksum, assertNoNativeAutomationConflict, NativeAutomationError, validateNativeAutomationDefinition } from '@/lib/nativeAutomations/validation';
 import { listTenantAutomationSummaries } from '@/lib/nativeAutomations/summaries';
 import { refreshNativeAutomationCloudRevision } from '@/lib/nativeAutomations/delivery';
+import { lockAndValidateTenantAutomationAuthority } from '@/lib/nativeAutomations/tenantAuthority';
 
 export const dynamic = 'force-dynamic';
 
@@ -42,6 +43,10 @@ export async function POST(request: Request) {
     const response = await serializableTransaction(async (tx) => runIdempotentHomeMutation(tx, {
       namespace: identity.namespace, keyHash: identity.keyHash, actorId: principal.id, homeId: principal.homeId,
       requestHash: homeownerRequestHash(raw),
+      beforeLookup: async () => {
+        await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`native-automation-home:${principal.homeId}`}, 0)) IS NULL AS acquired`;
+        await lockAndValidateTenantAutomationAuthority(tx, principal);
+      },
       operation: async () => {
         await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`native-automation-home:${principal.homeId}`}, 0)) IS NULL AS acquired`;
         const [membership, home] = await Promise.all([
@@ -53,8 +58,8 @@ export async function POST(request: Request) {
         try { new Intl.DateTimeFormat('en', { timeZone: home.timezone }); } catch { throw new NativeAutomationError(409, 'AUTOMATION_TRIGGER_INVALID', 'The Home time zone is not valid'); }
         const count = await tx.nativeAutomation.count({ where: { homeId: home.id, status: { not: 'RETIRED' } } });
         if (count >= 100) throw new NativeAutomationError(409, 'AUTOMATION_ACTIONS_INVALID', 'This Home has reached its automation limit');
-        const definition = await validateNativeAutomationDefinition(tx, { homeId: home.id, membershipId: membership.id, grantedAreaIds: membership.tenantAreaGrants.map((grant) => grant.areaId), raw });
-        await assertNoNativeAutomationConflict(tx, { homeId: home.id, candidate: definition });
+        const definition = await validateNativeAutomationDefinition(tx, { homeId: home.id, membershipId: membership.id, grantedAreaIds: membership.tenantAreaGrants.map((grant) => grant.areaId), raw, allowInitialState: true });
+        if (definition.initiallyEnabled) await assertNoNativeAutomationConflict(tx, { homeId: home.id, candidate: definition });
         const automationId = randomUUID();
         const triggerId = randomUUID();
         const normalized = { name: definition.name, timezone: home.timezone, minuteOfDay: definition.minuteOfDay, weekdays: definition.weekdays,
@@ -64,15 +69,15 @@ export async function POST(request: Request) {
         const updatedHome = await tx.home.updateMany({ where: { id: home.id, lifecycle: 'ACTIVE', installationStatus: 'COMPLETE', managementRevision: home.managementRevision }, data: { managementRevision: { increment: 1 } } });
         if (updatedHome.count !== 1) throw new NativeAutomationError(409, 'AUTOMATION_REVISION_CONFLICT', 'The Home changed while this automation was being saved');
         const created = await tx.nativeAutomation.create({ data: {
-          id: automationId, homeId: home.id, createdByMembershipId: membership.id, name: definition.name, status: 'ACTIVE', revision: 1,
+          id: automationId, homeId: home.id, createdByMembershipId: membership.id, name: definition.name, status: definition.initiallyEnabled ? 'ACTIVE' : 'PAUSED', revision: 1,
           propertyImpact: definition.actions.some((action) => action.managementClass === 'PROPERTY_DEVICE'),
-          definitionChecksum, timezone: home.timezone, enabledAt: new Date(), triggers: { create: { id: triggerId, kind: 'SCHEDULE', configuration: { minuteOfDay: definition.minuteOfDay, weekdays: definition.weekdays } as Prisma.InputJsonValue, revision: 1 } },
+          definitionChecksum, timezone: home.timezone, enabledAt: definition.initiallyEnabled ? new Date() : null, triggers: { create: { id: triggerId, kind: 'SCHEDULE', configuration: { minuteOfDay: definition.minuteOfDay, weekdays: definition.weekdays } as Prisma.InputJsonValue, revision: 1 } },
           actions: { create: definition.actions.map((action) => ({ homeId: home.id, deviceId: action.deviceId, areaId: action.areaId, controlId: action.controlId, sortOrder: action.sortOrder, descriptorRevision: action.descriptorRevision, actionValue: action.targetValue as Prisma.InputJsonValue, needsAttention: false, lastValidatedAt: new Date() })) },
         }, select: { id: true, revision: true } });
         if (!home.activeHubInstallationId) throw new NativeAutomationError(409, 'HUB_UNAVAILABLE', 'The selected Home has no current hub');
         const delivery = await refreshNativeAutomationCloudRevision(tx, { homeId: home.id, hubInstallationId: home.activeHubInstallationId });
         await tx.auditEvent.create({ data: { homeId: home.id, actorType: 'CUSTOMER', actorId: principal.id, category: 'ACCESS', action: 'tenant_automation_created', targetType: 'NativeAutomation', targetId: created.id,
-          metadata: { revision: created.revision, actionCount: definition.actions.length, managementRevision: nextManagementRevision, definitionChecksum }, purgeAt: new Date(Date.now() + 365 * 24 * 60 * 60 * 1000) } });
+          metadata: { revision: created.revision, actionCount: definition.actions.length, managementRevision: nextManagementRevision, definitionChecksum, initiallyEnabled: definition.initiallyEnabled }, purgeAt: new Date(Date.now() + 365 * 24 * 60 * 60 * 1000) } });
         return { ok: true, automationId: created.id, revision: created.revision, managementRevision: nextManagementRevision, deliveryState: delivery.changed ? 'pending_delivery' : 'waiting_for_activation' };
       },
     }));

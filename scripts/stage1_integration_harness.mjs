@@ -1017,11 +1017,210 @@ async function customerAuthorizationChecks(deliveryEnv) {
     { deviceId: automationDevice.id, areaId: areaOne.id, controlId: 'power', targetValue: { type: 'boolean', boolean: true } },
     { deviceId: automationDevice.id, areaId: areaOne.id, controlId: 'brightness', targetValue: { type: 'number', number: 40 } },
   ] };
+  const stage11ProbeStartedAt = new Date();
+  const stage11ProbeHome = await prisma.home.findUniqueOrThrow({ where: { id: homeOne.id }, select: { managementRevision: true } });
+  const stage11ProbeHub = await prisma.hubInstallation.findUniqueOrThrow({ where: { id: hubOne.id }, select: { cloudConfigurationRevision: true, cloudConfigurationChecksum: true } });
+  const stage11ProbeAutomationIds = new Set();
+  const stage11ProbeSessionIds = new Set();
+  const stage11ProbeTrustedDeviceIds = new Set();
+  async function issuedAutomationProbeCredential(label) {
+    const pair = keyPair();
+    const installationId = `stage11-revocation-${label}-${crypto.randomUUID()}`;
+    // This harness reuses one disposable identity across independent race
+    // cases. Clear only its login throttle bucket in disposable PostgreSQL so
+    // each case still obtains a fresh session through the real login route.
+    await prisma.authRateLimitBucket.deleteMany({ where: { bucketKey: `customer-login:${sha256(email)}` } });
+    const jar = {};
+    const login = await fetchJson(`${base}/api/v2/session`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({
+      email, password: customerPassword, deviceInstallationId: installationId, publicKey: pair.publicKey,
+      deviceName: 'Disposable revocation probe', model: 'integration-test', osFamily: 'test', osVersion: 'test',
+    }) });
+    updateCookieJar(jar, login.response);
+    const credential = cookieValue(jar, 'dinodia_customer_session');
+    if (login.response.status !== 200 || !credential) fail(`Stage 11 revocation regression could not obtain an actual disposable browser session (status=${login.response.status}, code=${login.body?.error?.code ?? login.body?.code ?? 'none'})`);
+    const session = await prisma.customerSession.findUniqueOrThrow({ where: { refreshTokenHash: sha256(credential) } });
+    stage11ProbeSessionIds.add(session.id);
+    stage11ProbeTrustedDeviceIds.add(session.trustedDeviceId);
+    return { credential, session };
+  }
+  async function revokedWhileHomeLockWaits({ credential, sessionId, trustedDeviceId, key, definition, seedFirst, mutation, authorityChange = 'session' }) {
+    const headers = { ...preferenceHeaders(credential, homeOne.id), 'idempotency-key': key };
+    let requestPath = '/api/automations';
+    let requestMethod = 'POST';
+    let requestBody = definition;
+    if (seedFirst) requestBody = { ...definition, enabled: false };
+    if (mutation) {
+      const mutationMinute = mutation === 'update' ? 1373 : mutation === 'enable' ? 1374 : mutation === 'disable' ? 1375 : 1376;
+      const seedDefinition = { ...definition, enabled: false, name: `Disposable ${mutation} target`, trigger: { minuteOfDay: mutationMinute, weekdays: [6] } };
+      const seedKey = crypto.randomUUID();
+      const seed = await fetchJson(`${base}/api/automations`, { method: 'POST', headers: { ...headers, 'idempotency-key': seedKey }, body: JSON.stringify(seedDefinition) });
+      if (seed.response.status !== 201 || !seed.body?.automationId) fail(`Stage 11 ${mutation} revocation case could not establish its disposable target`);
+      const automationId = seed.body.automationId;
+      stage11ProbeAutomationIds.add(automationId);
+      if (mutation === 'update') {
+        requestPath = `/api/automations/${automationId}`; requestMethod = 'PUT';
+        requestBody = { expectedRevision: 1, definition: { ...seedDefinition, name: 'Revoked queued update', trigger: { minuteOfDay: 1374, weekdays: [7] } } };
+      } else if (mutation === 'enable' || mutation === 'disable') {
+        requestPath = `/api/automations/${automationId}/enabled`; requestMethod = 'POST';
+        requestBody = { expectedRevision: 1, enabled: mutation === 'enable' };
+      } else if (mutation === 'delete') {
+        requestPath = `/api/automations/${automationId}`; requestMethod = 'DELETE';
+        requestBody = { expectedRevision: 1 };
+      } else {
+        fail(`Unknown Stage 11 revocation mutation ${mutation}`);
+      }
+    }
+    if (seedFirst) {
+      const seed = await fetchJson(`${base}/api/automations`, { method: 'POST', headers, body: JSON.stringify(requestBody) });
+      if (seed.response.status !== 201 || !seed.body?.automationId) fail('Stage 11 revocation regression could not establish its disposable idempotency receipt');
+      stage11ProbeAutomationIds.add(seed.body.automationId);
+    }
+    const countBefore = await prisma.nativeAutomation.count({ where: { homeId: homeOne.id } });
+    const actionCountBefore = await prisma.nativeAutomationAction.count({ where: { homeId: homeOne.id } });
+    const homeBefore = await prisma.home.findUniqueOrThrow({ where: { id: homeOne.id }, select: { managementRevision: true } });
+    const hubBefore = await prisma.hubInstallation.findUniqueOrThrow({ where: { id: hubOne.id }, select: { cloudConfigurationRevision: true } });
+    const rulesBefore = await prisma.nativeAutomation.findMany({ where: { homeId: homeOne.id }, orderBy: { id: 'asc' }, select: {
+      id: true, status: true, revision: true, definitionChecksum: true, enabledAt: true, retiredAt: true, updatedAt: true,
+      triggers: { orderBy: { id: 'asc' }, select: { id: true, revision: true, configuration: true } },
+      actions: { orderBy: [{ sortOrder: 'asc' }, { id: 'asc' }], select: { id: true, deviceId: true, areaId: true, controlId: true, sortOrder: true, descriptorRevision: true, actionValue: true, needsAttention: true } },
+    } });
+    const receiptsBefore = await prisma.idempotencyRecord.count({ where: { homeId: homeOne.id, namespace: { startsWith: 'tenant-automation-' } } });
+    const auditBefore = await prisma.auditEvent.count({ where: { homeId: homeOne.id, action: { startsWith: 'tenant_automation_' } } });
+    let releaseLock; let acquiredLock; let restoreAuthority = async () => {};
+    const lockAcquired = new Promise(resolve => { acquiredLock = resolve; });
+    const release = new Promise(resolve => { releaseLock = resolve; });
+    const holder = prisma.$transaction(async tx => {
+      await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`native-automation-home:${homeOne.id}`}, 0)) IS NULL AS acquired`;
+      acquiredLock(); await release;
+    }, { timeout: 20000 });
+    await lockAcquired;
+    const pending = fetchJson(`${base}${requestPath}`, { method: requestMethod, headers, body: JSON.stringify(requestBody) });
+    let observedWait = false;
+    try {
+      const deadline = Date.now() + 12000;
+      while (Date.now() < deadline) {
+        const waits = await prisma.$queryRaw`SELECT count(*)::int AS count FROM pg_stat_activity WHERE datname = current_database() AND pid <> pg_backend_pid() AND wait_event_type = 'Lock' AND query LIKE '%pg_advisory_xact_lock%'`;
+        if (waits[0]?.count > 0) { observedWait = true; break; }
+        await new Promise(resolve => setTimeout(resolve, 50));
+      }
+      if (!observedWait) fail('Maintained Stage 11 regression did not observe the actual Home advisory-lock wait');
+      if (authorityChange === 'session') {
+        await prisma.customerSession.update({ where: { id: sessionId }, data: { revokedAt: new Date(), revokeReason: 'stage11_lock_revocation_regression' } });
+      } else if (authorityChange === 'expiry') {
+        await prisma.customerSession.update({ where: { id: sessionId }, data: { expiresAt: new Date(Date.now() - 1) } });
+      } else if (authorityChange === 'trusted-device') {
+        await prisma.trustedDevice.update({ where: { id: trustedDeviceId }, data: { revokedAt: new Date() } });
+      } else if (authorityChange === 'account-version') {
+        const prior = await prisma.customerAccount.findUniqueOrThrow({ where: { id: account.id }, select: { securityVersion: true } });
+        await prisma.customerAccount.update({ where: { id: account.id }, data: { securityVersion: { increment: 1 } } });
+        restoreAuthority = async () => { await prisma.customerAccount.update({ where: { id: account.id }, data: { securityVersion: prior.securityVersion } }); };
+      } else if (authorityChange === 'area-grant') {
+        const grant = await prisma.tenantAreaGrant.findFirst({ where: { membershipId: tenantMembership.id, areaId: areaOne.id, revokedAt: null }, select: { id: true, revokedAt: true } });
+        if (!grant) fail('Stage 11 area-grant revocation case could not find its disposable selected grant');
+        await prisma.tenantAreaGrant.update({ where: { id: grant.id }, data: { revokedAt: new Date() } });
+        restoreAuthority = async () => { await prisma.tenantAreaGrant.update({ where: { id: grant.id }, data: { revokedAt: grant.revokedAt } }); };
+      } else {
+        fail(`Unknown Stage 11 authority change ${authorityChange}`);
+      }
+    } finally { releaseLock(); }
+    await holder;
+    const result = await pending;
+    const [countAfter, actionCountAfter, homeAfter, hubAfter] = await Promise.all([
+      prisma.nativeAutomation.count({ where: { homeId: homeOne.id } }),
+      prisma.nativeAutomationAction.count({ where: { homeId: homeOne.id } }),
+      prisma.home.findUniqueOrThrow({ where: { id: homeOne.id }, select: { managementRevision: true } }),
+      prisma.hubInstallation.findUniqueOrThrow({ where: { id: hubOne.id }, select: { cloudConfigurationRevision: true } }),
+    ]);
+    const [rulesAfter, receiptsAfter, auditAfter] = await Promise.all([
+      prisma.nativeAutomation.findMany({ where: { homeId: homeOne.id }, orderBy: { id: 'asc' }, select: {
+        id: true, status: true, revision: true, definitionChecksum: true, enabledAt: true, retiredAt: true, updatedAt: true,
+        triggers: { orderBy: { id: 'asc' }, select: { id: true, revision: true, configuration: true } },
+        actions: { orderBy: [{ sortOrder: 'asc' }, { id: 'asc' }], select: { id: true, deviceId: true, areaId: true, controlId: true, sortOrder: true, descriptorRevision: true, actionValue: true, needsAttention: true } },
+      } }),
+      prisma.idempotencyRecord.count({ where: { homeId: homeOne.id, namespace: { startsWith: 'tenant-automation-' } } }),
+      prisma.auditEvent.count({ where: { homeId: homeOne.id, action: { startsWith: 'tenant_automation_' } } }),
+    ]);
+    const receiptDisclosure = Boolean(result.body?.automationId);
+    const effectsUnchanged = countAfter === countBefore && actionCountAfter === actionCountBefore
+      && homeAfter.managementRevision === homeBefore.managementRevision
+      && hubAfter.cloudConfigurationRevision === hubBefore.cloudConfigurationRevision
+      && JSON.stringify(rulesAfter) === JSON.stringify(rulesBefore)
+      && receiptsAfter === receiptsBefore && auditAfter === auditBefore && !receiptDisclosure;
+    await restoreAuthority();
+    if (!observedWait || result.response.status !== 401 || result.body?.error?.code !== 'TOKEN_EXPIRED' || !effectsUnchanged) {
+      fail(`Changed tenant automation authority had an effect after a real lock wait (${JSON.stringify({ method: requestMethod, pathKind: mutation ?? (seedFirst ? 'exact-retry' : 'create'), authorityChange, observedWait, status: result.response.status, code: result.body?.error?.code, automationDelta: countAfter-countBefore, actionDelta: actionCountAfter-actionCountBefore, homeRevisionDelta: homeAfter.managementRevision-homeBefore.managementRevision, deliveryRevisionDelta: hubAfter.cloudConfigurationRevision-hubBefore.cloudConfigurationRevision, ruleStateUnchanged: JSON.stringify(rulesAfter) === JSON.stringify(rulesBefore), receiptDelta: receiptsAfter-receiptsBefore, auditDelta: auditAfter-auditBefore, receiptDisclosure })})`);
+    }
+  }
+  const freshRevocationProbe = await issuedAutomationProbeCredential('new-create');
+  await revokedWhileHomeLockWaits({ credential: freshRevocationProbe.credential, sessionId: freshRevocationProbe.session.id, key: crypto.randomUUID(),
+    definition: { ...automationBody, name: 'Revoked queued create', trigger: { minuteOfDay: 783, weekdays: [7] } }, seedFirst: false });
+  const receiptRevocationProbe = await issuedAutomationProbeCredential('receipt-replay');
+  const receiptProbeKey = crypto.randomUUID();
+  await revokedWhileHomeLockWaits({ credential: receiptRevocationProbe.credential, sessionId: receiptRevocationProbe.session.id, key: receiptProbeKey,
+    definition: { ...automationBody, name: 'Revoked exact retry', trigger: { minuteOfDay: 787, weekdays: [7] } }, seedFirst: true });
+  for (const mutation of ['update', 'enable', 'disable', 'delete']) {
+    const probe = await issuedAutomationProbeCredential(`${mutation}-wait`);
+    await revokedWhileHomeLockWaits({ credential: probe.credential, sessionId: probe.session.id, trustedDeviceId: probe.session.trustedDeviceId, key: crypto.randomUUID(),
+      definition: { ...automationBody, name: `Revoked queued ${mutation}`, trigger: { minuteOfDay: 790, weekdays: [7] } }, mutation });
+  }
+  for (const authorityChange of ['trusted-device', 'account-version', 'area-grant', 'expiry']) {
+    const probe = await issuedAutomationProbeCredential(`${authorityChange}-wait`);
+    await revokedWhileHomeLockWaits({ credential: probe.credential, sessionId: probe.session.id, trustedDeviceId: probe.session.trustedDeviceId,
+      key: crypto.randomUUID(), definition: { ...automationBody, name: `Changed authority ${authorityChange}`, trigger: { minuteOfDay: 791, weekdays: [7] } }, authorityChange });
+  }
+  if (stage11ProbeAutomationIds.size) {
+    const automationIds = [...stage11ProbeAutomationIds];
+    const sessionIds = [...stage11ProbeSessionIds];
+    const deviceIds = [...stage11ProbeTrustedDeviceIds];
+    await prisma.nativeAutomation.deleteMany({ where: { id: { in: automationIds }, homeId: homeOne.id } });
+    await prisma.idempotencyRecord.deleteMany({ where: { homeId: homeOne.id, actorId: account.id,
+      namespace: { startsWith: 'tenant-automation-' }, createdAt: { gte: stage11ProbeStartedAt } } });
+    await prisma.auditEvent.deleteMany({ where: { OR: [
+      { homeId: homeOne.id, targetId: { in: automationIds }, action: { startsWith: 'tenant_automation_' } },
+      { actorId: account.id, targetId: { in: sessionIds }, action: 'customer_login_succeeded' },
+    ] } });
+    await prisma.customerSession.deleteMany({ where: { id: { in: sessionIds }, customerAccountId: account.id } });
+    await prisma.trustedDevice.deleteMany({ where: { id: { in: deviceIds }, customerAccountId: account.id } });
+    await prisma.authRateLimitBucket.deleteMany({ where: { bucketKey: `customer-login:${sha256(email)}` } });
+    await prisma.home.update({ where: { id: homeOne.id }, data: { managementRevision: stage11ProbeHome.managementRevision } });
+    await prisma.hubInstallation.update({ where: { id: hubOne.id }, data: {
+      cloudConfigurationRevision: stage11ProbeHub.cloudConfigurationRevision,
+      cloudConfigurationChecksum: stage11ProbeHub.cloudConfigurationChecksum,
+    } });
+  }
+  console.log('[stage11:integration] PASS: actual tenant create, exact-retry, update, enable, disable and delete routes revalidate live session/device/account/grant/expiry authority after observed Home lock waits; denials cause zero protected effects or receipt disclosure');
   const automationKey = crypto.randomUUID();
   const automationCountBefore = await prisma.nativeAutomation.count({ where: { homeId: homeOne.id } });
   const automationCreate = await fetchJson(`${base}/api/automations`, { method: 'POST', headers: { ...automationHeaders, 'idempotency-key': automationKey }, body: JSON.stringify(automationBody) });
   const automationRetry = await fetchJson(`${base}/api/automations`, { method: 'POST', headers: { ...automationHeaders, 'idempotency-key': automationKey }, body: JSON.stringify(automationBody) });
-  const automationAfterCreate = automationCreate.body?.automationId ? await prisma.nativeAutomation.findUnique({ where: { id: automationCreate.body.automationId }, include: { actions: { orderBy: [{ sortOrder: 'asc' }, { id: 'asc' }] } } }) : null;
+  const automationAfterCreate = automationCreate.body?.automationId ? await prisma.nativeAutomation.findUnique({ where: { id: automationCreate.body.automationId }, include: { triggers: true, actions: { orderBy: [{ sortOrder: 'asc' }, { id: 'asc' }] } } }) : null;
+  const duplicateAutomationBody = { ...automationBody, name: 'Disabled tenant duplicate', enabled: false };
+  const duplicateAutomationResponse = await fetchJson(`${base}/api/automations`, { method: 'POST', headers: { ...automationHeaders, 'idempotency-key': crypto.randomUUID() }, body: JSON.stringify(duplicateAutomationBody) });
+  const duplicateAutomation = duplicateAutomationResponse.body?.automationId
+    ? await prisma.nativeAutomation.findUnique({ where: { id: duplicateAutomationResponse.body.automationId }, include: { triggers: true, actions: true, executions: true } }) : null;
+  const tenantAutomationSummary = await fetchJson(`${base}/api/automations`, { headers: preferenceHeaders(rawSession, homeOne.id) });
+  const duplicateSummary = tenantAutomationSummary.body?.automations?.find((row) => row.id === duplicateAutomation?.id);
+  if (duplicateAutomationResponse.response.status !== 201 || duplicateAutomation?.status !== 'PAUSED' || duplicateAutomation.enabledAt !== null
+    || duplicateAutomation.triggers[0]?.id === automationAfterCreate?.triggers?.[0]?.id
+    || duplicateAutomation.actions.some((action) => automationAfterCreate?.actions?.some((prior) => prior.id === action.id))
+    || duplicateAutomation.executions.length !== 0 || !['disabled', 'disabled_waiting_for_hub'].includes(duplicateSummary?.status)) {
+    fail(`A duplicate tenant automation must be created disabled with fresh identities, no copied run history, and a truthful disabled summary (${JSON.stringify({ status: duplicateAutomationResponse.response.status, code: duplicateAutomationResponse.body?.error?.code, persistedStatus: duplicateAutomation?.status, enabledAt: duplicateAutomation?.enabledAt, triggerIsFresh: duplicateAutomation?.triggers[0]?.id !== automationAfterCreate?.triggers?.[0]?.id, actionsAreFresh: !duplicateAutomation?.actions.some((action) => automationAfterCreate?.actions?.some((prior) => prior.id === action.id)), executionCount: duplicateAutomation?.executions.length, summaryStatus: duplicateSummary?.status })})`);
+  }
+  if (!Array.isArray(tenantAutomationSummary.body?.automations) || tenantAutomationSummary.body.automations.some((row) => !Object.hasOwn(row, 'lastOutcome'))) {
+    fail('Tenant automation summaries must include the bounded lastOutcome field, including explicit null before the first run');
+  }
+  const createOnlyStateRowBefore = await prisma.nativeAutomation.findUniqueOrThrow({ where: { id: automationCreate.body.automationId }, select: { revision: true } });
+  const createOnlyStateHomeBefore = await prisma.home.findUniqueOrThrow({ where: { id: homeOne.id }, select: { managementRevision: true } });
+  const createOnlyStateOnUpdate = await fetchJson(`${base}/api/automations/${automationCreate.body.automationId}`, { method: 'PUT',
+    headers: { ...automationHeaders, 'idempotency-key': crypto.randomUUID() },
+    body: JSON.stringify({ expectedRevision: createOnlyStateRowBefore.revision, definition: { ...automationBody, enabled: false } }) });
+  const createOnlyStateRowAfter = await prisma.nativeAutomation.findUniqueOrThrow({ where: { id: automationCreate.body.automationId }, select: { revision: true } });
+  const createOnlyStateHomeAfter = await prisma.home.findUniqueOrThrow({ where: { id: homeOne.id }, select: { managementRevision: true } });
+  if (createOnlyStateOnUpdate.response.status !== 400 || createOnlyStateOnUpdate.body?.error?.code !== 'AUTOMATION_INVALID'
+    || createOnlyStateRowAfter.revision !== createOnlyStateRowBefore.revision
+    || createOnlyStateHomeAfter.managementRevision !== createOnlyStateHomeBefore.managementRevision) {
+    fail('Create-only enabled:false must be rejected on update without changing automation or Home revisions');
+  }
   const automationConflict = await fetchJson(`${base}/api/automations`, { method: 'POST', headers: { ...automationHeaders, 'idempotency-key': crypto.randomUUID() }, body: JSON.stringify({ ...automationBody, name: 'Conflicting disposable routine', actions: [{ deviceId: automationDevice.id, areaId: areaOne.id, controlId: 'power', targetValue: { type: 'boolean', boolean: false } }] }) });
   const appOnlyAutomation = await fetchJson(`${base}/api/automations`, { method: 'POST', headers: { ...automationHeaders, 'idempotency-key': crypto.randomUUID() }, body: JSON.stringify({ ...automationBody, name: 'Forbidden lock routine', actions: [{ deviceId: automationDevice.id, areaId: areaOne.id, controlId: 'lock', targetValue: { type: 'invoke' } }] }) });
   const wrongHomeAutomation = await fetchJson(`${base}/api/automations`, { method: 'POST', headers: { ...preferenceHeaders(rawSession, homeTwo.id), 'idempotency-key': crypto.randomUUID() }, body: JSON.stringify(automationBody) });
@@ -1053,11 +1252,19 @@ async function customerAuthorizationChecks(deliveryEnv) {
     || automationConflict.response.status !== 409 || automationConflict.body?.error?.code !== 'AUTOMATION_CONFLICT'
     || appOnlyAutomation.response.status !== 400 || appOnlyAutomation.body?.error?.code !== 'AUTOMATION_CONTROL_APP_ONLY'
     || wrongHomeAutomation.response.status !== 403 || otherTenantDeviceAttempt.response.status !== 400
-    || automationAfterDenials !== automationCountBefore + 1 || automationList.response.status !== 200
+    || automationAfterDenials !== automationCountBefore + 2 || automationList.response.status !== 200
     || listedAutomationIds.length !== automationListOwnedIds.length || automationListOwnedIds.some((row) => !listedAutomationIds.includes(row.id))
     || listedAutomationIds.filter((id) => id === automationCreate.body?.automationId).length !== 1
     || JSON.stringify(automationList.body).includes('Private disposable device')
-    || enabledAutomationConfiguration.automations.length !== 1 || enabledAutomationConfiguration.automations[0]?.actions.length !== 2
+    // The complete replacement configuration intentionally carries PAUSED
+    // definitions as tombstones so the OS can remove a previously active
+    // local mirror. Only ACTIVE entries may be executable; the OS consumer
+    // independently filters that exact status before installing schedules.
+    || enabledAutomationConfiguration.automations.filter((item) => item.status === 'ACTIVE').length !== 1
+    || enabledAutomationConfiguration.automations.find((item) => item.id === automationCreate.body?.automationId)?.actions.length !== 2
+    || enabledAutomationConfiguration.automations.filter((item) => item.status === 'PAUSED').length !== 1
+    || enabledAutomationConfiguration.automations.find((item) => item.id === duplicateAutomation.id)?.status !== 'PAUSED'
+    || enabledAutomationConfiguration.automations.some((item) => !['ACTIVE', 'PAUSED', 'NEEDS_ATTENTION', 'RETIRED'].includes(item.status))
     || disabledAutomationConfiguration.automations.length !== 0) {
     fail(`Stage 11 tenant automation route did not preserve idempotency/scope/conflict safety (${JSON.stringify({ create: automationCreate.response.status, createCode: automationCreate.body?.error?.code, retry: automationRetry.response.status, retryCode: automationRetry.body?.error?.code, conflict: automationConflict.response.status, conflictCode: automationConflict.body?.error?.code, lock: appOnlyAutomation.response.status, wrongHome: wrongHomeAutomation.response.status, otherTenantDevice: otherTenantDeviceAttempt.response.status, countDelta: automationAfterDenials - automationCountBefore, list: automationList.response.status, listed: listedAutomationIds.length, expectedListed: automationListOwnedIds.length, privateLabelLeaked: JSON.stringify(automationList.body).includes('Private disposable device'), enabledCount: enabledAutomationConfiguration.automations.length, enabledActionCount: enabledAutomationConfiguration.automations[0]?.actions.length ?? 0, disabledCount: disabledAutomationConfiguration.automations.length })})`);
   }
@@ -2497,10 +2704,15 @@ async function customerAuthorizationChecks(deliveryEnv) {
   } });
   const automationExecutionKey = `hub:${hubOne.id}:${automationOccurrenceId}`;
   const acceptedAutomationExecution = await prisma.nativeAutomationExecution.findUnique({ where: { idempotencyKey: automationExecutionKey }, select: { status: true, safeOutcome: true } });
+  const tenantOutcomeProjection = await fetchJson(`${base}/api/automations`, { headers: automationHeaders });
+  const projectedOutcome = tenantOutcomeProjection.body?.automations?.find((row) => row.id === automationCreate.body.automationId)?.lastOutcome;
   const tenantFailureReceipts = await prisma.nativeNotificationDeliveryReceipt.findMany({ where: {
     homeId: homeOne.id, family: 'TENANT_AUTOMATION_FAILURE', idempotencyKey: { startsWith: `automation-failure:${automationCreate.body.automationId}:` },
   }, select: { id: true, customerAccountId: true, trustedDeviceId: true, membershipId: true, status: true, expiresAt: true } });
   if (automationOutcomeResponse.response.status !== 200 || acceptedAutomationExecution?.status !== 'PARTIAL'
+    || tenantOutcomeProjection.response.status !== 200 || projectedOutcome?.status !== 'partial' || projectedOutcome?.actionCount !== 2
+    || projectedOutcome?.actionStatuses?.applied !== 1 || projectedOutcome?.actionStatuses?.failed !== 1
+    || projectedOutcome?.actionStatuses?.uncertain !== 0 || projectedOutcome?.actionStatuses?.skipped !== 0
     || tenantFailureReceipts.length !== 1 || tenantFailureReceipts[0].customerAccountId !== account.id
     || tenantFailureReceipts[0].membershipId !== tenantMembership.id || tenantFailureReceipts[0].trustedDeviceId !== automationPushDevice.id
     || tenantFailureReceipts[0].status !== 'PENDING' || tenantFailureReceipts[0].expiresAt.getTime() <= Date.now()) {
@@ -2536,6 +2748,7 @@ async function customerAuthorizationChecks(deliveryEnv) {
     fail(`The actual bounded notification dispatcher did not revalidate and send one opted-in tenant failure notice through the injected APNs transport (${JSON.stringify({ dispatch: automationPushDispatch, sends: deliveredAutomationTokens.length, matchingToken: deliveredAutomationTokens.length === 1 && deliveredAutomationTokens[0].deviceToken === automationPushToken, matchingReceipt: deliveredAutomationTokens.length === 1 && deliveredAutomationTokens[0].requestId === tenantFailureReceipts[0].id, receiptStatus: deliveredAutomationReceipt.status, attempts: deliveredAutomationReceipt.attemptCount, errorCode: deliveredAutomationReceipt.lastErrorCode })})`);
   }
   console.log('[stage11:integration] PASS: durable OS outcome entered the actual signed sync route once; one bounded failure receipt went only to the owning opted-in tenant, exact replay had zero duplicate effects, and dispatcher acceptance is recorded without claiming device delivery');
+  console.log('[stage11:integration] PASS: actual tenant summary exposes the retained partial execution with bounded per-action outcome counts and genuine timestamps');
   // Reproduce the real installation backlog shape: multiple critical
   // integration incidents can retain successive revisions in one contiguous
   // batch. Revisions of a stable incident key must update one projection, not

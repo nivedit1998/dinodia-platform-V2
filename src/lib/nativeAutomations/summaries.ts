@@ -21,6 +21,27 @@ function triggerSummary(trigger: { id: string; kind: string; configuration: unkn
   return { id: trigger.id, kind: trigger.kind, minuteOfDay, weekdays, revision: trigger.revision };
 }
 
+function tenantOutcome(execution: { status: string; startedAt: Date; completedAt: Date | null; safeOutcome: unknown } | undefined) {
+  if (!execution) return null;
+  const raw = execution.safeOutcome && typeof execution.safeOutcome === 'object' && !Array.isArray(execution.safeOutcome)
+    ? execution.safeOutcome as Record<string, unknown> : null;
+  const rawCounts = raw?.actionStatuses && typeof raw.actionStatuses === 'object' && !Array.isArray(raw.actionStatuses)
+    ? raw.actionStatuses as Record<string, unknown> : null;
+  const actionCount = raw?.actionCount;
+  const statuses = rawCounts && ['applied', 'failed', 'uncertain', 'skipped'].every((key) => Number.isSafeInteger(rawCounts[key]))
+    ? { applied: Number(rawCounts.applied), failed: Number(rawCounts.failed), uncertain: Number(rawCounts.uncertain), skipped: Number(rawCounts.skipped) }
+    : null;
+  const countsValid = Number.isSafeInteger(actionCount) && Number(actionCount) >= 0 && Number(actionCount) <= 32
+    && statuses !== null && Object.values(statuses).every((count) => count >= 0 && count <= Number(actionCount))
+    && Object.values(statuses).reduce((sum, count) => sum + count, 0) <= Number(actionCount);
+  return {
+    status: execution.status === 'INTERRUPTED' ? 'uncertain' : execution.status.toLowerCase(),
+    startedAt: execution.startedAt.toISOString(),
+    completedAt: execution.completedAt?.toISOString() ?? null,
+    ...(countsValid ? { actionCount: Number(actionCount), actionStatuses: statuses } : {}),
+  };
+}
+
 export async function listTenantAutomationSummaries(input: { homeId: string; membershipId: string }) {
   const membership = await prisma.homeMembership.findFirst({ where: { id: input.membershipId, homeId: input.homeId, role: 'TENANT', status: 'ACTIVE' }, select: {
     id: true, accessRevision: true, tenantAreaGrants: { where: { revokedAt: null, area: { status: 'ACTIVE' } }, select: { areaId: true } },
@@ -32,6 +53,7 @@ export async function listTenantAutomationSummaries(input: { homeId: string; mem
       id: true, name: true, status: true, revision: true, definitionChecksum: true, timezone: true, retiredAt: true, createdAt: true, updatedAt: true,
       triggers: { orderBy: { id: 'asc' }, take: 1, select: { id: true, kind: true, configuration: true, revision: true } },
       actions: { orderBy: [{ sortOrder: 'asc' }, { id: 'asc' }], take: 32, select: { id: true, deviceId: true, areaId: true, controlId: true, sortOrder: true, descriptorRevision: true, actionValue: true, needsAttention: true, device: { select: { managementClass: true, ownerMembershipId: true, originalName: true, overrideName: true, customerLabel: true } }, area: { select: { originalName: true, overrideName: true } } } },
+      executions: { where: { purgeAt: { gt: new Date() } }, orderBy: { startedAt: 'desc' }, take: 1, select: { status: true, startedAt: true, completedAt: true, safeOutcome: true } },
     } }),
   ]);
   const visibleRows = rows.filter((row) => row.status !== 'RETIRED' || !delivery.applied);
@@ -56,6 +78,7 @@ export async function listTenantAutomationSummaries(input: { homeId: string; mem
         deviceName: action.device.overrideName ?? action.device.customerLabel ?? action.device.originalName,
         areaName: action.area.overrideName ?? action.area.originalName,
       }] : []),
+      lastOutcome: tenantOutcome(row.executions[0]),
       createdAt: row.createdAt.toISOString(), updatedAt: row.updatedAt.toISOString(),
     })),
   };

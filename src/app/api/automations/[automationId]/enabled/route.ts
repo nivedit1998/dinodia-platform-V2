@@ -7,6 +7,7 @@ import { Stage1AuthError } from '@/lib/stage1Auth';
 import { homeownerIdempotencyIdentity, homeownerRequestHash, runIdempotentHomeMutation } from '@/lib/homeownerIdempotency';
 import { automationDefinitionChecksum, assertNoNativeAutomationConflict, NativeAutomationError, validateNativeAutomationDefinition } from '@/lib/nativeAutomations/validation';
 import { refreshNativeAutomationCloudRevision } from '@/lib/nativeAutomations/delivery';
+import { lockAndValidateTenantAutomationAuthority } from '@/lib/nativeAutomations/tenantAuthority';
 
 export const dynamic = 'force-dynamic';
 type Context = { params: Promise<{ automationId: string }> };
@@ -21,6 +22,10 @@ export async function POST(request: Request, context: Context) {
     const identity = homeownerIdempotencyIdentity(principal.id, request.headers.get('idempotency-key') ?? '', `tenant-automation-enabled:${principal.homeId}:${automationId}`);
     const result = await serializableTransaction(async (tx) => runIdempotentHomeMutation(tx, {
       namespace: identity.namespace, keyHash: identity.keyHash, actorId: principal.id, homeId: principal.homeId, requestHash: homeownerRequestHash(raw),
+      beforeLookup: async () => {
+        await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`native-automation-home:${principal.homeId}`}, 0)) IS NULL AS acquired`;
+        await lockAndValidateTenantAutomationAuthority(tx, principal);
+      },
       operation: async () => {
         await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`native-automation-home:${principal.homeId}`}, 0)) IS NULL AS acquired`;
         const [membership, home, hub, row] = await Promise.all([

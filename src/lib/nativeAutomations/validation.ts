@@ -6,7 +6,7 @@ export class NativeAutomationError extends Error {
 }
 
 type ActionInput = { deviceId: string; areaId: string; controlId: string; targetValue: Record<string, unknown> };
-type NormalizedDefinition = { name: string; minuteOfDay: number; weekdays: number[]; actions: Array<ActionInput & { sortOrder: number; descriptorRevision: number; managementClass: string; osDeviceId: string; osAreaId: string }> };
+type NormalizedDefinition = { name: string; minuteOfDay: number; weekdays: number[]; initiallyEnabled: boolean; actions: Array<ActionInput & { sortOrder: number; descriptorRevision: number; managementClass: string; osDeviceId: string; osAreaId: string }> };
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const APP_ONLY_ROLES = new Set(['security_lock', 'lock_state']);
 
@@ -49,9 +49,11 @@ function scheduleOverlaps(left: { minuteOfDay: number; weekdays: number[] }, rig
 }
 
 export async function validateNativeAutomationDefinition(tx: Prisma.TransactionClient, input: {
-  homeId: string; membershipId: string; grantedAreaIds: readonly string[]; raw: unknown;
+  homeId: string; membershipId: string; grantedAreaIds: readonly string[]; raw: unknown; allowInitialState?: boolean;
 }): Promise<NormalizedDefinition> {
-  if (!plainObject(input.raw) || Object.keys(input.raw).some((key) => !['name', 'trigger', 'actions'].includes(key))) fail('AUTOMATION_INVALID', 'The automation details are incomplete');
+  const allowedKeys = input.allowInitialState ? ['name', 'trigger', 'actions', 'enabled'] : ['name', 'trigger', 'actions'];
+  if (!plainObject(input.raw) || Object.keys(input.raw).some((key) => !allowedKeys.includes(key))) fail('AUTOMATION_INVALID', 'The automation details are incomplete');
+  if (input.allowInitialState && input.raw.enabled !== undefined && typeof input.raw.enabled !== 'boolean') fail('AUTOMATION_INVALID', 'The automation enabled state is not valid');
   if (!validName(input.raw.name)) fail('AUTOMATION_INVALID', 'The automation name must be 1–60 characters');
   if (!plainObject(input.raw.trigger) || Object.keys(input.raw.trigger).some((key) => !['minuteOfDay', 'weekdays'].includes(key))) fail('AUTOMATION_TRIGGER_INVALID', 'Choose one recurring time and weekdays');
   const minuteOfDay = input.raw.trigger.minuteOfDay;
@@ -96,7 +98,8 @@ export async function validateNativeAutomationDefinition(tx: Prisma.TransactionC
     actions.push({ ...action, sortOrder, descriptorRevision: device.descriptorRevision, managementClass: device.managementClass,
       osDeviceId: device.osDeviceId, osAreaId: device.assignments[0].area.osAreaId });
   }
-  return { name: input.raw.name.normalize('NFC').trim(), minuteOfDay: Number(minuteOfDay), weekdays: [...weekdays as number[]].sort((a, b) => a - b), actions };
+  return { name: input.raw.name.normalize('NFC').trim(), minuteOfDay: Number(minuteOfDay), weekdays: [...weekdays as number[]].sort((a, b) => a - b),
+    initiallyEnabled: input.allowInitialState ? input.raw.enabled !== false : true, actions };
 }
 
 export async function assertNoNativeAutomationConflict(tx: Prisma.TransactionClient, input: {

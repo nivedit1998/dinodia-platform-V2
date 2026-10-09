@@ -9,6 +9,7 @@ import { homeownerIdempotencyIdentity, homeownerRequestHash, runIdempotentHomeMu
 import { automationDefinitionChecksum, assertNoNativeAutomationConflict, NativeAutomationError, validateNativeAutomationDefinition } from '@/lib/nativeAutomations/validation';
 import { refreshNativeAutomationCloudRevision } from '@/lib/nativeAutomations/delivery';
 import { retireNativeAutomations } from '@/lib/nativeAutomations/lifecycle';
+import { lockAndValidateTenantAutomationAuthority } from '@/lib/nativeAutomations/tenantAuthority';
 
 export const dynamic = 'force-dynamic';
 type RouteContext = { params: Promise<{ automationId: string }> };
@@ -46,6 +47,10 @@ export async function PUT(request: Request, context: RouteContext) {
     const idempotency = homeownerIdempotencyIdentity(principal.id, request.headers.get('idempotency-key') ?? '', `tenant-automation-update:${principal.homeId}:${automationId}`);
     const result = await serializableTransaction(async (tx) => runIdempotentHomeMutation(tx, {
       namespace: idempotency.namespace, keyHash: idempotency.keyHash, actorId: principal.id, homeId: principal.homeId, requestHash: homeownerRequestHash(raw),
+      beforeLookup: async () => {
+        await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`native-automation-home:${principal.homeId}`}, 0)) IS NULL AS acquired`;
+        await lockAndValidateTenantAutomationAuthority(tx, principal);
+      },
       operation: async () => {
         await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`native-automation-home:${principal.homeId}`}, 0)) IS NULL AS acquired`;
         const [membership, home, current] = await Promise.all([
@@ -99,6 +104,10 @@ export async function DELETE(request: Request, context: RouteContext) {
     const idempotency = homeownerIdempotencyIdentity(principal.id, request.headers.get('idempotency-key') ?? '', `tenant-automation-delete:${principal.homeId}:${automationId}`);
     const result = await serializableTransaction(async (tx) => runIdempotentHomeMutation(tx, {
       namespace: idempotency.namespace, keyHash: idempotency.keyHash, actorId: principal.id, homeId: principal.homeId, requestHash: homeownerRequestHash(raw),
+      beforeLookup: async () => {
+        await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`native-automation-home:${principal.homeId}`}, 0)) IS NULL AS acquired`;
+        await lockAndValidateTenantAutomationAuthority(tx, principal);
+      },
       operation: async () => {
         await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`native-automation-home:${principal.homeId}`}, 0)) IS NULL AS acquired`;
         const [membership, home, current] = await Promise.all([

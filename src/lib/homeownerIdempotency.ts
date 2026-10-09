@@ -24,10 +24,14 @@ export function homeownerRequestHash(value: unknown): string { return sha256(can
  */
 export async function runIdempotentHomeMutation<T extends Record<string, unknown>>(db: Prisma.TransactionClient, input: {
   namespace: string; keyHash: string; actorId: string; homeId: string; requestHash: string; now?: Date;
+  beforeLookup?: () => Promise<void>;
   operation: () => Promise<T>;
 }): Promise<T> {
   // Project PostgreSQL's `void` lock result to a supported Prisma scalar.
   await db.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`${input.namespace}:${input.keyHash}`}, 0)) IS NULL AS acquired`;
+  // The caller acquires its shared Home lock and revalidates live authority
+  // here, before an exact retry can read or disclose an old mutation receipt.
+  await input.beforeLookup?.();
   const now = input.now ?? new Date();
   const prior = await db.idempotencyRecord.findUnique({ where: { namespace_keyHash: { namespace: input.namespace, keyHash: input.keyHash } }, select: { actorId: true, homeId: true, requestHash: true, responseBody: true, expiresAt: true } });
   if (prior) {
