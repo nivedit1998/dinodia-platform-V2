@@ -122,8 +122,8 @@ export async function listPropertyAutomationSummaries(input: { homeId: string; m
       revision: row.revision, timeZone: row.timezone, trigger: triggerSummary(row.triggers[0]),
       // Deliberately project permanent-device actions only. Mixed rules expose
       // no private label, control, value, count, fragment or private-only rule.
-      actions: row.status === 'RETIRED' ? [] : row.actions.filter((action) => action.device.managementClass === 'PROPERTY_DEVICE').map((action) => ({
-        id: action.id, deviceId: action.deviceId, areaId: action.areaId, controlId: action.controlId, sortOrder: action.sortOrder,
+      actions: row.status === 'RETIRED' ? [] : row.actions.filter((action) => action.device.managementClass === 'PROPERTY_DEVICE').map((action, visibleIndex) => ({
+        id: action.id, deviceId: action.deviceId, areaId: action.areaId, controlId: action.controlId, sortOrder: visibleIndex,
         deviceName: action.device.overrideName ?? action.device.customerLabel ?? action.device.originalName,
         areaName: action.area.overrideName ?? action.area.originalName,
         needsAttention: action.needsAttention,

@@ -1310,8 +1310,8 @@ async function customerAuthorizationChecks(deliveryEnv) {
     return device;
   });
   const mixedRuleBody = { name: 'Private bedtime mixed routine', trigger: { minuteOfDay: 480, weekdays: [1, 2, 3, 4, 5] }, actions: [
-    { deviceId: automationDevice.id, areaId: areaOne.id, controlId: 'power', targetValue: { type: 'boolean', boolean: true } },
     { deviceId: mixedPrivateDevice.id, areaId: areaOne.id, controlId: 'power', targetValue: { type: 'boolean', boolean: true } },
+    { deviceId: automationDevice.id, areaId: areaOne.id, controlId: 'power', targetValue: { type: 'boolean', boolean: true } },
   ] };
   const mixedRule = await fetchJson(`${base}/api/automations`, { method: 'POST', headers: { ...automationHeaders, 'idempotency-key': crypto.randomUUID() }, body: JSON.stringify(mixedRuleBody) });
   const privateOnlyRule = await fetchJson(`${base}/api/automations`, { method: 'POST', headers: { ...automationHeaders, 'idempotency-key': crypto.randomUUID() }, body: JSON.stringify({
@@ -1319,7 +1319,37 @@ async function customerAuthorizationChecks(deliveryEnv) {
       { deviceId: mixedPrivateDevice.id, areaId: areaOne.id, controlId: 'brightness', targetValue: { type: 'number', number: 35 } },
     ],
   }) });
-  if (mixedRule.response.status !== 201 || privateOnlyRule.response.status !== 201) fail(`Disposable mixed/private automation fixtures were not accepted through the tenant route (${mixedRule.response.status}/${privateOnlyRule.response.status})`);
+  const secondMixedPrivateDevice = await prisma.$transaction(async (tx) => {
+    const device = await tx.nativeDevice.create({ data: { homeId: homeOne.id, hubInstallationId: hubOne.id,
+      osDeviceId: `stage11-mixed-private-${crypto.randomUUID()}`, originalName: 'Second private automation device label',
+      technicalLabel: 'tenant_device', managementClass: 'TENANT_DEVICE', ownerMembershipId: tenantMembership.id,
+      deviceType: 'test.light', protocol: 'virtual', lifecycle: 'INSTALLED', descriptorRevision: 1,
+      descriptorDigest: automationDescriptorDigest, capabilitySummary: automationDevice.capabilitySummary } });
+    await tx.deviceAreaAssignment.create({ data: { homeId: homeOne.id, deviceId: device.id, areaId: areaOne.id,
+      source: 'STAGE11_DISPOSABLE_TEST', actorType: 'SYSTEM', validFrom: now } });
+    return device;
+  });
+  const interleavedRule = await fetchJson(`${base}/api/automations`, { method: 'POST', headers: { ...automationHeaders, 'idempotency-key': crypto.randomUUID() }, body: JSON.stringify({
+    name: 'Private interleaved disposable routine', enabled: false, trigger: { minuteOfDay: 481, weekdays: [1, 2, 3, 4, 5] }, actions: [
+      { deviceId: automationDevice.id, areaId: areaOne.id, controlId: 'power', targetValue: { type: 'boolean', boolean: false } },
+      { deviceId: mixedPrivateDevice.id, areaId: areaOne.id, controlId: 'brightness', targetValue: { type: 'number', number: 35 } },
+      { deviceId: automationDevice.id, areaId: areaOne.id, controlId: 'brightness', targetValue: { type: 'number', number: 60 } },
+    ],
+  }) });
+  const multiplePrivateRule = await fetchJson(`${base}/api/automations`, { method: 'POST', headers: { ...automationHeaders, 'idempotency-key': crypto.randomUUID() }, body: JSON.stringify({
+    name: 'Private multi-step interleaved disposable routine', enabled: false, trigger: { minuteOfDay: 482, weekdays: [1, 2, 3, 4, 5] }, actions: [
+      { deviceId: mixedPrivateDevice.id, areaId: areaOne.id, controlId: 'power', targetValue: { type: 'boolean', boolean: true } },
+      { deviceId: secondMixedPrivateDevice.id, areaId: areaOne.id, controlId: 'brightness', targetValue: { type: 'number', number: 42 } },
+      { deviceId: automationDevice.id, areaId: areaOne.id, controlId: 'power', targetValue: { type: 'boolean', boolean: false } },
+      { deviceId: mixedPrivateDevice.id, areaId: areaOne.id, controlId: 'brightness', targetValue: { type: 'number', number: 29 } },
+      { deviceId: secondMixedPrivateDevice.id, areaId: areaOne.id, controlId: 'power', targetValue: { type: 'boolean', boolean: false } },
+      { deviceId: automationDevice.id, areaId: areaOne.id, controlId: 'brightness', targetValue: { type: 'number', number: 73 } },
+    ],
+  }) });
+  if (mixedRule.response.status !== 201 || privateOnlyRule.response.status !== 201
+    || interleavedRule.response.status !== 201 || multiplePrivateRule.response.status !== 201) {
+    fail(`Disposable mixed/private positional fixtures were not accepted through the tenant route (${JSON.stringify({ mixed: mixedRule.response.status, privateOnly: privateOnlyRule.response.status, interleaved: interleavedRule.response.status, multiplePrivate: multiplePrivateRule.response.status })})`);
+  }
   const ownerAutomationLogin = await fetchJson(`${base}/api/v2/mobile/session`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({
     email: propertyEmail, password: propertyPassword, deviceInstallationId: propertyInstallationId, publicKey: propertyPhone.publicKey,
     deviceName: 'Disposable automation oversight owner', model: 'integration-test', osFamily: 'test', osVersion: 'test',
@@ -1335,21 +1365,80 @@ async function customerAuthorizationChecks(deliveryEnv) {
   const ownerAutomationHeaders = { authorization: `Bearer ${ownerAutomationLogin.body?.accessToken ?? ''}`, 'x-dinodia-home-id': homeOne.id, 'content-type': 'application/json' };
   const managerAutomationHeaders = { authorization: `Bearer ${managerAutomationLogin.body?.accessToken ?? ''}`, 'x-dinodia-home-id': homeOne.id, 'content-type': 'application/json' };
   const tenantAutomationHeaders = { authorization: `Bearer ${tenantAutomationLogin.body?.accessToken ?? ''}`, 'x-dinodia-home-id': homeOne.id, 'content-type': 'application/json' };
+  const oversightFixtureIds = [automationCreate.body.automationId, mixedRule, privateOnlyRule, interleavedRule, multiplePrivateRule].map((result) => typeof result === 'string' ? result : result.body.automationId);
+  const persistedOversightBefore = await prisma.nativeAutomation.findMany({ where: { id: { in: oversightFixtureIds } }, orderBy: { id: 'asc' }, select: {
+    id: true, actions: { orderBy: [{ sortOrder: 'asc' }, { id: 'asc' }], select: { id: true, deviceId: true, areaId: true, controlId: true, sortOrder: true, actionValue: true } },
+  } });
+  const privateDeviceIds = new Set([mixedPrivateDevice.id, secondMixedPrivateDevice.id]);
+  const persistedByAutomationId = new Map(persistedOversightBefore.map((row) => [row.id, row]));
+  const privateActionIds = persistedOversightBefore.flatMap((row) => row.actions.filter((action) => privateDeviceIds.has(action.deviceId)).map((action) => action.id));
+  const privateOnlyPersisted = await prisma.nativeAutomation.findUniqueOrThrow({ where: { id: privateOnlyRule.body.automationId }, select: {
+    actions: { select: { id: true, deviceId: true, controlId: true, sortOrder: true, actionValue: true } },
+  } });
+  const privateOnlyActionIds = privateOnlyPersisted.actions.map((action) => action.id);
   const ownerOversight = await fetchJson(`${base}/api/v2/homes/${homeOne.id}/property-automations`, { headers: ownerAutomationHeaders });
   const managerOversight = await fetchJson(`${base}/api/v2/homes/${homeOne.id}/property-automations`, { headers: managerAutomationHeaders });
   const tenantOversight = await fetchJson(`${base}/api/v2/homes/${homeOne.id}/property-automations`, { headers: tenantAutomationHeaders });
   const wrongHomeOversight = await fetchJson(`${base}/api/v2/homes/${homeTwo.id}/property-automations`, { headers: ownerAutomationHeaders });
   const oversightText = JSON.stringify(ownerOversight.body ?? {});
+  const managerOversightText = JSON.stringify(managerOversight.body ?? {});
   const mixedSummary = ownerOversight.body?.automations?.find((item) => item.id === mixedRule.body?.automationId);
   const privateOnlyVisible = ownerOversight.body?.automations?.some((item) => item.id === privateOnlyRule.body?.automationId);
+  const ownerPositionCases = [
+    { id: automationCreate.body.automationId, expectedVisibleCount: 2, expectedName: 'Disposable morning routine' },
+    { id: mixedRule.body.automationId, expectedVisibleCount: 1, expectedName: 'Tenant automation' },
+    { id: interleavedRule.body.automationId, expectedVisibleCount: 2, expectedName: 'Tenant automation' },
+    { id: multiplePrivateRule.body.automationId, expectedVisibleCount: 2, expectedName: 'Tenant automation' },
+  ];
+  const assertVisiblePositions = (body) => ownerPositionCases.every(({ id, expectedVisibleCount, expectedName }) => {
+    const summary = body?.automations?.find((item) => item.id === id);
+    const persisted = persistedByAutomationId.get(id);
+    const expectedActions = persisted?.actions.filter((action) => action.deviceId === automationDevice.id) ?? [];
+    return Boolean(summary && summary.name === expectedName && summary.actions.length === expectedVisibleCount
+      && summary.actions.length === expectedActions.length
+      && JSON.stringify(summary.actions.map((action) => action.id)) === JSON.stringify(expectedActions.map((action) => action.id))
+      && JSON.stringify(summary.actions.map((action) => action.sortOrder)) === JSON.stringify(expectedActions.map((_, visibleIndex) => visibleIndex))
+      && summary.actions.every((action, visibleIndex) => action.deviceId === automationDevice.id
+        && action.controlId === expectedActions[visibleIndex].controlId && action.areaId === expectedActions[visibleIndex].areaId));
+  });
+  const positionDiagnostics = (body) => ownerPositionCases.map(({ id, expectedVisibleCount, expectedName }) => {
+    const summary = body?.automations?.find((item) => item.id === id);
+    const persisted = persistedByAutomationId.get(id);
+    const expectedActions = persisted?.actions.filter((action) => action.deviceId === automationDevice.id) ?? [];
+    return { present: Boolean(summary), visibleCount: summary?.actions?.length ?? null, expectedVisibleCount,
+      visibleSortOrders: summary?.actions?.map((action) => action.sortOrder) ?? [],
+      visibleControlIdsMatch: Boolean(summary && JSON.stringify(summary.actions.map((action) => action.controlId)) === JSON.stringify(expectedActions.map((action) => action.controlId))),
+      expectedNameMatches: summary?.name === expectedName };
+  });
+  const privateLeakFlags = (serialized) => ({
+    privateDeviceId: [...privateDeviceIds].some((id) => serialized.includes(id)),
+    privateActionId: [...privateActionIds, ...privateOnlyActionIds].some((id) => serialized.includes(id)),
+    privateDeviceName: serialized.includes('Private automation device label') || serialized.includes('Second private automation device label'),
+    privateTitle: ['Private bedtime mixed routine', 'Private interleaved disposable routine', 'Private multi-step interleaved disposable routine', 'Secret private-only routine'].some((value) => serialized.includes(value)),
+    privateValuesOrCount: ['targetValue', 'actionValue', 'actionCount'].some((field) => serialized.includes(field)),
+  });
+  const managerPrivateOnlyVisible = managerOversight.body?.automations?.some((item) => item.id === privateOnlyRule.body?.automationId);
   if (ownerAutomationLogin.response.status !== 200 || managerAutomationLogin.response.status !== 200 || tenantAutomationLogin.response.status !== 200
     || ownerOversight.response.status !== 200 || managerOversight.response.status !== 200
     || tenantOversight.response.status !== 404 || wrongHomeOversight.response.status !== 404
-    || !mixedSummary || mixedSummary.name !== 'Tenant automation' || mixedSummary.actions.length !== 1
-    || mixedSummary.actions[0].deviceId !== automationDevice.id || privateOnlyVisible
-    || oversightText.includes('Private automation device label') || oversightText.includes('Private bedtime mixed routine')
-    || oversightText.includes('Secret private-only routine')) {
-    fail(`Property-automation oversight did not enforce selected owner/manager scope and mixed/private redaction (${JSON.stringify({ ownerLogin: ownerAutomationLogin.response.status, managerLogin: managerAutomationLogin.response.status, tenantLogin: tenantAutomationLogin.response.status, owner: ownerOversight.response.status, ownerCode: ownerOversight.body?.error?.code, manager: managerOversight.response.status, managerCode: managerOversight.body?.error?.code, tenant: tenantOversight.response.status, tenantCode: tenantOversight.body?.error?.code, wrongHome: wrongHomeOversight.response.status, wrongHomeCode: wrongHomeOversight.body?.error?.code, mixed: Boolean(mixedSummary), visiblePrivate: Boolean(privateOnlyVisible) })})`);
+    || !mixedSummary || !assertVisiblePositions(ownerOversight.body) || !assertVisiblePositions(managerOversight.body)
+    || mixedSummary.actions[0]?.deviceId !== automationDevice.id || privateOnlyVisible || managerPrivateOnlyVisible
+    || [...privateDeviceIds].some((id) => oversightText.includes(id) || managerOversightText.includes(id))
+    || [...privateActionIds, ...privateOnlyActionIds].some((id) => oversightText.includes(id) || managerOversightText.includes(id))
+    || oversightText.includes('Private automation device label') || oversightText.includes('Second private automation device label')
+    || managerOversightText.includes('Private automation device label') || managerOversightText.includes('Second private automation device label')
+    || oversightText.includes('Private bedtime mixed routine') || oversightText.includes('Private interleaved disposable routine')
+    || oversightText.includes('Private multi-step interleaved disposable routine') || oversightText.includes('Secret private-only routine')
+    || managerOversightText.includes('Private bedtime mixed routine') || managerOversightText.includes('Private interleaved disposable routine')
+    || managerOversightText.includes('Private multi-step interleaved disposable routine') || managerOversightText.includes('Secret private-only routine')
+    || ['targetValue', 'actionValue', 'actionCount'].some((field) => oversightText.includes(field) || managerOversightText.includes(field))) {
+    fail(`Property-automation oversight did not enforce selected owner/manager scope and mixed/private redaction (${JSON.stringify({ ownerLogin: ownerAutomationLogin.response.status, managerLogin: managerAutomationLogin.response.status, tenantLogin: tenantAutomationLogin.response.status, owner: ownerOversight.response.status, ownerCode: ownerOversight.body?.error?.code, manager: managerOversight.response.status, managerCode: managerOversight.body?.error?.code, tenant: tenantOversight.response.status, tenantCode: tenantOversight.body?.error?.code, wrongHome: wrongHomeOversight.response.status, wrongHomeCode: wrongHomeOversight.body?.error?.code, ownerPositions: positionDiagnostics(ownerOversight.body), managerPositions: positionDiagnostics(managerOversight.body), ownerPrivateLeaks: privateLeakFlags(oversightText), managerPrivateLeaks: privateLeakFlags(managerOversightText), ownerPrivateOnlyVisible: Boolean(privateOnlyVisible), managerPrivateOnlyVisible: Boolean(managerPrivateOnlyVisible) })})`);
+  }
+  const persistedOversightAfter = await prisma.nativeAutomation.findMany({ where: { id: { in: oversightFixtureIds } }, orderBy: { id: 'asc' }, select: {
+    id: true, actions: { orderBy: [{ sortOrder: 'asc' }, { id: 'asc' }], select: { id: true, deviceId: true, areaId: true, controlId: true, sortOrder: true, actionValue: true } },
+  } });
+  if (JSON.stringify(persistedOversightAfter) !== JSON.stringify(persistedOversightBefore)) {
+    fail('Owner/manager property-automation projection reads changed canonical tenant action IDs, values or execution order');
   }
   const propertyOnlyAutomation = ownerOversight.body.automations.find((item) => item.id === automationCreate.body.automationId);
   const currentHomeManagementRevision = ownerOversight.body.managementRevision;
@@ -1422,7 +1511,7 @@ async function customerAuthorizationChecks(deliveryEnv) {
   const expectedDisabledConfigurationRevision = Number(pendingOwnerOverview.body.delivery.cloudRevision);
   pendingStage11AutomationDisableAck = { homeId: homeOne.id, automationId: propertyOnlyAutomation.id,
     expectedRevision: expectedDisabledConfigurationRevision, ownerAccessToken: ownerAutomationLogin.body.accessToken };
-  console.log('[stage11:integration] PASS: actual owner/manager property-automation routes enforce access-proof scope, hide private-only rules and private details in mixed rules, deny mismatched proof with zero protected effects, and persist one generic-noticed Disable as waiting for the paired-hub acknowledgement');
+  console.log('[stage11:integration] PASS: actual owner/manager property-automation routes preserve canonical execution order while returning contiguous visible-only positions, omit private-only rules and private identifiers/details, leave stored definitions unchanged, enforce access-proof scope, deny mismatched proof with zero protected effects, and persist one generic-noticed Disable as waiting for the paired-hub acknowledgement');
 
   const ownerAssignments = await fetchJson(`${base}/api/v2/homes/${homeOne.id}/preferences`, { method: 'PUT', headers: preferenceHeaders(propertyRawSession, homeOne.id), body: JSON.stringify({ kind: 'MANAGER_NOTIFICATION_ASSIGNMENT', expectedRevision: 0, document: { version: 1, assignments: [{ membershipId: managerMembership.id, enabledFamilies: ['hub_availability', 'installation_updates'] }] } }) });
   const managerFamilyChoice = await fetchJson(`${base}/api/v2/homes/${homeOne.id}/preferences`, { method: 'PUT', headers: preferenceHeaders(managerRawSession, homeOne.id), body: JSON.stringify({ kind: 'NOTIFICATION_PREFERENCES', expectedRevision: 0, document: { version: 1, enabledFamilies: ['hub_availability'] } }) });
