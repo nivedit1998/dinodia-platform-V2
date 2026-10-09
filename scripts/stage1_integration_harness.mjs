@@ -537,6 +537,7 @@ async function startFakeSes() {
           endpointId: event?.endpoint?.endpointId ?? null,
           causeType: event?.payload?.change?.cause?.type ?? null,
           propertyNames: Array.isArray(properties) ? properties.map((item) => item?.name ?? null) : [],
+          rangeInstances: Array.isArray(properties) ? properties.filter((item) => item?.namespace === 'Alexa.RangeController').map((item) => item?.instance ?? null) : [],
         });
         response.statusCode = 202;
         response.setHeader('content-type', 'application/json');
@@ -3726,6 +3727,18 @@ async function nativeAlexaOAuthChecks(deliveryEnv) {
     osPowerEntity.capability = { ...(osPowerEntity.capability || {}), runtime: 'dinodia_os', kind: 'binary', category: 'control', primary: true,
       semanticRole: 'power', readable: true, writable: true, automatable: true, observable: true,
       idempotency: 'set_value', stepUpPolicy: 'none', bindings: [{ serviceId: 'switch.turn_on' }, { serviceId: 'switch.turn_off' }] };
+    const makeRangeEntity = (controlId, semanticRole, initialValue) => {
+      const id = `${osFixtureDeviceId}:${controlId}`;
+      return { ...structuredClone(osPowerEntity), id, sourceId: id, logicalKey: controlId, stateKey: controlId,
+        name: semanticRole === 'position' ? 'Position' : 'Opening percentage', original_name: semanticRole === 'position' ? 'Position' : 'Opening percentage',
+        domain: 'number', state: initialValue, capability: { runtime: 'dinodia_os', controlId, kind: 'number', category: 'control',
+          primary: false, semanticRole, readable: true, writable: true, automatable: true, observable: true, idempotency: 'set_value',
+          confirmationPolicy: 'none', riskLevel: 'normal', stepUpPolicy: 'none', unit: 'percent', constraints: { min: 0, max: 100, step: 5 },
+          bindings: [{ serviceId: 'number.set_value', parameter: { key: 'value', type: 'number', min: 0, max: 100, step: 5 } }] } };
+    };
+    const osPositionEntity = makeRangeEntity('position-control', 'position', 10);
+    const osOpeningEntity = makeRangeEntity('opening-control', 'opening_percentage', 15);
+    osFixtureDevice.entities = { ...(osFixtureDevice.entities || {}), [osPositionEntity.id]: osPositionEntity, [osOpeningEntity.id]: osOpeningEntity };
     await hub.store.upsertDevice(osFixtureDevice);
     const selectedOsSession = await fetchJson(`${base}/api/v2/hub-sessions`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-session': fixture.customerSessionSecret }, body: JSON.stringify({ homeId: fixture.homeOneId }) });
     const osInventory = selectedOsSession.response.status === 200
@@ -3733,7 +3746,9 @@ async function nativeAlexaOAuthChecks(deliveryEnv) {
       : { response: { status: selectedOsSession.response.status }, body: {} };
     const osTenantDescriptor = osInventory.body?.data?.find((device) => device.id === osFixtureDeviceId);
     const actualPowerDescriptor = osTenantDescriptor?.controls?.find((control) => control.semanticRole === 'power' && control.writable && control.observable);
-    if (selectedOsSession.response.status !== 200 || osInventory.response.status !== 200 || !osTenantDescriptor || !actualPowerDescriptor) {
+    const actualPositionDescriptor = osTenantDescriptor?.controls?.find((control) => control.controlId === 'position-control' && control.semanticRole === 'position' && control.writable && control.observable);
+    const actualOpeningDescriptor = osTenantDescriptor?.controls?.find((control) => control.controlId === 'opening-control' && control.semanticRole === 'opening_percentage' && control.writable && control.observable);
+    if (selectedOsSession.response.status !== 200 || osInventory.response.status !== 200 || !osTenantDescriptor || !actualPowerDescriptor || !actualPositionDescriptor || !actualOpeningDescriptor) {
       fail(`The actual Native OS test descriptor could not be read for Alexa (${selectedOsSession.response.status}/${osInventory.response.status})`);
     }
     const tenantDeviceRow = await prisma.nativeDevice.findUniqueOrThrow({ where: { id: fixture.tenantDeviceId }, select: { osDeviceId: true } });
@@ -3802,11 +3817,44 @@ async function nativeAlexaOAuthChecks(deliveryEnv) {
 
     const alexaPower = ownPrivateProjection.controls.find((control) => control.semanticRole === 'power' && control.writable);
     if (!alexaPower || alexaPower.controlId !== actualPowerDescriptor.controlId) fail('Platform Alexa discovery did not preserve the current OS-native power-control identity');
+    const rangeControls = ownPrivateProjection.controls.filter((control) => ['position', 'opening_percentage'].includes(control.semanticRole));
+    if (rangeControls.length !== 2 || new Set(rangeControls.map((control) => control.controlId)).size !== 2) fail('The actual tenant Alexa projection did not preserve both permitted range control identities');
     const commandMessageId = `stage12-command-${crypto.randomUUID()}`;
     const powerDirective = (name, messageId = commandMessageId) => ({ directive: {
       header: { namespace: 'Alexa.PowerController', name, messageId, payloadVersion: '3', correlationToken: `corr-${messageId}` },
       endpoint: { endpointId: ownPrivateProjection.endpointId, scope: { type: 'BearerToken', token: tokenBody.access_token } }, payload: {},
     } });
+    const rangeDirective = (instance, value, messageId, payload = {}) => ({ directive: {
+      header: { namespace: 'Alexa.RangeController', name: 'SetRangeValue', messageId, payloadVersion: '3', instance },
+      endpoint: { endpointId: ownPrivateProjection.endpointId, scope: { type: 'BearerToken', token: tokenBody.access_token } }, payload: { rangeValue: value, ...payload },
+    } });
+    const positionMessageId = `stage12-position-${crypto.randomUUID()}`;
+    const rangeEffectsBefore = hub.store.listEvents(1000).filter((event) => event.type === 'device_command' && event.deviceId === osFixtureDeviceId).length;
+    const positionSet = await fetchJsonLoopback(`${base}/api/v2/alexa/directives`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(rangeDirective('Dinodia.Position', 50, positionMessageId)) });
+    const rangeEffectsAfterPosition = hub.store.listEvents(1000).filter((event) => event.type === 'device_command' && event.deviceId === osFixtureDeviceId).length;
+    if (positionSet.response.status !== 200 || positionSet.body.event?.header?.name !== 'Response'
+      || hub.store.getDevice(osFixtureDeviceId)?.entities?.[osPositionEntity.id]?.state !== 50 || rangeEffectsAfterPosition !== rangeEffectsBefore + 1) {
+      fail(`The standard Alexa header.instance Dinodia.Position did not reach its exact virtual OS control (${positionSet.response.status}/${rangeEffectsAfterPosition - rangeEffectsBefore})`);
+    }
+    const exactPositionRetry = await fetchJsonLoopback(`${base}/api/v2/alexa/directives`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(rangeDirective('Dinodia.Position', 50, positionMessageId)) });
+    const changedInstanceReplay = await fetchJsonLoopback(`${base}/api/v2/alexa/directives`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(rangeDirective('Dinodia.OpeningPercentage', 50, positionMessageId)) });
+    const openingSet = await fetchJsonLoopback(`${base}/api/v2/alexa/directives`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(rangeDirective('Dinodia.OpeningPercentage', 65, `stage12-opening-${crypto.randomUUID()}`)) });
+    const rangeEffectsAfterAllowed = hub.store.listEvents(1000).filter((event) => event.type === 'device_command' && event.deviceId === osFixtureDeviceId).length;
+    const missingInstance = await fetchJsonLoopback(`${base}/api/v2/alexa/directives`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(rangeDirective(undefined, 50, `stage12-range-missing-${crypto.randomUUID()}`, { instance: 'Dinodia.Position' })) });
+    const wrongInstance = await fetchJsonLoopback(`${base}/api/v2/alexa/directives`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(rangeDirective('Dinodia.Unknown', 50, `stage12-range-wrong-${crypto.randomUUID()}`)) });
+    const mismatchedPayloadInstance = await fetchJsonLoopback(`${base}/api/v2/alexa/directives`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(rangeDirective('Dinodia.Position', 50, `stage12-range-mismatch-${crypto.randomUUID()}`, { instance: 'Dinodia.OpeningPercentage' })) });
+    const outOfRangeValue = await fetchJsonLoopback(`${base}/api/v2/alexa/directives`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(rangeDirective('Dinodia.Position', 105, `stage12-range-out-of-range-${crypto.randomUUID()}`)) });
+    const invalidStepValue = await fetchJsonLoopback(`${base}/api/v2/alexa/directives`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(rangeDirective('Dinodia.Position', 52, `stage12-range-step-${crypto.randomUUID()}`)) });
+    const rangeEffectsAfterDenials = hub.store.listEvents(1000).filter((event) => event.type === 'device_command' && event.deviceId === osFixtureDeviceId).length;
+    if (exactPositionRetry.response.status !== 200 || changedInstanceReplay.body.event?.payload?.type !== 'INVALID_DIRECTIVE'
+      || openingSet.response.status !== 200 || hub.store.getDevice(osFixtureDeviceId)?.entities?.[osOpeningEntity.id]?.state !== 65
+      || rangeEffectsAfterAllowed !== rangeEffectsBefore + 2 || missingInstance.body.event?.header?.name !== 'ErrorResponse'
+      || wrongInstance.body.event?.payload?.type !== 'NO_SUCH_ENDPOINT' || mismatchedPayloadInstance.body.event?.payload?.type !== 'INVALID_DIRECTIVE'
+      || outOfRangeValue.body.event?.payload?.type !== 'INVALID_DIRECTIVE' || invalidStepValue.body.event?.payload?.type !== 'INVALID_DIRECTIVE'
+      || rangeEffectsAfterDenials !== rangeEffectsAfterAllowed) {
+      fail('Alexa range header identity, exact control routing, replay separation, constraints or zero-effect denial failed');
+    }
+    console.log('[stage12:integration] PASS: actual Alexa RangeController header.instance routes position and opening-percentage semantics to exact virtual controls; exact retry is one effect and missing/wrong/payload-only/mismatched/replayed/invalid values have zero effects');
     const nativeCommandEventsBefore = hub.store.listEvents(1000).filter((event) => event.type === 'device_command' && event.deviceId === osFixtureDeviceId).length;
     const commandResult = await fetchJsonLoopback(`${base}/api/v2/alexa/directives`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(powerDirective('TurnOn')) });
     const postCommandDevice = hub.store.getDevice(osFixtureDeviceId);
@@ -3825,23 +3873,31 @@ async function nativeAlexaOAuthChecks(deliveryEnv) {
     }
 
     const reportStateDirective = (messageId) => ({ directive: {
-      header: { namespace: 'Alexa', name: 'ReportState', messageId, payloadVersion: '3' },
+      header: { namespace: 'Alexa', name: 'ReportState', messageId, correlationToken: `corr-${messageId}`, payloadVersion: '3' },
       endpoint: { endpointId: ownPrivateProjection.endpointId, scope: { type: 'BearerToken', token: tokenBody.access_token } }, payload: {},
     } });
-    const reportState = await fetchJsonLoopback(`${base}/api/v2/alexa/report-state`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(reportStateDirective(`stage12-state-${crypto.randomUUID()}`)) });
+    const reportStateMessageId = `stage12-state-${crypto.randomUUID()}`;
+    const reportState = await fetchJsonLoopback(`${base}/api/v2/alexa/report-state`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(reportStateDirective(reportStateMessageId)) });
     const reportedPower = reportState.body.context?.properties?.find((property) => property.namespace === 'Alexa.PowerController' && property.name === 'powerState');
-    if (reportState.response.status !== 200 || reportState.body.event?.header?.name !== 'Response' || reportedPower?.value !== 'ON'
-      || typeof reportedPower?.timeOfSample !== 'string') fail('Alexa ReportState did not return the current observed Native OS power state and its source timestamp');
+    const reportedPosition = reportState.body.context?.properties?.find((property) => property.namespace === 'Alexa.RangeController' && property.name === 'rangeValue' && property.instance === 'Dinodia.Position');
+    const reportedOpening = reportState.body.context?.properties?.find((property) => property.namespace === 'Alexa.RangeController' && property.name === 'rangeValue' && property.instance === 'Dinodia.OpeningPercentage');
+    if (reportState.response.status !== 200 || reportState.body.event?.header?.name !== 'StateReport'
+      || reportState.body.event?.header?.namespace !== 'Alexa' || reportState.body.event?.header?.payloadVersion !== '3'
+      || reportState.body.event?.header?.correlationToken !== `corr-${reportStateMessageId}`
+      || reportState.body.event?.endpoint?.endpointId !== ownPrivateProjection.endpointId || Object.keys(reportState.body.event?.payload ?? {}).length !== 0
+      || reportedPower?.value !== 'ON' || typeof reportedPower?.timeOfSample !== 'string'
+      || reportedPosition?.value !== 50 || reportedOpening?.value !== 65) fail('Alexa ReportState did not return a canonical StateReport with actual source states and matching range instances');
 
-    const staleFixture = structuredClone(hub.store.getDevice(osFixtureDeviceId));
-    const staleEntity = Object.values(staleFixture.entities || {}).find((entity) => entity.id === osPowerEntity.id);
-    staleEntity.lastChanged = new Date(Date.now() - (Number(actualPowerDescriptor.maxStateValiditySeconds) + 1) * 1000).toISOString();
-    // upsertDevice intentionally preserves its authoritative lastChanged time
-    // when the value is unchanged. Set the disposable adapter observation
-    // directly so this test actually crosses the OS freshness deadline.
-    await hub.store.updateEntity(osFixtureDeviceId, osPowerEntity.id, { lastChanged: staleEntity.lastChanged });
-    const persistedStaleObservation = hub.store.getDevice(osFixtureDeviceId)?.entities?.[osPowerEntity.id]?.lastChanged;
-    if (persistedStaleObservation !== staleEntity.lastChanged) fail('The disposable OS fixture did not persist its stale adapter observation timestamp');
+    // Keep every advertised retrievable property stale for this endpoint-wide
+    // unknown case. Other tests separately assert the exact per-range sample
+    // and instance while those controls are current.
+    const staleControlEntities = [osPowerEntity, osPositionEntity, osOpeningEntity];
+    for (const entity of staleControlEntities) {
+      const descriptor = osTenantDescriptor.controls.find((control) => control.controlId === entity.capability.controlId);
+      const staleAt = new Date(Date.now() - (Number(descriptor?.maxStateValiditySeconds ?? 420) + 1) * 1000).toISOString();
+      await hub.store.updateEntity(osFixtureDeviceId, entity.id, { lastChanged: staleAt });
+      if (hub.store.getDevice(osFixtureDeviceId)?.entities?.[entity.id]?.lastChanged !== staleAt) fail('The disposable OS fixture did not persist its stale adapter observation timestamp');
+    }
     const staleReport = await fetchJsonLoopback(`${base}/api/v2/alexa/report-state`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(reportStateDirective(`stage12-stale-${crypto.randomUUID()}`)) });
     if (staleReport.response.status !== 200 || staleReport.body.event?.header?.name !== 'ErrorResponse'
       || staleReport.body.event?.payload?.type !== 'ENDPOINT_UNREACHABLE' || staleReport.body.context?.properties?.some((property) => property.name === 'powerState')) {
@@ -3869,6 +3925,12 @@ async function nativeAlexaOAuthChecks(deliveryEnv) {
     await hub.store.savePlatform({ ...priorOsPlatform, homeId: fixture.homeOneId,
       devicePolicies: nextPolicies, areaBindings: nextAreaBindings });
     const propertyOsFixture = structuredClone(osFixtureDevice);
+    // Keep this unrelated permanent-device sync fixture on its original
+    // single PowerController so its established order/receipt assertions do
+    // not inherit the separate range-control test channels above.
+    for (const [entityId, entity] of Object.entries(propertyOsFixture.entities ?? {})) {
+      if (['position', 'opening_percentage'].includes(String(entity.capability?.semanticRole))) delete propertyOsFixture.entities[entityId];
+    }
     propertyOsFixture.id = propertyDeviceRow.osDeviceId;
     propertyOsFixture.areaId = fixture.areaOneOsId;
     propertyOsFixture.managementClass = 'property_device';
@@ -4076,6 +4138,65 @@ async function nativeAlexaOAuthChecks(deliveryEnv) {
       fail('The existing Operations route did not deliver one current, scope-authorized ChangeReport to the loopback Event Gateway');
     }
 
+    // Drive the real dispatcher with an isolated, current authoritative state
+    // fixture. The preceding power case already proves OS -> signed sync ->
+    // queued ChangeReport end to end; this fixture isolates the corrected
+    // RangeController property shape without adding synthetic catalog events
+    // to the OS stream (which would contaminate unrelated sync assertions).
+    const permanentRangeNativeControl = structuredClone(tenantControls.find((control) => control.controlId === 'position-control'));
+    if (!permanentRangeNativeControl) fail('The disposable current OS descriptor has no position control');
+    permanentRangeNativeControl.deviceId = propertyDeviceRow.osDeviceId;
+    permanentRangeNativeControl.catalogRevision = Number(propertyOsDescriptor.descriptorRevision);
+    const permanentRangeAlexaControl = structuredClone(ownPrivateProjection.controls.find((control) => control.controlId === 'position-control'));
+    if (!permanentRangeAlexaControl) fail('The disposable Alexa projection has no position control');
+    const permanentDeviceForRangeReport = await prisma.nativeDevice.findUniqueOrThrow({ where: { id: permanentDeviceId }, select: { capabilitySummary: true } });
+    const permanentSummary = permanentDeviceForRangeReport.capabilitySummary;
+    const permanentCatalog = permanentSummary?.controlCatalog;
+    const currentProjectionForRangeReport = await prisma.alexaNativeEndpointProjection.findUniqueOrThrow({
+      where: { endpointId: propertyProjection.endpointId }, select: { id: true, capabilities: true },
+    });
+    const currentCapabilities = currentProjectionForRangeReport.capabilities;
+    const rangeObservedAt = new Date(Date.now() - 1000);
+    const rangeValidUntil = new Date(Date.now() + 120_000);
+    const rangeStateRevision = 9801;
+    await prisma.nativeDevice.update({ where: { id: permanentDeviceId }, data: { capabilitySummary: {
+      ...permanentSummary,
+      controlCatalog: { ...permanentCatalog, controls: [...permanentCatalog.controls, permanentRangeNativeControl] },
+      alexaStateByControl: { ...(permanentSummary.alexaStateByControl ?? {}), 'position-control': {
+        deviceId: propertyDeviceRow.osDeviceId, controlId: 'position-control', homeId: fixture.homeOneId,
+        descriptorRevision: Number(propertyOsDescriptor.descriptorRevision), sourceGeneration: fixture.identityOneGeneration,
+        revision: rangeStateRevision, observedAt: rangeObservedAt.toISOString(), receivedAt: new Date().toISOString(),
+        validUntil: rangeValidUntil.toISOString(), quality: 'fresh', value: 35, deviceAvailability: 'online', causeType: 'APP_INTERACTION',
+      } },
+    } } });
+    await prisma.alexaNativeEndpointProjection.update({ where: { id: currentProjectionForRangeReport.id }, data: {
+      capabilities: { ...currentCapabilities, controls: [...currentCapabilities.controls, permanentRangeAlexaControl] },
+    } });
+    const queuedRangeReport = await prisma.nativeDomainOutbox.create({ data: {
+      homeId: fixture.homeOneId, hubInstallationId: fixture.hubOneId,
+      aggregateType: 'AlexaChangeReport', aggregateId: propertyProjection.endpointId,
+      eventType: 'ALEXA_CHANGE_REPORT', idempotencyKey: `stage12-alexa-range-report-${crypto.randomUUID()}`,
+      payload: { endpointProjectionId: currentProjectionForRangeReport.id, linkId: link.id, homeId: fixture.homeOneId,
+        membershipId: fixture.tenantMembershipId, areaId: fixture.areaOneId, deviceId: permanentDeviceId,
+        controlId: 'position-control', descriptorRevision: Number(propertyOsDescriptor.descriptorRevision),
+        sourceGeneration: fixture.identityOneGeneration, stateRevision: rangeStateRevision,
+        observedAt: rangeObservedAt.toISOString(), causeType: 'APP_INTERACTION' },
+      state: 'PENDING', attempts: 0, nextAttemptAt: new Date(), expiresAt: rangeValidUntil,
+    }, select: { id: true } });
+    alexaEventDeliveries = [];
+    const rangeEventDispatch = await fetchJson(`${base}/api/cron/native-operations`, { method: 'POST',
+      headers: { authorization: `Bearer ${deliveryEnv.CRON_SECRET}` } });
+    const deliveredRangeReport = await prisma.nativeDomainOutbox.findUniqueOrThrow({ where: { id: queuedRangeReport.id }, select: { state: true, attempts: true } });
+    if (![200, 207].includes(rangeEventDispatch.response.status) || deliveredRangeReport.state !== 'DELIVERED'
+      || deliveredRangeReport.attempts !== 1 || alexaEventDeliveries.length !== 1
+      || !alexaEventDeliveries[0].propertyNames.includes('rangeValue')
+      || alexaEventDeliveries[0].rangeInstances.length !== 1 || alexaEventDeliveries[0].rangeInstances[0] !== 'Dinodia.Position') {
+      fail('The real proactive RangeController ChangeReport omitted its matching instance or was not delivered once');
+    }
+    console.log('[stage12:integration] PASS: the real proactive dispatcher emits a RangeController ChangeReport with the exact instance from a current disposable state fixture; the preceding power report independently proves signed OS-sync delivery');
+    await prisma.nativeDevice.update({ where: { id: permanentDeviceId }, data: { capabilitySummary: permanentSummary } });
+    await prisma.alexaNativeEndpointProjection.update({ where: { id: currentProjectionForRangeReport.id }, data: { capabilities: currentCapabilities } });
+
     await sleep(5);
     const secondAppCommand = {
       commandId: `command-${crypto.randomUUID()}`, homeId: fixture.homeOneId,
@@ -4112,7 +4233,20 @@ async function nativeAlexaOAuthChecks(deliveryEnv) {
     const grantForQueuedRevocation = await prisma.tenantAreaGrant.findFirst({ where: {
       membershipId: fixture.tenantMembershipId, areaId: fixture.areaOneId, revokedAt: null,
     }, select: { id: true } });
-    if (!secondQueuedReport || !grantForQueuedRevocation) fail('The second current report was not queued before its scoped grant was revoked');
+    if (!secondQueuedReport || !grantForQueuedRevocation) {
+      const recentReports = await prisma.nativeDomainOutbox.findMany({ where: { aggregateType: 'AlexaChangeReport', eventType: 'ALEXA_CHANGE_REPORT', homeId: fixture.homeOneId },
+        orderBy: { createdAt: 'desc' }, take: 6, select: { state: true, attempts: true, payload: true, expiresAt: true } });
+      const currentPropertyState = await prisma.nativeDevice.findUnique({ where: { id: permanentDeviceId }, select: { capabilitySummary: true } });
+      fail(`The second current report was not queued before its scoped grant was revoked (${JSON.stringify({
+        ack: hub.store.getSyncOutbox().acknowledgedSequence, expectedSequence: secondNativeStateEvent.sequence,
+        syncErrorCode: hub.pairing.status()?.sync?.lastErrorCode ?? null,
+        syncFailure: String(hub.pairing.lastError || '').slice(0, 160) || null,
+        event: { controlId: secondNativeStateEvent.payload?.controlId, value: secondNativeStateEvent.payload?.value,
+          observedAt: secondObservationAt, validUntil: secondNativeStateEvent.payload?.validUntil, quality: secondNativeStateEvent.payload?.quality },
+        currentPower: currentPropertyState?.capabilitySummary?.alexaStateByControl?.power ?? null,
+        recentReports: recentReports.map((row) => ({ state: row.state, attempts: row.attempts, expiresAt: row.expiresAt.toISOString(), observedAt: row.payload?.observedAt, controlId: row.payload?.controlId })),
+      })})`);
+    }
     await prisma.tenantAreaGrant.update({ where: { id: grantForQueuedRevocation.id }, data: { revokedAt: new Date() } });
     const eventCountBeforeRevokedDispatch = alexaEventDeliveries.length;
     const revokedEventDispatch = await fetchJson(`${base}/api/cron/native-operations`, { method: 'POST',
@@ -4137,6 +4271,31 @@ async function nativeAlexaOAuthChecks(deliveryEnv) {
       || effectsAfterGrantDenial !== effectsBeforeGrantDenial || hub.store.getDevice(osFixtureDeviceId)?.entities?.[osPowerEntity.id]?.state !== 'ON') {
       fail('A revoked tenant Area grant did not deny Alexa before any Native OS command effect or disclosure');
     }
+
+    const appOnlyEffectsBefore = hub.store.listEvents(1000).filter((event) => event.type === 'device_command' && event.deviceId === osFixtureDeviceId).length;
+    const appOnlyReceiptsBefore = await prisma.alexaNativeDirectiveReceipt.count({ where: { linkId: initialHomeScope.connectionId } });
+    const appOnlyLock = await fetchJsonLoopback(`${base}/api/v2/alexa/directives`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ directive: {
+      header: { namespace: 'Alexa.LockController', name: 'Lock', messageId: `stage12-app-only-${crypto.randomUUID()}`, payloadVersion: '3' },
+      endpoint: { endpointId: ownPrivateProjection.endpointId, scope: { type: 'BearerToken', token: tokenBody.access_token } }, payload: {},
+    } }) });
+    const appOnlyEffectsAfter = hub.store.listEvents(1000).filter((event) => event.type === 'device_command' && event.deviceId === osFixtureDeviceId).length;
+    const appOnlyReceiptsAfter = await prisma.alexaNativeDirectiveReceipt.count({ where: { linkId: initialHomeScope.connectionId } });
+    if (appOnlyLock.body.event?.header?.name !== 'ErrorResponse' || appOnlyLock.body.event?.payload?.type !== 'INVALID_DIRECTIVE'
+      || appOnlyEffectsAfter !== appOnlyEffectsBefore || appOnlyReceiptsAfter !== appOnlyReceiptsBefore) {
+      fail('An app-only lock directive was accepted, receipted, or dispatched through Alexa');
+    }
+
+    const revisionRow = await prisma.nativeDevice.findUniqueOrThrow({ where: { id: fixture.tenantDeviceId }, select: { descriptorRevision: true } });
+    await prisma.nativeDevice.update({ where: { id: fixture.tenantDeviceId }, data: { descriptorRevision: revisionRow.descriptorRevision + 1 } });
+    let changedDescriptorResult;
+    try {
+      changedDescriptorResult = await fetchJsonLoopback(`${base}/api/v2/alexa/directives`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(rangeDirective('Dinodia.Position', 55, `stage12-range-revision-${crypto.randomUUID()}`)) });
+    } finally {
+      await prisma.nativeDevice.update({ where: { id: fixture.tenantDeviceId }, data: { descriptorRevision: revisionRow.descriptorRevision } });
+    }
+    const afterRevisionDenialEffects = hub.store.listEvents(1000).filter((event) => event.type === 'device_command' && event.deviceId === osFixtureDeviceId).length;
+    if (changedDescriptorResult?.body.event?.header?.name !== 'ErrorResponse' || changedDescriptorResult.body.event?.payload?.type !== 'NO_SUCH_ENDPOINT'
+      || afterRevisionDenialEffects !== appOnlyEffectsAfter) fail('A range directive continued after the current OS descriptor revision changed');
     console.log('[stage12:integration] PASS: actual Alexa directive and ReportState routes traverse the signed Native OS boundary; exact message retry dispatches once, changed replay and revoked Area grant have zero effects, and stale observations are not reported as current');
 
     await prisma.nativeDevice.deleteMany({ where: { id: { in: [otherPrivateDevice.id, unselectedPropertyDevice.id] } } });
@@ -4175,6 +4334,11 @@ async function nativeAlexaOAuthChecks(deliveryEnv) {
   } finally {
     try {
       if (originalOsAlexaFixtureDevice) {
+        const current = hub.store.getDevice(originalOsAlexaFixtureDevice.id);
+        const originalEntityIds = new Set(Object.keys(originalOsAlexaFixtureDevice.entities || {}));
+        for (const entityId of Object.keys(current?.entities || {})) {
+          if (!originalEntityIds.has(entityId)) await hub.store.removeEntity(originalOsAlexaFixtureDevice.id, entityId);
+        }
         await hub.store.upsertDevice(originalOsAlexaFixtureDevice);
         const restored = hub.store.getDevice(originalOsAlexaFixtureDevice.id);
         const originalSourceIds = Object.values(originalOsAlexaFixtureDevice.entities || {}).map((entity) => String(entity.sourceId || entity.id || '')).sort();

@@ -8,7 +8,7 @@ import { projectSupportedAlexaControl } from '@/lib/nativeAlexaDiscovery';
 
 type JsonObject = Record<string, unknown>;
 type AlexaDirective = {
-  header: { namespace: string; name: string; messageId: string; payloadVersion: string; correlationToken?: string };
+  header: { namespace: string; name: string; messageId: string; payloadVersion: string; correlationToken?: string; instance?: string };
   endpoint: { endpointId: string; scope: { type: 'BearerToken'; token: string } };
   payload: JsonObject;
 };
@@ -24,6 +24,8 @@ const MAX_HUB_RESPONSE_BYTES = 64 * 1024;
 const RECEIPT_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const MAX_OS_DELEGATION_SECONDS = 15;
 const READABLE = new Set(['power', 'brightness', 'target_temperature', 'ambient_temperature', 'opening_percentage', 'position']);
+const RANGE_ROLES = new Set(['opening_percentage', 'position']);
+type AlexaProperty = { namespace: string; name: string; value: unknown; timeOfSample: string; uncertaintyInMilliseconds: number; instance?: string };
 
 function record(value: unknown): JsonObject | null {
   return value && typeof value === 'object' && !Array.isArray(value) ? value as JsonObject : null;
@@ -56,7 +58,39 @@ function parseDirective(value: unknown): AlexaDirective {
   if (header.correlationToken !== undefined && (typeof header.correlationToken !== 'string' || header.correlationToken.length > 2048)) {
     throw new Stage1AuthError(400, 'alexa_directive_invalid', 'The Alexa request is not a valid Native V2 directive');
   }
+  if (header.instance !== undefined && (header.namespace !== 'Alexa.RangeController' || typeof header.instance !== 'string'
+    || !/^[A-Za-z0-9._:-]{1,128}$/.test(header.instance))) {
+    throw new Stage1AuthError(400, 'alexa_directive_invalid', 'The Alexa request is not a valid Native V2 directive');
+  }
   return { header: header as AlexaDirective['header'], endpoint: endpoint as AlexaDirective['endpoint'], payload };
+}
+
+function validRangeControl(control: JsonObject): boolean {
+  const constraints = record(control.constraints);
+  return RANGE_ROLES.has(String(control.semanticRole)) && control.valueType === 'number'
+    && control.readable === true && control.writable === true && control.automatable === true
+    && control.idempotency === 'set_value' && control.stepUpPolicy !== 'required'
+    && constraints !== null && typeof constraints.minimum === 'number' && Number.isFinite(constraints.minimum)
+    && typeof constraints.maximum === 'number' && Number.isFinite(constraints.maximum)
+    && constraints.minimum <= constraints.maximum && typeof constraints.step === 'number'
+    && Number.isFinite(constraints.step) && constraints.step > 0 && typeof control.controlId === 'string';
+}
+
+/** A single control keeps the established instance; duplicate same-role channels get stable opaque IDs. */
+function rangeControllerInstances(controls: JsonObject[]): Map<string, string> {
+  const eligible = controls.filter(validRangeControl);
+  const roleCounts = new Map<string, number>();
+  for (const control of eligible) roleCounts.set(String(control.semanticRole), (roleCounts.get(String(control.semanticRole)) ?? 0) + 1);
+  const result = new Map<string, string>();
+  for (const control of eligible) {
+    const role = String(control.semanticRole);
+    const base = role === 'position' ? 'Dinodia.Position' : 'Dinodia.OpeningPercentage';
+    const instance = roleCounts.get(role) === 1
+      ? base
+      : `${base}.${crypto.createHash('sha256').update(String(control.controlId), 'utf8').digest('base64url')}`;
+    result.set(String(control.controlId), instance);
+  }
+  return result;
 }
 
 function cloudOrigin(endpoint: AuthorizedEndpoint): string {
@@ -218,12 +252,12 @@ async function lockAndAuthorizeEndpoint(tokenHash: string, endpointId: string): 
 
 function commandValue(directive: AlexaDirective, controls: JsonObject[]): { control: JsonObject; value: boolean | number; alexaNamespace: string; propertyName: string; propertyValue: unknown } {
   const { namespace, name } = directive.header;
-  const instance = directive.payload.instance;
   let role: string;
   let value: boolean | number;
   let alexaNamespace: string;
   let propertyName: string;
   let propertyValue: unknown;
+  let matchedControl: JsonObject | undefined;
   if (namespace === 'Alexa.PowerController' && (name === 'TurnOn' || name === 'TurnOff')) {
     role = 'power'; value = name === 'TurnOn'; alexaNamespace = namespace; propertyName = 'powerState'; propertyValue = value ? 'ON' : 'OFF';
   } else if (namespace === 'Alexa.BrightnessController' && name === 'SetBrightness') {
@@ -236,8 +270,14 @@ function commandValue(directive: AlexaDirective, controls: JsonObject[]): { cont
     }
     value = target.scale === 'FAHRENHEIT' ? (target.value - 32) * 5 / 9 : target.value;
     alexaNamespace = namespace; propertyName = 'targetSetpoint'; propertyValue = { value, scale: 'CELSIUS' };
-  } else if (namespace === 'Alexa.RangeController' && name === 'SetRangeValue' && instance === 'Dinodia.Position') {
-    role = 'opening_percentage';
+  } else if (namespace === 'Alexa.RangeController' && name === 'SetRangeValue') {
+    if (Object.hasOwn(directive.payload, 'instance') || !directive.header.instance) {
+      throw new Stage1AuthError(400, 'alexa_directive_invalid', 'Range control identity must be supplied in the Alexa header');
+    }
+    const instances = rangeControllerInstances(controls);
+    matchedControl = controls.find((candidate) => instances.get(String(candidate.controlId)) === directive.header.instance);
+    if (!matchedControl) throw new Stage1AuthError(404, 'alexa_control_unavailable', 'This range control is not currently available to Alexa');
+    role = String(matchedControl.semanticRole);
     value = directive.payload.rangeValue as number; alexaNamespace = namespace; propertyName = 'rangeValue'; propertyValue = value;
   } else {
     throw new Stage1AuthError(400, 'alexa_directive_unsupported', 'This Alexa control operation is not supported by the current Dinodia descriptor');
@@ -245,7 +285,7 @@ function commandValue(directive: AlexaDirective, controls: JsonObject[]): { cont
   if (typeof value !== 'number' && typeof value !== 'boolean' || typeof value === 'number' && !Number.isFinite(value)) {
     throw new Stage1AuthError(400, 'alexa_value_invalid', 'The requested value is invalid');
   }
-  const control = controls.find((candidate) => candidate.semanticRole === role && candidate.writable === true
+  const control = matchedControl ?? controls.find((candidate) => candidate.semanticRole === role && candidate.writable === true
     && candidate.automatable === true && candidate.idempotency === 'set_value' && candidate.stepUpPolicy !== 'required');
   if (!control) throw new Stage1AuthError(404, 'alexa_control_unavailable', 'This control is not currently available to Alexa');
   const bounds = record(control.constraints);
@@ -266,6 +306,7 @@ function requestDigest(directive: AlexaDirective): string {
   const canonical = {
     namespace: directive.header.namespace, name: directive.header.name, payloadVersion: directive.header.payloadVersion,
     messageId: directive.header.messageId, correlationToken: directive.header.correlationToken ?? null,
+    instance: directive.header.instance ?? null,
     endpointId: directive.endpoint.endpointId, payload: directive.payload,
   };
   return sha256(JSON.stringify(canonical));
@@ -324,22 +365,31 @@ function alexaResponse(directive: AlexaDirective, properties: Array<{ namespace:
   };
 }
 
+function alexaStateReport(directive: AlexaDirective, properties: AlexaProperty[]) {
+  return {
+    event: { header: alexaHeader(directive, 'Alexa', 'StateReport'), endpoint: { endpointId: directive.endpoint.endpointId }, payload: {} },
+    context: { properties },
+  };
+}
+
 function alexaErrorFor(error: unknown, directive: AlexaDirective) {
   if (error instanceof Stage1AuthError) {
     if (error.status === 401) return alexaError(directive, 'INVALID_AUTHORIZATION_CREDENTIAL', 'Authorization is no longer valid. Relink Dinodia in the Alexa app.');
     if (error.status === 404) return alexaError(directive, 'NO_SUCH_ENDPOINT', 'This Dinodia endpoint is no longer available. Discover devices again.');
     if (error.status === 400) return alexaError(directive, 'INVALID_DIRECTIVE', 'This request is not supported by the current Dinodia device controls.');
+    if (error.status === 409) return alexaError(directive, 'INVALID_DIRECTIVE', 'This Alexa message identifier was already used for a different control request.');
   }
   return alexaError(directive, 'ENDPOINT_UNREACHABLE', 'Dinodia could not confirm this request. Retry safely or check the Dinodia app.');
 }
 
-export function alexaPropertiesFromStates(endpoint: AuthorizedEndpoint, controls: JsonObject[], states: unknown[], now = Date.now()): Array<{ namespace: string; name: string; value: unknown; timeOfSample: string; uncertaintyInMilliseconds: number }> {
+export function alexaPropertiesFromStates(endpoint: AuthorizedEndpoint, controls: JsonObject[], states: unknown[], now = Date.now()): AlexaProperty[] {
   const byId = new Map<string, JsonObject>();
   for (const stateValue of states) {
     const state = record(stateValue);
     if (state && typeof state.controlId === 'string') byId.set(state.controlId, state);
   }
-  const result: Array<{ namespace: string; name: string; value: unknown; timeOfSample: string; uncertaintyInMilliseconds: number }> = [];
+  const result: AlexaProperty[] = [];
+  const rangeInstances = rangeControllerInstances(controls);
   const stateRows = [...byId.values()];
   const onlineEvidence = stateRows.find((state) => state.deviceAvailability === 'online' && typeof state.observedAt === 'string');
   const offlineEvidence = stateRows.find((state) => state.deviceAvailability === 'offline' && typeof state.observedAt === 'string');
@@ -357,7 +407,8 @@ export function alexaPropertiesFromStates(endpoint: AuthorizedEndpoint, controls
     const state = byId.get(String(control.controlId));
     if (!state || state.deviceId !== endpoint.osDeviceId || state.descriptorRevision !== endpoint.descriptorRevision
       || state.quality !== 'fresh' || typeof state.observedAt !== 'string' || typeof state.validUntil !== 'string'
-      || Date.parse(state.validUntil) <= now || Date.parse(state.observedAt) > now) continue;
+      || !Number.isFinite(Date.parse(state.validUntil)) || Date.parse(state.validUntil) <= now
+      || !Number.isFinite(Date.parse(state.observedAt)) || Date.parse(state.observedAt) > now) continue;
     const role = control.semanticRole;
     let namespace = '';
     let name = '';
@@ -366,11 +417,19 @@ export function alexaPropertiesFromStates(endpoint: AuthorizedEndpoint, controls
     else if (role === 'brightness' && typeof value === 'number' && value >= 0 && value <= 100) { namespace = 'Alexa.BrightnessController'; name = 'brightness'; }
     else if (role === 'target_temperature' && typeof value === 'number') { namespace = 'Alexa.ThermostatController'; name = 'targetSetpoint'; value = { value, scale: 'CELSIUS' }; }
     else if (role === 'ambient_temperature' && typeof value === 'number') { namespace = 'Alexa.TemperatureSensor'; name = 'temperature'; value = { value, scale: 'CELSIUS' }; }
-    else if (['opening_percentage', 'position'].includes(String(role)) && typeof value === 'number') { namespace = 'Alexa.RangeController'; name = 'rangeValue'; }
+    else if (RANGE_ROLES.has(String(role)) && typeof value === 'number') {
+      const bounds = record(control.constraints);
+      const instance = rangeInstances.get(String(control.controlId));
+      if (!bounds || !instance || value < Number(bounds.minimum) || value > Number(bounds.maximum)) continue;
+      const steps = (value - Number(bounds.minimum)) / Number(bounds.step);
+      if (Math.abs(steps - Math.round(steps)) > 1e-7) continue;
+      namespace = 'Alexa.RangeController'; name = 'rangeValue';
+    }
     if (!namespace || !READABLE.has(String(role))) continue;
     const observedAt = Date.parse(state.observedAt);
     if (!Number.isFinite(observedAt)) continue;
-    result.push({ namespace, name, value, timeOfSample: new Date(observedAt).toISOString(), uncertaintyInMilliseconds: Math.max(0, Math.min(60_000, Math.round(now - observedAt))) });
+    result.push({ namespace, name, value, timeOfSample: new Date(observedAt).toISOString(), uncertaintyInMilliseconds: Math.max(0, Math.min(60_000, Math.round(now - observedAt))),
+      ...(namespace === 'Alexa.RangeController' ? { instance: rangeInstances.get(String(control.controlId)) } : {}) });
   }
   return result;
 }
@@ -455,7 +514,7 @@ async function reportNativeAlexaState(directive: AlexaDirective): Promise<object
   }
   const properties = alexaPropertiesFromStates(endpoint, controls, result.states);
   if (!properties.length) return alexaError(directive, 'ENDPOINT_UNREACHABLE', 'The current device state is unknown or out of date. Try again when the device is available.');
-  return alexaResponse(directive, properties);
+  return alexaStateReport(directive, properties);
 }
 
 export async function handleNativeAlexaDirective(request: Request): Promise<object> {
