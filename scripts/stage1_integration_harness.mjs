@@ -371,7 +371,7 @@ function baseEnv() {
   const disposablePolicyText = 'Disposable test-only customer policy for the Stage 6 integration harness. It is not Production legal copy.';
   return {
     ...safeProcessEnvironment(),
-    CI: '1', NODE_ENV: 'production', V2_ENVIRONMENT: 'test', STAGE1_INTERNAL_OPERATOR_DAY_SESSION: 'true', STAGE9_LIFECYCLE_REHEARSAL: 'true',
+    CI: '1', NODE_ENV: 'production', V2_ENVIRONMENT: 'test', STAGE9_LIFECYCLE_REHEARSAL: 'true',
     NEXT_TELEMETRY_DISABLED: '1', PRISMA_TELEMETRY_DISABLED: '1', CHECKPOINT_DISABLE: '1',
     NODE_OPTIONS: `--import=${JSON.stringify(path.join(root, 'scripts/stage1_loopback_guard.mjs'))}`,
     STAGE1_OUTBOUND_TARGET_LOG: outboundTargetFile,
@@ -469,45 +469,58 @@ async function employeeSessionPolicyChecks(runEnv) {
   const employee = await prisma.companyEmployeeAccount.create({ data: { displayName: 'Session policy boundary fixture', email: employeeEmail, emailNormalized: employeeEmail, role: 'CXO', status: 'ACTIVE', passwordHash: hashPassword(employeePassword) } });
   try {
     await stopPlatform();
-    await startPlatform({ ...runEnv, STAGE1_INTERNAL_OPERATOR_DAY_SESSION: 'false' });
-    const ordinary = await loginEmployee(base, employee, employeePassword);
-    if (!ordinary.setCookie.includes('Max-Age=28800') || !/HttpOnly/i.test(ordinary.setCookie) || !/Secure/i.test(ordinary.setCookie) || !/SameSite=Lax/i.test(ordinary.setCookie) || ordinary.claims.exp - ordinary.claims.iat !== 8 * 60 * 60 || ordinary.session.expiresAt.getTime() !== ordinary.claims.exp * 1000 || ordinary.claims.sessionPolicy !== undefined) fail('Policy OFF did not restore the aligned eight-hour Portal cookie, signed token and database expiry');
-    await prisma.employeeSession.update({ where: { id: ordinary.session.id }, data: { recentAuthenticatedAt: new Date(Date.now() - 5 * 60 * 1000 - 1) } });
-    const launchWhileStale = await fetchJson(`${base}/api/installer/home-support/homes/${crypto.randomUUID()}/os-access/launch`, { method: 'POST', headers: { 'content-type': 'application/json', cookie: cookieHeader(ordinary.jar) }, body: '{}' });
-    if (launchWhileStale.response.status !== 401 || launchWhileStale.body.errorCode !== 'recent_authentication_required') fail('Policy OFF did not retain the five-minute recent-auth requirement on secure OS launch');
-    await prisma.employeeSession.deleteMany({ where: { employeeId: employee.id } });
-
-    await stopPlatform();
+    // Deliberately inject the retired setting. A cutover must make old
+    // environment values inert, not depend on an operator remembering to
+    // remove every copy before the runtime is safe.
     await startPlatform({ ...runEnv, STAGE1_INTERNAL_OPERATOR_DAY_SESSION: 'true' });
-    const extended = await loginEmployee(base, employee, employeePassword);
-    const deadline = extended.session.expiresAt.getTime();
-    if (!extended.setCookie.includes('Max-Age=86400') || !/HttpOnly/i.test(extended.setCookie) || !/Secure/i.test(extended.setCookie) || !/SameSite=Lax/i.test(extended.setCookie) || extended.claims.sessionPolicy !== 'STAGE1_INTERNAL_OPERATOR_DAY_SESSION' || extended.claims.exp - extended.claims.iat !== 24 * 60 * 60 || deadline !== extended.claims.exp * 1000 || Date.parse(extended.loginBody.expiresAt) !== deadline) fail('Policy ON did not give the durable Portal row, signed token, cookie and response one 24-hour absolute deadline');
-    if (JSON.stringify(extended.loginBody).includes(extended.token)) fail('Employee login JSON exposed its reusable signed session');
+    const current = await loginEmployee(base, employee, employeePassword);
+    const deadline = current.session.expiresAt.getTime();
+    if (!current.setCookie.includes('Max-Age=28800') || !/HttpOnly/i.test(current.setCookie) || !/Secure/i.test(current.setCookie) || !/SameSite=Lax/i.test(current.setCookie) || current.claims.exp - current.claims.iat !== 8 * 60 * 60 || current.session.expiresAt.getTime() !== current.claims.exp * 1000 || current.claims.sessionPolicy !== undefined) fail('The retired environment setting extended the employee cookie, signed token or durable session beyond the fixed eight-hour policy');
+    if (JSON.stringify(current.loginBody).includes(current.token)) fail('Employee login JSON exposed its reusable signed session');
 
     const authBoundary = Math.floor(Date.now() / 1000) * 1000;
-    await prisma.employeeSession.update({ where: { id: extended.session.id }, data: { recentAuthenticatedAt: new Date(authBoundary - 5 * 60 * 1000) } });
+    await prisma.employeeSession.update({ where: { id: current.session.id }, data: { recentAuthenticatedAt: new Date(authBoundary - 5 * 60 * 1000) } });
     const recentRouteProbe = async (label, instant, expectedRecentDenial) => {
       await stopPlatform();
       await startPlatform({ ...runEnv, STAGE1_INTERNAL_OPERATOR_DAY_SESSION: 'true', STAGE1_TEST_NOW_MS: String(instant) });
-      const response = await fetchJson(`${base}/api/installer/home-support/homes/${crypto.randomUUID()}/os-access/rotate`, { method: 'POST', headers: { 'content-type': 'application/json', cookie: cookieHeader(extended.jar), 'idempotency-key': `recent-boundary-${label}-${crypto.randomUUID()}` }, body: JSON.stringify({ workflowId: crypto.randomUUID() }) });
+      const response = await fetchJson(`${base}/api/installer/home-support/homes/${crypto.randomUUID()}/os-access/rotate`, { method: 'POST', headers: { 'content-type': 'application/json', cookie: cookieHeader(current.jar), 'idempotency-key': `recent-boundary-${label}-${crypto.randomUUID()}` }, body: JSON.stringify({ workflowId: crypto.randomUUID() }) });
       const deniedForRecentAuth = response.response.status === 401 && response.body.errorCode === 'recent_authentication_required';
       if (deniedForRecentAuth !== expectedRecentDenial) fail(`Credential rotation recent-auth boundary ${label} behaved incorrectly (${response.response.status}/${response.body.errorCode || 'none'})`);
     };
     await recentRouteProbe('before', authBoundary - 1, false);
-    await recentRouteProbe('exact', authBoundary, false);
+    await recentRouteProbe('exact', authBoundary, true);
     await recentRouteProbe('after', authBoundary + 1, true);
-    await prisma.employeeSession.update({ where: { id: extended.session.id }, data: { recentAuthenticatedAt: new Date() } });
+    await prisma.employeeSession.update({ where: { id: current.session.id }, data: { recentAuthenticatedAt: new Date() } });
 
-    const unchangedDeadline = extended.session.expiresAt.getTime();
     for (const [label, now, expected] of [['immediately-before', deadline - 1, 200], ['exactly-at', deadline, 401], ['immediately-after', deadline + 1, 401]]) {
       await stopPlatform();
       await startPlatform({ ...runEnv, STAGE1_INTERNAL_OPERATOR_DAY_SESSION: 'true', STAGE1_TEST_NOW_MS: String(now) });
-      const probe = await fetchJson(`${base}/api/company/auth/session`, { headers: { cookie: cookieHeader(extended.jar) } });
-      if (probe.response.status !== expected) fail(`Portal 24-hour absolute expiry ${label} returned ${probe.response.status}, expected ${expected}`);
-      const durable = await prisma.employeeSession.findUnique({ where: { id: extended.session.id }, select: { expiresAt: true } });
-      if (durable?.expiresAt.getTime() !== unchangedDeadline) fail('Portal status polling or process restart extended the durable absolute deadline');
+      const probe = await fetchJson(`${base}/api/company/auth/session`, { headers: { cookie: cookieHeader(current.jar) } });
+      if (probe.response.status !== expected) fail(`Portal eight-hour absolute expiry ${label} returned ${probe.response.status}, expected ${expected}`);
+      const durable = await prisma.employeeSession.findUnique({ where: { id: current.session.id }, select: { expiresAt: true } });
+      if (durable?.expiresAt.getTime() !== deadline) fail('Portal status polling or process restart extended the durable absolute deadline');
     }
-    console.log('[stage1:integration] PASS: real employee login/logout and Platform session route enforce aligned 8-hour OFF and 24-hour ON absolute deadlines; exact 24-hour boundary and launch-only recent-auth exception verified');
+
+    // A previously issued 24-hour employee token and matching database row
+    // must lose authority after cutover even when the obsolete opt-in is set.
+    const legacyIssuedAt = Math.floor(Date.now() / 1000);
+    const legacyExpiresAt = legacyIssuedAt + 24 * 60 * 60;
+    const legacyHeader = Buffer.from(JSON.stringify({ alg: 'EdDSA', typ: 'DNO-EMP-1', v: 1 }), 'utf8').toString('base64url');
+    const legacyPayload = Buffer.from(JSON.stringify({
+      iss: 'dinodia-platform-v2', aud: 'dinodia-company-portal', sub: employee.id,
+      sid: current.session.id, jti: crypto.randomBytes(24).toString('base64url'), areaIds: [],
+      scope: ['company:portal'], policyRevision: 0, iat: legacyIssuedAt, exp: legacyExpiresAt,
+      recentAuthenticatedAt: Date.now(), sessionPolicy: 'STAGE1_INTERNAL_OPERATOR_DAY_SESSION',
+    }), 'utf8').toString('base64url');
+    const legacyInput = `${legacyHeader}.${legacyPayload}`;
+    const legacyToken = `dno-employee-1.${legacyInput}.${crypto.sign(null, Buffer.from(legacyInput), crypto.createPrivateKey(runEnv.COMPANY_PORTAL_SESSION_PRIVATE_KEY)).toString('base64url')}`;
+    await prisma.employeeSession.update({ where: { id: current.session.id }, data: { expiresAt: new Date(legacyExpiresAt * 1000) } });
+    await stopPlatform();
+    await startPlatform({ ...runEnv, STAGE1_INTERNAL_OPERATOR_DAY_SESSION: 'true' });
+    const legacyResponse = await fetchJson(`${base}/api/company/auth/session`, { headers: { cookie: `dinodia_employee_session=${encodeURIComponent(legacyToken)}` } });
+    if (legacyResponse.response.status !== 401 || legacyResponse.body.errorCode !== 'employee_session_invalid') fail(`Retired 24-hour employee authority survived cutover (${legacyResponse.response.status}/${legacyResponse.body.errorCode || 'none'})`);
+    if (!String(legacyResponse.response.headers.get('set-cookie') || '').includes('Max-Age=0')) fail('Retired employee cookie was not cleared after the actual session route denied it');
+    console.log('[stage1:integration] PASS: actual employee login/launch/session routes preserve 8-hour absolute and strict 5-minute launch bounds with the retired flag injected; prior signed 24-hour sessions are denied and cleared');
   } finally {
     await stopPlatform();
     await prisma.auditEvent.deleteMany({ where: { actorType: 'EMPLOYEE', actorId: employee.id } }).catch(() => {});
@@ -2678,18 +2691,18 @@ async function customerAuthorizationChecks(deliveryEnv) {
     socket.once('close', (code, reason) => { if (socket.readyState !== 1) { clearTimeout(timer); reject(new Error(`websocket ${label} closed before open (${code}/${String(reason)})`)); } });
   });
   const socketUrl = `ws://127.0.0.1:${hub.server.address().port}/api/websocket`;
+  const assertLegacySocketRetired = async (label, headers = {}) => {
+    const socket = new WebSocket(socketUrl, { headers });
+    const status = await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(`retired legacy WebSocket ${label} denial timeout`)), 5000);
+      socket.once('unexpected-response', (_request, response) => { clearTimeout(timer); resolve(response.statusCode); });
+      socket.once('open', () => { clearTimeout(timer); socket.close(); reject(new Error(`retired legacy WebSocket ${label} unexpectedly opened`)); });
+      socket.once('error', (error) => { clearTimeout(timer); reject(error); });
+    });
+    if (status !== 404) fail(`Retired legacy WebSocket ${label} should not exist (HTTP ${status})`);
+  };
   const fakeEffectsBeforeLegacyProbe = fakePhysicalCommandCount;
-  const tenantSocket = new WebSocket(socketUrl);
-  const tenantAuthRequired = wsMessage(tenantSocket, 'tenant auth_required');
-  await wsOpen(tenantSocket, 'tenant');
-  if ((await tenantAuthRequired).type !== 'auth_required') fail('Native WebSocket did not request authentication');
-  tenantSocket.send(JSON.stringify({ type: 'auth', access_token: tenantToken.body.token }));
-  if ((await wsMessage(tenantSocket, 'tenant compatibility denial')).type !== 'auth_invalid') fail('A native customer bearer authenticated on the HA-shaped compatibility WebSocket');
-  await new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error('denied customer compatibility WebSocket did not close')), 2000);
-    tenantSocket.once('close', () => { clearTimeout(timer); resolve(); });
-    tenantSocket.once('error', (error) => { clearTimeout(timer); reject(error); });
-  });
+  await assertLegacySocketRetired('tenant', { authorization: `Bearer ${tenantToken.body.token}` });
   if (fakePhysicalCommandCount !== fakeEffectsBeforeLegacyProbe) fail('Denied customer compatibility WebSocket caused a fake-device effect');
   const nativeHubBase = `http://127.0.0.1:${hub.server.address().port}`;
   const nativeDevicesResponse = await fetchJson(`${nativeHubBase}/api/dinodia/v1/devices`, { headers: { authorization: `Bearer ${tenantToken.body.token}` } });
@@ -2706,17 +2719,12 @@ async function customerAuthorizationChecks(deliveryEnv) {
   });
   if (nativeEventSocket.readyState !== WebSocket.OPEN) fail('Canonical Native V1 event stream closed an active selected tenant session');
   nativeEventSocket.close();
-  console.log('[stage4:integration] PASS: actual Native V1 inventory and selected-tenant event WebSocket authenticate; HA-shaped customer WebSocket denies with zero fake-device effects');
+  console.log('[stage4:integration] PASS: actual Native V1 inventory and selected-tenant event WebSocket authenticate; retired HA-shaped customer WebSocket returns 404 with zero fake-device effects');
   for (const { role, token } of [
     { role: 'owner', token: propertyToken.body.token },
     { role: 'property manager', token: managerToken.body.token },
   ]) {
-    const roleSocket = new WebSocket(socketUrl);
-    const roleAuthRequired = wsMessage(roleSocket, `same-home ${role} auth_required`);
-    await wsOpen(roleSocket, `same-home ${role}`);
-    if ((await roleAuthRequired).type !== 'auth_required') fail(`Same-home ${role} WebSocket did not request authentication`);
-    roleSocket.send(JSON.stringify({ type: 'auth', access_token: token }));
-    if ((await wsMessage(roleSocket, `same-home ${role} compatibility denial`)).type !== 'auth_invalid') fail(`Same-home ${role} bearer authenticated on the HA-shaped compatibility socket`);
+    await assertLegacySocketRetired(`same-home ${role}`, { authorization: `Bearer ${token}` });
     if (fakePhysicalCommandCount !== fakeEffectsBeforeLegacyProbe) fail(`Same-home ${role} compatibility denial caused a fake-device effect`);
   }
 
@@ -2738,15 +2746,10 @@ async function customerAuthorizationChecks(deliveryEnv) {
     { role: 'owner', token: propertyToken.body.token },
     { role: 'property manager', token: managerToken.body.token },
   ]) {
-    const roleSocket = new WebSocket(socketUrl);
-    const roleAuthRequired = wsMessage(roleSocket, `same-home ${role} auth_required`);
-    await wsOpen(roleSocket, `same-home ${role}`);
-    if ((await roleAuthRequired).type !== 'auth_required') fail(`Same-home ${role} compatibility socket skipped authentication`);
-    roleSocket.send(JSON.stringify({ type: 'auth', access_token: token }));
-    if ((await wsMessage(roleSocket, `same-home ${role} compatibility denial`)).type !== 'auth_invalid') fail(`Same-home ${role} bearer authenticated on the HA-shaped compatibility socket`);
+    await assertLegacySocketRetired(`same-home ${role}`, { authorization: `Bearer ${token}` });
     if (fakePhysicalCommandCount !== fakeEffectsBeforeLegacyProbe) fail(`Same-home ${role} compatibility denial caused a fake-device effect`);
   }
-  console.log('[stage4:integration] PASS: owner, manager and other-home principals cannot obtain Native V1 tenant events or authenticate on the HA-shaped customer socket');
+  console.log('[stage4:integration] PASS: owner, manager and other-home principals cannot obtain Native V1 tenant events, and the retired HA-shaped socket returns 404');
   const tenantDeviceAfter = hub.store.getDevice('harness-tenant-device');
   if (tenantDeviceAfter?.state?.state !== 'OFF') fail('The fake physical denial fixture was unexpectedly mutated before authorization');
   const offlineGrantId = `offline-${crypto.randomUUID()}`;
@@ -3160,7 +3163,7 @@ async function customerAuthorizationChecks(deliveryEnv) {
   const operatorSession = operatorLogin.session;
   const operatorToken = operatorLogin.token;
   const operatorWork = await prisma.companyOperationalWorkItem.create({ data: { publicReference: `DIN-${sha256(`handoff-${crypto.randomUUID()}`).slice(0, 16).toUpperCase()}`, kind: 'INITIAL_HUB_INSTALLATION', state: 'ASSIGNED', homeId: homeOne.id, hubInstallationId: hubOne.id, certifiedSerialNumber: identityOne.serialNumber, assignedEmployeeId: operatorEmployee.id, createdByEmployeeId: operatorEmployee.id, reason: 'Disposable browser-bound operator handoff test' } });
-  customerFixture = { accountId: account.id, loginEmail: email, loginPassword: customerPassword, loginInstallationId: trustedInstallationId, loginPublicKey: phone.publicKey, sessionId: session.id, trustedDeviceId: trusted.id, trustedPhonePrivateKey: phone.privateKey, customerSessionSecret: rawSession, offlineAuthorisationId: tenantOffline.body.authorisation.id, revocableTrustedDeviceId: revocableTrustedDevice.id, revocableRawSession, revocablePhonePrivateKey: revocablePhone.privateKey, revocableOfflineAuthorisationId: revocableOffline.body.authorisation.id, propertyAccountId: propertyAccount.id, propertyEmail, propertyPassword, propertyInstallationId, propertyPublicKey: propertyPhone.publicKey, propertySessionId: propertySession.id, propertySessionSecret: propertyRawSession, propertyTrustedDeviceId: propertyTrusted.id, propertyTrustedPhonePrivateKey: propertyPhone.privateKey, managerAccountId: managerAccount.id, managerEmail, managerPassword, managerMembershipId: managerMembership.id, managerInstallationId: managerTrusted.deviceInstallationId, managerPublicKey: managerPhone.publicKey, managerPhonePrivateKey: managerPhone.privateKey, managerSessionId: managerSession.id, managerSessionSecret: managerRawSession, managerTrustedDeviceId: managerTrusted.id, homeOneId: homeOne.id, homeTwoId: homeTwo.id, hubOneId: hubOne.id, hubTwoId: hubTwo.id, identityOneId: identityOne.id, identityTwoId: identityTwo.id, identityTwoSerial: identityTwo.serialNumber, identityTwoGeneration: identityTwo.identityGeneration, identityTwoSigningPrivateKey: identityTwoSigning.privateKey, tenantDeviceId: tenantDevice.id, machineSecret, tenantMembershipId: tenantMembership.id, ownerMembershipId: ownerMembership.id, propertyMembershipId: propertyMembership.id, areaOneId: areaOne.id, areaOneOsId: areaOne.osAreaId, areaTwoId: areaTwo.id, areaTwoOsId: areaTwo.osAreaId, tenantToken: tenantToken.body.token, ownerToken: ownerToken.body.token, propertyToken: propertyToken.body.token, managerToken: managerToken.body.token, ticketId, stepUpTicketId, identityOneSigningPrivateKey: identityOneSigning.privateKey, identityOneSigningPublicKey: identityOneSigning.publicKey, identityOneEncryptionPrivateKey: identityOneEncryption.privateKey, identityOneEncryptionPublicKey: identityOneEncryption.publicKey, identityOneSerial: identityOne.serialNumber, identityOneGeneration: identityOne.identityGeneration, operatorEmployeeId: operatorEmployee.id, operatorSessionId: operatorSession.id, operatorWorkId: operatorWork.id, operatorToken };
+  customerFixture = { accountId: account.id, loginEmail: email, loginPassword: customerPassword, loginInstallationId: trustedInstallationId, loginPublicKey: phone.publicKey, sessionId: session.id, trustedDeviceId: trusted.id, trustedPhonePrivateKey: phone.privateKey, customerSessionSecret: rawSession, offlineAuthorisationId: tenantOffline.body.authorisation.id, revocableTrustedDeviceId: revocableTrustedDevice.id, revocableRawSession, revocablePhonePrivateKey: revocablePhone.privateKey, revocableOfflineAuthorisationId: revocableOffline.body.authorisation.id, propertyAccountId: propertyAccount.id, propertyEmail, propertyPassword, propertyInstallationId, propertyPublicKey: propertyPhone.publicKey, propertySessionId: propertySession.id, propertySessionSecret: propertyRawSession, propertyTrustedDeviceId: propertyTrusted.id, propertyTrustedPhonePrivateKey: propertyPhone.privateKey, managerAccountId: managerAccount.id, managerEmail, managerPassword, managerMembershipId: managerMembership.id, managerInstallationId: managerTrusted.deviceInstallationId, managerPublicKey: managerPhone.publicKey, managerPhonePrivateKey: managerPhone.privateKey, managerSessionId: managerSession.id, managerSessionSecret: managerRawSession, managerTrustedDeviceId: managerTrusted.id, homeOneId: homeOne.id, homeTwoId: homeTwo.id, hubOneId: hubOne.id, hubTwoId: hubTwo.id, identityOneId: identityOne.id, identityTwoId: identityTwo.id, identityTwoSerial: identityTwo.serialNumber, identityTwoGeneration: identityTwo.identityGeneration, identityTwoSigningPrivateKey: identityTwoSigning.privateKey, tenantDeviceId: tenantDevice.id, machineSecret, tenantMembershipId: tenantMembership.id, ownerMembershipId: ownerMembership.id, propertyMembershipId: propertyMembership.id, areaOneId: areaOne.id, areaOneOsId: areaOne.osAreaId, areaTwoId: areaTwo.id, areaTwoOsId: areaTwo.osAreaId, tenantToken: tenantToken.body.token, ownerToken: ownerToken.body.token, propertyToken: propertyToken.body.token, managerToken: managerToken.body.token, ticketId, stepUpTicketId, identityOneSigningPrivateKey: identityOneSigning.privateKey, identityOneSigningPublicKey: identityOneSigning.publicKey, identityOneEncryptionPrivateKey: identityOneEncryption.privateKey, identityOneEncryptionPublicKey: identityOneEncryption.publicKey, identityOneSerial: identityOne.serialNumber, identityOneGeneration: identityOne.identityGeneration, operatorEmployeeId: operatorEmployee.id, operatorEmail, operatorPassword, operatorSessionId: operatorSession.id, operatorWorkId: operatorWork.id, operatorToken };
   await installationRequestRouteChecks(deliveryEnv);
 }
 
@@ -8981,7 +8984,8 @@ async function osChecks() {
   if (setup.status !== 200) fail(`OS locked setup returned ${setup.status}`);
   const setupPage = await setup.text();
   if (!setupPage.includes('Dinodia OS') && !setupPage.includes('data-empty')) fail('OS setup did not serve the locked setup surface');
-  if ((await fetch(`${base}/api/status`, { headers: { host: '127.0.0.1' } })).status !== 401) fail('OS unauthenticated API was not denied');
+  const retiredStatusRoute = await fetch(`${base}/api/status`, { headers: { host: '127.0.0.1' } });
+  if (retiredStatusRoute.status !== 404) fail(`Retired OS compatibility status route should not exist (${retiredStatusRoute.status})`);
   if ((await fetch(`${base}/_dinodia/setup/status`, { headers: { host: '127.0.0.1' } })).status !== 403) fail('OS second browser was not locked');
 
   // Full operator handoff: browser A is created and registered by the hub,
@@ -9044,10 +9048,16 @@ async function osChecks() {
     body: JSON.stringify({ workflowId: customerFixture.operatorWorkId, setupAttemptId: expiredRegistration.body.setupAttemptId, accessMode: 'secure' }),
   });
   if (expiredAttemptLaunch.response.status !== 403) fail(`An expired hub-created browser attempt received an operator handoff (${expiredAttemptLaunch.response.status})`);
-  await prisma.employeeSession.update({ where: { id: customerFixture.operatorSessionId }, data: { recentAuthenticatedAt: new Date(Date.now() - 5 * 60 * 1000 - 1) } });
-  // Keep issue times in distinct JWT seconds so this real-session test proves
-  // that the OS deadline starts at handoff, not at Portal login.
-  await sleep(1100);
+  await prisma.employeeSession.update({ where: { id: customerFixture.operatorSessionId }, data: { recentAuthenticatedAt: new Date(Date.now() - 5 * 60 * 1000) } });
+  const staleLaunch = await fetchJson(`${platformBase}/api/installer/home-support/homes/${encodeURIComponent(customerFixture.homeOneId)}/os-access/launch`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-dinodia-employee-session': customerFixture.operatorToken },
+    body: JSON.stringify({ workflowId: customerFixture.operatorWorkId, setupAttemptId: setupAttempt.body.setupAttemptId, accessMode: 'secure' }),
+  });
+  if (staleLaunch.response.status !== 401 || staleLaunch.body.errorCode !== 'recent_authentication_required') fail(`Secure OS launch accepted employee authentication at the exact five-minute boundary (${staleLaunch.response.status}/${staleLaunch.body.errorCode || 'none'})`);
+  const reauthenticated = await loginEmployee(platformBase, { id: customerFixture.operatorEmployeeId, email: customerFixture.operatorEmail }, customerFixture.operatorPassword);
+  customerFixture.operatorSessionId = reauthenticated.session.id;
+  customerFixture.operatorToken = reauthenticated.token;
   const launch = await fetchJson(`${platformBase}/api/installer/home-support/homes/${encodeURIComponent(customerFixture.homeOneId)}/os-access/launch`, {
     method: 'POST',
     headers: { 'content-type': 'application/json', 'x-dinodia-employee-session': customerFixture.operatorToken },
@@ -9129,7 +9139,7 @@ async function osChecks() {
   const firstDeadline = Date.parse(intendedBody.expiresAt);
   const firstMaxAge = Number(intendedSetCookies.match(/Max-Age=(\d+)/i)?.[1]);
   const firstRemainingMs = firstDeadline - Date.now();
-  if (!Number.isFinite(firstDeadline) || !Number.isInteger(firstMaxAge) || firstMaxAge < 86_380 || firstMaxAge > 86_400 || firstRemainingMs > 86_400_000 || firstRemainingMs < 86_380_000 || Math.abs(firstRemainingMs - firstMaxAge * 1000) > 1_500) fail('The OS browser handle/cookie did not share one bounded absolute 24-hour grant deadline');
+  if (!Number.isFinite(firstDeadline) || !Number.isInteger(firstMaxAge) || firstMaxAge < 880 || firstMaxAge > 900 || firstRemainingMs > 900_000 || firstRemainingMs < 880_000 || Math.abs(firstRemainingMs - firstMaxAge * 1000) > 1_500) fail('The OS browser handle/cookie did not share one bounded absolute 15-minute grant deadline');
   if (/dno1\.|operatorToken|handoffSecret|sessionGrant|DINODIA_ADMIN_TOKEN/i.test(JSON.stringify(intendedBody))) fail('Operator handoff response exposed an OS bearer or reusable secret');
   const persistedGrantAuthority = await prisma.operatorHandoff.findUnique({ where: { id: launch.body.handoffId }, select: { scope: true } });
   const authorityScope = persistedGrantAuthority?.scope && typeof persistedGrantAuthority.scope === 'object' ? persistedGrantAuthority.scope : {};
@@ -9142,6 +9152,13 @@ async function osChecks() {
   if (Object.values(durableAuthorityOk).some((value) => !value)) fail(`Consumed handoff did not durably bind grant authority (valid-jti=${durableAuthorityOk.jti}, expected-version=${durableAuthorityOk.credentialVersion}, generation-match=${durableAuthorityOk.generation}, certified-serial-match=${durableAuthorityOk.serial})`);
   const currentAuthority = await machineRequest({ base: platformBase, path: '/api/hub-agent/operator-session/revalidate', machineSecret: customerFixture.machineSecret, body: { serial: customerFixture.identityOneSerial, identityGeneration: customerFixture.identityOneGeneration, handoffId: launch.body.handoffId, jti: authorityScope.operatorJti, credentialVersion: authorityScope.credentialVersion } });
   if (currentAuthority.response.status !== 200 || currentAuthority.body.active !== true) fail(`Machine-authenticated operator revalidation rejected the exact consumed grant (${currentAuthority.response.status}/${currentAuthority.body.errorCode || 'unknown'})`);
+  const employeeSessionBeforeRetiredPolicyProbe = await prisma.employeeSession.findUniqueOrThrow({ where: { id: customerFixture.operatorSessionId }, select: { createdAt: true, expiresAt: true } });
+  await prisma.employeeSession.update({ where: { id: customerFixture.operatorSessionId }, data: { expiresAt: new Date(employeeSessionBeforeRetiredPolicyProbe.createdAt.getTime() + 24 * 60 * 60 * 1000) } });
+  const retiredPolicyRevalidation = await machineRequest({ base: platformBase, path: '/api/hub-agent/operator-session/revalidate', machineSecret: customerFixture.machineSecret, body: { serial: customerFixture.identityOneSerial, identityGeneration: customerFixture.identityOneGeneration, handoffId: launch.body.handoffId, jti: authorityScope.operatorJti, credentialVersion: authorityScope.credentialVersion } });
+  await prisma.employeeSession.update({ where: { id: customerFixture.operatorSessionId }, data: { expiresAt: employeeSessionBeforeRetiredPolicyProbe.expiresAt } });
+  if (retiredPolicyRevalidation.response.status !== 401 || retiredPolicyRevalidation.body.errorCode !== 'operator_employee_session_revoked') fail(`OS revalidation retained a grant backed by a retired one-day employee row (${retiredPolicyRevalidation.response.status}/${retiredPolicyRevalidation.body.errorCode || 'none'})`);
+  const restoredAuthority = await machineRequest({ base: platformBase, path: '/api/hub-agent/operator-session/revalidate', machineSecret: customerFixture.machineSecret, body: { serial: customerFixture.identityOneSerial, identityGeneration: customerFixture.identityOneGeneration, handoffId: launch.body.handoffId, jti: authorityScope.operatorJti, credentialVersion: authorityScope.credentialVersion } });
+  if (restoredAuthority.response.status !== 200 || restoredAuthority.body.active !== true) fail('Restoring the disposable employee-row fixture did not restore only its original bounded revalidation result');
   const substitutedJti = await machineRequest({ base: platformBase, path: '/api/hub-agent/operator-session/revalidate', machineSecret: customerFixture.machineSecret, body: { serial: customerFixture.identityOneSerial, identityGeneration: customerFixture.identityOneGeneration, handoffId: launch.body.handoffId, jti: `substitute-${crypto.randomUUID()}`, credentialVersion: authorityScope.credentialVersion } });
   if (substitutedJti.response.status !== 401) fail(`Machine operator revalidation accepted a substituted grant JTI (${substitutedJti.response.status})`);
   const intendedOsRead = await fetchJsonLoopback(`${base}/_dinodia/admin/api/devices`, { headers: { ...remoteOsHeaders, cookie: cookieHeader(browserA) } });
@@ -9149,12 +9166,14 @@ async function osChecks() {
   const copiedSessionRead = await fetchJsonLoopback(`${base}/_dinodia/admin/api/devices`, { headers: { ...remoteOsHeaders, cookie: cookieHeader(browserB) } });
   if (copiedSessionRead.response.status !== 401) fail(`A second browser obtained OS access without the originating browser session (${copiedSessionRead.response.status})`);
   const WebSocket = createRequire(import.meta.url)(path.join(osRoot, 'node_modules/ws'));
-  const endSessionSocket = new WebSocket(`${base.replace('http', 'ws')}/api/websocket`, { headers: { ...remoteOsHeaders, cookie: cookieHeader(browserA) } });
-  await new Promise((resolve, reject) => {
-    const timer = setTimeout(() => { endSessionSocket.terminate(); reject(new Error('operator WebSocket did not authenticate before End session')); }, 5000);
-    endSessionSocket.on('message', (value) => { try { const message = JSON.parse(String(value)); if (message.type === 'auth_required') endSessionSocket.send(JSON.stringify({ type: 'auth', access_token: '' })); if (message.type === 'auth_ok') { clearTimeout(timer); resolve(); } } catch {} });
-    endSessionSocket.on('error', (error) => { clearTimeout(timer); reject(error); });
+  const endSessionSocket = new WebSocket(`${base.replace('http', 'ws')}/_dinodia/admin/events`, { headers: { ...remoteOsHeaders, cookie: cookieHeader(browserA) } });
+  const endSessionReady = await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => { endSessionSocket.terminate(); reject(new Error('Native operator event stream did not authenticate before End session')); }, 5000);
+    endSessionSocket.once('message', (value) => { clearTimeout(timer); try { resolve(JSON.parse(String(value))); } catch (error) { reject(error); } });
+    endSessionSocket.once('error', (error) => { clearTimeout(timer); reject(error); });
+    endSessionSocket.once('unexpected-response', (_request, response) => { clearTimeout(timer); reject(new Error(`Native operator event stream denied (${response.statusCode})`)); });
   });
+  if (endSessionReady.schemaVersion !== 'dinodia.v1' || endSessionReady.type !== 'ready') fail('Native operator event stream did not return its bounded ready envelope');
   const replayHandoff = await fetchJson(`${base}/_dinodia/setup/operator-session`, {
     method: 'POST',
     headers: { 'content-type': 'application/json', ...remoteOsHeaders, cookie: cookieHeader(browserA), 'x-dinodia-setup-csrf': decodeURIComponent(cookieValue(browserA, 'dinodia_setup_csrf')) },
@@ -9247,65 +9266,70 @@ async function osChecks() {
   updateCookieJar(browserC, consumeB.response);
   if (consumeB.response.status !== 200 || consumeBBody.ok !== true || consumeBBody.state !== 'established' || operatorHandoffPlatformRequestCount - platformCallsBeforeDuplicateB !== 2) fail(`The independent browser's duplicate handoff did not converge to exactly one prepare/consume pair and one OS session (${consumeB.response.status}/${operatorHandoffPlatformRequestCount - platformCallsBeforeDuplicateB})`);
   const secondDeadline = Date.parse(consumeBBody.expiresAt);
-  if (!Number.isFinite(secondDeadline) || secondDeadline - Date.now() > 86_400_000 || secondDeadline - Date.now() < 86_390_000) fail('The second OS grant does not carry a single absolute 24-hour deadline');
+  if (!Number.isFinite(secondDeadline) || secondDeadline - Date.now() > 900_000 || secondDeadline - Date.now() < 880_000) fail('The second OS grant does not carry a single absolute 15-minute deadline');
   const remoteSetCookies = typeof consumeB.response.headers.getSetCookie === 'function' ? consumeB.response.headers.getSetCookie().join(';') : String(consumeB.response.headers.get('set-cookie') || '');
   if (!/dinodia_os_operator_session=[^;]+/.test(remoteSetCookies) || !/HttpOnly/i.test(remoteSetCookies) || !/Secure/i.test(remoteSetCookies) || !/SameSite=Strict/i.test(remoteSetCookies)) fail('Secure CloudURL handoff did not issue an HttpOnly/Secure/SameSite OS cookie');
   const secondRead = await fetchJsonLoopback(`${base}/_dinodia/admin/api/devices`, { headers: { host: remoteHost, 'x-forwarded-proto': 'https', cookie: cookieHeader(browserC) } });
   if (secondRead.response.status !== 200) fail(`The second browser's own fresh handoff did not authorize a protected OS read (${secondRead.response.status})`);
-  // The two absolute deadlines are independent: advance Platform past the
-  // real Portal token/database deadline while the later-issued OS grant is
-  // still live. Portal must deny while the already-established OS read works.
-  const portalSession = await prisma.employeeSession.findUnique({ where: { id: customerFixture.operatorSessionId }, select: { expiresAt: true } });
+  // Portal login authority remains eight hours; each local OS operator grant
+  // is independently bounded to fifteen minutes.
+  const portalSession = await prisma.employeeSession.findUnique({ where: { id: customerFixture.operatorSessionId }, select: { createdAt: true, expiresAt: true } });
   const portalDeadline = portalSession?.expiresAt.getTime() ?? 0;
-  if (!(portalDeadline > Date.now() && portalDeadline < secondDeadline)) fail(`The fixture did not create independent Portal and later OS deadlines (portalRemaining=${portalDeadline - Date.now()}ms, osRemaining=${secondDeadline - Date.now()}ms)`);
-  osHarnessNow = portalDeadline + 1;
-  await stopPlatform();
-  await startPlatform({ ...env, STAGE1_TEST_NOW_MS: String(portalDeadline + 1) });
-  const expiredPortal = await fetchJson(`${platformBase}/api/company/auth/session`, { headers: { 'x-dinodia-employee-session': customerFixture.operatorToken } });
-  if (expiredPortal.response.status !== 401) fail(`Portal login remained valid after its own 24-hour absolute deadline (${expiredPortal.response.status})`);
-  await hub.syncOperatorBrowserSessions();
-  const afterPortalExpiryRead = await fetchJsonLoopback(`${base}/_dinodia/admin/api/devices`, { headers: { host: remoteHost, 'x-forwarded-proto': 'https', cookie: cookieHeader(browserC) } });
-  if (afterPortalExpiryRead.response.status !== 200) fail(`Natural Portal expiry incorrectly ended the independent OS operator grant (${afterPortalExpiryRead.response.status})`);
+  if (!(secondDeadline > Date.now() && secondDeadline < portalDeadline) || portalDeadline - (portalSession?.createdAt.getTime() ?? 0) > 8 * 60 * 60 * 1000) fail('The fixture did not preserve the eight-hour Portal and fifteen-minute OS bounds');
+  const activePortal = await fetchJson(`${platformBase}/api/company/auth/session`, { headers: { 'x-dinodia-employee-session': customerFixture.operatorToken } });
+  if (activePortal.response.status !== 200) fail(`The valid Portal session was unexpectedly denied before the shorter OS grant expires (${activePortal.response.status})`);
 
-  const socket = new WebSocket(`${base.replace('http', 'ws')}/api/websocket`, { headers: { host: remoteHost, origin: `https://${remoteHost}`, 'x-forwarded-proto': 'https', cookie: cookieHeader(browserC) } });
-  await new Promise((resolve, reject) => {
-    const timer = setTimeout(() => { socket.terminate(); reject(new Error('valid operator WebSocket did not authenticate')); }, 5000);
-    socket.on('message', (value) => { try { const message = JSON.parse(String(value)); if (message.type === 'auth_required') socket.send(JSON.stringify({ type: 'auth', access_token: '' })); if (message.type === 'auth_ok') { clearTimeout(timer); resolve(); } } catch {} });
-    socket.on('error', (error) => { clearTimeout(timer); reject(error); });
+  const socket = new WebSocket(`${base.replace('http', 'ws')}/_dinodia/admin/events`, { headers: { host: remoteHost, origin: `https://${remoteHost}`, 'x-forwarded-proto': 'https', cookie: cookieHeader(browserC) } });
+  const operatorReady = await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => { socket.terminate(); reject(new Error('valid Native operator event stream did not authenticate')); }, 5000);
+    socket.once('message', (value) => { clearTimeout(timer); try { resolve(JSON.parse(String(value))); } catch (error) { reject(error); } });
+    socket.once('error', (error) => { clearTimeout(timer); reject(error); });
+    socket.once('unexpected-response', (_request, response) => { clearTimeout(timer); reject(new Error(`Native operator event stream denied (${response.statusCode})`)); });
   });
-  socket.send(JSON.stringify({ id: 41, type: 'get_states' }));
-  const initialWsRead = await new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error('authenticated operator WebSocket did not return its protected read')), 5000);
-    socket.on('message', (value) => { try { const message = JSON.parse(String(value)); if (message.id === 41) { clearTimeout(timer); resolve(message); } } catch {} });
-    socket.once('error', reject);
+  if (operatorReady.schemaVersion !== 'dinodia.v1' || operatorReady.type !== 'ready') fail('Intended browser did not receive the Native operator event ready envelope');
+  const deviceRefresh = new Promise((resolve, reject) => {
+    const timer = setTimeout(() => { socket.off('message', onMessage); reject(new Error('Native operator event stream did not signal a device refresh')); }, 3000);
+    const onMessage = (value) => {
+      try {
+        const message = JSON.parse(String(value));
+        if (message.schemaVersion === 'dinodia.v1' && message.type === 'refresh' && message.resource === 'devices') {
+          clearTimeout(timer); socket.off('message', onMessage); resolve(message);
+        }
+      } catch {}
+    };
+    socket.on('message', onMessage);
   });
-  if (initialWsRead?.success !== true) fail('Intended-browser WebSocket could not perform a protected read before session expiry');
+  hub.eventBus.emit('dinodia_dashboard_updated', { kind: 'device' });
+  await deviceRefresh;
   osHarnessNow = secondDeadline - 1;
   await hub.syncOperatorBrowserSessions();
   const beforeOsExpiry = await fetchJsonLoopback(`${base}/_dinodia/admin/api/devices`, { headers: { host: remoteHost, 'x-forwarded-proto': 'https', cookie: cookieHeader(browserC) } });
-  if (beforeOsExpiry.response.status !== 200) fail(`OS protected HTTP read was denied immediately before 24-hour expiry (${beforeOsExpiry.response.status})`);
+  if (beforeOsExpiry.response.status !== 200) fail(`OS protected HTTP read was denied immediately before 15-minute expiry (${beforeOsExpiry.response.status})`);
   osHarnessNow = secondDeadline;
-  socket.send(JSON.stringify({ id: 42, type: 'get_states' }));
   await new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error('operator WebSocket remained open at the exact 24-hour expiry')), 2000);
+    const timer = setTimeout(() => { socket.terminate(); reject(new Error('Native operator event stream remained open at the exact 15-minute expiry')); }, 5000);
     socket.once('close', () => { clearTimeout(timer); resolve(); });
   });
   const atOsExpiry = await fetchJsonLoopback(`${base}/_dinodia/admin/api/devices`, { headers: { host: remoteHost, 'x-forwarded-proto': 'https', cookie: cookieHeader(browserC) } });
   osHarnessNow = secondDeadline + 1;
   const afterOsExpiry = await fetchJsonLoopback(`${base}/_dinodia/admin/api/devices`, { headers: { host: remoteHost, 'x-forwarded-proto': 'https', cookie: cookieHeader(browserC) } });
-  if (atOsExpiry.response.status !== 401 || afterOsExpiry.response.status !== 401) fail(`OS protected HTTP authority did not end exactly at 24 hours (${atOsExpiry.response.status}/${afterOsExpiry.response.status})`);
-  console.log('[stage1:integration] PASS: real consumed grant is durably JTI-bound; Portal and OS deadlines remain independent; intended and independently handed-off browsers read protected OS data; End session revokes HTTP and closes its WebSocket; HTTP and WebSocket authority stop at the exact 24-hour deadline without exposing bearer material');
+  if (atOsExpiry.response.status !== 401 || afterOsExpiry.response.status !== 401) fail(`OS protected HTTP authority did not end exactly at 15 minutes (${atOsExpiry.response.status}/${afterOsExpiry.response.status})`);
+  console.log('[stage1:integration] PASS: real consumed grant is durably JTI-bound; Portal and OS deadlines remain independent; intended and independently handed-off browsers read protected OS data; native refresh events are cookie-bound; End session revokes HTTP and closes the Native event stream; HTTP/socket authority stop at the exact 15-minute deadline without exposing bearer material');
   osHarnessNow = Date.now();
   await stopPlatform();
   await startPlatform(env);
 
-  await new Promise((resolve, reject) => {
-    const socket = new WebSocket(`${base.replace('http', 'ws')}/api/websocket`, { headers: { host: '127.0.0.1' } });
-    const timer = setTimeout(() => { socket.terminate(); reject(new Error('unauthenticated OS WebSocket did not close')); }, 5000);
-    socket.on('message', (value) => { try { if (JSON.parse(String(value)).type === 'auth_required') socket.send(JSON.stringify({ type: 'auth', access_token: 'DINODIA_ADMIN_TOKEN' })); } catch {} });
-    socket.on('close', () => { clearTimeout(timer); resolve(); });
-    socket.on('error', (error) => { clearTimeout(timer); reject(error); });
+  const unauthenticatedOperatorSocket = new WebSocket(`${base.replace('http', 'ws')}/_dinodia/admin/events`, { headers: { host: '127.0.0.1', origin: 'http://127.0.0.1' } });
+  const unauthenticatedOperatorStatus = await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => { unauthenticatedOperatorSocket.terminate(); reject(new Error('unauthenticated Native operator event stream did not deny')); }, 5000);
+    unauthenticatedOperatorSocket.once('unexpected-response', (_request, response) => { clearTimeout(timer); response.resume(); resolve(response.statusCode); });
+    unauthenticatedOperatorSocket.once('error', (error) => {
+      clearTimeout(timer);
+      if (error.message.includes('Unexpected server response')) resolve(Number(error.message.match(/\d+/)?.[0] || 0));
+      else reject(error);
+    });
   });
+  if (unauthenticatedOperatorStatus !== 401) fail(`Unauthenticated Native operator event stream was not denied (${unauthenticatedOperatorStatus})`);
 }
 async function verifyStage11PropertyDisableAcknowledgement() {
   if (!pendingStage11AutomationDisableAck || !customerFixture) fail('The property-automation disable acknowledgement scenario was not prepared');

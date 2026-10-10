@@ -1,6 +1,6 @@
 import crypto from 'node:crypto';
 import { encryptToHubKey } from './hubOperatorCredentials';
-import { DEFAULT_OPERATOR_SESSION_SECONDS, INTERNAL_OPERATOR_DAY_SESSION_POLICY, INTERNAL_OPERATOR_SESSION_SECONDS, internalOperatorDaySessionEnabled, stage1NowMs } from './internalOperatorDaySession';
+import { OPERATOR_SESSION_SECONDS, stage1NowMs } from './stage1SessionPolicy';
 
 function encode(value: unknown): string { return Buffer.from(JSON.stringify(value), 'utf8').toString('base64url'); }
 
@@ -84,13 +84,10 @@ export function createHubBoundOperatorGrant(input: { employeeId: string; hubId: 
   if (!privatePem) throw new Error('OPERATOR_SESSION_PRIVATE_KEY is required');
   const privateKey = crypto.createPrivateKey(privatePem.replaceAll('\\n', '\n'));
   const scope = [...new Set(input.scope)];
-  const adminOnly = scope.includes('os:admin') && !scope.includes('support:redeem');
-  const dayPolicy = adminOnly && internalOperatorDaySessionEnabled();
-  const lifetimeCap = dayPolicy ? INTERNAL_OPERATOR_SESSION_SECONDS : DEFAULT_OPERATOR_SESSION_SECONDS;
   const issuedAt = Math.floor((input.issuedAt ?? stage1NowMs()) / 1000);
-  const exp = Math.min(Math.floor(input.expiresAt / 1000), issuedAt + lifetimeCap);
+  const exp = Math.min(Math.floor(input.expiresAt / 1000), issuedAt + OPERATOR_SESSION_SECONDS);
   const areaOptions = input.areaOptions?.filter((row) => /^[0-9a-f-]{36}$/i.test(row.id) && row.name.trim().length > 0 && row.name.length <= 120).slice(0, 64);
-  const payload = { iss: 'dinodia-platform', aud: `dinodia-os:${input.hubId}`, sub: input.employeeId, sid: crypto.randomUUID(), jti: input.operatorJti || crypto.randomUUID(), hubId: input.hubId, scope, iat: issuedAt, exp, recentAuthAt: input.recentAuthAt, workflow: input.workflowId, credentialVersion: Number(input.credentialVersion || 0), ...(dayPolicy ? { sessionPolicy: INTERNAL_OPERATOR_DAY_SESSION_POLICY } : {}), ...(input.areaIds ? { areaIds: [...new Set(input.areaIds)] } : {}), ...(areaOptions ? { areaOptions } : {}), ...(input.requestId ? { requestId: input.requestId } : {}), ...(input.homeId ? { homeId: input.homeId } : {}), ...(input.identityGeneration ? { identityGeneration: Number(input.identityGeneration) } : {}), ...(input.requestBodyDigest ? { requestBodyDigest: input.requestBodyDigest } : {}), ...(input.handoffId ? { handoffId: input.handoffId } : {}), ...(input.employeeSessionId ? { employeeSessionId: input.employeeSessionId } : {}), ...(input.workRevision != null ? { workRevision: Number(input.workRevision) } : {}) };
+  const payload = { iss: 'dinodia-platform', aud: `dinodia-os:${input.hubId}`, sub: input.employeeId, sid: crypto.randomUUID(), jti: input.operatorJti || crypto.randomUUID(), hubId: input.hubId, scope, iat: issuedAt, exp, recentAuthAt: input.recentAuthAt, workflow: input.workflowId, credentialVersion: Number(input.credentialVersion || 0), ...(input.areaIds ? { areaIds: [...new Set(input.areaIds)] } : {}), ...(areaOptions ? { areaOptions } : {}), ...(input.requestId ? { requestId: input.requestId } : {}), ...(input.homeId ? { homeId: input.homeId } : {}), ...(input.identityGeneration ? { identityGeneration: Number(input.identityGeneration) } : {}), ...(input.requestBodyDigest ? { requestBodyDigest: input.requestBodyDigest } : {}), ...(input.handoffId ? { handoffId: input.handoffId } : {}), ...(input.employeeSessionId ? { employeeSessionId: input.employeeSessionId } : {}), ...(input.workRevision != null ? { workRevision: Number(input.workRevision) } : {}) };
   if (!payload.scope.length) throw new Error('operator scope is required');
   const header = { alg: 'EdDSA', typ: 'DNO-OPS-1' };
   const signingInput = `${encode(header)}.${encode(payload)}`;
@@ -122,11 +119,7 @@ export function verifyHubBoundOperatorGrant(token: string, input: { hubId: strin
   const iat = Number(payload.iat);
   const recentAuthAt = Number(payload.recentAuthAt);
   const scopes = Array.isArray(payload.scope) ? payload.scope.map(String) : [];
-  const adminOnly = scopes.includes('os:admin') && !scopes.includes('support:redeem');
-  const dayPolicy = adminOnly && payload.sessionPolicy === INTERNAL_OPERATOR_DAY_SESSION_POLICY;
-  if (adminOnly && internalOperatorDaySessionEnabled() !== dayPolicy) return null;
-  const lifetimeCap = dayPolicy ? INTERNAL_OPERATOR_SESSION_SECONDS : DEFAULT_OPERATOR_SESSION_SECONDS;
-  if (!payload.sub || !payload.sid || !payload.jti || payload.hubId !== input.hubId || payload.workflow !== input.workflowId || !scopes.includes(input.requiredScope) || !Number.isSafeInteger(iat) || !Number.isSafeInteger(exp) || exp <= nowSeconds || exp - iat > lifetimeCap || (!adminOnly && payload.sessionPolicy !== undefined) || !Number.isFinite(recentAuthAt) || (!dayPolicy && now - recentAuthAt > 5 * 60 * 1000)) return null;
+  if (!payload.sub || !payload.sid || !payload.jti || payload.hubId !== input.hubId || payload.workflow !== input.workflowId || !scopes.includes(input.requiredScope) || !Number.isSafeInteger(iat) || !Number.isSafeInteger(exp) || exp <= nowSeconds || exp - iat > OPERATOR_SESSION_SECONDS || payload.sessionPolicy !== undefined || !Number.isFinite(recentAuthAt) || recentAuthAt > iat * 1000 + 5000 || iat * 1000 - recentAuthAt > 5 * 60 * 1000) return null;
   if (input.employeeId && payload.sub !== input.employeeId) return null;
   if (input.requestId && payload.requestId !== input.requestId) return null;
   if (input.homeId && payload.homeId !== input.homeId) return null;

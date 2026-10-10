@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
 import { authErrorResponse, Stage1AuthError } from '@/lib/stage1Auth';
 import { authenticateHub } from '@/lib/stage1HubAuth';
+import { EMPLOYEE_SESSION_SECONDS, stage1NowMs } from '@/lib/stage1SessionPolicy';
 
 export const dynamic = 'force-dynamic';
 
@@ -24,12 +25,12 @@ export async function POST(request: Request) {
     if (!employeeSessionId || !Number.isInteger(workRevision) || String(scope.operatorJti ?? '') !== jti || Number(scope.credentialVersion) !== credentialVersion) throw new Stage1AuthError(401, 'operator_session_authority_invalid', 'The Dinodia OS operator session authority is invalid');
     const [employee, employeeSession, work, installation, credential] = await Promise.all([
       prisma.companyEmployeeAccount.findUnique({ where: { id: handoff.employeeId }, select: { id: true, status: true } }),
-      prisma.employeeSession.findUnique({ where: { id: employeeSessionId }, select: { id: true, employeeId: true, status: true, revokedAt: true, expiresAt: true } }),
+      prisma.employeeSession.findUnique({ where: { id: employeeSessionId }, select: { id: true, employeeId: true, status: true, revokedAt: true, createdAt: true, expiresAt: true } }),
       prisma.companyOperationalWorkItem.findUnique({ where: { id: handoff.workflowId }, select: { id: true, kind: true, assignedEmployeeId: true, homeId: true, hubInstallationId: true, certifiedSerialNumber: true, state: true, workRevision: true, permanentInstallationRequestId: true } }),
       prisma.hubInstallation.findUnique({ where: { id: handoff.hubInstallationId }, select: { id: true, homeId: true, state: true, serialNumberSnapshot: true, manufacturingIdentity: { select: { identityGeneration: true, status: true } } } }),
       credentialVersion > 0 ? prisma.hubCredentialVersion.findFirst({ where: { hubInstallationId: handoff.hubInstallationId, purpose: 'operator-credential', version: credentialVersion }, select: { state: true, revokedReason: true } }) : Promise.resolve(null),
     ]);
-    if (!employee || employee.status !== 'ACTIVE' || !employeeSession || employeeSession.employeeId !== employee.id || employeeSession.status !== 'ACTIVE' || employeeSession.revokedAt || employeeSession.expiresAt <= new Date()) throw new Stage1AuthError(401, 'operator_employee_session_revoked', 'The Company Portal session was explicitly ended or the employee is inactive');
+    if (!employee || employee.status !== 'ACTIVE' || !employeeSession || employeeSession.employeeId !== employee.id || employeeSession.status !== 'ACTIVE' || employeeSession.revokedAt || employeeSession.expiresAt.getTime() <= stage1NowMs() || employeeSession.expiresAt.getTime() - employeeSession.createdAt.getTime() > EMPLOYEE_SESSION_SECONDS * 1000) throw new Stage1AuthError(401, 'operator_employee_session_revoked', 'The Company Portal session is expired, retired or the employee is inactive');
     const scopes = Array.isArray(scope.scopes) ? scope.scopes.map(String) : [];
     const permanentInstallation = scopes.length === 1 && scopes[0] === 'os:permanent-installation';
     if (!work || work.assignedEmployeeId !== employee.id || work.homeId !== handoff.homeId || work.hubInstallationId !== handoff.hubInstallationId || work.certifiedSerialNumber !== hub.identity.serialNumber || work.workRevision !== workRevision

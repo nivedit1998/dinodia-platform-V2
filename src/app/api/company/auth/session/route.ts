@@ -5,7 +5,7 @@ import { verifyPassword } from '@/lib/passwords';
 import { signStage1Token } from '@/lib/stage1Crypto';
 import { authErrorResponse, recordFailedAuthentication, requireEmployee, requireEmployeeToken, Stage1AuthError } from '@/lib/stage1Auth';
 import { enforcePersistentRateLimit } from '@/lib/rateLimit';
-import { DEFAULT_EMPLOYEE_SESSION_SECONDS, INTERNAL_EMPLOYEE_SESSION_SECONDS, INTERNAL_OPERATOR_DAY_SESSION_POLICY, internalOperatorDaySessionEnabled, stage1NowMs } from '@/lib/internalOperatorDaySession';
+import { EMPLOYEE_SESSION_SECONDS, stage1NowMs } from '@/lib/stage1SessionPolicy';
 
 export const dynamic = 'force-dynamic';
 
@@ -30,9 +30,8 @@ export async function POST(request: Request) {
       await recordFailedAuthentication('employee_login_failed', email);
       throw new Stage1AuthError(401, 'employee_credentials_invalid', 'The employee credentials are invalid');
     }
-    const dayPolicyEnabled = internalOperatorDaySessionEnabled();
     const issuedAt = Math.floor(stage1NowMs() / 1000);
-    const lifetimeSeconds = dayPolicyEnabled ? INTERNAL_EMPLOYEE_SESSION_SECONDS : DEFAULT_EMPLOYEE_SESSION_SECONDS;
+    const lifetimeSeconds = EMPLOYEE_SESSION_SECONDS;
     const now = new Date(issuedAt * 1000);
     const expiresAt = new Date((issuedAt + lifetimeSeconds) * 1000);
     // Bind the durable row to the signed token's session identifier.  The
@@ -44,7 +43,7 @@ export async function POST(request: Request) {
       await tx.auditEvent.create({ data: { actorType: 'EMPLOYEE', actorId: employee.id, category: 'SECURITY', action: 'employee_login_succeeded', targetType: 'EmployeeSession', targetId: created.id, metadata: { outcome: 'succeeded' }, purgeAt: new Date(now.getTime() + 365 * 24 * 60 * 60 * 1000) } });
       return created;
     });
-    const token = signStage1Token('employee', { id: employee.id, sessionId: session.id, areaIds: [], scopes: ['company:portal'], policyRevision: 0, issuedAt, expiresAt: issuedAt + lifetimeSeconds, recentAuthenticatedAt: now.getTime(), ...(dayPolicyEnabled ? { sessionPolicy: INTERNAL_OPERATOR_DAY_SESSION_POLICY } : {}) }, signingKey());
+    const token = signStage1Token('employee', { id: employee.id, sessionId: session.id, areaIds: [], scopes: ['company:portal'], policyRevision: 0, issuedAt, expiresAt: issuedAt + lifetimeSeconds, recentAuthenticatedAt: now.getTime() }, signingKey());
     return NextResponse.json({ ok: true, employee: { id: employee.id, role: employee.role }, expiresAt: session.expiresAt }, { headers: { 'Set-Cookie': `dinodia_employee_session=${encodeURIComponent(token)}; HttpOnly; SameSite=Lax; Secure; Path=/; Max-Age=${lifetimeSeconds}`, 'Cache-Control': 'no-store', Pragma: 'no-cache' } });
   } catch (error) { return authErrorResponse(error); }
 }
@@ -73,5 +72,12 @@ export async function GET(request: Request) {
   try {
     const principal = await requireEmployee(request);
     return NextResponse.json({ ok: true, expiresAt: new Date(principal.expiresAt).toISOString() }, { headers: { 'Cache-Control': 'no-store', Pragma: 'no-cache' } });
-  } catch (error) { return authErrorResponse(error); }
+  } catch (error) {
+    const response = authErrorResponse(error);
+    if (error instanceof Stage1AuthError && ['employee_session_invalid', 'employee_session_revoked', 'employee_revoked'].includes(error.code)
+      && request.headers.get('cookie')?.includes('dinodia_employee_session=')) {
+      response.headers.set('Set-Cookie', 'dinodia_employee_session=; HttpOnly; SameSite=Lax; Secure; Path=/; Max-Age=0');
+    }
+    return response;
+  }
 }

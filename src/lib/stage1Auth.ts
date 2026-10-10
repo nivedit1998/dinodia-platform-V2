@@ -3,7 +3,7 @@ import { NextResponse } from 'next/server';
 import { prisma } from './prisma';
 import { headerToken, parsePublicKeys, sha256, verifyStage1Token } from './stage1Crypto';
 import { validateMembership } from './contracts/dinodiaV1';
-import { DEFAULT_EMPLOYEE_SESSION_SECONDS, INTERNAL_EMPLOYEE_SESSION_SECONDS, INTERNAL_OPERATOR_DAY_SESSION_POLICY, internalOperatorDaySessionEnabled, stage1NowMs } from './internalOperatorDaySession';
+import { EMPLOYEE_SESSION_SECONDS, stage1NowMs } from './stage1SessionPolicy';
 import { currentCustomerPolicy } from './customerPolicyConfig';
 
 export class Stage1AuthError extends Error {
@@ -83,23 +83,18 @@ export async function requireEmployeeRecentAuth(request: Request, allowedRoles: 
 }
 
 export async function requireEmployeeToken(token: string, allowedRoles: EmployeePrincipal['role'][] = [], requireRecent = false): Promise<EmployeePrincipal> {
-  const dayPolicyEnabled = internalOperatorDaySessionEnabled();
-  const verified = verifyStage1Token(token, 'employee', keys('COMPANY_PORTAL_SESSION_PUBLIC_KEYS'), stage1NowMs(), dayPolicyEnabled ? INTERNAL_EMPLOYEE_SESSION_SECONDS : DEFAULT_EMPLOYEE_SESSION_SECONDS);
+  const verified = verifyStage1Token(token, 'employee', keys('COMPANY_PORTAL_SESSION_PUBLIC_KEYS'), stage1NowMs(), EMPLOYEE_SESSION_SECONDS);
   if (!verified) fail(new Stage1AuthError(401, 'employee_session_invalid', 'A valid Company Portal session is required'));
   const lifetimeSeconds = verified.expiresAt - verified.issuedAt;
-  if (verified.sessionPolicy === INTERNAL_OPERATOR_DAY_SESSION_POLICY) {
-    if (!dayPolicyEnabled || lifetimeSeconds > INTERNAL_EMPLOYEE_SESSION_SECONDS) fail(new Stage1AuthError(401, 'employee_session_invalid', 'This Company Portal session policy is not active'));
-  } else if (verified.sessionPolicy !== undefined || lifetimeSeconds > DEFAULT_EMPLOYEE_SESSION_SECONDS) {
-    fail(new Stage1AuthError(401, 'employee_session_invalid', 'The employee session policy is invalid'));
-  }
+  if (lifetimeSeconds > EMPLOYEE_SESSION_SECONDS) fail(new Stage1AuthError(401, 'employee_session_invalid', 'The employee session exceeds the current absolute lifetime'));
   const employee = await prisma.companyEmployeeAccount.findUnique({ where: { id: verified.id }, select: { id: true, role: true, status: true } });
   if (!employee || employee.status !== 'ACTIVE') fail(new Stage1AuthError(401, 'employee_revoked', 'The employee session is no longer active'));
   if (allowedRoles.length > 0 && !allowedRoles.includes(employee.role)) fail(new Stage1AuthError(403, 'employee_role_denied', 'This employee role is not allowed for the operation'));
-  const session = await prisma.employeeSession.findUnique({ where: { id: verified.sessionId }, select: { id: true, employeeId: true, tokenHash: true, status: true, expiresAt: true, recentAuthenticatedAt: true } });
+  const session = await prisma.employeeSession.findUnique({ where: { id: verified.sessionId }, select: { id: true, employeeId: true, tokenHash: true, status: true, createdAt: true, expiresAt: true, recentAuthenticatedAt: true } });
   const tokenDeadline = verified.expiresAt * 1000;
   const dbDeadline = session?.expiresAt.getTime() ?? 0;
-  if (!session || session.employeeId !== employee.id || session.tokenHash !== sha256(verified.sessionId) || session.status !== 'ACTIVE' || dbDeadline <= stage1NowMs() || tokenDeadline > dbDeadline || dbDeadline - tokenDeadline >= 1000) fail(new Stage1AuthError(401, 'employee_session_revoked', 'The employee session is no longer active'));
-  if (requireRecent && stage1NowMs() - session.recentAuthenticatedAt.getTime() > 5 * 60 * 1000) fail(new Stage1AuthError(401, 'recent_authentication_required', 'Recent Company Portal authentication is required'));
+  if (!session || session.employeeId !== employee.id || session.tokenHash !== sha256(verified.sessionId) || session.status !== 'ACTIVE' || dbDeadline <= stage1NowMs() || dbDeadline - session.createdAt.getTime() > EMPLOYEE_SESSION_SECONDS * 1000 || tokenDeadline > dbDeadline || dbDeadline - tokenDeadline >= 1000) fail(new Stage1AuthError(401, 'employee_session_revoked', 'The employee session is no longer active'));
+  if (requireRecent && stage1NowMs() - session.recentAuthenticatedAt.getTime() >= 5 * 60 * 1000) fail(new Stage1AuthError(401, 'recent_authentication_required', 'Recent Company Portal authentication is required'));
   return { kind: 'employee', id: employee.id, role: employee.role, sessionId: verified.sessionId, recentAuthenticatedAt: session.recentAuthenticatedAt.getTime(), tokenHash: sha256(verified.sessionId), expiresAt: session.expiresAt.getTime() };
 }
 

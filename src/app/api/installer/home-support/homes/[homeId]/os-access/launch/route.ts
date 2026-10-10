@@ -4,7 +4,7 @@ import { requireEmployee, requireEmployeeRecentAuth, Stage1AuthError, authErrorR
 import { randomSecret, sha256 } from '@/lib/stage1Crypto';
 import { enforcePersistentRateLimit } from '@/lib/rateLimit';
 import { encryptOperatorGrant, isStrictlyUnexpired } from '@/lib/stage1Operator';
-import { internalOperatorDaySessionEnabled, stage1NowMs } from '@/lib/internalOperatorDaySession';
+import { stage1NowMs } from '@/lib/stage1SessionPolicy';
 import { lanEndpointFresh } from '@/lib/lanEndpoint';
 
 export const dynamic = 'force-dynamic';
@@ -14,9 +14,7 @@ export async function POST(request: Request, context: { params: Promise<{ homeId
     // This is the sole sensitive route allowed to rely on an active employee
     // session instead of five-minute recent authentication under the named,
     // temporary Stage 1 policy. Rotation, revocation and support stay strict.
-    const employee = internalOperatorDaySessionEnabled()
-      ? await requireEmployee(request, ['CXO', 'SENIOR_OPERATIONS_MANAGER', 'INSTALLER'])
-      : await requireEmployeeRecentAuth(request, ['CXO', 'SENIOR_OPERATIONS_MANAGER', 'INSTALLER']);
+    const employee = await requireEmployeeRecentAuth(request, ['CXO', 'SENIOR_OPERATIONS_MANAGER', 'INSTALLER']);
     const { homeId } = await context.params;
     await enforcePersistentRateLimit(`operator-launch:${employee.id}:${homeId}`, 5, 15 * 60 * 1000);
     await enforcePersistentRateLimit(`operator-launch-hour:${employee.id}`, 20, 60 * 60 * 1000);

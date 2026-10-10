@@ -4,7 +4,7 @@ import { authErrorResponse, Stage1AuthError } from '@/lib/stage1Auth';
 import { authenticateHub } from '@/lib/stage1HubAuth';
 import { encryptOperatorGrant, createHubBoundOperatorGrant, isStrictlyUnexpired } from '@/lib/stage1Operator';
 import { sha256 } from '@/lib/stage1Crypto';
-import { DEFAULT_OPERATOR_SESSION_SECONDS, INTERNAL_OPERATOR_SESSION_SECONDS, internalOperatorDaySessionEnabled, stage1NowMs } from '@/lib/internalOperatorDaySession';
+import { OPERATOR_SESSION_SECONDS, stage1NowMs } from '@/lib/stage1SessionPolicy';
 import { lanEndpointFresh } from '@/lib/lanEndpoint';
 
 export const dynamic = 'force-dynamic';
@@ -69,9 +69,8 @@ export async function POST(request: Request) {
         if (!areas.length || areaOptions.length !== areas.length || areas.some((area) => !areaOptions!.some((option) => option.id === area.id && option.name === area.originalName))) throw new Stage1AuthError(403, 'installation_area_changed', 'The assigned original Area options changed; relaunch from Company Portal');
       }
       const credential = await tx.hubCredentialVersion.findFirst({ where: { hubInstallationId: hub.installation.id, purpose: 'operator-credential', state: { in: ['ACTIVE', 'GRACE'] } }, orderBy: { version: 'desc' }, select: { version: true } });
-      const policyEnabled = internalOperatorDaySessionEnabled();
       const issuedAt = Math.floor(now.getTime() / 1000) * 1000;
-      const sessionLifetimeSeconds = policyEnabled ? INTERNAL_OPERATOR_SESSION_SECONDS : DEFAULT_OPERATOR_SESSION_SECONDS;
+      const sessionLifetimeSeconds = OPERATOR_SESSION_SECONDS;
       const grantExpiresAt = issuedAt + sessionLifetimeSeconds * 1000;
       const operatorJti = crypto.randomUUID();
       const credentialVersion = credential?.version ?? 0;

@@ -43,7 +43,6 @@ export type Stage1Principal = {
   issuedAt: number;
   expiresAt: number;
   recentAuthenticatedAt?: number;
-  sessionPolicy?: string;
 };
 
 export function sha256(value: string): string {
@@ -108,7 +107,6 @@ export function signStage1Token(
     iat: claims.issuedAt,
     exp: claims.expiresAt,
     ...(claims.recentAuthenticatedAt ? { recentAuthenticatedAt: claims.recentAuthenticatedAt } : {}),
-    ...(claims.sessionPolicy ? { sessionPolicy: claims.sessionPolicy } : {}),
   };
   const encodedHeader = encode(header);
   const encodedPayload = encode(payload);
@@ -208,7 +206,7 @@ export function verifyStage1Token(
     return null;
   }
   const expectedType = kind === 'employee' ? 'DNO-EMP-1' : 'DNO-APP-1';
-  if (header.alg !== 'EdDSA' || header.typ !== expectedType || header.v !== 1 || payload.iss !== 'dinodia-platform-v2') return null;
+  if (header.alg !== 'EdDSA' || header.typ !== expectedType || header.v !== 1 || payload.iss !== 'dinodia-platform-v2' || payload.sessionPolicy !== undefined) return null;
   const valid = publicKeys.some((key) => {
     try {
       return crypto.verify(null, Buffer.from(`${parts[1]}.${parts[2]}`), key, Buffer.from(parts[3], 'base64url'));
@@ -244,7 +242,6 @@ export function verifyStage1Token(
     issuedAt,
     expiresAt,
     recentAuthenticatedAt: Number.isFinite(Number(payload.recentAuthenticatedAt)) ? Number(payload.recentAuthenticatedAt) : undefined,
-    sessionPolicy: typeof payload.sessionPolicy === 'string' ? payload.sessionPolicy : undefined,
   };
 }
 

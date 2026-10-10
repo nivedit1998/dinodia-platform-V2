@@ -157,13 +157,19 @@ function loadTypeScriptModule(relativePath, overrides = {}) {
   return module.exports;
 }
 
-test('temporary internal day mode is disabled unless the exact opt-in is present', () => {
-  const { internalOperatorDaySessionEnabled } = loadTypeScriptModule('src/lib/internalOperatorDaySession.ts');
-  assert.equal(internalOperatorDaySessionEnabled({}), false);
-  assert.equal(internalOperatorDaySessionEnabled({ STAGE1_INTERNAL_OPERATOR_DAY_SESSION: 'false' }), false);
-  assert.equal(internalOperatorDaySessionEnabled({ STAGE1_INTERNAL_OPERATOR_DAY_SESSION: 'TRUE' }), false);
-  assert.equal(internalOperatorDaySessionEnabled({ STAGE1_INTERNAL_OPERATOR_DAY_SESSION: ' true ' }), false);
-  assert.equal(internalOperatorDaySessionEnabled({ STAGE1_INTERNAL_OPERATOR_DAY_SESSION: 'true' }), true);
+test('retired operator-day environment settings cannot change permanent session bounds', () => {
+  const previousFlag = process.env.STAGE1_INTERNAL_OPERATOR_DAY_SESSION;
+  process.env.STAGE1_INTERNAL_OPERATOR_DAY_SESSION = 'true';
+  try {
+    const { EMPLOYEE_SESSION_SECONDS, OPERATOR_SESSION_SECONDS, stage1NowMs } = loadTypeScriptModule('src/lib/stage1SessionPolicy.ts');
+    assert.equal(EMPLOYEE_SESSION_SECONDS, 8 * 60 * 60);
+    assert.equal(OPERATOR_SESSION_SECONDS, 15 * 60);
+    assert.equal(stage1NowMs({ NODE_ENV: 'production', V2_ENVIRONMENT: 'production', STAGE1_TEST_NOW_MS: '1900000000000' }) !== 1900000000000, true, 'Production must ignore the test clock');
+    assert.equal(stage1NowMs({ NODE_ENV: 'test', V2_ENVIRONMENT: 'test', STAGE1_TEST_NOW_MS: '1900000000000' }), 1900000000000, 'the disposable integration harness retains its controlled-clock seam');
+  } finally {
+    if (previousFlag === undefined) delete process.env.STAGE1_INTERNAL_OPERATOR_DAY_SESSION;
+    else process.env.STAGE1_INTERNAL_OPERATOR_DAY_SESSION = previousFlag;
+  }
 });
 
 test('native task registry dispatches business operations and daily lease cleanup to disjoint owners', async () => {
@@ -408,7 +414,7 @@ test('native expiry handlers use stable bounded oldest-first batches and conditi
   assert.deepEqual(conditionalUpdate?.where, { id: 'request:1', status: { in: ['REQUESTED', 'APPROVED', 'ISSUED'] }, codeExpiresAt: { lte: new Date('2026-09-29T12:00:00Z') } });
 });
 
-test('the signed one-day OS grant remains valid past recent-auth while flag-off grants keep the short cap', () => {
+test('OS admin grants remain 15-minute with the retired flag and reject old one-day grants', () => {
   const crypto = createRequire(import.meta.url)('node:crypto');
   const keys = crypto.generateKeyPairSync('ed25519');
   const privateKey = keys.privateKey.export({ type: 'pkcs8', format: 'pem' }).toString();
@@ -419,20 +425,28 @@ test('the signed one-day OS grant remains valid past recent-auth while flag-off 
   try {
     const { createHubBoundOperatorGrant, verifyHubBoundOperatorGrant } = loadTypeScriptModule('src/lib/stage1Operator.ts', {
       './hubOperatorCredentials': { encryptToHubKey() { throw new Error('not used'); } },
-      './internalOperatorDaySession': {
-        DEFAULT_OPERATOR_SESSION_SECONDS: 900,
-        INTERNAL_OPERATOR_DAY_SESSION_POLICY: 'STAGE1_INTERNAL_OPERATOR_DAY_SESSION',
-        INTERNAL_OPERATOR_SESSION_SECONDS: 86400,
-        internalOperatorDaySessionEnabled: () => process.env.STAGE1_INTERNAL_OPERATOR_DAY_SESSION === 'true',
+      './stage1SessionPolicy': {
+        OPERATOR_SESSION_SECONDS: 900,
         stage1NowMs: () => Date.now(),
       },
     });
     const issuedAt = Date.parse('2026-09-26T12:00:00.000Z');
     const grant = createHubBoundOperatorGrant({ employeeId: 'employee-1', hubId: 'serial-1', workflowId: 'work-1', scope: ['os:admin'], recentAuthAt: issuedAt, issuedAt, expiresAt: issuedAt + 86_400_000 });
     const verifyInput = { hubId: 'serial-1', workflowId: 'work-1', requiredScope: 'os:admin', employeeId: 'employee-1' };
-    assert.ok(verifyHubBoundOperatorGrant(grant, verifyInput, issuedAt + 60 * 60 * 1000), 'enabled one-day grant must survive beyond the ordinary five-minute launch-auth window');
+    const decoded = JSON.parse(Buffer.from(grant.split('.')[2], 'base64url').toString('utf8'));
+    assert.equal(decoded.exp - decoded.iat, 900, 'stale opt-in cannot extend a new signed grant');
+    assert.equal(decoded.sessionPolicy, undefined, 'new grants omit the retired policy marker');
+    assert.ok(verifyHubBoundOperatorGrant(grant, verifyInput, issuedAt + 14 * 60 * 1000));
+    assert.equal(verifyHubBoundOperatorGrant(grant, verifyInput, issuedAt + 15 * 60 * 1000), null);
+    const legacyPayload = { ...decoded, exp: decoded.iat + 86400, sessionPolicy: 'STAGE1_INTERNAL_OPERATOR_DAY_SESSION' };
+    const encode = (value) => Buffer.from(JSON.stringify(value), 'utf8').toString('base64url');
+    const legacyHeader = encode({ alg: 'EdDSA', typ: 'DNO-OPS-1' });
+    const legacyBody = encode(legacyPayload);
+    const legacyInput = `${legacyHeader}.${legacyBody}`;
+    const legacy = `dno1.${legacyInput}.${crypto.sign(null, Buffer.from(legacyInput), crypto.createPrivateKey(privateKey)).toString('base64url')}`;
+    assert.equal(verifyHubBoundOperatorGrant(legacy, verifyInput, issuedAt + 60_000), null, 'old one-day marker is denied regardless of process environment');
     process.env.STAGE1_INTERNAL_OPERATOR_DAY_SESSION = 'false';
-    assert.equal(verifyHubBoundOperatorGrant(grant, verifyInput, issuedAt + 60 * 60 * 1000), null, 'flag-off verifier must reject an extended grant');
+    assert.ok(verifyHubBoundOperatorGrant(grant, verifyInput, issuedAt + 60_000), 'stale environment values cannot revoke/extend a short current grant');
   } finally {
     if (previousPrivateKey === undefined) delete process.env.OPERATOR_SESSION_PRIVATE_KEY;
     else process.env.OPERATOR_SESSION_PRIVATE_KEY = previousPrivateKey;
@@ -626,7 +640,7 @@ test('Platform step-up operation digest matches the published cross-runtime vect
 test('support proof requires possession of the decrypted ephemeral signing key and binds its full context', () => {
   const { supportProofRequestDigest, verifySupportProofSignature } = loadTypeScriptModule('src/lib/stage1Operator.ts', {
     './hubOperatorCredentials': { encryptToHubKey: () => ({}) },
-    './internalOperatorDaySession': { DEFAULT_OPERATOR_SESSION_SECONDS: 900, INTERNAL_OPERATOR_SESSION_SECONDS: 86400, INTERNAL_OPERATOR_DAY_SESSION_POLICY: 'STAGE1_INTERNAL_OPERATOR_DAY_SESSION', internalOperatorDaySessionEnabled: () => false, stage1NowMs: () => Date.now() },
+    './stage1SessionPolicy': { OPERATOR_SESSION_SECONDS: 900, stage1NowMs: () => Date.now() },
   });
   const keys = createRequire(import.meta.url)('node:crypto').generateKeyPairSync('ed25519');
   const otherKeys = createRequire(import.meta.url)('node:crypto').generateKeyPairSync('ed25519');
@@ -681,7 +695,7 @@ test('trusted-phone assertions interoperate with Secure Enclave P-256 and preser
 test('operator handoff expiry accepts only timestamps strictly before the bound deadline', () => {
   const { isStrictlyUnexpired } = loadTypeScriptModule('src/lib/stage1Operator.ts', {
     './hubOperatorCredentials': { encryptToHubKey: () => ({}) },
-    './internalOperatorDaySession': { DEFAULT_OPERATOR_SESSION_SECONDS: 900, INTERNAL_OPERATOR_SESSION_SECONDS: 86400, INTERNAL_OPERATOR_DAY_SESSION_POLICY: 'STAGE1_INTERNAL_OPERATOR_DAY_SESSION', internalOperatorDaySessionEnabled: () => false, stage1NowMs: () => Date.now() },
+    './stage1SessionPolicy': { OPERATOR_SESSION_SECONDS: 900, stage1NowMs: () => Date.now() },
   });
   const now = new Date('2026-09-25T12:00:00.000Z');
   const deadline = new Date(now.getTime() + 60_000);
