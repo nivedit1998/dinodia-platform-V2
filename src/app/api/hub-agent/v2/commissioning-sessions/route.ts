@@ -19,7 +19,7 @@ function assertCommissioningProtocolEnabled(hub: Awaited<ReturnType<typeof authe
   const summary = hub.installation.capabilitySummary && typeof hub.installation.capabilitySummary === 'object' && !Array.isArray(hub.installation.capabilitySummary)
     ? hub.installation.capabilitySummary as Record<string, unknown> : {};
   const flag = protocol === 'ZIGBEE' ? 'nativeZigbeeCommissioningV1' : 'nativeMatterCommissioningV1';
-  if (summary[flag] !== true || summary.nativeCommissioningCatalogueVersion !== 'DINODIA-NATIVE-COMMISSIONING-V1') {
+  if (summary[flag] !== true) {
     fail(503, 'commissioning_protocol_disabled', 'This commissioning protocol is not enabled for the enrolled hub');
   }
 }
@@ -117,7 +117,11 @@ export async function POST(request: Request) {
   const raw = await request.text();
   try {
     const hub = await authenticateHub(request, raw, { maxBodyBytes: 48 * 1024 });
-    const body = hub.body;
+    // serial is the authenticated machine-envelope identity, not an action
+    // field. Keep the signed identityGeneration in the action contract, but do
+    // not let the envelope-only serial break the route's exact-key schemas.
+    const body = { ...hub.body };
+    delete body.serial;
     const action = String(body.action || '');
     if (!UUID.test(String(body.sessionId || '')) || body.homeId !== hub.installation.homeId || body.hubInstallationId && body.hubInstallationId !== hub.installation.id
       || !['create','transition','finalize'].includes(action)) fail(400, 'commissioning_request_invalid', 'The commissioning request is invalid');
@@ -237,7 +241,10 @@ export async function POST(request: Request) {
       const controls = (device.capabilitySummary as { controls: Array<{ readable: boolean; writable: boolean }> }).controls;
       const hasWritable = controls.some((control) => control.readable && control.writable);
       if (body.disposition === 'install' && (device.catalogueStatus !== 'ready' || !hasWritable)
-        || body.disposition === 'view_only' && (!['no_safe_controls','unsupported'].includes(String(device.catalogueStatus)) || device.usefulReadings !== true || hasWritable)) fail(409, 'commissioning_catalogue_invalid', 'The current device catalogue does not support this choice');
+        || body.disposition === 'view_only' && hasWritable
+        || body.disposition === 'view_only' && device.catalogueStatus === 'no_safe_controls' && device.usefulReadings !== true
+        || body.disposition === 'view_only' && device.catalogueStatus === 'unsupported' && device.usefulReadings !== false
+        || body.disposition === 'view_only' && !['no_safe_controls','unsupported'].includes(String(device.catalogueStatus))) fail(409, 'commissioning_catalogue_invalid', 'The current device descriptor does not support this safe retained state');
       const areaId = String(device.areaId || '');
       if (!authority.areaIds.has(areaId) || !await tx.area.findFirst({ where: { id: areaId, homeId: authority.home.id, status: 'ACTIVE' }, select: { id: true } })) fail(403, 'commissioning_area_denied', 'The selected Area is not currently granted to this tenant');
       const finalHash = sessionBinding(COMPLETE_NAMESPACE, row);

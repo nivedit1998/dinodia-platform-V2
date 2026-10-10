@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
-import { requireEmployee, requireEmployeeRecentAuth, Stage1AuthError, authErrorResponse } from '@/lib/stage1Auth';
+import { requireEmployeeRecentAuth, Stage1AuthError, authErrorResponse } from '@/lib/stage1Auth';
 import { randomSecret, sha256 } from '@/lib/stage1Crypto';
 import { enforcePersistentRateLimit } from '@/lib/rateLimit';
 import { encryptOperatorGrant, isStrictlyUnexpired } from '@/lib/stage1Operator';
@@ -22,6 +22,9 @@ export async function POST(request: Request, context: { params: Promise<{ homeId
     const workflowId = String(body.workflowId ?? '').trim();
     const setupAttemptId = String(body.setupAttemptId ?? '').trim();
     const accessMode = String(body.accessMode ?? '');
+    const fullDashboard = body.fullDashboard === true;
+    if (Object.keys(body).some((key) => !['workflowId', 'setupAttemptId', 'accessMode', 'fullDashboard'].includes(key))
+      || (body.fullDashboard !== undefined && typeof body.fullDashboard !== 'boolean')) throw new Stage1AuthError(400, 'operator_launch_invalid', 'The Dinodia OS access request is invalid');
     if (!workflowId || !/^[A-Za-z0-9_-]{32,160}$/.test(setupAttemptId)) throw new Stage1AuthError(400, 'workflow_or_attempt_required', 'An assigned workflow and hub-created setup attempt are required');
     if (!['secure', 'local'].includes(accessMode)) throw new Stage1AuthError(400, 'operator_access_mode_required', 'Choose the verified secure or current local hub endpoint');
     const now = new Date(stage1NowMs());
@@ -37,8 +40,8 @@ export async function POST(request: Request, context: { params: Promise<{ homeId
         if (!installationRequest) throw new Stage1AuthError(403, 'installation_request_not_current', 'This permanent-device installation request is no longer current');
         requestId = installationRequest.id;
         const areas = await tx.area.findMany({ where: { homeId, status: 'ACTIVE', ...(installationRequest.requestedAreaId ? { id: installationRequest.requestedAreaId } : {}) }, select: { id: true, originalName: true }, orderBy: { originalName: 'asc' }, take: 64 });
-        if (!areas.length) throw new Stage1AuthError(409, 'installation_area_unavailable', 'The assigned Home has no active original Area available for installation');
-        areaOptions = areas.map((area) => ({ id: area.id, name: area.originalName }));
+        if (!areas.length && !fullDashboard) throw new Stage1AuthError(409, 'installation_area_unavailable', 'The assigned Home has no active original Area available for installation');
+        if (areas.length) areaOptions = areas.map((area) => ({ id: area.id, name: area.originalName }));
       }
       const hub = await tx.hubInstallation.findUnique({ where: { id: work.hubInstallationId }, select: { id: true, homeId: true, serialNumberSnapshot: true, baseUrl: true, cloudUrl: true, cloudUrlVerifiedAt: true, remoteVerificationAt: true, lanEndpointRevision: true, lanEndpointReportedAt: true, lanEndpointState: true, lanEndpointIdentityGeneration: true, manufacturingIdentity: { select: { encryptionPublicKey: true, identityGeneration: true, status: true } } } });
       if (!hub || hub.homeId !== homeId || work.certifiedSerialNumber !== hub.serialNumberSnapshot) throw new Stage1AuthError(403, 'workflow_hub_mismatch', 'The selected workflow is not bound to this hub');
@@ -60,15 +63,19 @@ export async function POST(request: Request, context: { params: Promise<{ homeId
       const browserAttempt = await tx.operatorBrowserAttempt.findUnique({ where: { attemptId: setupAttemptId }, select: { id: true, attemptId: true, homeId: true, hubInstallationId: true, browserBindingHash: true, accessMode: true, endpointOrigin: true, endpointRevision: true, expiresAt: true, consumedAt: true, revokedAt: true } });
       if (!browserAttempt || browserAttempt.homeId !== homeId || browserAttempt.hubInstallationId !== hub.id || browserAttempt.consumedAt || browserAttempt.revokedAt || !isStrictlyUnexpired(browserAttempt.expiresAt, now)) throw new Stage1AuthError(403, 'operator_attempt_not_authorized', 'The setup attempt was not created by this paired hub browser or has expired');
       if (browserAttempt.accessMode !== accessMode || browserAttempt.endpointOrigin !== operatorOrigin || browserAttempt.endpointRevision !== endpointRevision) throw new Stage1AuthError(409, 'operator_endpoint_changed', 'The locked browser was opened on a different or outdated hub endpoint; close it and launch again');
-      const existing = await tx.operatorHandoff.findFirst({ where: { operatorBrowserAttemptId: browserAttempt.id, employeeId: employee.id, workflowId: work.id, consumedAt: null, revokedAt: null, expiresAt: { gt: now } }, select: { id: true, expiresAt: true } });
-      if (existing) return { id: existing.id, expiresAt: existing.expiresAt, operatorOrigin, accessMode, endpointRevision, endpointReportedAt, endpointState, destination: permanentInstallation ? '/permanent-installation' : '/support-access' };
+      const scopes = fullDashboard ? ['os:admin'] : permanentInstallation ? ['os:permanent-installation'] : ['os:admin'];
+      const existing = await tx.operatorHandoff.findFirst({ where: { operatorBrowserAttemptId: browserAttempt.id, employeeId: employee.id, workflowId: work.id, consumedAt: null, revokedAt: null, expiresAt: { gt: now } }, select: { id: true, expiresAt: true, scope: true } });
+      if (existing) {
+        const existingScopes = (existing.scope as { scopes?: unknown } | null)?.scopes;
+        if (!Array.isArray(existingScopes) || existingScopes.join('|') !== scopes.join('|')) throw new Stage1AuthError(409, 'operator_handoff_scope_conflict', 'This browser attempt already has a different Dinodia OS scope. Close it and launch a fresh session.');
+        return { id: existing.id, expiresAt: existing.expiresAt, operatorOrigin, accessMode, endpointRevision, endpointReportedAt, endpointState, destination: scopes[0] === 'os:permanent-installation' ? '/permanent-installation' : '/' };
+      }
       const expiresAt = new Date(now.getTime() + 60 * 1000);
       const handoffSecret = randomSecret(32);
       const handoffEnvelope = JSON.stringify(encryptOperatorGrant(handoffSecret, hub.manufacturingIdentity.encryptionPublicKey, 1, 'operator-handoff'));
-      const scopes = permanentInstallation ? ['os:permanent-installation'] : ['os:admin'];
       const created = await tx.operatorHandoff.create({ data: { employeeId: employee.id, workflowId: work.id, homeId, hubInstallationId: hub.id, attemptId: browserAttempt.id, operatorBrowserAttemptId: browserAttempt.id, setupAttemptId: browserAttempt.attemptId, browserBindingHash: browserAttempt.browserBindingHash, handoffHash: sha256(handoffSecret), handoffEnvelope, scope: { scopes, workRevision: work.workRevision, employeeSessionId: employee.sessionId, serialNumber: hub.serialNumberSnapshot, identityGeneration: hub.manufacturingIdentity.identityGeneration, accessMode, endpointOrigin: operatorOrigin, endpointRevision, ...(requestId ? { requestId } : {}), ...(areaOptions ? { areaOptions } : {}) }, expiresAt }, select: { id: true, expiresAt: true } });
-      await tx.auditEvent.create({ data: { homeId, actorType: 'EMPLOYEE', actorId: employee.id, category: 'SECURITY', action: 'operator_handoff_issued', targetType: 'OperatorHandoff', targetId: created.id, metadata: { workflowId: work.id, outcome: 'issued', expiresAt: created.expiresAt.toISOString() }, purgeAt: new Date(now.getTime() + 365 * 24 * 60 * 60 * 1000) } });
-      return { id: created.id, expiresAt: created.expiresAt, operatorOrigin, accessMode, endpointRevision, endpointReportedAt, endpointState, destination: permanentInstallation ? '/permanent-installation' : '/support-access' };
+      await tx.auditEvent.create({ data: { homeId, actorType: 'EMPLOYEE', actorId: employee.id, category: 'SECURITY', action: 'operator_handoff_issued', targetType: 'OperatorHandoff', targetId: created.id, metadata: { workflowId: work.id, scope: scopes[0], outcome: 'issued', expiresAt: created.expiresAt.toISOString() }, purgeAt: new Date(now.getTime() + 365 * 24 * 60 * 60 * 1000) } });
+      return { id: created.id, expiresAt: created.expiresAt, operatorOrigin, accessMode, endpointRevision, endpointReportedAt, endpointState, destination: scopes[0] === 'os:permanent-installation' ? '/permanent-installation' : '/' };
     });
     // Only an opaque handoff identifier is returned. The setup attempt and
     // browser binding were created by the paired hub before this transaction;

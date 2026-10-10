@@ -67,6 +67,7 @@ const installationEmailBodies = [];
 let capturedCustomerAuthPath;
 let customerFixture;
 let pendingStage11AutomationDisableAck = null;
+let stageHomeSyncReceipts = [];
 let fakePhysicalCommandCount = 0;
 let osHarnessNow = Date.now();
 let operatorHandoffFetchDelayMs = 0;
@@ -122,6 +123,58 @@ function loadNativeV1Contract() {
   return loaded.exports;
 }
 const nativeV1Contract = loadNativeV1Contract();
+function loadHubSyncEnvelopeValidator() {
+  const require = createRequire(import.meta.url);
+  const ts = require('typescript');
+  const source = fs.readFileSync(path.join(root, 'src/lib/hubSyncEnvelope.ts'), 'utf8');
+  const compiled = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, esModuleInterop: true } }).outputText;
+  const loaded = { exports: {} };
+  new Function('require', 'module', 'exports', compiled)(require, loaded, loaded.exports);
+  return loaded.exports.validateHubSyncEnvelope;
+}
+const validateHubSyncEnvelope = loadHubSyncEnvelopeValidator();
+function usageBucketContractFacts(event) {
+  const payload = event?.payload && typeof event.payload === 'object' ? event.payload : {};
+  const start = Date.parse(String(payload.bucketStart || ''));
+  const coverageStart = Date.parse(String(payload.coverageStartAt || ''));
+  const coverageEnd = Date.parse(String(payload.coverageEndAt || ''));
+  const totalSeconds = Number(payload.onSeconds) + Number(payload.offSeconds) + Number(payload.unknownSeconds);
+  let expectedPurge = Number.NaN;
+  if (Number.isFinite(start)) {
+    const expiry = new Date(start);
+    const originalMonth = expiry.getUTCMonth();
+    expiry.setUTCFullYear(expiry.getUTCFullYear() + 1);
+    if (expiry.getUTCMonth() !== originalMonth) expiry.setUTCDate(0);
+    expectedPurge = expiry.getTime();
+  }
+  const expectedAggregate = crypto.createHash('sha256').update([
+    String(payload.osDeviceId), String(payload.osAreaId), String(payload.analyticsCategory),
+    String(payload.controlId), String(payload.sourceGeneration), String(start),
+  ].join('|'), 'utf8').digest('hex');
+  return {
+    coverageSeconds: Number.isFinite(coverageStart) && Number.isFinite(coverageEnd) ? (coverageEnd - coverageStart) / 1000 : null,
+    reportedSeconds: Number.isFinite(totalSeconds) ? totalSeconds : null,
+    coverageInsideHour: Number.isFinite(start) && coverageStart >= start && coverageEnd <= start + 3600000 && coverageEnd > coverageStart,
+    coverageMatchesCounters: Number.isFinite(coverageStart) && Number.isFinite(coverageEnd) && coverageEnd - coverageStart === totalSeconds * 1000,
+    closedAtMatchesHourEnd: payload.closedAt === null || Number.isFinite(start) && Date.parse(String(payload.closedAt)) === start + 3600000,
+    purgeMatchesRetention: Date.parse(String(payload.purgeAt)) === expectedPurge,
+    aggregateMatchesIdentity: event?.aggregateId === expectedAggregate,
+    categoryAllowed: ['LIGHT', 'BOILER', 'RADIATOR'].includes(String(payload.analyticsCategory)),
+    countersBounded: [payload.onSeconds, payload.offSeconds, payload.unknownSeconds].every((value) => Number.isSafeInteger(value) && Number(value) >= 0 && Number(value) <= 3600) && totalSeconds <= 3600,
+  };
+}
+function inspectRejectedSyncEnvelope(body) {
+  const envelope = { ...body };
+  delete envelope.serial;
+  delete envelope.identityGeneration;
+  const envelopeAccepted = validateHubSyncEnvelope(envelope);
+  const invalidEvents = Array.isArray(envelope.events) ? envelope.events.flatMap((event) => {
+    const single = { ...envelope, fromSequence: event.sequence, toSequence: event.sequence, events: [event], queueDepth: 1 };
+    if (validateHubSyncEnvelope(single)) return [];
+    return [{ sequence: Number(event.sequence) || null, type: String(event.type || '').slice(0, 60), critical: event.critical === true, payloadKeys: event.payload && typeof event.payload === 'object' && !Array.isArray(event.payload) ? Object.keys(event.payload).sort() : [], ...(event.type === 'usage.bucket' ? { usageFacts: usageBucketContractFacts(event) } : {}) }];
+  }) : [];
+  return { envelopeAccepted, invalidEvents };
+}
 function loadInstallationPushDispatcher(platformDataEncryptionKey = '') {
   const require = createRequire(import.meta.url);
   const ts = require('typescript');
@@ -394,6 +447,13 @@ function baseEnv() {
     // builder around a disposable fixture to prove the Stage 13 gate without
     // delivering a deliberately synthetic descriptor into the OS runtime.
     DINODIA_NATIVE_AUTOMATIONS_ENABLED: 'false',
+    // The connected commissioning cases below use disposable identities and
+    // never open a radio. Enable the Platform protocol gates only in this
+    // isolated harness; the enrolled Pi and Vercel Production flags remain
+    // unchanged and fail closed until the owner explicitly prepares radio
+    // commissioning.
+    DINODIA_NATIVE_ZIGBEE_COMMISSIONING_ENABLED: 'true',
+    DINODIA_NATIVE_MATTER_COMMISSIONING_ENABLED: 'true',
     DINODIA_NATIVE_POLICY_TITLE: 'Disposable Stage 6 policy fixture',
     DINODIA_NATIVE_POLICY_TEXT: disposablePolicyText,
     DINODIA_NATIVE_POLICY_CONTENT_SHA256: sha256(disposablePolicyText),
@@ -2729,11 +2789,6 @@ async function customerAuthorizationChecks(deliveryEnv) {
   const descriptorCancelled = await fetchJson(`${base}/api/v2/security/step-up/challenge`, { method: 'DELETE', headers: { 'content-type': 'application/json', 'x-dinodia-app-token': tenantToken.body.token }, body: JSON.stringify({ challengeId: descriptorChallenge.body.challengeId }) });
   if (descriptorCancelled.response.status !== 200) fail(`The accepted descriptor challenge could not be cancelled safely (${descriptorCancelled.response.status})`);
   const WebSocket = createRequire(import.meta.url)(path.join(osRoot, 'node_modules', 'ws'));
-  const wsMessage = (socket, label = 'message') => new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(`authenticated OS WebSocket ${label} timeout`)), 5000);
-    socket.once('message', (value) => { clearTimeout(timer); resolve(JSON.parse(String(value))); });
-    socket.once('error', (error) => { clearTimeout(timer); reject(error); });
-  });
   const wsOpen = (socket, label) => new Promise((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error(`authenticated OS WebSocket ${label} open timeout`)), 5000);
     socket.once('open', () => { clearTimeout(timer); resolve(); });
@@ -5658,15 +5713,19 @@ async function pendingInvitationRouteChecks(deliveryEnv) {
   await hub.store.acknowledgeSyncBatch({ streamId: telemetryAccepted.body.streamId, acceptedThroughSequence: Number(telemetryAccepted.body.acceptedThroughSequence),
     cloudRevision: Number(telemetryAccepted.body.cloudRevision), configurationAppliedRevision: Number(telemetryAccepted.body.configurationAppliedRevision) });
   const telemetryOutboxAfter = hub.store.getSyncOutbox();
+  const telemetryExpectedBucketCount = Math.floor((telemetryNow.getTime() - 1) / 3_600_000) - Math.floor(telemetryObservedAt.getTime() / 3_600_000) + 1;
+  const telemetryExpectedActivitySeconds = Math.ceil(telemetryNow.getTime() / 1000) - Math.ceil(telemetryObservedAt.getTime() / 1000);
   const [telemetryUsageRows, telemetryTemperatureRows, telemetrySyncCursor, telemetryReceiptCount, telemetryPrivateRows, telemetryDeviceAfterSync] = await Promise.all([
-    prisma.nativeDeviceUsageBucket.findMany({ where: { homeId: telemetryHomeId, deviceId: telemetryDevice.id }, select: { revision: true, onSeconds: true, offSeconds: true, unknownSeconds: true, closedAt: true } }),
+    prisma.nativeDeviceUsageBucket.findMany({ where: { homeId: telemetryHomeId, deviceId: telemetryDevice.id }, select: { bucketStart: true, revision: true, onSeconds: true, offSeconds: true, unknownSeconds: true, closedAt: true } }),
     prisma.nativeTemperatureSample.findMany({ where: { homeId: telemetryHomeId, deviceId: telemetryDevice.id }, select: { temperature: true, sourceObservedAt: true, validUntil: true } }),
     prisma.hubInstallation.findUniqueOrThrow({ where: { id: telemetryHubId }, select: { syncStreamId: true, syncAcceptedSequence: true } }),
     prisma.hubSyncReceipt.count({ where: { hubInstallationId: telemetryHubId } }),
     prisma.nativeDeviceUsageBucket.count({ where: { homeId: telemetryHomeId, deviceId: telemetryPrivateDevice.id } }),
     prisma.nativeDevice.findUniqueOrThrow({ where: { id: telemetryDevice.id }, select: { managementClass: true, analyticsCategory: true, lifecycle: true, descriptorRevision: true, descriptorDigest: true, capabilitySummary: true } }),
   ]);
-  if (telemetryUsageRows.length !== 1 || telemetryUsageRows[0].onSeconds <= 0
+  const telemetryActivityTotals = telemetryUsageRows.reduce((totals, row) => ({ on: totals.on + row.onSeconds, off: totals.off + row.offSeconds, unknown: totals.unknown + row.unknownSeconds }), { on: 0, off: 0, unknown: 0 });
+  if (telemetryUsageRows.length !== telemetryExpectedBucketCount || telemetryActivityTotals.on !== telemetryExpectedActivitySeconds
+    || telemetryActivityTotals.off !== 0 || telemetryActivityTotals.unknown !== 0
     || telemetryTemperatureRows.length !== 1 || Number(telemetryTemperatureRows[0].temperature) !== 20.5
     || telemetryTemperatureRows[0].sourceObservedAt.getTime() !== telemetryObservedAt.getTime()
     || telemetryTemperatureRows[0].validUntil.getTime() !== telemetryExpectedValidUntil.getTime()
@@ -5677,7 +5736,7 @@ async function pendingInvitationRouteChecks(deliveryEnv) {
     const catalogEvent = telemetryPending.find((event) => event.type === 'control.catalog.upsert');
     const usageEvent = telemetryPending.find((event) => event.type === 'usage.bucket');
     const temperatureEvent = telemetryPending.find((event) => event.type === 'temperature.sample');
-    fail(`The signed OS outbox did not durably ingest and acknowledge its real measurements (${JSON.stringify({ usageRows: telemetryUsageRows.length, activitySeconds: telemetryUsageRows[0]?.onSeconds ?? 0, temperatureRows: telemetryTemperatureRows.length, temperature: telemetryTemperatureRows[0]?.temperature ?? null, observedAt: telemetryTemperatureRows[0]?.sourceObservedAt?.toISOString() ?? null, expectedObservedAt: telemetryObservedAt.toISOString(), validUntil: telemetryTemperatureRows[0]?.validUntil?.toISOString() ?? null, expectedValidUntil: telemetryExpectedValidUntil?.toISOString() ?? null, descriptorValiditySeconds: telemetryValiditySeconds, outboxAcknowledged: telemetryOutboxAfter.acknowledgedSequence >= telemetryRequiredSequence, cursorAdvanced: Number(telemetrySyncCursor.syncAcceptedSequence) >= telemetryRequiredSequence, receiptAdded: telemetryReceiptCount > telemetryReceiptCountBefore, streamMatches: telemetryOutboxAfter.streamId === telemetrySyncCursor.syncStreamId, privateRows: telemetryPrivateRows, deviceClass: telemetryDeviceAfterSync.managementClass, category: telemetryDeviceAfterSync.analyticsCategory, lifecycle: telemetryDeviceAfterSync.lifecycle, descriptorRevision: telemetryDeviceAfterSync.descriptorRevision, catalogRevision: telemetryDeviceAfterSync.capabilitySummary?.controlCatalog?.revision ?? null, catalogControls: (catalogEvent?.payload?.controls || []).map((control) => ({ controlId: control.controlId, semanticRole: control.semanticRole, observable: control.observable, valueType: control.valueType, maxStateValiditySeconds: control.maxStateValiditySeconds })), usageControl: usageEvent?.payload?.controlId ?? null, usageGeneration: usageEvent?.payload?.sourceGeneration ?? null, temperatureControl: temperatureEvent?.payload?.controlId ?? null, temperatureGeneration: temperatureEvent?.payload?.sourceGeneration ?? null, identityGeneration: hub.store.getIdentity()?.generation ?? null })})`);
+    fail(`The signed OS outbox did not durably ingest and acknowledge its real measurements (${JSON.stringify({ usageRows: telemetryUsageRows.length, expectedUsageRows: telemetryExpectedBucketCount, activitySeconds: telemetryActivityTotals, expectedActivitySeconds: telemetryExpectedActivitySeconds, temperatureRows: telemetryTemperatureRows.length, temperature: telemetryTemperatureRows[0]?.temperature ?? null, observedAt: telemetryTemperatureRows[0]?.sourceObservedAt?.toISOString() ?? null, expectedObservedAt: telemetryObservedAt.toISOString(), validUntil: telemetryTemperatureRows[0]?.validUntil?.toISOString() ?? null, expectedValidUntil: telemetryExpectedValidUntil?.toISOString() ?? null, descriptorValiditySeconds: telemetryValiditySeconds, outboxAcknowledged: telemetryOutboxAfter.acknowledgedSequence >= telemetryRequiredSequence, cursorAdvanced: Number(telemetrySyncCursor.syncAcceptedSequence) >= telemetryRequiredSequence, receiptAdded: telemetryReceiptCount > telemetryReceiptCountBefore, streamMatches: telemetryOutboxAfter.streamId === telemetrySyncCursor.syncStreamId, privateRows: telemetryPrivateRows, deviceClass: telemetryDeviceAfterSync.managementClass, category: telemetryDeviceAfterSync.analyticsCategory, lifecycle: telemetryDeviceAfterSync.lifecycle, descriptorRevision: telemetryDeviceAfterSync.descriptorRevision, catalogRevision: telemetryDeviceAfterSync.capabilitySummary?.controlCatalog?.revision ?? null, catalogControls: (catalogEvent?.payload?.controls || []).map((control) => ({ controlId: control.controlId, semanticRole: control.semanticRole, observable: control.observable, valueType: control.valueType, maxStateValiditySeconds: control.maxStateValiditySeconds })), usageControl: usageEvent?.payload?.controlId ?? null, usageGeneration: usageEvent?.payload?.sourceGeneration ?? null, temperatureControl: temperatureEvent?.payload?.controlId ?? null, temperatureGeneration: temperatureEvent?.payload?.sourceGeneration ?? null, identityGeneration: hub.store.getIdentity()?.generation ?? null })})`);
   }
   const delayedTemperatureResults = [];
   for (const sampleCase of [
@@ -8798,6 +8857,8 @@ async function operatorMutationChecks() {
 async function osChecks() {
   const base = `http://127.0.0.1:${hub.server.address().port}`;
   const platformBase = `http://127.0.0.1:${appPort}`;
+  let syncedArea = null;
+  let createdAreaName = '';
   // Match the exact verified reserved hostname seeded for hub one. The
   // operator-attempt route intentionally rejects a caller-selected origin.
   const remoteHost = harnessCloudHostname;
@@ -8832,10 +8893,26 @@ async function osChecks() {
     },
   };
   const heartbeatReceipts = [];
+  stageHomeSyncReceipts = [];
   const pairingFetch = hub.pairing.fetchImpl;
   hub.pairing.fetchImpl = async (input, init) => {
     const response = await pairingFetch(input, init);
-    if (new URL(typeof input === 'string' ? input : input.url).pathname === '/api/hub-agent/v2/heartbeat') {
+    const requestPath = new URL(typeof input === 'string' ? input : input.url).pathname;
+    if (requestPath === '/api/hub-agent/v2/sync') {
+      const requestBody = typeof init?.body === 'string' ? JSON.parse(init.body) : {};
+      const responseBody = await response.clone().json().catch(() => ({}));
+      const errorCode = responseBody.errorCode || responseBody.error?.code || null;
+      const uncommissionedDevices = response.status === 409 && errorCode === 'hub_sync_device_uncommissioned'
+        ? await Promise.all((Array.isArray(requestBody.events) ? requestBody.events : []).filter((event) => event.type === 'device.upsert').map(async (event) => {
+          const device = await prisma.nativeDevice.findUnique({ where: { hubInstallationId_osDeviceId: { hubInstallationId: customerFixture.hubOneId, osDeviceId: String(event.payload?.osDeviceId || '') } }, select: { homeId: true, managementClass: true } });
+          const osDevice = hub?.store.getDevice?.(String(event.payload?.osDeviceId || ''));
+          const osPolicy = hub?.store.getPlatform?.()?.devicePolicies?.[String(event.payload?.osDeviceId || '')];
+          return { sequence: Number(event.sequence) || null, knownForHub: Boolean(device), propertyClass: device?.managementClass === 'PROPERTY_DEVICE', homeMatches: device?.homeId === customerFixture.homeOneId, osDevicePresent: Boolean(osDevice), osSetupReady: osDevice?.setup?.status === 'ready', osPlatformPolicyPresent: Boolean(osPolicy), osPolicyPropertyClass: osPolicy?.managementClass === 'PROPERTY_DEVICE', osProtocolAllowed: ['zigbee', 'matter', 'thread', 'hive', 'google_nest', 'unknown'].includes(String(event.payload?.protocol)) };
+        })) : undefined;
+      stageHomeSyncReceipts.push({ status: response.status, requestAck: Number(requestBody.acknowledgedCloudRevision), from: Number(requestBody.fromSequence), to: Number(requestBody.toSequence), errorCode, cloudRevision: Number(responseBody.cloudRevision) || null, appliedRevision: Number(responseBody.configurationAppliedRevision) || null, acceptedThrough: Number(responseBody.acceptedThroughSequence) || null, duplicate: responseBody.duplicate === true, ...(response.status === 400 ? inspectRejectedSyncEnvelope(requestBody) : {}), ...(uncommissionedDevices ? { uncommissionedDevices } : {}) });
+      if (stageHomeSyncReceipts.length > 12) stageHomeSyncReceipts.shift();
+    }
+    if (requestPath === '/api/hub-agent/v2/heartbeat') {
       const body = await response.clone().json().catch(() => ({}));
       heartbeatReceipts.push({ status: response.status, errorCode: body.errorCode || body.error?.code || null, endpointRevision: body.lanEndpoint?.revision ?? null, endpointState: body.lanEndpoint?.state ?? null });
     }
@@ -8865,6 +8942,162 @@ async function osChecks() {
     }
     return latest;
   };
+  const postHandoffStart = (jar, handoffId, originHeaders = remoteOsHeaders) => fetchJsonLoopback(`${base}/_dinodia/setup/operator-session`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', ...originHeaders, cookie: cookieHeader(jar), 'x-dinodia-setup-csrf': decodeURIComponent(cookieValue(jar, 'dinodia_setup_csrf')) },
+    body: JSON.stringify({ action: 'start', handoffId }),
+  });
+  const pollHandoff = async (jar, originHeaders = remoteOsHeaders, timeoutMs = 15_000) => {
+    const deadline = Date.now() + timeoutMs;
+    let result;
+    do {
+      result = await fetchJsonLoopback(`${base}/_dinodia/setup/operator-session`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', ...originHeaders, cookie: cookieHeader(jar), 'x-dinodia-setup-csrf': decodeURIComponent(cookieValue(jar, 'dinodia_setup_csrf')) },
+        body: JSON.stringify({ action: 'status' }),
+      });
+      if (result.response.status !== 202) return result;
+      await sleep(50);
+    } while (Date.now() < deadline);
+    fail(`OS operator handoff did not reach a terminal state (${result?.body?.handoffPhase || 'pending'})`);
+  };
+  // Execute the full-dashboard → Area registry → signed Platform sync path
+  // before this shared OS fixture accumulates unrelated deliberately
+  // uncommissioned devices. Those devices must remain rejected by Platform;
+  // they are not a reason to weaken the sync contract for a valid Area event.
+  const homeownerLogin = await fetchJson(`${platformBase}/api/v2/mobile/session`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({
+    email: customerFixture.propertyEmail, password: customerFixture.propertyPassword,
+    deviceInstallationId: customerFixture.propertyInstallationId, publicKey: customerFixture.propertyPublicKey,
+    deviceName: 'Disposable operator-handoff owner', model: 'integration-test', osFamily: 'test', osVersion: 'test',
+  }) });
+  if (homeownerLogin.response.status !== 200 || !homeownerLogin.body?.accessToken) fail('Could not obtain an issued disposable homeowner session for the operator-handoff fixture');
+  const newInstallationRequest = await fetchJson(`${platformBase}/api/v2/homes/${encodeURIComponent(customerFixture.homeOneId)}/installation-requests`, {
+    method: 'POST', headers: { authorization: `Bearer ${homeownerLogin.body.accessToken}`, 'x-dinodia-home-id': customerFixture.homeOneId, 'idempotency-key': `stage-home-handoff-${crypto.randomUUID()}` },
+    body: JSON.stringify({ category: 'LIGHTING', notes: 'Disposable whole-property full-dashboard and restricted-commissioning handoff test', areaId: null }),
+  });
+  if (newInstallationRequest.response.status !== 201 || !newInstallationRequest.body?.request?.id || newInstallationRequest.body.request.areaId != null) fail(`Could not create the disposable whole-property installation request (${newInstallationRequest.response.status})`);
+  const refreshedOperator = await loginEmployee(platformBase, { id: customerFixture.operatorEmployeeId, email: customerFixture.operatorEmail }, customerFixture.operatorPassword);
+  customerFixture.operatorSessionId = refreshedOperator.session.id;
+  customerFixture.operatorToken = refreshedOperator.token;
+  const startNewInstallation = await fetchJson(`${platformBase}/api/installer/installation-requests/${encodeURIComponent(newInstallationRequest.body.request.id)}/start`, {
+    method: 'POST', headers: { 'x-dinodia-employee-session': customerFixture.operatorToken, 'idempotency-key': `stage-home-start-${crypto.randomUUID()}` },
+    body: JSON.stringify({ expectedRevision: newInstallationRequest.body.request.revision }),
+  });
+  const handoffWork = await prisma.companyOperationalWorkItem.findUnique({ where: { permanentInstallationRequestId: newInstallationRequest.body.request.id }, select: { id: true, kind: true, state: true, homeId: true, hubInstallationId: true, assignedEmployeeId: true, certifiedSerialNumber: true, workRevision: true } });
+  if (startNewInstallation.response.status !== 201 || !handoffWork || handoffWork.id !== startNewInstallation.body?.workflowId || handoffWork.kind !== 'PERMANENT_DEVICE_INSTALLATION'
+    || handoffWork.state !== 'IN_PROGRESS' || handoffWork.homeId !== customerFixture.homeOneId || handoffWork.hubInstallationId !== customerFixture.hubOneId
+    || handoffWork.assignedEmployeeId !== customerFixture.operatorEmployeeId || handoffWork.certifiedSerialNumber !== customerFixture.identityOneSerial) fail('The operator handoff test did not establish an exact active assigned permanent-installation work item');
+  customerFixture.operatorWorkId = handoffWork.id;
+  customerFixture.stage8RequestIds = [...(customerFixture.stage8RequestIds || []), newInstallationRequest.body.request.id];
+  customerFixture.stage8WorkIds = [...(customerFixture.stage8WorkIds || []), handoffWork.id];
+  const areaAdminBrowser = {};
+  const areaAdminSetup = await fetchLoopback(`${base}/support-access`, { headers: remoteOsHeaders });
+  updateCookieJar(areaAdminBrowser, areaAdminSetup);
+  const areaAdminAttempt = await fetchJsonLoopback(`${base}/_dinodia/setup/operator-attempt`, { method: 'POST', headers: { ...remoteOsHeaders, cookie: cookieHeader(areaAdminBrowser), 'x-dinodia-setup-csrf': decodeURIComponent(cookieValue(areaAdminBrowser, 'dinodia_setup_csrf')) } });
+  if (areaAdminAttempt.response.status !== 200 || !areaAdminAttempt.body.setupAttemptId) fail('The full-dashboard Area test could not register a fresh hub-bound browser attempt');
+  await prisma.authRateLimitBucket.deleteMany({ where: { bucketKey: { in: [
+    `operator-launch:${customerFixture.operatorEmployeeId}:${customerFixture.homeOneId}`,
+    `operator-launch-hour:${customerFixture.operatorEmployeeId}`,
+  ] } } });
+  const areaAdminLaunch = await fetchJson(`${platformBase}/api/installer/home-support/homes/${encodeURIComponent(customerFixture.homeOneId)}/os-access/launch`, {
+    method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-employee-session': customerFixture.operatorToken },
+    body: JSON.stringify({ workflowId: customerFixture.operatorWorkId, setupAttemptId: areaAdminAttempt.body.setupAttemptId, accessMode: 'secure', fullDashboard: true }),
+  });
+  const areaAdminHandoff = areaAdminLaunch.body?.handoffId ? await prisma.operatorHandoff.findUnique({ where: { id: areaAdminLaunch.body.handoffId }, select: { scope: true } }) : null;
+  const areaAdminScopes = Array.isArray(areaAdminHandoff?.scope?.scopes) ? areaAdminHandoff.scope.scopes : [];
+  if (areaAdminLaunch.response.status !== 200 || areaAdminScopes.length !== 1 || areaAdminScopes[0] !== 'os:admin') fail(`The assigned full dashboard could not be opened for Area creation (${areaAdminLaunch.response.status})`);
+  const areaAdminStarted = await postHandoffStart(areaAdminBrowser, areaAdminLaunch.body.handoffId);
+  if (areaAdminStarted.response.status !== 202) fail(`The Area dashboard handoff did not start (${areaAdminStarted.response.status})`);
+  const areaAdminEstablished = await pollHandoff(areaAdminBrowser);
+  updateCookieJar(areaAdminBrowser, areaAdminEstablished.response);
+  const areasBefore = await fetchJsonLoopback(`${base}/_dinodia/admin/api/areas`, { headers: { ...remoteOsHeaders, cookie: cookieHeader(areaAdminBrowser) } });
+  if (areaAdminEstablished.response.status !== 200 || areaAdminEstablished.body.destination !== '/' || areasBefore.response.status !== 200
+    || !areasBefore.body.areas?.some((area) => area.id === customerFixture.areaOneOsId)) fail('The full dashboard did not expose the current OS Area registry to assigned staff');
+  const createdAreaOsId = crypto.randomUUID();
+  createdAreaName = `UAT room ${createdAreaOsId.slice(0, 8)}`;
+  const areaPayload = JSON.stringify({ id: createdAreaOsId, name: createdAreaName, icon: 'room' });
+  const originalAreaSyncNow = hub.pairing.syncNow.bind(hub.pairing);
+  let deferAreaSync = true;
+  // The registry event normally starts sync asynchronously. Hold only this
+  // disposable test instance until its verified cursor and Area-only batch
+  // selection are installed, then call the unchanged production method.
+  hub.pairing.syncNow = async (...args) => deferAreaSync ? null : originalAreaSyncNow(...args);
+  const areaCreate = await fetchJsonLoopback(`${base}/_dinodia/admin/api/areas`, { method: 'POST', headers: { ...remoteOsHeaders, cookie: cookieHeader(areaAdminBrowser), 'content-type': 'application/json' }, body: areaPayload });
+  const areaReplay = await fetchJsonLoopback(`${base}/_dinodia/admin/api/areas`, { method: 'POST', headers: { ...remoteOsHeaders, cookie: cookieHeader(areaAdminBrowser), 'content-type': 'application/json' }, body: areaPayload });
+  if (areaCreate.response.status !== 201 || areaCreate.body.id !== createdAreaOsId || areaCreate.body.name !== createdAreaName
+    || areaReplay.response.status !== 200 || areaReplay.body.id !== createdAreaOsId) fail('Full-dashboard Area save or exact retry did not reconcile the same OS registry identity');
+  const priorSyncBusyDeadline = Date.now() + 8_000;
+  while (hub.pairing.syncing && Date.now() < priorSyncBusyDeadline) await sleep(20);
+  if (hub.pairing.syncing) fail('The disposable signed sync owner did not settle before the focused Area event');
+  const areaSyncCursor = await machineRequest({ base: platformBase, path: '/api/hub-agent/token-state', machineSecret: customerFixture.machineSecret, body: { serial: customerFixture.identityOneSerial, identityGeneration: customerFixture.identityOneGeneration } });
+  if (areaSyncCursor.response.status !== 200 || Number(areaSyncCursor.body.syncAcceptedSequence || 0) !== Number(hub.store.getSyncOutbox?.()?.acknowledgedSequence || 0)) fail('Platform did not provide a matching signed-sync cursor before the focused Area event');
+  const originalPrepareSyncBatch = hub.store.prepareSyncBatch.bind(hub.store);
+  let focusedAreaBatchSelected = false;
+  hub.store.prepareSyncBatch = (hubInstallId, runtime, now, options = {}) => {
+    if (focusedAreaBatchSelected) return originalPrepareSyncBatch(hubInstallId, runtime, now, options);
+    focusedAreaBatchSelected = true;
+    // Focus this regression on the contiguous genuine Area prefix. The real
+    // route must continue rejecting later uncommissioned device events; do
+    // not weaken the production sync or commissioning authorization.
+    return originalPrepareSyncBatch(hubInstallId, runtime, now, {
+      ...options,
+      allowedTypesPrefix: ['sync.compacted', 'area.upsert'],
+      serverAcceptedSequence: Number(areaSyncCursor.body.syncAcceptedSequence || 0),
+      serverStreamId: areaSyncCursor.body.syncStreamId || null,
+    });
+  };
+  deferAreaSync = false;
+  const areaSyncDeadline = Date.now() + 20_000;
+  try {
+    while (!syncedArea && Date.now() < areaSyncDeadline) {
+      syncedArea = await prisma.area.findUnique({ where: { homeId_osAreaId: { homeId: customerFixture.homeOneId, osAreaId: createdAreaOsId } }, select: { id: true, osAreaId: true, originalName: true, status: true } });
+      if (syncedArea) break;
+      if (!hub.pairing.syncing && hub.store.getPlatform?.()?.paired) {
+        hub.pairing.nextRetryAt = 0;
+        await hub.pairing.syncNow();
+      }
+      await sleep(100);
+    }
+  } finally {
+    hub.store.prepareSyncBatch = originalPrepareSyncBatch;
+    hub.pairing.syncNow = originalAreaSyncNow;
+  }
+  if (!syncedArea) {
+    const syncState = hub.pairing.status?.().sync || {};
+    const inFlight = hub.store.getSyncOutbox?.()?.inFlight || {};
+    const batchEvents = Array.isArray(inFlight.events) ? inFlight.events : [];
+    const eventSequences = batchEvents.map((event) => Number(event.sequence));
+    const eventTypes = [...new Set(batchEvents.map((event) => String(event.type || 'unknown')))].sort();
+    const firstEvent = batchEvents[0] || {};
+    const compactedEvents = batchEvents.filter((event) => event.type === 'sync.compacted');
+    const safeBatchShape = {
+      streamLength: String(inFlight.streamId || '').length,
+      envelopeKeys: Object.keys(inFlight).sort(),
+      fromEqualsFirst: Number(inFlight.fromSequence) === eventSequences[0],
+      toEqualsLast: Number(inFlight.toSequence) === eventSequences.at(-1),
+      sequencesContiguous: eventSequences.every((sequence, index) => sequence === eventSequences[0] + index),
+      eventTypes, eventCount: batchEvents.length,
+      queueDepthCoversEvents: Number(inFlight.queueDepth) >= batchEvents.length,
+      eventBytes: Buffer.byteLength(JSON.stringify(batchEvents), 'utf8'),
+      eventKeys: Object.keys(firstEvent).sort(),
+      eventIdsUuid: batchEvents.every((event) => /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(String(event.id || ''))),
+      eventTimestampsUtc: batchEvents.every((event) => /^\d{4}-\d{2}-\d{2}T.*Z$/.test(String(event.occurredAt || ''))),
+      areaPayloadKeys: firstEvent.type === 'area.upsert' ? Object.keys(firstEvent.payload || {}).sort() : [],
+      compacted: compactedEvents.slice(0, 2).map((event) => ({ sequence: Number(event.sequence), critical: event.critical, payloadKeys: Object.keys(event.payload || {}).sort(), supersededByAfterSequence: Number(event.payload?.supersededBy) > Number(event.sequence) })),
+      runtimeKeys: Object.keys(inFlight.runtime || {}).sort(),
+      runtimeKind: inFlight.runtime?.kind,
+      runtimeVersionLength: String(inFlight.runtime?.version || '').length,
+      capabilitiesKeys: Object.keys(inFlight.runtime?.capabilities || {}).sort(),
+      nativeOutboxKeys: Object.keys(inFlight.runtime?.capabilities?.nativeSyncOutbox || {}).sort(),
+      sentAtLooksUtc: /^\d{4}-\d{2}-\d{2}T.*Z$/.test(String(inFlight.sentAt || '')),
+    };
+    fail(`Signed OS Area synchronisation to Platform did not complete (${String(syncState.lastErrorCode || 'sync_failed').replace(/[^a-z0-9_.:-]/gi, '').slice(0, 80)}; batch=${JSON.stringify(safeBatchShape)})`);
+  }
+  const areaTokenState = await machineRequest({ base: platformBase, path: '/api/hub-agent/token-state', machineSecret: customerFixture.machineSecret, body: { serial: customerFixture.identityOneSerial, identityGeneration: customerFixture.identityOneGeneration } });
+  const syncedAreaBinding = areaTokenState.body?.areaBindings?.find((binding) => binding.areaId === syncedArea.id);
+  if (syncedArea.status !== 'ACTIVE' || syncedArea.originalName !== createdAreaName || syncedAreaBinding?.hubAreaId !== createdAreaOsId) fail('The signed sync did not preserve the OS-to-Platform canonical Area binding');
+  const areaAdminEnd = await fetchJsonLoopback(`${base}/_dinodia/operator-session/end`, { method: 'POST', headers: { ...remoteOsHeaders, cookie: cookieHeader(areaAdminBrowser) } });
+  if (areaAdminEnd.response.status !== 200) fail('The disposable full-dashboard Area session could not be safely ended');
   // Synchronize signed policy from the actual Platform machine route into the
   // running OS store, including both active and later-revoked phone grants.
   // The shared hub fixture may have entered exponential retry backoff during
@@ -8879,9 +9112,9 @@ async function osChecks() {
   await hub.pairing.requestImmediateHeartbeat();
   const synchronizedAreaBindings = hub.store.getPlatform().areaBindings;
   const sortedAreaBindings = [...synchronizedAreaBindings].sort((left, right) => left.areaId.localeCompare(right.areaId));
-  const expectedAreaBindings = [
-    { areaId: customerFixture.areaOneId, hubAreaId: customerFixture.areaOneOsId },
-  ].sort((left, right) => left.areaId.localeCompare(right.areaId));
+  const expectedAreaBindings = (areaTokenState.body?.areaBindings || [])
+    .map(({ areaId, hubAreaId }) => ({ areaId, hubAreaId }))
+    .sort((left, right) => left.areaId.localeCompare(right.areaId));
   if (JSON.stringify(sortedAreaBindings) !== JSON.stringify(expectedAreaBindings) || heartbeatReceipts.length <= tokenStateHeartbeatCount
     || heartbeatReceipts.at(-1)?.status !== 200) fail(`Machine-authenticated token-state did not synchronize the canonical Area UUID to private OS alias mapping (${JSON.stringify({
       areaBindings: sortedAreaBindings, expectedAreaBindings, heartbeatCountDelta: heartbeatReceipts.length - tokenStateHeartbeatCount,
@@ -9161,6 +9394,9 @@ async function osChecks() {
   // Portal issues only an opaque handoff against assigned work, browser B
   // cannot redeem a copied id, and browser A receives only an HttpOnly OS
   // session handle.  No bearer or one-use secret is asserted in any response.
+  // Use an actual disposable permanent-installation work item here so this
+  // case proves the explicit full-dashboard path cannot replace the narrow
+  // tracked commissioning grant.
   const browserA = {};
   const secureSetupPage = await fetchLoopback(`${base}/support-access`, { headers: remoteOsHeaders });
   updateCookieJar(browserA, secureSetupPage);
@@ -9185,6 +9421,11 @@ async function osChecks() {
     body: JSON.stringify({ workflowId: customerFixture.operatorWorkId, setupAttemptId: crypto.randomBytes(32).toString('base64url'), accessMode: 'secure' }),
   });
   if (wrongAttemptLaunch.response.status !== 403) fail(`An unregistered setup attempt was accepted for operator handoff (${wrongAttemptLaunch.response.status})`);
+  const homeownerAdminAttempt = await fetchJson(`${platformBase}/api/installer/home-support/homes/${encodeURIComponent(customerFixture.homeOneId)}/os-access/launch`, {
+    method: 'POST', headers: { 'content-type': 'application/json', cookie: `dinodia_customer_session=${encodeURIComponent(customerFixture.propertySessionSecret)}` },
+    body: JSON.stringify({ workflowId: customerFixture.operatorWorkId, setupAttemptId: setupAttempt.body.setupAttemptId, accessMode: 'secure', fullDashboard: true }),
+  });
+  if (homeownerAdminAttempt.response.status !== 401) fail(`A homeowner session received Company Portal full-dashboard authority (${homeownerAdminAttempt.response.status})`);
 
   const wrongEmployeePassword = `harness-wrong-employee-${crypto.randomUUID()}`;
   const wrongEmployeeEmail = `other-installer-${crypto.randomUUID()}@invalid.test`;
@@ -9230,9 +9471,27 @@ async function osChecks() {
   const launch = await fetchJson(`${platformBase}/api/installer/home-support/homes/${encodeURIComponent(customerFixture.homeOneId)}/os-access/launch`, {
     method: 'POST',
     headers: { 'content-type': 'application/json', 'x-dinodia-employee-session': customerFixture.operatorToken },
+    body: JSON.stringify({ workflowId: customerFixture.operatorWorkId, setupAttemptId: setupAttempt.body.setupAttemptId, accessMode: 'secure', fullDashboard: true }),
+  });
+  const fullDashboardHandoff = launch.body?.handoffId ? await prisma.operatorHandoff.findUnique({ where: { id: launch.body.handoffId }, select: { scope: true, workflowId: true, homeId: true, hubInstallationId: true } }) : null;
+  const fullDashboardScopes = fullDashboardHandoff?.scope && typeof fullDashboardHandoff.scope === 'object' && Array.isArray(fullDashboardHandoff.scope.scopes) ? fullDashboardHandoff.scope.scopes : [];
+  if (launch.response.status !== 200 || !launch.body.handoffId || fullDashboardScopes.length !== 1 || fullDashboardScopes[0] !== 'os:admin'
+    || fullDashboardHandoff.workflowId !== handoffWork.id || fullDashboardHandoff.homeId !== customerFixture.homeOneId || fullDashboardHandoff.hubInstallationId !== customerFixture.hubOneId
+    || launch.body.handoffSecret || launch.body.operatorToken || launch.body.sessionGrant) fail(`Company Portal did not issue an opaque exact-work full-dashboard handoff (${launch.response.status})`);
+  if (new URL(launch.body.operatorUrl).pathname !== '/') fail('The explicit full-dashboard handoff did not target the native OS dashboard');
+  const changedScopeReplay = await fetchJson(`${platformBase}/api/installer/home-support/homes/${encodeURIComponent(customerFixture.homeOneId)}/os-access/launch`, {
+    method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-employee-session': customerFixture.operatorToken },
     body: JSON.stringify({ workflowId: customerFixture.operatorWorkId, setupAttemptId: setupAttempt.body.setupAttemptId, accessMode: 'secure' }),
   });
-  if (launch.response.status !== 200 || !launch.body.handoffId || launch.body.handoffSecret || launch.body.operatorToken || launch.body.sessionGrant) fail(`Company Portal did not issue an opaque operator handoff (${launch.response.status})`);
+  if (changedScopeReplay.response.status !== 409 || changedScopeReplay.body.errorCode !== 'operator_handoff_scope_conflict') fail('A browser attempt was silently changed from full dashboard to restricted commissioning scope');
+  const restrictedBrowser = {};
+  const restrictedSetupPage = await fetchLoopback(`${base}/support-access`, { headers: remoteOsHeaders });
+  updateCookieJar(restrictedBrowser, restrictedSetupPage);
+  const restrictedAttempt = await fetchJsonLoopback(`${base}/_dinodia/setup/operator-attempt`, {
+    method: 'POST', headers: { ...remoteOsHeaders, cookie: cookieHeader(restrictedBrowser), 'x-dinodia-setup-csrf': decodeURIComponent(cookieValue(restrictedBrowser, 'dinodia_setup_csrf')) },
+  });
+  if (restrictedAttempt.response.status !== 200) fail('The paired hub did not register the separate restricted-installation browser attempt');
+  let restrictedLaunch;
   const handoffJson = JSON.stringify(launch.body);
   if (/dno1\.|osb_|handoffSecret|secret/i.test(handoffJson)) fail('Company Portal handoff response contained a reusable credential');
   const directPrepare = await machineRequest({ base: platformBase, path: '/api/hub-agent/operator-session/consume', machineSecret: customerFixture.machineSecret, body: { serial: customerFixture.identityOneSerial, identityGeneration: customerFixture.identityOneGeneration, handoffId: launch.body.handoffId, browserBinding: decodeURIComponent(cookieValue(browserA, 'dinodia_operator_binding')), setupAttemptId: setupAttempt.body.setupAttemptId, phase: 'prepare' } });
@@ -9240,25 +9499,86 @@ async function osChecks() {
   const missingSecretConsume = await machineRequest({ base: platformBase, path: '/api/hub-agent/operator-session/consume', machineSecret: customerFixture.machineSecret, body: { serial: customerFixture.identityOneSerial, identityGeneration: customerFixture.identityOneGeneration, handoffId: launch.body.handoffId, browserBinding: decodeURIComponent(cookieValue(browserA, 'dinodia_operator_binding')), setupAttemptId: setupAttempt.body.setupAttemptId, phase: 'consume' } });
   if (missingSecretConsume.response.status !== 401 || missingSecretConsume.body.errorCode !== 'handoff_secret_required') fail(`A machine handoff was consumed without proof of its one-use secret (${missingSecretConsume.response.status}/${missingSecretConsume.body.errorCode || 'unknown'})`);
 
-  const postHandoffStart = (jar, handoffId, originHeaders = remoteOsHeaders) => fetchJsonLoopback(`${base}/_dinodia/setup/operator-session`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json', ...originHeaders, cookie: cookieHeader(jar), 'x-dinodia-setup-csrf': decodeURIComponent(cookieValue(jar, 'dinodia_setup_csrf')) },
-    body: JSON.stringify({ action: 'start', handoffId }),
+  // The cases above deliberately exercise missing, expired, stale-auth,
+  // scope-change and dashboard launches. Reset only this disposable employee
+  // and Home's buckets so this independent authorization assertion does not
+  // inherit an exhausted test quota.
+  await prisma.authRateLimitBucket.deleteMany({ where: { bucketKey: { in: [
+    `operator-launch:${customerFixture.operatorEmployeeId}:${customerFixture.homeOneId}`,
+    `operator-launch-hour:${customerFixture.operatorEmployeeId}`,
+  ] } } });
+  restrictedLaunch = await fetchJson(`${platformBase}/api/installer/home-support/homes/${encodeURIComponent(customerFixture.homeOneId)}/os-access/launch`, {
+    method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-employee-session': customerFixture.operatorToken },
+    body: JSON.stringify({ workflowId: customerFixture.operatorWorkId, setupAttemptId: restrictedAttempt.body.setupAttemptId, accessMode: 'secure' }),
   });
-  const pollHandoff = async (jar, originHeaders = remoteOsHeaders, timeoutMs = 15_000) => {
-    const deadline = Date.now() + timeoutMs;
-    let result;
-    do {
-      result = await fetchJsonLoopback(`${base}/_dinodia/setup/operator-session`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json', ...originHeaders, cookie: cookieHeader(jar), 'x-dinodia-setup-csrf': decodeURIComponent(cookieValue(jar, 'dinodia_setup_csrf')) },
-        body: JSON.stringify({ action: 'status' }),
-      });
-      if (result.response.status !== 202) return result;
-      await sleep(50);
-    } while (Date.now() < deadline);
-    fail(`OS operator handoff did not reach a terminal state (${result?.body?.handoffPhase || 'pending'})`);
-  };
+  const restrictedHandoff = restrictedLaunch.body?.handoffId ? await prisma.operatorHandoff.findUnique({ where: { id: restrictedLaunch.body.handoffId }, select: { scope: true, workflowId: true, homeId: true, hubInstallationId: true } }) : null;
+  const restrictedScopes = restrictedHandoff?.scope && typeof restrictedHandoff.scope === 'object' && Array.isArray(restrictedHandoff.scope.scopes) ? restrictedHandoff.scope.scopes : [];
+  if (restrictedLaunch.response.status !== 200 || restrictedScopes.length !== 1 || restrictedScopes[0] !== 'os:permanent-installation'
+    || restrictedHandoff.workflowId !== handoffWork.id || restrictedHandoff.homeId !== customerFixture.homeOneId || restrictedHandoff.hubInstallationId !== customerFixture.hubOneId
+    || !restrictedLaunch.body.operatorUrl || new URL(restrictedLaunch.body.operatorUrl).pathname !== '/permanent-installation') fail(`The assigned installation handoff was widened or was not bound to its current Home and work (${JSON.stringify({ status: restrictedLaunch.response.status, errorCode: restrictedLaunch.body.errorCode ?? restrictedLaunch.body.error?.code ?? null, scopes: restrictedScopes, workflowBound: restrictedHandoff?.workflowId === handoffWork.id, homeBound: restrictedHandoff?.homeId === customerFixture.homeOneId, hubBound: restrictedHandoff?.hubInstallationId === customerFixture.hubOneId, destination: restrictedLaunch.body.operatorUrl ? new URL(restrictedLaunch.body.operatorUrl).pathname : null })})`);
+  const restrictedStart = await postHandoffStart(restrictedBrowser, restrictedLaunch.body.handoffId);
+  if (restrictedStart.response.status !== 202) fail(`The assigned-work browser did not start its separate restricted OS session (${restrictedStart.response.status})`);
+  const restrictedEstablished = await pollHandoff(restrictedBrowser);
+  if (restrictedEstablished.response.status !== 200 || restrictedEstablished.body.destination !== '/permanent-installation') fail('The restricted assigned-work session did not land on the tracked installation workspace');
+  updateCookieJar(restrictedBrowser, restrictedEstablished.response);
+  const restrictedContext = await fetchJsonLoopback(`${base}/_dinodia/installer/commissioning`, { headers: { ...remoteOsHeaders, cookie: cookieHeader(restrictedBrowser) } });
+  if (restrictedContext.response.status !== 200 || !restrictedContext.body.areas?.some((area) => area.id === customerFixture.areaOneId)
+    || !restrictedContext.body.areas?.some((area) => area.id === syncedArea.id && area.name === createdAreaName)
+    || typeof restrictedContext.body.protocols?.zigbee?.enabled !== 'boolean' || typeof restrictedContext.body.protocols?.zigbee?.adapterReady !== 'boolean'
+    || typeof restrictedContext.body.protocols?.matter?.enabled !== 'boolean' || typeof restrictedContext.body.protocols?.matter?.adapterReady !== 'boolean'
+    || typeof restrictedContext.body.protocols?.matter?.threadReady !== 'boolean') fail('The restricted installation page did not return current signed Area scope and separate protocol/readiness observations');
+  const restrictedAreaId = crypto.randomUUID();
+  const restrictedAreaCreate = await fetchJsonLoopback(`${base}/_dinodia/admin/api/areas`, { method: 'POST', headers: { ...remoteOsHeaders, cookie: cookieHeader(restrictedBrowser), 'content-type': 'application/json' }, body: JSON.stringify({ id: restrictedAreaId, name: 'Must not be created from restricted commissioning', icon: 'room' }) });
+  const restrictedAreaLookup = await prisma.area.findUnique({ where: { homeId_osAreaId: { homeId: customerFixture.homeOneId, osAreaId: restrictedAreaId } }, select: { id: true } });
+  if (restrictedAreaCreate.response.status !== 403 || restrictedAreaLookup) fail('The restricted commissioning session created an Area or left a durable Platform record');
+  await prisma.hubInstallation.update({ where: { id: customerFixture.hubOneId }, data: { capabilitySummary: { nativeZigbeeCommissioningV1: true, nativeMatterCommissioningV1: true } } });
+  const consumedRestrictedAuthority = await prisma.operatorHandoff.findUniqueOrThrow({ where: { id: restrictedLaunch.body.handoffId }, select: { scope: true } });
+  const restrictedScope = consumedRestrictedAuthority.scope && typeof consumedRestrictedAuthority.scope === 'object' ? consumedRestrictedAuthority.scope : {};
+  const operationId = crypto.randomUUID();
+  const commissioningId = crypto.randomUUID();
+  const commissioningExpiry = new Date(Date.now() + 10 * 60 * 1000).toISOString();
+  const commissioningActor = { actorType: 'STAFF_INSTALLER', employeeId: customerFixture.operatorEmployeeId, employeeSessionId: customerFixture.operatorSessionId,
+    operatorHandoffId: restrictedLaunch.body.handoffId, operatorJti: restrictedScope.operatorJti, workItemId: handoffWork.id, workRevision: handoffWork.workRevision,
+    requestId: newInstallationRequest.body.request.id };
+  const commissioningBase = { serial: customerFixture.identityOneSerial, identityGeneration: customerFixture.identityOneGeneration, sessionId: commissioningId,
+    homeId: customerFixture.homeOneId, hubInstallationId: customerFixture.hubOneId, protocol: 'zigbee', expiresAt: commissioningExpiry, ...commissioningActor };
+  const commissioningCreate = await machineRequest({ base: platformBase, path: '/api/hub-agent/v2/commissioning-sessions', machineSecret: customerFixture.machineSecret, body: {
+    ...commissioningBase, action: 'create', expectedRevision: 1, idempotencyHash: sha256(`stage-home-commission:${operationId}`), requestHash: sha256(JSON.stringify({ protocol: 'zigbee' })),
+  } });
+  if (commissioningCreate.response.status !== 201 || commissioningCreate.body.state !== 'REQUESTED') fail(`The actual commissioning owner rejected an enabled Zigbee request without any catalogue approval marker (${commissioningCreate.response.status}/${commissioningCreate.body.error?.code || 'no-code'})`);
+  const commissioningAdvertise = await machineRequest({ base: platformBase, path: '/api/hub-agent/v2/commissioning-sessions', machineSecret: customerFixture.machineSecret, body: { ...commissioningBase, action: 'transition', expectedRevision: 1, status: 'ADVERTISING' } });
+  if (commissioningAdvertise.response.status !== 200 || commissioningAdvertise.body.state !== 'ADVERTISING') fail('The actual commissioning owner did not accept the bounded radio-session transition');
+  const unsupportedDeviceId = `stage-home-unsupported-${crypto.randomUUID()}`;
+  const unsupportedDigest = sha256(`unsupported-descriptor:${unsupportedDeviceId}`);
+  const unsupportedCandidateRef = crypto.randomUUID();
+  const commissioningReady = await machineRequest({ base: platformBase, path: '/api/hub-agent/v2/commissioning-sessions', machineSecret: customerFixture.machineSecret, body: {
+    ...commissioningBase, action: 'transition', expectedRevision: 2, status: 'READY', selectedAreaId: syncedArea.id,
+    candidateRef: unsupportedCandidateRef, osDeviceId: unsupportedDeviceId, requestedName: 'Unfamiliar Zigbee accessory', customerLabel: 'Unclassified accessory',
+    catalogueStatus: 'unsupported', catalogueRevision: 1, descriptorDigest: unsupportedDigest,
+  } });
+  if (commissioningReady.response.status !== 200 || commissioningReady.body.state !== 'READY') fail(`The actual commissioning owner rejected a bounded unsupported-device review (${commissioningReady.response.status}/${commissioningReady.body.error?.code || 'no-code'})`);
+  const unsupportedFinalize = await machineRequest({ base: platformBase, path: '/api/hub-agent/v2/commissioning-sessions', machineSecret: customerFixture.machineSecret, body: {
+    ...commissioningBase, action: 'finalize', expectedRevision: 3, candidateRef: unsupportedCandidateRef, disposition: 'view_only', device: {
+      osDeviceId: unsupportedDeviceId, originalName: 'Unfamiliar Zigbee accessory', technicalLabel: 'property_device', deviceType: 'unknown_accessory',
+      manufacturer: 'Unlisted manufacturer', model: 'Unlisted model', protocol: 'ZIGBEE', descriptorRevision: 1, descriptorDigest: unsupportedDigest,
+      capabilitySummary: { controls: [] }, areaId: syncedArea.id, name: 'Unclassified accessory', customerLabel: 'Unclassified accessory',
+      catalogueStatus: 'unsupported', usefulReadings: false,
+    },
+  } });
+  const retainedUnsupported = await prisma.nativeDevice.findFirst({ where: { homeId: customerFixture.homeOneId, hubInstallationId: customerFixture.hubOneId, osDeviceId: unsupportedDeviceId }, select: { id: true, lifecycle: true, capabilitySummary: true, assignments: { select: { areaId: true, source: true } } } });
+  if (unsupportedFinalize.response.status !== 200 || unsupportedFinalize.body.device?.lifecycle !== 'VIEW_ONLY' || !retainedUnsupported || retainedUnsupported.lifecycle !== 'VIEW_ONLY'
+    || retainedUnsupported.capabilitySummary?.commissioning?.status !== 'unsupported' || retainedUnsupported.capabilitySummary?.commissioning?.usefulReadings !== false
+    || retainedUnsupported.assignments.length !== 1 || retainedUnsupported.assignments[0].areaId !== syncedArea.id
+    || retainedUnsupported.assignments[0].source !== 'NATIVE_STAFF_COMMISSIONING') fail(`The canonical registration path did not preserve the unsupported device honestly and safely (${unsupportedFinalize.response.status}/${unsupportedFinalize.body.error?.code || 'no-device'}: ${unsupportedFinalize.body.error?.message || 'no-message'})`);
+  const homeownerResult = await fetchJson(`${platformBase}/api/v2/homes/${encodeURIComponent(customerFixture.homeOneId)}/homeowner-context`, { headers: { authorization: `Bearer ${homeownerLogin.body.accessToken}`, 'x-dinodia-home-id': customerFixture.homeOneId } });
+  const homeownerUnsupported = homeownerResult.body?.devices?.find((device) => device.id === unsupportedFinalize.body.device?.id);
+  if (homeownerResult.response.status !== 200 || !homeownerResult.body.areas?.some((area) => area.id === syncedArea.id && area.originalName === createdAreaName)
+    || !homeownerUnsupported || homeownerUnsupported.lifecycle !== 'VIEW_ONLY' || !homeownerUnsupported.canonicalAreaIds.includes(syncedArea.id)
+    || homeownerUnsupported.readings.length !== 0 || homeownerUnsupported.onlineState !== 'UNKNOWN'
+    || homeownerResult.body.devices.some((device) => device.id === customerFixture.tenantDeviceId)) fail(`The homeowner app projection did not show the synchronized Area and truthful read-only unsupported device without tenant-private inventory (${JSON.stringify({ status: homeownerResult.response.status, errorCode: homeownerResult.body.errorCode ?? homeownerResult.body.error?.code ?? null, expectedArea: { id: syncedArea.id, originalName: createdAreaName }, returnedAreas: homeownerResult.body.areas?.map((area) => ({ id: area.id, originalName: area.originalName })) ?? null, areaPresent: Boolean(homeownerResult.body.areas?.some((area) => area.id === syncedArea.id && area.originalName === createdAreaName)), expectedDeviceId: unsupportedFinalize.body.device?.id ?? null, deviceFound: Boolean(homeownerUnsupported), lifecycle: homeownerUnsupported?.lifecycle ?? null, areaIds: homeownerUnsupported?.canonicalAreaIds ?? null, readingsCount: homeownerUnsupported?.readings?.length ?? null, onlineState: homeownerUnsupported?.onlineState ?? null, privateDevicePresent: homeownerResult.body.devices?.some((device) => device.id === customerFixture.tenantDeviceId) ?? null })})`);
+  console.log('[stage-home:integration] PASS: assigned full OS dashboard created and exact-retried a disposable Area; signed sync preserved OS↔Platform IDs, refreshed whole-property commissioning options, restricted scope could not create Areas, and the homeowner projection showed the unsupported VIEW_ONLY device as UNKNOWN with no invented readings or tenant-private inventory');
+  const restrictedAdminRead = await fetchJsonLoopback(`${base}/_dinodia/admin/api/devices`, { headers: { ...remoteOsHeaders, cookie: cookieHeader(restrictedBrowser) } });
+  if (restrictedAdminRead.response.status !== 403) fail(`The restricted installation handoff gained the full OS admin device API (${restrictedAdminRead.response.status})`);
   const setupB = await fetchLoopback(`${base}/support-access`, { headers: remoteOsHeaders });
   const browserB = {};
   updateCookieJar(browserB, setupB);
@@ -9331,7 +9651,8 @@ async function osChecks() {
   const substitutedJti = await machineRequest({ base: platformBase, path: '/api/hub-agent/operator-session/revalidate', machineSecret: customerFixture.machineSecret, body: { serial: customerFixture.identityOneSerial, identityGeneration: customerFixture.identityOneGeneration, handoffId: launch.body.handoffId, jti: `substitute-${crypto.randomUUID()}`, credentialVersion: authorityScope.credentialVersion } });
   if (substitutedJti.response.status !== 401) fail(`Machine operator revalidation accepted a substituted grant JTI (${substitutedJti.response.status})`);
   const intendedOsRead = await fetchJsonLoopback(`${base}/_dinodia/admin/api/devices`, { headers: { ...remoteOsHeaders, cookie: cookieHeader(browserA) } });
-  if (intendedOsRead.response.status !== 200 || !Array.isArray(intendedOsRead.body.devices)) fail(`The intended browser's HttpOnly handoff session did not authorize a real OS devices read (${intendedOsRead.response.status})`);
+  const intendedDashboard = await fetchLoopback(`${base}/`, { headers: { ...remoteOsHeaders, cookie: cookieHeader(browserA) } });
+  if (intendedOsRead.response.status !== 200 || !Array.isArray(intendedOsRead.body.devices) || intendedDashboard.status !== 200 || !(await intendedDashboard.text()).includes('Dinodia OS')) fail(`The intended browser's HttpOnly handoff session did not open the full OS dashboard and authorize a real devices read (${intendedDashboard.status}/${intendedOsRead.response.status})`);
   const copiedSessionRead = await fetchJsonLoopback(`${base}/_dinodia/admin/api/devices`, { headers: { ...remoteOsHeaders, cookie: cookieHeader(browserB) } });
   if (copiedSessionRead.response.status !== 401) fail(`A second browser obtained OS access without the originating browser session (${copiedSessionRead.response.status})`);
   const WebSocket = createRequire(import.meta.url)(path.join(osRoot, 'node_modules/ws'));
@@ -9370,7 +9691,15 @@ async function osChecks() {
   updateCookieJar(localBrowser, localSetupPage);
   const localAttempt = await fetchJsonLoopback(`${base}/_dinodia/setup/operator-attempt`, { method: 'POST', headers: { ...localOsHeaders, cookie: cookieHeader(localBrowser), 'x-dinodia-setup-csrf': decodeURIComponent(cookieValue(localBrowser, 'dinodia_setup_csrf')) } });
   if (localAttempt.response.status !== 200 || !localAttempt.body.setupAttemptId) fail(`Fresh local endpoint could not register a bound browser attempt (${localAttempt.response.status}/${localAttempt.body.errorCode || 'unknown'})`);
-  const localLaunch = await fetchJson(`${platformBase}/api/installer/home-support/homes/${encodeURIComponent(customerFixture.homeOneId)}/os-access/launch`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-employee-session': customerFixture.operatorToken }, body: JSON.stringify({ workflowId: customerFixture.operatorWorkId, setupAttemptId: localAttempt.body.setupAttemptId, accessMode: 'local' }) });
+  // The independent secure/full-dashboard/restricted-scope cases above each
+  // exercise the real launch limiter. Clear only their disposable buckets so
+  // this separate local-origin composition case gets its own five-attempt
+  // budget; production throttling remains untouched and fully asserted.
+  await prisma.authRateLimitBucket.deleteMany({ where: { bucketKey: { in: [
+    `operator-launch:${customerFixture.operatorEmployeeId}:${customerFixture.homeOneId}`,
+    `operator-launch-hour:${customerFixture.operatorEmployeeId}`,
+  ] } } });
+  const localLaunch = await fetchJson(`${platformBase}/api/installer/home-support/homes/${encodeURIComponent(customerFixture.homeOneId)}/os-access/launch`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-employee-session': customerFixture.operatorToken }, body: JSON.stringify({ workflowId: customerFixture.operatorWorkId, setupAttemptId: localAttempt.body.setupAttemptId, accessMode: 'local', fullDashboard: true }) });
   if (localLaunch.response.status !== 200 || localLaunch.body.accessMode !== 'local' || new URL(localLaunch.body.operatorUrl).origin !== `http://${localHost}`) fail(`Portal did not issue the local handoff on the exact current BaseURL (${localLaunch.response.status})`);
   const localStart = await postHandoffStart(localBrowser, localLaunch.body.handoffId, localOsHeaders);
   if (localStart.response.status !== 202) fail(`Fresh local-origin handoff was not accepted (${localStart.response.status})`);
@@ -9421,7 +9750,7 @@ async function osChecks() {
   updateCookieJar(browserC, setupC);
   const attemptB = await fetchJsonLoopback(`${base}/_dinodia/setup/operator-attempt`, { method: 'POST', headers: { ...remoteOsHeaders, cookie: cookieHeader(browserC), 'x-dinodia-setup-csrf': decodeURIComponent(cookieValue(browserC, 'dinodia_setup_csrf')) } });
   if (attemptB.response.status !== 200 || !attemptB.body.setupAttemptId) fail(`Independent secure-origin browser could not create its own hub attempt (${attemptB.response.status}/${attemptB.body.error || attemptB.body.errorCode || 'unknown'}; browser=${Boolean(browserC.dinodia_setup_browser)}, csrf=${Boolean(browserC.dinodia_setup_csrf)}, binding=${Boolean(browserC.dinodia_operator_binding)}, attempt=${Boolean(browserC.dinodia_operator_attempt)})`);
-  const launchB = await fetchJson(`${platformBase}/api/installer/home-support/homes/${encodeURIComponent(customerFixture.homeOneId)}/os-access/launch`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-employee-session': customerFixture.operatorToken }, body: JSON.stringify({ workflowId: customerFixture.operatorWorkId, setupAttemptId: attemptB.body.setupAttemptId, accessMode: 'secure' }) });
+  const launchB = await fetchJson(`${platformBase}/api/installer/home-support/homes/${encodeURIComponent(customerFixture.homeOneId)}/os-access/launch`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-employee-session': customerFixture.operatorToken }, body: JSON.stringify({ workflowId: customerFixture.operatorWorkId, setupAttemptId: attemptB.body.setupAttemptId, accessMode: 'secure', fullDashboard: true }) });
   if (launchB.response.status !== 200 || !launchB.body.handoffId) fail(`A valid fresh handoff could not be issued for the independent browser (${launchB.response.status})`);
   operatorHandoffFetchDelayMs = 250;
   const platformCallsBeforeDuplicateB = operatorHandoffPlatformRequestCount;
@@ -9504,7 +9833,17 @@ async function verifyStage11PropertyDisableAcknowledgement() {
   if (!pendingStage11AutomationDisableAck || !customerFixture) fail('The property-automation disable acknowledgement scenario was not prepared');
   const expected = pendingStage11AutomationDisableAck.expectedRevision;
   const url = `http://127.0.0.1:${appPort}/api/v2/homes/${pendingStage11AutomationDisableAck.homeId}/property-automations`;
-  const ownerHeaders = { authorization: `Bearer ${pendingStage11AutomationDisableAck.ownerAccessToken}`, 'x-dinodia-home-id': pendingStage11AutomationDisableAck.homeId };
+  // This acknowledgement check runs after the long OS/Portal integration
+  // sequence. Issue a fresh token for the same disposable owner instead of
+  // relying on the short-lived access token captured during Stage 11 setup.
+  const ownerEmail = customerFixture.propertyEmail.trim().toLowerCase();
+  await prisma.authRateLimitBucket.deleteMany({ where: { bucketKey: `customer-login:${sha256(ownerEmail)}` } });
+  const ownerLogin = await fetchJson(`http://127.0.0.1:${appPort}/api/v2/mobile/session`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({
+    email: ownerEmail, password: customerFixture.propertyPassword, deviceInstallationId: customerFixture.propertyInstallationId,
+    publicKey: customerFixture.propertyPublicKey, deviceName: 'Disposable homeowner acknowledgement check', model: 'integration-test', osFamily: 'test', osVersion: 'test',
+  }) });
+  if (ownerLogin.response.status !== 200 || !ownerLogin.body?.accessToken) fail(`The disposable homeowner could not refresh its short-lived session for the final acknowledgement check (${ownerLogin.response.status})`);
+  const ownerHeaders = { authorization: `Bearer ${ownerLogin.body.accessToken}`, 'x-dinodia-home-id': pendingStage11AutomationDisableAck.homeId };
   const beforeSync = await fetchJson(url, { headers: ownerHeaders });
   const target = Number(beforeSync.body?.delivery?.cloudRevision);
   if (beforeSync.response.status !== 200 || !Number.isSafeInteger(target) || target < expected) fail(`Current owner delivery projection lost the persisted property-automation Disable revision (${JSON.stringify({ status: beforeSync.response.status, code: beforeSync.body?.error?.code, target, expected })})`);
@@ -9524,13 +9863,28 @@ async function verifyStage11PropertyDisableAcknowledgement() {
     const code = String(hub.pairing.status?.().sync?.lastErrorCode || outbox.lastErrorCode || 'sync_error');
     fail(`Paired OS did not durably apply the property-automation disable configuration (${/^[a-z0-9_.:-]{1,80}$/i.test(code) ? code : 'sync_error'}; paired=${Boolean(hub.store.getPlatform?.()?.paired)}; applied=${Number(outbox.configurationAppliedRevision || 0)}; cloud=${Number(outbox.cloudRevision || 0)}; target=${target}; syncing=${Boolean(hub.pairing.syncing)})`);
   }
+  // The first signed sync can deliver revision N while still reporting the
+  // previous acknowledged revision N-1. After the OS durably applies N, send
+  // a second real signed sync so Platform records that exact ACK before the
+  // owner projection is expected to say `disabled` rather than pending.
+  const cloudAckDeadline = Date.now() + 10_000;
+  let cloudAck = null;
+  while (Date.now() < cloudAckDeadline) {
+    cloudAck = await prisma.hubInstallation.findUniqueOrThrow({ where: { id: pendingStage11AutomationDisableAck.hubInstallationId || customerFixture.hubOneId }, select: { acknowledgedCloudRevision: true, cloudConfigurationRevision: true } });
+    if (Number(cloudAck.acknowledgedCloudRevision) >= target) break;
+    while (hub.pairing.syncing && Date.now() < cloudAckDeadline) await sleep(20);
+    if (Number(cloudAck.acknowledgedCloudRevision) >= target) break;
+    if (hub.store.getPlatform?.()?.paired) { hub.pairing.nextRetryAt = 0; await hub.pairing.syncNow(); }
+    else await sleep(20);
+  }
+  if (!cloudAck || Number(cloudAck.acknowledgedCloudRevision) < target) fail(`The actual signed follow-up sync did not persist the OS configuration acknowledgement in Platform (${JSON.stringify({ acknowledged: cloudAck?.acknowledgedCloudRevision ?? null, cloudRevision: cloudAck?.cloudConfigurationRevision ?? null, target, localApplied: Number(hub.store.getSyncOutbox?.()?.configurationAppliedRevision || 0), localAckSequence: Number(hub.store.getSyncOutbox?.()?.acknowledgedSequence || 0), inFlight: Boolean(hub.store.getSyncOutbox?.()?.inFlight), lastErrorCode: String(hub.pairing.status?.().sync?.lastErrorCode || hub.pairing.lastError || '').slice(0, 80), recentSyncReceipts: stageHomeSyncReceipts.slice(-6) })})`);
   const ownerOverview = await fetchJson(url, { headers: ownerHeaders });
   const automation = ownerOverview.body?.automations?.find((item) => item.id === pendingStage11AutomationDisableAck.automationId);
   if (ownerOverview.response.status !== 200 || automation?.status !== 'disabled'
     || ownerOverview.body?.delivery?.appliedRevision < ownerOverview.body?.delivery?.cloudRevision
     || Number(ownerOverview.body?.delivery?.cloudRevision) !== target
     || Number(ownerOverview.body?.delivery?.cloudRevision) < expected) {
-    fail('The live owner projection did not reconcile the management Disable after the real OS configuration acknowledgement');
+    fail(`The live owner projection did not reconcile the management Disable after the real OS configuration acknowledgement (${JSON.stringify({ status: ownerOverview.response.status, errorCode: ownerOverview.body?.errorCode ?? ownerOverview.body?.error?.code ?? null, automationStatus: automation?.status ?? null, appliedRevision: ownerOverview.body?.delivery?.appliedRevision ?? null, cloudRevision: ownerOverview.body?.delivery?.cloudRevision ?? null, target, expected, appliedAtLeastTarget: Number(outbox.configurationAppliedRevision || 0) >= target })})`);
   }
   console.log('[stage11:integration] PASS: the paired OS applied the exact current full-home configuration revision; the actual owner projection advanced the management Disable from waiting-for-hub to acknowledged-disabled');
 }

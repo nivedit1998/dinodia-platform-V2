@@ -814,8 +814,9 @@ test('installer UI separates verified secure launch from fresh local endpoint la
   const consume = read('src/app/api/hub-agent/operator-session/consume/route.ts');
   assert.match(installer, /cloudflare\/reserve/);
   assert.match(installer, /Reserve secure endpoint/);
-  assert.match(installer, /work\.hubInstallation\?\.secureVerified && <button[\s\S]*openHub\(work, "secure"\)/);
-  assert.match(installer, /work\.hubInstallation\?\.localUrl && <button[\s\S]*openHub\(work, "local"\)/);
+  assert.match(installer, /work\.hubInstallation\?\.secureVerified && work\.kind === "PERMANENT_DEVICE_INSTALLATION" && <><button[\s\S]*openHub\(work, "secure", true\)[\s\S]*Open full Home dashboard[\s\S]*openHub\(work, "secure"\)[\s\S]*Open assigned device installation/);
+  assert.match(installer, /work\.hubInstallation\?\.localUrl && work\.kind === "PERMANENT_DEVICE_INSTALLATION" && <><button[\s\S]*openHub\(work, "local", true\)[\s\S]*Open full Home dashboard \(local\)[\s\S]*openHub\(work, "local"\)[\s\S]*Open assigned device installation \(local\)/);
+  assert.match(installer, /work\.kind !== "PERMANENT_DEVICE_INSTALLATION" && <button[\s\S]*openHub\(work, "secure"\)/);
   assert.match(installer, /currently unreachable by its signed heartbeat/);
   assert.match(installer, /did not confirm an authenticated operator session/);
   assert.match(installer, /Open secure Dinodia OS/);
@@ -843,8 +844,9 @@ test('R3 tenant-device and device step-up paths use current membership and descr
   assert.match(osServer, /targetIds: \[item\.device\.id\]/);
   assert.match(osServer, /step_up_descriptor_stale/);
   assert.match(osStepUp, /descriptorBoundValue/);
-  assert.match(osConfig, /platformHeartbeatUrl: developmentCompatibility/);
-  assert.match(osConfig, /platformToken: developmentCompatibility/);
+  assert.match(osConfig, /platformApiUrl,/);
+  assert.match(osConfig, /configuredPlatformOrigin === canonicalPlatformOrigin/);
+  assert.doesNotMatch(osConfig, /platformHeartbeatUrl|platformToken/);
   assert.doesNotMatch(osExample, /DINODIA_PLATFORM_HEARTBEAT_URL|DINODIA_PLATFORM_TOKEN/);
 });
 
@@ -909,7 +911,8 @@ test('R11 signed CloudURL re-verification is challenge-bound and compare-and-set
   assert.match(installer, /correlationId\.slice\(0, 8\)/);
   assert.doesNotMatch(installer, /window\.setInterval\(\(\) => \{ if \(popup\?\.closed\)/);
   assert.match(installer, /The hub did not confirm an authenticated operator session/);
-  assert.match(installer, /operator session was verified by the hub/);
+  assert.match(installer, /full Home dashboard.*session was verified by the hub/);
+  assert.match(installer, /assigned-work Dinodia OS.*session was verified by the hub/);
   assert.match(installer, /window\.open\(operatorUrl, "_blank", "popup,width=860,height=760"\)/);
   assert.doesNotMatch(installer, /window\.open\(operatorUrl, "dinodia-os-operator"/);
   assert.doesNotMatch(installer, /The secure Dinodia OS window opened/);
