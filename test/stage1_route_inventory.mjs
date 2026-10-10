@@ -56,6 +56,7 @@ export const stage1RouteInventory = [
   ['POST', '/api/installer/home-support/homes/:homeId/os-access/rotate', 'employee'],
   ['GET', '/api/installer/home-support/homes/:homeId/os-access/status', 'employee'],
   ['POST', '/api/installer/hubs/:hubInstallationId/claim-resolver/replace', 'employee'],
+  ['GET', '/api/installer/hubs/claim-recovery', 'employee'],
   ['POST', '/api/installer/hubs/:hubInstallationId/cloudflare/reserve', 'employee'],
   ['POST', '/api/installer/hubs/provision', 'employee'],
   ['GET', '/api/installer/installation-requests', 'employee'],
