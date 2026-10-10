@@ -135,7 +135,8 @@ test('permanent-label LAN endpoint projection is strict, fresh and contains only
     publicHubId: '0123456789abcdefabcd', certificateGeneration: 2,
     currentSpkiPin: 'sha256/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=',
     currentNotBefore: '2026-10-05T00:00:00.000Z', currentNotAfter: '2026-10-07T00:00:00.000Z',
-    reportedAt: '2026-10-06T11:59:00.000Z', validUntil: '2026-10-06T12:06:00.000Z' };
+    reportedAt: '2026-10-06T11:59:00.000Z', validUntil: '2026-10-06T12:06:00.000Z', lanAddress: '192.168.1.76',
+    lanAddressReportedAt: '2026-10-06T11:59:00.000Z', lanAddressValidUntil: '2026-10-06T12:06:00.000Z' };
   const schema = ajv.compile({ $ref: `${contract.$id}#/$defs/customerHomeClaimLanEndpointReceipt` });
   const receipt = { schemaVersion: 'dinodia.v1', ok: true, lanEndpoint };
   assert.equal(schema(receipt), true, JSON.stringify(schema.errors));
@@ -145,6 +146,12 @@ test('permanent-label LAN endpoint projection is strict, fresh and contains only
   assert.equal(native.validateCustomerHomeClaimLanEndpointReceipt({ ...receipt, homeId: 'leaked-home' }, now), false);
   assert.equal(native.validateCustomerHomeClaimLanEndpointReceipt({ ...receipt, lanEndpoint: { ...lanEndpoint, validUntil: '2026-10-06T11:59:59.000Z' } }, now), false);
   assert.equal(native.validateCustomerHomeClaimLanEndpointReceipt({ ...receipt, lanEndpoint: { ...lanEndpoint, origin: 'http://dinodia-0123456789abcdefabcd.local:80' } }, now), false);
+  assert.equal(native.validateCustomerHomeClaimLanEndpointReceipt({ ...receipt, lanEndpoint: { ...lanEndpoint, lanAddress: '8.8.8.8' } }, now), false);
+  assert.equal(native.validateCustomerLanEndpoint({ ...lanEndpoint, lanAddress: '192.168.1.76' }, now), false, 'private routing stays exclusive to the authenticated claim-proof endpoint');
+  assert.equal(native.validateCustomerHomeClaimLanEndpointReceipt({ ...receipt, lanEndpoint: { ...lanEndpoint, lanAddressValidUntil: '2026-10-06T12:07:00.000Z' } }, now), false, 'LAN address validity cannot exceed the signed report lifetime');
+  const missingAddress = { ...lanEndpoint };
+  delete missingAddress.lanAddress;
+  assert.equal(native.validateCustomerHomeClaimLanEndpointReceipt({ ...receipt, lanEndpoint: missingAddress }, now), false, 'the claim proof route requires a signed, fresh direct connection address');
 });
 test('invited tenant cannot choose a username until the invitation credential, email and server gate are satisfied', () => {
   const invitationId = '55555555-5555-4555-8555-555555555555';
@@ -910,6 +917,7 @@ test('customer LAN projection is bound to the current active manufacturing gener
   const now = new Date('2026-10-04T10:00:00Z');
   const identity = {
     manufacturingIdentityGeneration: 7, manufacturingIdentityStatus: 'ACTIVE',
+    baseUrl: 'http://192.168.1.76:8123', lanEndpointState: 'CURRENT', lanEndpointReportedAt: new Date(now.getTime() - 1000), lanEndpointIdentityGeneration: 7,
     publicHubId: '0123456789abcdef0123', lanTlsReportedAt: new Date(now.getTime() - 1000), lanTlsState: 'CURRENT',
     lanTlsIdentityGeneration: 7, lanTlsCertificateGeneration: 2,
     lanTlsCurrentSpkiPin: 'sha256/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=',
@@ -918,6 +926,10 @@ test('customer LAN projection is bound to the current active manufacturing gener
   };
   const projected = lanEndpointModule.exports.verifiedCustomerLanEndpoint(identity, now);
   assert.equal(projected?.origin, 'https://dinodia-0123456789abcdef0123.local:8123');
+  assert.equal(lanEndpointModule.exports.verifiedCustomerClaimLanAddress(identity, now), '192.168.1.76');
+  assert.equal(lanEndpointModule.exports.verifiedCustomerClaimLanAddress({ ...identity, lanEndpointIdentityGeneration: 6 }, now), undefined, 'old manufacturing generation cannot supply the connection address');
+  assert.equal(lanEndpointModule.exports.verifiedCustomerClaimLanAddress({ ...identity, lanEndpointReportedAt: new Date(now.getTime() - 420_001) }, now), undefined, 'stale signed endpoint cannot supply the address');
+  assert.equal(lanEndpointModule.exports.verifiedCustomerClaimLanAddress({ ...identity, baseUrl: 'http://8.8.8.8:8123' }, now), undefined, 'public addresses are never projected');
   assert.equal(lanEndpointModule.exports.verifiedCustomerLanEndpoint({ ...identity, manufacturingIdentityGeneration: 8 }, now), undefined, 'old TLS report is not authority after manufacturing rotation');
   assert.equal(lanEndpointModule.exports.verifiedCustomerLanEndpoint({ ...identity, manufacturingIdentityStatus: 'REVOKED' }, now), undefined);
   assert.equal(lanEndpointModule.exports.verifiedCustomerLanEndpoint({ ...identity, lanTlsReportedAt: new Date(now.getTime() - 420_001) }, now), undefined);

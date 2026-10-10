@@ -49,6 +49,29 @@ export function lanEndpointFresh(state: string, reportedAt: Date | null, now = D
     && reportedAt.getTime() <= now && now - reportedAt.getTime() <= maxAgeMs;
 }
 
+/** Return only the private address from a fresh, current-generation signed OS LAN observation. */
+export function verifiedCustomerClaimLanAddress(input: {
+  manufacturingIdentityGeneration: number;
+  manufacturingIdentityStatus: string;
+  lanEndpointState: string;
+  lanEndpointReportedAt: Date | null;
+  lanEndpointIdentityGeneration: number | null;
+  baseUrl: string | null;
+}, now: Date): string | undefined {
+  if (input.manufacturingIdentityStatus !== 'ACTIVE'
+    || !Number.isInteger(input.manufacturingIdentityGeneration)
+    || input.lanEndpointIdentityGeneration !== input.manufacturingIdentityGeneration
+    || !lanEndpointFresh(input.lanEndpointState, input.lanEndpointReportedAt, now.getTime())
+    || typeof input.baseUrl !== 'string') return undefined;
+  const match = input.baseUrl.match(/^http:\/\/(\d{1,3}(?:\.\d{1,3}){3}):(80|8123)$/);
+  if (!match || !privateIpv4(match[1])) return undefined;
+  return match[1];
+}
+
+export function customerClaimLanAddressValidUntil(reportedAt: Date): Date {
+  return new Date(reportedAt.getTime() + 420_000);
+}
+
 export type CurrentLanTlsIdentity = {
   manufacturingIdentityGeneration: number;
   manufacturingIdentityStatus: string;

@@ -5,7 +5,7 @@ import { nativeV1ErrorResponse } from '@/lib/contracts/nativeV1Error';
 import { validateCustomerHomeClaimLanEndpointReceipt, validateCustomerHomeClaimLanEndpointRequest } from '@/lib/contracts/dinodiaV1';
 import { Stage1AuthError, requireCustomerAccountSession } from '@/lib/stage1Auth';
 import { hashClaimReference } from '@/lib/stage1ClaimContract';
-import { verifiedCustomerLanEndpoint } from '@/lib/lanEndpoint';
+import { customerClaimLanAddressValidUntil, verifiedCustomerClaimLanAddress, verifiedCustomerLanEndpoint } from '@/lib/lanEndpoint';
 
 export const dynamic = 'force-dynamic';
 
@@ -24,6 +24,7 @@ export async function POST(request: Request) {
         id: true, homeId: true, lifecycleStatus: true, permanentResolverHash: true,
         permanentResolverGeneration: true, permanentResolverStatus: true,
         publicHubId: true, lanTlsReportedAt: true, lanTlsState: true, lanTlsIdentityGeneration: true,
+        baseUrl: true, lanEndpointReportedAt: true, lanEndpointState: true, lanEndpointIdentityGeneration: true,
         lanTlsCertificateGeneration: true, lanTlsCurrentSpkiPin: true, lanTlsCurrentNotBefore: true,
         lanTlsCurrentNotAfter: true, lanTlsNextCertificateGeneration: true, lanTlsNextSpkiPin: true,
         lanTlsNextNotBefore: true, lanTlsNextNotAfter: true,
@@ -64,7 +65,23 @@ export async function POST(request: Request) {
       lanTlsNextNotBefore: installation.lanTlsNextNotBefore,
       lanTlsNextNotAfter: installation.lanTlsNextNotAfter,
     }, now);
-    const receipt = { schemaVersion: 'dinodia.v1', ok: true, lanEndpoint };
+    const lanAddress = verifiedCustomerClaimLanAddress({
+      manufacturingIdentityGeneration: installation.manufacturingIdentity.identityGeneration,
+      manufacturingIdentityStatus: installation.manufacturingIdentity.status,
+      baseUrl: installation.baseUrl,
+      lanEndpointReportedAt: installation.lanEndpointReportedAt,
+      lanEndpointState: installation.lanEndpointState,
+      lanEndpointIdentityGeneration: installation.lanEndpointIdentityGeneration,
+    }, now);
+    if (!lanAddress) throw new Stage1AuthError(404, 'claim_resolver_unavailable', 'The current claim resolver is unavailable');
+    const lanAddressReportedAt = installation.lanEndpointReportedAt?.toISOString();
+    const lanAddressValidUntil = installation.lanEndpointReportedAt
+      ? customerClaimLanAddressValidUntil(installation.lanEndpointReportedAt).toISOString()
+      : undefined;
+    const claimLanEndpoint = lanEndpoint && lanAddressReportedAt && lanAddressValidUntil
+      ? { ...lanEndpoint, lanAddress, lanAddressReportedAt, lanAddressValidUntil }
+      : undefined;
+    const receipt = { schemaVersion: 'dinodia.v1', ok: true, lanEndpoint: claimLanEndpoint };
     if (!lanEndpoint || !validateCustomerHomeClaimLanEndpointReceipt(receipt, now.getTime())) {
       throw new Stage1AuthError(404, 'claim_resolver_unavailable', 'The current claim resolver is unavailable');
     }

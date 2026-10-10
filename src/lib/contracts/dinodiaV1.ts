@@ -124,11 +124,14 @@ export interface CustomerHomeClaimResolverProof {
 }
 export interface CustomerHomeClaimResolveRequest { reference: string; resolverProof?: CustomerHomeClaimResolverProof }
 export interface CustomerHomeClaimLanEndpointRequest { reference: string }
-export interface CustomerHomeClaimLanEndpointReceipt { schemaVersion: typeof DINODIA_V1; ok: true; lanEndpoint: CustomerLanEndpoint }
+export interface CustomerHomeClaimLanEndpointReceipt { schemaVersion: typeof DINODIA_V1; ok: true; lanEndpoint: CustomerHomeClaimLanEndpoint }
 export interface CustomerLanEndpoint {
   state: 'verified_lan'; origin: string; publicHubId: string; certificateGeneration: number; currentSpkiPin: string;
   currentNotBefore: string; currentNotAfter: string; nextCertificateGeneration?: number; nextSpkiPin?: string;
   nextNotBefore?: string; nextNotAfter?: string; reportedAt: string; validUntil: string;
+}
+export interface CustomerHomeClaimLanEndpoint extends CustomerLanEndpoint {
+  lanAddress: string; lanAddressReportedAt: string; lanAddressValidUntil: string;
 }
 export type CustomerHomeClaimSetupStep = 'PROFILE'|'ADDRESS'|'ADDRESS_CONFIRMATION'|'POLICY';
 export interface CustomerHomeClaimSetupRequest { expectedRevision: number; step: CustomerHomeClaimSetupStep; mutation: Record<string, unknown> }
@@ -178,6 +181,13 @@ export interface LanTlsIdentityObservation {
   acknowledgedGeneration: number;
 }
 const object = (x: unknown): x is Record<string, unknown> => !!x && typeof x === 'object' && !Array.isArray(x);
+function validPrivateLanAddress(value: string): boolean {
+  const parts = value.split('.');
+  if (parts.length !== 4 || parts.some((part) => !/^\d{1,3}$/.test(part) || String(Number(part)) !== part || Number(part) > 255)) return false;
+  const [a, b, c, d] = parts.map(Number);
+  if (d === 0 || d === 255 || a === 172 && (b === 17 || b === 18)) return false;
+  return a === 10 || a === 172 && b >= 16 && b <= 31 || a === 192 && b === 168 && c >= 0 && c <= 255;
+}
 const codePointLength = (value: string): number => Array.from(value).length;
 const nonEmptyText = (value: unknown, maximumCodePoints: number): value is string => typeof value === 'string' && value.trim().length > 0 && codePointLength(value) <= maximumCodePoints;
 /** Trim user-supplied text and enforce JSON Schema's Unicode code-point bound. */
@@ -643,8 +653,15 @@ export function validateCustomerHomeClaimLanEndpointRequest(value: unknown): val
     && /^DNO-HOME-[A-Za-z0-9_-]{32,64}$/.test(value.reference);
 }
 export function validateCustomerHomeClaimLanEndpointReceipt(value: unknown, now = Date.now()): value is CustomerHomeClaimLanEndpointReceipt {
-  return object(value) && hasOnlyKeys(value, ['schemaVersion','ok','lanEndpoint']) && value.schemaVersion === DINODIA_V1
-    && value.ok === true && validateCustomerLanEndpoint(value.lanEndpoint, now);
+  if (!object(value) || !hasOnlyKeys(value, ['schemaVersion','ok','lanEndpoint']) || value.schemaVersion !== DINODIA_V1 || value.ok !== true
+    || !validateCustomerLanEndpoint(value.lanEndpoint, now, true) || !object(value.lanEndpoint)) return false;
+  const endpoint = value.lanEndpoint as CustomerLanEndpoint & Record<string, unknown>;
+  return typeof endpoint.lanAddress === 'string' && validPrivateLanAddress(endpoint.lanAddress)
+    && typeof endpoint.lanAddressReportedAt === 'string' && utcTimestamp(endpoint.lanAddressReportedAt)
+    && typeof endpoint.lanAddressValidUntil === 'string' && utcTimestamp(endpoint.lanAddressValidUntil)
+    && Date.parse(endpoint.lanAddressReportedAt) <= now && now - Date.parse(endpoint.lanAddressReportedAt) <= 420_000
+    && Date.parse(endpoint.lanAddressValidUntil) > now
+    && Date.parse(endpoint.lanAddressValidUntil) <= Date.parse(endpoint.lanAddressReportedAt) + 420_000;
 }
 export function validateCustomerHomeClaimSetupRequest(value: unknown): value is CustomerHomeClaimSetupRequest {
   if (!object(value) || !hasOnlyKeys(value, ['expectedRevision','step','mutation']) || !Number.isSafeInteger(value.expectedRevision)
@@ -830,8 +847,10 @@ export function validateOfflineAuthorisationReceipt(value: unknown): boolean {
   return id(row.id) && id(row.homeId) && id(row.membershipId) && id(row.trustedDeviceId) && Array.isArray(row.areaIds) && row.areaIds.length > 0 && row.areaIds.every(id) && new Set(row.areaIds).size === row.areaIds.length && sameJsonValue(row.scopes, ['tenant:device-command']) && Number.isInteger(row.policyRevision) && Number(row.policyRevision) >= 0;
 }
 
-export function validateCustomerLanEndpoint(value: unknown, now = Date.now()): value is CustomerLanEndpoint {
-  if (!object(value) || !hasOnlyKeys(value, ['state','origin','publicHubId','certificateGeneration','currentSpkiPin','currentNotBefore','currentNotAfter','nextCertificateGeneration','nextSpkiPin','nextNotBefore','nextNotAfter','reportedAt','validUntil'])
+export function validateCustomerLanEndpoint(value: unknown, now = Date.now(), allowClaimAddress = false): value is CustomerLanEndpoint {
+  const allowedKeys = ['state','origin','publicHubId','certificateGeneration','currentSpkiPin','currentNotBefore','currentNotAfter','nextCertificateGeneration','nextSpkiPin','nextNotBefore','nextNotAfter','reportedAt','validUntil'];
+  const claimKeys = ['lanAddress','lanAddressReportedAt','lanAddressValidUntil'];
+  if (!object(value) || !hasOnlyKeys(value, allowClaimAddress ? [...allowedKeys, ...claimKeys] : allowedKeys)
     || value.state !== 'verified_lan' || typeof value.publicHubId !== 'string' || !/^[a-f0-9]{20}$/.test(value.publicHubId)
     || value.origin !== `https://dinodia-${value.publicHubId}.local:8123`
     || !Number.isSafeInteger(value.certificateGeneration) || Number(value.certificateGeneration) < 1
@@ -840,7 +859,13 @@ export function validateCustomerLanEndpoint(value: unknown, now = Date.now()): v
     || !utcTimestamp(value.reportedAt) || !utcTimestamp(value.validUntil) || Date.parse(value.validUntil) <= Date.parse(value.reportedAt)
     || Date.parse(value.reportedAt) > now || now - Date.parse(value.reportedAt) > 420_000 || Date.parse(value.validUntil) <= now
     || Date.parse(value.validUntil) > Date.parse(value.reportedAt) + 420_000
-    || Date.parse(value.currentNotBefore) > now || Date.parse(value.currentNotAfter) <= now) return false;
+    || Date.parse(value.currentNotBefore) > now || Date.parse(value.currentNotAfter) <= now
+    || allowClaimAddress && (typeof value.lanAddress !== 'string' || !validPrivateLanAddress(value.lanAddress)
+      || typeof value.lanAddressReportedAt !== 'string' || !utcTimestamp(value.lanAddressReportedAt)
+      || typeof value.lanAddressValidUntil !== 'string' || !utcTimestamp(value.lanAddressValidUntil)
+      || Date.parse(value.lanAddressReportedAt) > now || now - Date.parse(value.lanAddressReportedAt) > 420_000
+      || Date.parse(value.lanAddressValidUntil) <= now
+      || Date.parse(value.lanAddressValidUntil) > Date.parse(value.lanAddressReportedAt) + 420_000)) return false;
   const next = ['nextCertificateGeneration','nextSpkiPin','nextNotBefore','nextNotAfter'];
   const hasNext = next.some((key) => Object.hasOwn(value, key));
   return !hasNext || next.every((key) => Object.hasOwn(value, key))

@@ -983,7 +983,7 @@ async function customerAuthorizationChecks(deliveryEnv) {
   const claimIdentityEncryption = x25519KeyPair();
   const claimIdentity = await prisma.hubManufacturingIdentity.create({ data: { serialNumber: `harness-claim-${crypto.randomUUID()}`, signingPublicKey: claimIdentitySigning.publicKey, encryptionPublicKey: claimIdentityEncryption.publicKey, signingKeyFingerprint: publicKeyFingerprint(claimIdentitySigning.publicKey), encryptionKeyFingerprint: publicKeyFingerprint(claimIdentityEncryption.publicKey) } });
   const claimHome = await prisma.home.create({ data: { lifecycle: 'INSTALLING', installationStatus: 'DRAFT' } });
-  const claimHub = await prisma.hubInstallation.create({ data: { homeId: claimHome.id, manufacturingIdentityId: claimIdentity.id, serialNumberSnapshot: claimIdentity.serialNumber, state: 'PAIRING', lifecycleStatus: 'ACTIVE', permanentResolverHash: claimReferenceHashValue, permanentResolverGeneration: 1, permanentResolverStatus: 'ACTIVE', publicHubId: crypto.randomBytes(10).toString('hex'), lanTlsReportedAt: verifiedAt, lanTlsState: 'CURRENT', lanTlsIdentityGeneration: claimIdentity.identityGeneration, lanTlsCertificateGeneration: 1, lanTlsCurrentSpkiPin: `sha256/${Buffer.alloc(32).toString('base64')}`, lanTlsCurrentNotBefore: new Date(verifiedAt.getTime() - 60_000), lanTlsCurrentNotAfter: new Date(verifiedAt.getTime() + 86_400_000) } });
+  const claimHub = await prisma.hubInstallation.create({ data: { homeId: claimHome.id, manufacturingIdentityId: claimIdentity.id, serialNumberSnapshot: claimIdentity.serialNumber, state: 'PAIRING', lifecycleStatus: 'ACTIVE', permanentResolverHash: claimReferenceHashValue, permanentResolverGeneration: 1, permanentResolverStatus: 'ACTIVE', publicHubId: crypto.randomBytes(10).toString('hex'), baseUrl: 'http://192.168.1.76:8123', lanEndpointRevision: 1, lanEndpointReportedAt: verifiedAt, lanEndpointState: 'CURRENT', lanEndpointIdentityGeneration: claimIdentity.identityGeneration, lanTlsReportedAt: verifiedAt, lanTlsState: 'CURRENT', lanTlsIdentityGeneration: claimIdentity.identityGeneration, lanTlsCertificateGeneration: 1, lanTlsCurrentSpkiPin: `sha256/${Buffer.alloc(32).toString('base64')}`, lanTlsCurrentNotBefore: new Date(verifiedAt.getTime() - 60_000), lanTlsCurrentNotAfter: new Date(verifiedAt.getTime() + 86_400_000) } });
   await prisma.home.update({ where: { id: claimHome.id }, data: { activeHubInstallationId: claimHub.id } });
   const claimReference = await prisma.homeClaimReference.create({ data: { homeId: claimHome.id, hubInstallationId: claimHub.id, purpose: 'INITIAL_OWNER', companyQrReferenceHash: claimReferenceHashValue, resolverGeneration: 1 } });
   const claimMachineSecret = `harness-claim-machine-${crypto.randomUUID()}`;
@@ -1725,6 +1725,9 @@ async function customerAuthorizationChecks(deliveryEnv) {
     || currentLanEndpoint.body?.schemaVersion !== 'dinodia.v1' || currentLanEndpoint.body?.ok !== true
     || Object.keys(currentLanEndpoint.body).sort().join(',') !== 'lanEndpoint,ok,schemaVersion'
     || safeLanEndpoint?.origin !== `https://dinodia-${claimHub.publicHubId}.local:8123`
+    || safeLanEndpoint?.lanAddress !== '192.168.1.76'
+    || safeLanEndpoint?.lanAddressReportedAt !== verifiedAt.toISOString()
+    || safeLanEndpoint?.lanAddressValidUntil !== new Date(verifiedAt.getTime() + 420_000).toISOString()
     || safeLanEndpoint?.publicHubId !== claimHub.publicHubId || Object.hasOwn(safeLanEndpoint || {}, 'homeId')
     || unavailableLanEndpoint.response.status !== 404 || JSON.stringify(unavailableLanEndpoint.body).includes(claimHome.id)) {
     fail(`Permanent-label endpoint authority was not authenticated, fresh and data-minimal (${unauthenticatedLanEndpoint.response.status}/${currentLanEndpoint.response.status}/${unavailableLanEndpoint.response.status})`);
@@ -1734,7 +1737,12 @@ async function customerAuthorizationChecks(deliveryEnv) {
   const staleLanEndpoint = await fetchJson(`${base}/api/v2/home-claims/lan-endpoint`, { method: 'POST', headers: { 'content-type': 'application/json', cookie: `dinodia_customer_session=${encodeURIComponent(rawSession)}` }, body: JSON.stringify({ reference: claimReferenceValue }) });
   await prisma.hubInstallation.update({ where: { id: claimHub.id }, data: { lanTlsReportedAt: staleLanReportedAt } });
   if (staleLanEndpoint.response.status !== 404 || JSON.stringify(staleLanEndpoint.body).includes(claimHome.id)) fail('Stale hub LAN identity exposed a claim endpoint or Home data');
-  console.log('[stage6:integration] PASS: actual authenticated permanent-label endpoint returns only fresh, current pinned hub identity; anonymous, unknown-label and stale-report requests deny without Home disclosure');
+  const freshEndpointObservationAt = claimHub.lanEndpointReportedAt;
+  await prisma.hubInstallation.update({ where: { id: claimHub.id }, data: { lanEndpointReportedAt: new Date(Date.now() - 421_000) } });
+  const staleAddressEndpoint = await fetchJson(`${base}/api/v2/home-claims/lan-endpoint`, { method: 'POST', headers: { 'content-type': 'application/json', cookie: `dinodia_customer_session=${encodeURIComponent(rawSession)}` }, body: JSON.stringify({ reference: claimReferenceValue }) });
+  await prisma.hubInstallation.update({ where: { id: claimHub.id }, data: { lanEndpointReportedAt: freshEndpointObservationAt } });
+  if (staleAddressEndpoint.response.status !== 404 || JSON.stringify(staleAddressEndpoint.body).includes(claimHome.id)) fail('A stale signed LAN address was exposed for permanent-label resolution');
+  console.log('[stage6:integration] PASS: authenticated permanent-label endpoint returns the fresh identity-bound pinned hub and private LAN address; anonymous, unknown-label, stale-identity, and stale-address requests deny without Home disclosure');
   const createSupportProofOfPossession = createRequire(import.meta.url)(path.join(osRoot, 'src/auth/supportProofOfPossession.js')).createSupportProofOfPossession;
   async function decryptedHubSupportRedemption({ ticketId, code }) {
     const deliveredProof = await machineRequest({ base: machineBase, path: '/api/hub-agent/support/v2/proof', machineSecret, body: { serial: identityOne.serialNumber, identityGeneration: identityOne.identityGeneration, ticketId } });
