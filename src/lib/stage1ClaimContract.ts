@@ -235,17 +235,39 @@ export async function recordQualifyingClaimMutation(reservationId: string, custo
     // waited at a lock must not use a timestamp from before the reservation
     // expired and thereby revive it.
     const now = new Date();
-    const reservation = await tx.homeClaimReservation.findUnique({ where: { id: reservationId }, select: { id: true, customerAccountId: true, state: true, expiresAt: true, claimReferenceId: true, setupRevision: true, claimReference: { select: { homeId: true } } } });
+    const reservation = await tx.homeClaimReservation.findUnique({ where: { id: reservationId }, select: {
+      id: true, customerAccountId: true, state: true, expiresAt: true, claimReferenceId: true, setupRevision: true,
+      claimReference: { select: { homeId: true } },
+      pendingSetup: { select: { state: true, requiredStep: true, retainedAddressRevision: true, retainedAddressDigest: true, retainedAddressConfirmedByAccountId: true } },
+    } });
     const pendingReconfirmation = normalizedStep === 'ADDRESS_CONFIRMATION' && reservation?.state === 'CONVERTED_TO_PENDING_INSTALLATION';
     if (!reservation || reservation.customerAccountId !== customerAccountId || (!pendingReconfirmation && (reservation.state !== 'ACTIVE' || reservation.expiresAt <= now))) throw new Stage1AuthError(409, 'claim_reservation_expired', 'The setup reservation has expired');
     const unchanged = () => ({ id: reservation.id, expiresAt: reservation.expiresAt, setupRevision: reservation.setupRevision });
+    const currentStep = reservation.pendingSetup?.requiredStep;
+    const staleStep = () => { throw new Stage1AuthError(409, 'REVISION_CONFLICT', 'The setup changed; refresh and continue with the current step'); };
+    const advanceWithoutDeadline = async (requiredStep: string, state: 'ADDRESS_REQUIRED'|'POLICY_REQUIRED') => {
+      if (expectedSetupRevision !== undefined && reservation.setupRevision !== expectedSetupRevision) staleStep();
+      const updated = await tx.homeClaimReservation.update({ where: { id: reservation.id }, data: { setupRevision: { increment: 1 } }, select: { id: true, expiresAt: true, setupRevision: true } });
+      await tx.pendingHomeSetup.update({ where: { reservationId }, data: { state, requiredStep, setupRevision: updated.setupRevision } });
+      return updated;
+    };
     if (normalizedStep === 'PROFILE') {
       const displayName = String(mutation.displayName ?? '').trim();
       const username = String(mutation.username ?? '').trim();
       if (!displayName || !username || displayName.length > 160 || username.length > 80) throw new Stage1AuthError(400, 'claim_profile_invalid', 'A saved display name and username are required');
       const current = await tx.customerAccount.findUnique({ where: { id: customerAccountId }, select: { displayName: true, username: true, usernameNormalized: true } });
       if (!current) throw new Stage1AuthError(404, 'claim_account_missing', 'The customer account does not exist');
-      if (current.displayName.trim() === displayName && current.usernameNormalized === username.toLowerCase()) return unchanged();
+      const profileUnchanged = current.displayName.trim() === displayName && current.usernameNormalized === username.toLowerCase();
+      if (profileUnchanged) {
+        // A complete profile already present at registration satisfies the
+        // initial profile step. Record only the setup-step transition: do not
+        // update account data or slide the reservation deadline. Once the
+        // flow has advanced, a normalized retry remains a strict no-op.
+        if (currentStep === 'PROFILE') return advanceWithoutDeadline('ADDRESS', 'ADDRESS_REQUIRED');
+        if (['ADDRESS', 'ADDRESS_CONFIRMATION', 'POLICY'].includes(String(currentStep))) return unchanged();
+        return staleStep();
+      }
+      if (!currentStep) return staleStep();
       if (expectedSetupRevision !== undefined && reservation.setupRevision !== expectedSetupRevision) throw new Stage1AuthError(409, 'REVISION_CONFLICT', 'The setup changed; refresh and try again');
       await tx.customerAccount.update({ where: { id: customerAccountId }, data: { displayName, username, usernameNormalized: username.toLowerCase() } });
     } else if (normalizedStep === 'ADDRESS') {
@@ -253,8 +275,21 @@ export async function recordQualifyingClaimMutation(reservationId: string, custo
       const { addressLine1, city, postcode, country, timezone } = nextAddress;
       if (!addressLine1 || !city || !postcode || !/^[A-Z]{2}$/.test(country) || !timezone || addressLine1.length > 200 || city.length > 120 || postcode.length > 32 || timezone.length > 80) throw new Stage1AuthError(400, 'claim_address_invalid', 'A complete address is required');
       const current = await tx.home.findUniqueOrThrow({ where: { id: reservation.claimReference.homeId }, select: { addressLine1: true, addressLine2: true, city: true, region: true, postcode: true, country: true, timezone: true, addressStatus: true } });
-      if (current.addressStatus === 'VERIFIED' || current.addressStatus === 'STAFF_CORRECTED') throw new Stage1AuthError(403, 'claim_staff_required', 'Only authorised staff may correct a registered address');
-      if (sameNormalizedAddress(nextAddress, normalizedPersistedAddress(current))) return unchanged();
+      const addressUnchanged = sameNormalizedAddress(nextAddress, normalizedPersistedAddress(current));
+      if (current.addressStatus === 'VERIFIED' || current.addressStatus === 'STAFF_CORRECTED') {
+        if (addressUnchanged && currentStep === 'ADDRESS') return advanceWithoutDeadline('ADDRESS_CONFIRMATION', 'ADDRESS_REQUIRED');
+        if (addressUnchanged && ['ADDRESS_CONFIRMATION', 'POLICY'].includes(String(currentStep))) return unchanged();
+        throw new Stage1AuthError(403, 'claim_staff_required', 'Only authorised staff may correct a registered address');
+      }
+      if (currentStep !== 'ADDRESS') {
+        if (addressUnchanged && ['ADDRESS_CONFIRMATION', 'POLICY'].includes(String(currentStep))) return unchanged();
+        // A customer may revise an unverified address after confirming it;
+        // the normal mutation below invalidates the prior confirmation and
+        // returns the wizard to ADDRESS_CONFIRMATION. Do not regress to the
+        // address-entry step or permit edits to staff-verified addresses.
+        if (!['ADDRESS_CONFIRMATION', 'POLICY'].includes(String(currentStep))) return staleStep();
+      }
+      if (addressUnchanged) return advanceWithoutDeadline('ADDRESS_CONFIRMATION', 'ADDRESS_REQUIRED');
       if (expectedSetupRevision !== undefined && reservation.setupRevision !== expectedSetupRevision) throw new Stage1AuthError(409, 'REVISION_CONFLICT', 'The setup changed; refresh and try again');
       await tx.home.update({ where: { id: reservation.claimReference.homeId }, data: { ...nextAddress, addressStatus: 'PENDING_CLAIM', managementRevision: { increment: 1 } } });
       await tx.pendingHomeSetup.update({ where: { reservationId }, data: { retainedAddressRevision: null, retainedAddressDigest: null, retainedAddressConfirmedAt: null, retainedAddressConfirmedByAccountId: null } });
@@ -263,8 +298,13 @@ export async function recordQualifyingClaimMutation(reservationId: string, custo
       const revision = mutation.addressRevision;
       const digest = mutation.addressDigest;
       if (!completeAddress(current) || !Number.isSafeInteger(revision) || revision !== current.managementRevision || typeof digest !== 'string' || digest !== addressDigest(current)) throw new Stage1AuthError(409, 'claim_address_changed', 'The registered address changed; refresh and confirm the current value');
-      const pending = await tx.pendingHomeSetup.findUniqueOrThrow({ where: { reservationId }, select: { retainedAddressRevision: true, retainedAddressDigest: true, retainedAddressConfirmedByAccountId: true } });
-      if (pending.retainedAddressRevision === revision && pending.retainedAddressDigest === digest && pending.retainedAddressConfirmedByAccountId === customerAccountId) return { id: reservation.id, expiresAt: reservation.expiresAt, setupRevision: reservation.setupRevision };
+      const pending = reservation.pendingSetup;
+      if (!pending) throw new Stage1AuthError(409, 'claim_reservation_expired', 'The setup reservation has expired');
+      const alreadyConfirmed = pending.retainedAddressRevision === revision && pending.retainedAddressDigest === digest && pending.retainedAddressConfirmedByAccountId === customerAccountId;
+      if (alreadyConfirmed) return { id: reservation.id, expiresAt: reservation.expiresAt, setupRevision: reservation.setupRevision };
+      const staffCorrectionNeedsReconfirmation = currentStep === 'POLICY'
+        && (pending.retainedAddressRevision !== current.managementRevision || pending.retainedAddressDigest !== digest || pending.retainedAddressConfirmedByAccountId !== customerAccountId);
+      if (!pendingReconfirmation && currentStep !== 'ADDRESS_CONFIRMATION' && !staffCorrectionNeedsReconfirmation) return staleStep();
       if (expectedSetupRevision !== undefined && reservation.setupRevision !== expectedSetupRevision) throw new Stage1AuthError(409, 'REVISION_CONFLICT', 'The setup changed; refresh and try again');
       await tx.pendingHomeSetup.update({ where: { reservationId }, data: { retainedAddressRevision: current.managementRevision, retainedAddressDigest: digest, retainedAddressConfirmedAt: now, retainedAddressConfirmedByAccountId: customerAccountId } });
     } else {
@@ -273,12 +313,23 @@ export async function recordQualifyingClaimMutation(reservationId: string, custo
       // precondition checked above.
       const existing = await tx.policyAcceptance.findUnique({ where: { customerAccountId_policyKind_policyVersion: { customerAccountId, policyKind: 'DINODIA_NATIVE', policyVersion: authoritativePolicyVersion! } }, select: { id: true } });
       if (existing) return unchanged();
+      if (currentStep !== 'POLICY') return staleStep();
       if (expectedSetupRevision !== undefined && reservation.setupRevision !== expectedSetupRevision) throw new Stage1AuthError(409, 'REVISION_CONFLICT', 'The setup changed; refresh and try again');
       await tx.policyAcceptance.create({ data: { customerAccountId, policyKind: 'DINODIA_NATIVE', policyVersion: authoritativePolicyVersion! } });
     }
     if (pendingReconfirmation) return { id: reservation.id, expiresAt: reservation.expiresAt, setupRevision: reservation.setupRevision };
     const updated = await tx.homeClaimReservation.update({ where: { id: reservation.id }, data: { expiresAt: new Date(now.getTime() + RESERVATION_MS), setupRevision: { increment: 1 }, lastQualifyingMutationAt: now }, select: { id: true, expiresAt: true, setupRevision: true } });
-    await tx.pendingHomeSetup.update({ where: { reservationId }, data: { requiredStep: normalizedStep, setupRevision: updated.setupRevision, lastQualifyingMutationAt: now } });
+    // A profile correction remains a valid qualifying edit after the wizard
+    // has advanced, but it must not regress the customer to an earlier step.
+    const nextStep = normalizedStep === 'ADDRESS' ? 'ADDRESS_CONFIRMATION'
+      : normalizedStep === 'ADDRESS_CONFIRMATION' ? 'POLICY'
+      : normalizedStep === 'POLICY' ? 'POLICY'
+      : currentStep === 'PROFILE' ? 'ADDRESS'
+      : currentStep;
+    const nextState = nextStep === 'PROFILE' ? 'PROFILE_REQUIRED'
+      : nextStep === 'POLICY' ? 'POLICY_REQUIRED'
+      : 'ADDRESS_REQUIRED';
+    await tx.pendingHomeSetup.update({ where: { reservationId }, data: { state: nextState, requiredStep: nextStep, setupRevision: updated.setupRevision, lastQualifyingMutationAt: now } });
     return updated;
   });
 }
@@ -292,7 +343,7 @@ export async function completeClaimSetup(reservationId: string, customerAccountI
     const reservation = await tx.homeClaimReservation.findUnique({ where: { id: reservationId }, select: { id: true, customerAccountId: true, claimReferenceId: true, state: true, expiresAt: true } });
     if (!reservation || reservation.customerAccountId !== customerAccountId) throw new Stage1AuthError(409, 'claim_reservation_expired', 'The setup reservation has expired');
     const reference = await tx.homeClaimReference.findUniqueOrThrow({ where: { id: reservation.claimReferenceId }, select: { homeId: true, hubInstallationId: true, state: true, claimedAccountId: true, consumedAt: true } });
-    const pending = await tx.pendingHomeSetup.findUniqueOrThrow({ where: { reservationId }, select: { state: true, setupRevision: true, retainedAddressRevision: true, retainedAddressDigest: true, retainedAddressConfirmedByAccountId: true } });
+    const pending = await tx.pendingHomeSetup.findUniqueOrThrow({ where: { reservationId }, select: { state: true, requiredStep: true, setupRevision: true, retainedAddressRevision: true, retainedAddressDigest: true, retainedAddressConfirmedByAccountId: true } });
     if (expectedSetupRevision !== undefined && pending.setupRevision !== expectedSetupRevision) throw new Stage1AuthError(409, 'REVISION_CONFLICT', 'The setup changed; refresh and try again');
     if (reservation.state === 'CONVERTED_TO_PENDING_INSTALLATION' && pending.state === 'ACTIVATED' && reference.state === 'CONSUMED' && reference.claimedAccountId === customerAccountId && reference.consumedAt) {
       return { ok: true, state: 'ACTIVE' as const, idempotentReplay: true };
@@ -301,6 +352,7 @@ export async function completeClaimSetup(reservationId: string, customerAccountI
       return { ok: true, state: 'PENDING_INSTALLATION' as const, idempotentReplay: true };
     }
     if (reservation.state !== 'ACTIVE' || reference.state !== 'RESERVED') throw new Stage1AuthError(409, 'claim_unavailable', 'This property claim is unavailable');
+    if (pending.state !== 'POLICY_REQUIRED' || pending.requiredStep !== 'POLICY') throw new Stage1AuthError(409, 'claim_setup_incomplete', 'Complete the current Home setup steps before continuing');
     const account = await tx.customerAccount.findUnique({ where: { id: customerAccountId }, select: { status: true, emailVerifiedAt: true } });
     if (!account || account.status !== 'ACTIVE' || !account.emailVerifiedAt) throw new Stage1AuthError(403, 'claim_account_unverified', 'An active verified customer account is required');
     await tx.$queryRaw`SELECT "id" FROM "Home" WHERE "id" = ${reference.homeId}::uuid FOR UPDATE`;

@@ -2019,11 +2019,12 @@ async function customerAuthorizationChecks(deliveryEnv) {
   await prisma.customerSession.create({ data: { customerAccountId: completeRaceAccount.id, trustedDeviceId: completeRaceTrustedDevice.id, refreshTokenHash: sha256(`complete-lock-session-${crypto.randomUUID()}`), securityVersion: completeRaceAccount.securityVersion, trustedDeviceSessionVersion: completeRaceTrustedDevice.sessionVersion, expiresAt: new Date(Date.now() + 60 * 60 * 1000) } });
   const completeRaceClaim = await claimAction({ action: 'redeem', reference: claimReferenceValue, customerAccountId: completeRaceAccount.id });
   if (completeRaceClaim.response.status !== 200) fail('Could not create disposable reservation for queued completion boundary');
+  const completeRaceProfile = await claimAction({ action: 'mutate', reservationId: completeRaceClaim.body.reservationId, customerAccountId: completeRaceAccount.id, step: 'PROFILE', mutation: { displayName: 'Completion lock boundary', username: `complete-lock-${crypto.randomUUID().slice(0, 12)}` } });
   const completeRaceAddress = { addressLine1: '2 Expiry Boundary Lane', city: 'London', postcode: 'N2 2AA', country: 'GB', timezone: 'Europe/London' };
   const completeRaceAddressSave = await claimAction({ action: 'mutate', reservationId: completeRaceClaim.body.reservationId, customerAccountId: completeRaceAccount.id, step: 'ADDRESS', mutation: completeRaceAddress });
   const completeRaceAddressView = await claimAction({ action: 'address', reservationId: completeRaceClaim.body.reservationId, customerAccountId: completeRaceAccount.id });
   const completeRaceConfirmation = await claimAction({ action: 'mutate', reservationId: completeRaceClaim.body.reservationId, customerAccountId: completeRaceAccount.id, step: 'ADDRESS_CONFIRMATION', mutation: { addressRevision: completeRaceAddressView.body.addressRevision, addressDigest: completeRaceAddressView.body.addressDigest } });
-  if (completeRaceAddressSave.response.status !== 200 || completeRaceAddressView.response.status !== 200 || completeRaceConfirmation.response.status !== 200) fail('Could not prepare the disposable pending claim for completion boundary test');
+  if (completeRaceProfile.response.status !== 200 || completeRaceAddressSave.response.status !== 200 || completeRaceAddressView.response.status !== 200 || completeRaceConfirmation.response.status !== 200) fail('Could not prepare the disposable pending claim for completion boundary test');
   const completionAuthority = async () => {
     const [reservation, pendingSetup, reference, home, accountExists, ownerCount] = await Promise.all([
       prisma.homeClaimReservation.findUniqueOrThrow({ where: { id: completeRaceClaim.body.reservationId }, select: { state: true, setupRevision: true, lastQualifyingMutationAt: true } }),
@@ -2055,6 +2056,12 @@ async function customerAuthorizationChecks(deliveryEnv) {
   const pendingClaim = await claimAction({ action: 'redeem', reference: claimReferenceValue, customerAccountId: pendingAccount.id });
   if (pendingClaim.response.status !== 200) fail(`Pending initial claim failed (${pendingClaim.response.status})`);
   const pendingId = pendingClaim.body.reservationId;
+  const pendingProfile = await claimAction({ action: 'mutate', reservationId: pendingId, customerAccountId: pendingAccount.id, step: 'PROFILE', mutation: { displayName: pendingAccount.displayName, username: pendingAccount.username } });
+  const pendingHomeAddress = await prisma.home.findUniqueOrThrow({ where: { id: claimHome.id }, select: { addressLine1: true, addressLine2: true, city: true, region: true, postcode: true, country: true, timezone: true } });
+  const pendingAddressSave = await claimAction({ action: 'mutate', reservationId: pendingId, customerAccountId: pendingAccount.id, step: 'ADDRESS', mutation: pendingHomeAddress });
+  const pendingAddressView = await claimAction({ action: 'address', reservationId: pendingId, customerAccountId: pendingAccount.id });
+  const pendingAddressConfirmation = await claimAction({ action: 'mutate', reservationId: pendingId, customerAccountId: pendingAccount.id, step: 'ADDRESS_CONFIRMATION', mutation: { addressRevision: pendingAddressView.body.addressRevision, addressDigest: pendingAddressView.body.addressDigest } });
+  if (pendingProfile.response.status !== 200 || pendingAddressSave.response.status !== 200 || pendingAddressView.response.status !== 200 || pendingAddressConfirmation.response.status !== 200) fail('Could not advance the disposable claim through profile and address steps before isolated policy validation');
   const initialCurrentPolicyVersion = env.DINODIA_NATIVE_POLICY_VERSION;
   const beforeUnapprovedPolicy = await snapshotClaimSetup(pendingId, pendingAccount.id, claimHome.id);
   const unapprovedPolicy = await claimAction({ action: 'mutate', reservationId: pendingId, customerAccountId: pendingAccount.id, step: 'POLICY', mutation: { policyVersion: 'harness-invented-policy-v9' } });
@@ -2101,6 +2108,13 @@ async function customerAuthorizationChecks(deliveryEnv) {
   deliveryEnv.DINODIA_NATIVE_POLICY_VERSION = initialCurrentPolicyVersion;
   await stopPlatform();
   await startPlatform(deliveryEnv);
+
+  // The next address-contract cases deliberately reuse this disposable
+  // reservation after the independent policy contract checks above. Seed it
+  // at the ADDRESS boundary so those tests remain focused on address
+  // validation rather than replaying the full setup wizard a second time.
+  const pendingReservationForAddressTests = await prisma.homeClaimReservation.findUniqueOrThrow({ where: { id: pendingId }, select: { setupRevision: true } });
+  await prisma.pendingHomeSetup.update({ where: { reservationId: pendingId }, data: { state: 'ADDRESS_REQUIRED', requiredStep: 'ADDRESS', setupRevision: pendingReservationForAddressTests.setupRevision } });
 
   let addressInput = { addressLine1: '1 Registered Lane', city: 'London', postcode: 'N1 1AA', country: 'GB', timezone: 'Europe/London' };
   const addressSave = await claimAction({ action: 'mutate', reservationId: pendingId, customerAccountId: pendingAccount.id, step: 'ADDRESS', mutation: addressInput });
@@ -2153,7 +2167,7 @@ async function customerAuthorizationChecks(deliveryEnv) {
   const correctedAddress = await claimAction({ action: 'address', reservationId: pendingId, customerAccountId: pendingAccount.id });
   if (correctedAddress.response.status !== 200 || correctedAddress.body.addressLine1 !== '2 Corrected Lane') fail('Claimant did not see the corrected retained address');
   const reconfirmed = await claimAction({ action: 'mutate', reservationId: pendingId, customerAccountId: pendingAccount.id, step: 'ADDRESS_CONFIRMATION', mutation: { addressRevision: correctedAddress.body.addressRevision, addressDigest: correctedAddress.body.addressDigest } });
-  if (reconfirmed.response.status !== 200) fail(`Corrected address was not confirmable (${reconfirmed.response.status})`);
+  if (reconfirmed.response.status !== 200) fail(`Corrected address was not confirmable (${reconfirmed.response.status}/${reconfirmed.body?.error?.code || 'no-code'})`);
   const pendingCompletion = await claimAction({ action: 'complete', reservationId: pendingId, customerAccountId: pendingAccount.id });
   const preInstallReference = await prisma.homeClaimReference.findUnique({ where: { id: claimReference.id }, select: { state: true, consumedAt: true } });
   if (pendingCompletion.response.status !== 200 || preInstallReference?.state !== 'PENDING_INSTALLATION' || preInstallReference.consumedAt || await prisma.homeMembership.count({ where: { homeId: claimHome.id } })) fail('Pre-installation claim consumed the reference or activated ownership');
@@ -7019,15 +7033,37 @@ async function pendingInvitationRouteChecks(deliveryEnv) {
     if (response.response.status === 200) revision = response.body.revision;
     return response;
   }
-  const changedProfile = { displayName: `${claimantAccount.displayName} Setup`, username: `claim-${crypto.randomUUID().slice(0, 12)}` };
-  const profile = await submitClaimStep('PROFILE', changedProfile);
+  const initialReservation = await prisma.homeClaimReservation.findUniqueOrThrow({ where: { id: claimId }, select: { expiresAt: true, setupRevision: true } });
+  // A newly claimed account may already have the exact profile values entered
+  // at registration. Confirming that current profile must advance the setup
+  // step without sliding the claim's 30-minute deadline.
+  const unchangedProfile = { displayName: claimantAccount.displayName, username: claimantAccount.username };
+  const profile = await submitClaimStep('PROFILE', unchangedProfile);
   const afterProfile = await prisma.homeClaimReservation.findUniqueOrThrow({ where: { id: claimId }, select: { expiresAt: true, setupRevision: true } });
-  const profileRetry = await submitClaimStep('PROFILE', changedProfile, `claim-profile-retry-${crypto.randomUUID()}`);
+  const profileResume = await fetchJson(`${base}/api/v2/home-claims/${claimId}/resume`, { method: 'POST', headers: { ...claimantHeaders, 'content-type': 'application/json' }, body: JSON.stringify({ expectedRevision: profile.body?.revision, idempotencyKey: `claim-profile-resume-${crypto.randomUUID()}` }) });
+  const profileRetry = await submitClaimStep('PROFILE', unchangedProfile, `claim-profile-retry-${crypto.randomUUID()}`);
   const afterProfileRetry = await prisma.homeClaimReservation.findUniqueOrThrow({ where: { id: claimId }, select: { expiresAt: true, setupRevision: true } });
+  if (profile.response.status !== 200 || afterProfile.setupRevision !== initialReservation.setupRevision + 1
+    || afterProfile.expiresAt.getTime() !== initialReservation.expiresAt.getTime()
+    || profileResume.response.status !== 200 || profileResume.body?.requiredStep !== 'ADDRESS'
+    || profileResume.body?.revision !== profile.body?.revision
+    || profileRetry.response.status !== 200 || profileRetry.body?.revision !== profile.body?.revision
+    || afterProfileRetry.setupRevision !== afterProfile.setupRevision || afterProfileRetry.expiresAt.getTime() !== afterProfile.expiresAt.getTime()) {
+    fail(`An unchanged initial profile did not advance exactly once without extending the reservation (${profile.response.status}/${profileResume.response.status}/${profileRetry.response.status})`);
+  }
+  revision = profileResume.body.revision;
   const addressPayload = { addressLine1: '81 Disposable Claim Lane', addressLine2: '', city: 'London', region: '', postcode: `N${crypto.randomInt(1, 9)} ${crypto.randomInt(1, 9)}AA`, country: 'GB', timezone: 'Europe/London' };
   const addressSave = await submitClaimStep('ADDRESS', addressPayload);
+  const addressResume = await fetchJson(`${base}/api/v2/home-claims/${claimId}/resume`, { method: 'POST', headers: { ...claimantHeaders, 'content-type': 'application/json' }, body: JSON.stringify({ expectedRevision: addressSave.body?.revision, idempotencyKey: `claim-address-resume-${crypto.randomUUID()}` }) });
   const address = await fetchJson(`${base}/api/v2/home-claims/${claimId}/address`, { headers: claimantHeaders });
+  if (addressSave.response.status !== 200 || addressResume.response.status !== 200 || addressResume.body?.requiredStep !== 'ADDRESS_CONFIRMATION'
+    || addressResume.body?.revision !== addressSave.body?.revision) fail(`An accepted address save did not advance to current-address confirmation (${addressSave.response.status}/${addressResume.response.status})`);
+  revision = addressResume.body.revision;
   const confirmation = await submitClaimStep('ADDRESS_CONFIRMATION', { addressRevision: address.body.addressRevision, addressDigest: address.body.addressDigest });
+  const confirmationResume = await fetchJson(`${base}/api/v2/home-claims/${claimId}/resume`, { method: 'POST', headers: { ...claimantHeaders, 'content-type': 'application/json' }, body: JSON.stringify({ expectedRevision: confirmation.body?.revision, idempotencyKey: `claim-confirmation-resume-${crypto.randomUUID()}` }) });
+  if (confirmation.response.status !== 200 || confirmationResume.response.status !== 200 || confirmationResume.body?.requiredStep !== 'POLICY'
+    || confirmationResume.body?.revision !== confirmation.body?.revision) fail(`An accepted address confirmation did not advance to policy/completion (${confirmation.response.status}/${confirmationResume.response.status})`);
+  revision = confirmationResume.body.revision;
   const preCompletion = await Promise.all([
     prisma.homeClaimReservation.findUniqueOrThrow({ where: { id: claimId }, select: { state: true, expiresAt: true, setupRevision: true, claimReference: { select: { state: true, claimedAccountId: true, consumedAt: true } } } }),
     prisma.home.findUniqueOrThrow({ where: { id: claimHome.id }, select: { lifecycle: true, managementRevision: true } }),
@@ -7116,6 +7152,10 @@ async function pendingInvitationRouteChecks(deliveryEnv) {
   const completedProfile = await fetchJson(`${base}/api/v2/home-claims/${completedClaimId}/setup`, { method: 'POST', headers: { ...headers, 'content-type': 'application/json', 'idempotency-key': `completed-profile-${crypto.randomUUID()}` }, body: JSON.stringify({ expectedRevision: completedRevision, step: 'PROFILE', mutation: { displayName: 'Disposable Completed Home Claimant', username: `completed-${crypto.randomUUID().slice(0, 10)}` } }) });
   if (completedProfile.response.status === 200) completedRevision = completedProfile.body.revision;
   const retainedAddress = await fetchJson(`${base}/api/v2/home-claims/${completedClaimId}/address`, { headers });
+  const completedAddressStep = await fetchJson(`${base}/api/v2/home-claims/${completedClaimId}/setup`, { method: 'POST', headers: { ...headers, 'content-type': 'application/json', 'idempotency-key': `completed-address-save-${crypto.randomUUID()}` }, body: JSON.stringify({ expectedRevision: completedRevision, step: 'ADDRESS', mutation: { addressLine1: retainedAddress.body?.addressLine1, addressLine2: retainedAddress.body?.addressLine2, city: retainedAddress.body?.city, region: retainedAddress.body?.region, postcode: retainedAddress.body?.postcode, country: retainedAddress.body?.country, timezone: retainedAddress.body?.timezone } }) });
+  if (completedAddressStep.response.status === 200) completedRevision = completedAddressStep.body.revision;
+  const completedAddressResume = await fetchJson(`${base}/api/v2/home-claims/${completedClaimId}/resume`, { method: 'POST', headers: { ...headers, 'content-type': 'application/json' }, body: JSON.stringify({ expectedRevision: completedRevision, idempotencyKey: `completed-address-resume-${crypto.randomUUID()}` }) });
+  if (completedAddressResume.response.status === 200) completedRevision = completedAddressResume.body.revision;
   const retainedConfirmation = await fetchJson(`${base}/api/v2/home-claims/${completedClaimId}/setup`, { method: 'POST', headers: { ...headers, 'content-type': 'application/json', 'idempotency-key': `completed-address-${crypto.randomUUID()}` }, body: JSON.stringify({ expectedRevision: completedRevision, step: 'ADDRESS_CONFIRMATION', mutation: { addressRevision: retainedAddress.body?.addressRevision, addressDigest: retainedAddress.body?.addressDigest } }) });
   if (retainedConfirmation.response.status === 200) completedRevision = retainedConfirmation.body.revision;
   const completedPolicyStep = await fetchJson(`${base}/api/v2/home-claims/${completedClaimId}/setup`, { method: 'POST', headers: { ...headers, 'content-type': 'application/json', 'idempotency-key': `completed-policy-${crypto.randomUUID()}` }, body: JSON.stringify({ expectedRevision: completedRevision, step: 'POLICY', mutation: { policyVersion: currentPolicyVersion, contentSha256: currentPolicyHash, accepted: true } }) });
@@ -7131,7 +7171,8 @@ async function pendingInvitationRouteChecks(deliveryEnv) {
     prisma.homeMembership.findUnique({ where: { customerAccountId_homeId: { customerAccountId: account.id, homeId: inviter.homeId } }, select: { role: true, status: true } }),
   ]);
   if (completedResolve.response.status !== 200 || completedStatus?.response.status !== 200
-    || retainedAddress.response.status !== 200 || retainedConfirmation.response.status !== 200 || completedPolicyStep.response.status !== 200
+    || retainedAddress.response.status !== 200 || completedAddressStep.response.status !== 200 || completedAddressResume.response.status !== 200
+    || completedAddressResume.body?.requiredStep !== 'ADDRESS_CONFIRMATION' || retainedConfirmation.response.status !== 200 || completedPolicyStep.response.status !== 200
     || completedActivation.response.status !== 200 || completedActivation.body.state !== 'ACTIVE'
     || completedActivationRetry.response.status !== 200 || !completedActivationRetry.body.idempotentReplay
     || completedAuthority[0].length !== 1 || completedAuthority[0][0].customerAccountId !== account.id || completedAuthority[0][0].role !== 'OWNER'
