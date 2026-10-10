@@ -98,7 +98,7 @@ export async function POST(request: Request) {
             throw new Stage1AuthError(401, 'hub_sync_authority_changed', 'The enrolled hub no longer has current synchronization authority');
           }
           if (syncMode === 'INSTALLATION_BOOTSTRAP' && (envelope.events.length === 0 || envelope.events.some((event) => !isInstallationBootstrapEvent(event)))) {
-            throw new Stage1AuthError(409, envelope.events.length === 0 ? 'hub_sync_installation_area_required' : 'hub_sync_installation_area_only', 'An assigned in-progress installation may synchronize only safe updater status, compaction and OS-owned Area events');
+            throw new Stage1AuthError(409, envelope.events.length === 0 ? 'hub_sync_installation_area_required' : 'hub_sync_installation_area_only', 'An ownerless or in-progress installation may synchronize only bounded installer events');
           }
 
           const priorRange = await tx.hubSyncReceipt.findFirst({ where: { hubInstallationId: current.id, streamId: envelope.streamId, fromSequence: from, toSequence: to } });
@@ -181,7 +181,7 @@ export async function POST(request: Request) {
           };
 
           if (envelope.events.length) {
-            const advanced = await tx.hubInstallation.updateMany({ where: { id: current.id, homeId: current.homeId, syncStreamId: current.syncStreamId, syncAcceptedSequence: current.syncAcceptedSequence, lifecycleStatus: syncMode === 'INSTALLATION_BOOTSTRAP' ? 'PENDING' : 'ACTIVE' }, data: {
+            const advanced = await tx.hubInstallation.updateMany({ where: { id: current.id, homeId: current.homeId, state: current.state, lifecycleStatus: current.lifecycleStatus, syncStreamId: current.syncStreamId, syncAcceptedSequence: current.syncAcceptedSequence }, data: {
               syncStreamId: envelope.streamId,
               syncAcceptedSequence: to,
               acknowledgedCloudRevision: Number(envelope.acknowledgedCloudRevision),

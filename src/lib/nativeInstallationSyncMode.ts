@@ -21,6 +21,16 @@ export function resolveNativeInstallationSyncMode(input: {
 
   const verified = Boolean(input.cloudUrlVerifiedAt && input.remoteVerificationAt
     && input.cloudUrlVerifiedAt <= now && input.remoteVerificationAt <= now);
+  // A completed hub can remain intentionally ownerless while its initial
+  // claim is available or reserved. Keep it on the bounded installer
+  // projection until owner activation: this lets the enrolled hub refresh
+  // signed liveness (including LAN/TLS receipts) without granting tenant
+  // inventory, telemetry, or device-event synchronization.
+  if (input.hubState === 'ACTIVE' && input.hubLifecycleStatus === 'ACTIVE'
+    && input.activeHubInstallationId === input.hubId && input.installationStatus === 'COMPLETE'
+    && ['CLAIMABLE', 'CLAIM_RESERVED'].includes(input.homeLifecycle)
+    && input.activeMembershipCount === 0 && verified) return 'INSTALLATION_BOOTSTRAP';
+
   if (input.hubLifecycleStatus === 'PENDING' && input.hubState === 'PROVISIONED'
     && input.homeLifecycle === 'INSTALLING' && input.installationStatus === 'IN_PROGRESS'
     && input.activeHubInstallationId === null && input.openAssignedInstallationWorkCount === 1

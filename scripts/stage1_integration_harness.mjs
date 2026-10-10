@@ -8431,7 +8431,7 @@ async function installationBootstrapChecks() {
   } });
   const signing = keyPair();
   const encryption = x25519KeyPair();
-  const serial = `harness-install-bootstrap-${crypto.randomUUID()}`;
+  const serial = `harness-${crypto.randomUUID()}`;
   const identity = await prisma.hubManufacturingIdentity.create({ data: {
     serialNumber: serial, signingPublicKey: signing.publicKey, encryptionPublicKey: encryption.publicKey,
     signingKeyFingerprint: publicKeyFingerprint(signing.publicKey), encryptionKeyFingerprint: publicKeyFingerprint(encryption.publicKey),
@@ -8568,14 +8568,105 @@ async function installationBootstrapChecks() {
       || await prisma.homeMembership.count({ where: { homeId: home.id, status: 'ACTIVE' } }) !== 0) {
     fail(`Installation completion did not atomically activate the verified hub/Home once under duplicate idempotent requests (${completions.map((result) => `${result.response.status}/${result.body.errorCode || 'no-code'}/${result.body.idempotentReplay}`).join(',')}; home=${completedHome.lifecycle}/${completedHome.installationStatus}; hub=${completedHub.state}/${completedHub.lifecycleStatus}; work=${completedWork.state}; audit=${completionEvents})`);
   }
+  // A completed, active hub stays ownerless while its initial owner QR is
+  // available/reserved. It may refresh signed LAN/TLS liveness, but only
+  // through the existing bounded installer event allowlist.
+  await prisma.home.update({ where: { id: home.id }, data: { lifecycle: 'CLAIMABLE' } });
+  const ownerClaimReferenceValue = `DNO-HOME-${crypto.randomBytes(32).toString('base64url')}`;
+  const ownerClaimReferenceHash = claimReferenceHash(ownerClaimReferenceValue, env.CLAIM_REFERENCE_PEPPER);
+  const ownerClaimReference = await prisma.homeClaimReference.create({ data: {
+    homeId: home.id, hubInstallationId: hub.id, purpose: 'INITIAL_OWNER', state: 'AVAILABLE', generation: 1,
+    companyQrReferenceHash: ownerClaimReferenceHash,
+    resolverGeneration: 1,
+  }, select: { id: true } });
+  await prisma.hubInstallation.update({ where: { id: hub.id }, data: {
+    permanentResolverHash: ownerClaimReferenceHash, permanentResolverGeneration: 1, permanentResolverStatus: 'ACTIVE',
+  } });
+  const ownerlessTokenState = await machineRequest({ base, path: '/api/hub-agent/token-state', machineSecret, body: { serial, identityGeneration: identity.identityGeneration, agentSeenVersion: 0, operatorCredentialVersion: 0 } });
+  if (ownerlessTokenState.response.status !== 200 || ownerlessTokenState.body.installationSyncMode !== 'INSTALLATION_BOOTSTRAP'
+    || ownerlessTokenState.body.offlineAuthorisations?.length !== 0) {
+    fail(`A completed ownerless Home did not receive only bounded bootstrap authority (${ownerlessTokenState.response.status}/${ownerlessTokenState.body.installationSyncMode || ownerlessTokenState.body.errorCode || 'no-mode'})`);
+  }
+  const forbiddenOwnerlessEvent = event(4, 'device.tombstone', 'private-device', { osDeviceId: 'private-device', removedAt: now.toISOString() });
+  const ownerlessDenied = await send([forbiddenOwnerlessEvent]);
+  const deniedOwnerlessState = await Promise.all([
+    prisma.hubInstallation.findUniqueOrThrow({ where: { id: hub.id }, select: { syncAcceptedSequence: true, state: true, lifecycleStatus: true } }),
+    prisma.hubSyncReceipt.count({ where: { hubInstallationId: hub.id, fromSequence: 4n, toSequence: 4n } }),
+    prisma.nativeDevice.count({ where: { homeId: home.id } }),
+  ]);
+  if (ownerlessDenied.response.status !== 409 || ownerlessDenied.body.errorCode !== 'hub_sync_installation_area_only'
+    || Number(deniedOwnerlessState[0].syncAcceptedSequence) !== 3 || deniedOwnerlessState[0].state !== 'ACTIVE'
+    || deniedOwnerlessState[0].lifecycleStatus !== 'ACTIVE' || deniedOwnerlessState[1] !== 0 || deniedOwnerlessState[2] !== 0) {
+    fail('Ownerless bootstrap accepted a device event or changed its cursor, receipt, hub lifecycle, or device rows');
+  }
+  const ownerlessStatusEvent = event(4, 'update.status', 'hub-updater', {
+    trustState: 'unprovisioned', phase: 'idle', activeReleaseVersion: null, attemptId: null, releaseId: null,
+    attemptPhase: null, resultCode: null, updatedAt: null, busy: false, revision: 2,
+  });
+  const ownerlessAccepted = await send([ownerlessStatusEvent]);
+  const ownerlessAfterSync = await Promise.all([
+    prisma.home.findUniqueOrThrow({ where: { id: home.id }, select: { lifecycle: true, installationStatus: true, activeHubInstallationId: true } }),
+    prisma.hubInstallation.findUniqueOrThrow({ where: { id: hub.id }, select: { syncAcceptedSequence: true, state: true, lifecycleStatus: true } }),
+    prisma.homeMembership.count({ where: { homeId: home.id, status: 'ACTIVE' } }),
+    prisma.nativeDevice.count({ where: { homeId: home.id } }),
+  ]);
+  if (ownerlessAccepted.response.status !== 200 || Number(ownerlessAccepted.body.acceptedThroughSequence) !== 4
+    || ownerlessAccepted.body.configuration?.memberships?.length !== 0
+    || ownerlessAfterSync[0].lifecycle !== 'CLAIMABLE' || ownerlessAfterSync[0].installationStatus !== 'COMPLETE'
+    || ownerlessAfterSync[0].activeHubInstallationId !== hub.id || Number(ownerlessAfterSync[1].syncAcceptedSequence) !== 4
+    || ownerlessAfterSync[1].state !== 'ACTIVE' || ownerlessAfterSync[1].lifecycleStatus !== 'ACTIVE'
+    || ownerlessAfterSync[2] !== 0 || ownerlessAfterSync[3] !== 0) {
+    fail('Bounded ownerless sync did not preserve the active installation and ownerless/no-device boundary');
+  }
+  const publicHubId = sha256(serial).slice(0, 20);
+  const pin = `sha256/${Buffer.from(sha256(serial), 'hex').toString('base64')}`;
+  const heartbeatAt = new Date();
+  const lanTlsIdentity = {
+    version: 1, revision: 1, state: 'CURRENT', publicHubId, host: `dinodia-${publicHubId}.local`, port: 8123,
+    certificateGeneration: 1, currentSpkiPin: pin,
+    currentNotBefore: new Date(heartbeatAt.getTime() - 60_000).toISOString(),
+    currentNotAfter: new Date(heartbeatAt.getTime() + 7 * 24 * 60 * 60_000).toISOString(), acknowledgedGeneration: 1,
+  };
+  const livenessHeartbeat = await machineRequest({ base, path: '/api/hub-agent/v2/heartbeat', machineSecret, body: {
+    serial, identityGeneration: identity.identityGeneration, hubRuntime: { kind: 'dinodia_os', version: 'integration-test', capabilities: {} },
+    lanEndpoint: { version: 1, revision: 1, state: 'CURRENT', baseUrl: 'http://192.168.1.76:8123', discoveryHost: `dinodia-${serial.toLowerCase()}.local` },
+    lanTlsIdentity,
+  } });
+  const liveEndpoint = await prisma.hubInstallation.findUniqueOrThrow({ where: { id: hub.id }, select: {
+    lastSeenAt: true, lanEndpointState: true, lanEndpointReportedAt: true, lanEndpointIdentityGeneration: true,
+    lanTlsState: true, lanTlsReportedAt: true, lanTlsIdentityGeneration: true, publicHubId: true,
+  } });
+  if (livenessHeartbeat.response.status !== 200 || liveEndpoint.lanEndpointState !== 'CURRENT'
+    || liveEndpoint.lanTlsState !== 'CURRENT' || liveEndpoint.publicHubId !== publicHubId
+    || liveEndpoint.lanEndpointIdentityGeneration !== identity.identityGeneration
+    || liveEndpoint.lanTlsIdentityGeneration !== identity.identityGeneration
+    || !liveEndpoint.lastSeenAt || Date.now() - liveEndpoint.lastSeenAt.getTime() > 420_000
+    || !liveEndpoint.lanEndpointReportedAt || Date.now() - liveEndpoint.lanEndpointReportedAt.getTime() > 420_000
+    || !liveEndpoint.lanTlsReportedAt || Date.now() - liveEndpoint.lanTlsReportedAt.getTime() > 420_000) {
+    fail('Signed ownerless heartbeat did not refresh current-generation LAN/TLS receipts and liveness');
+  }
+  const resolvedOwnerlessEndpoint = await fetchJson(`${base}/api/v2/home-claims/lan-endpoint`, {
+    method: 'POST', headers: { 'content-type': 'application/json', cookie: `dinodia_customer_session=${encodeURIComponent(customerFixture.customerSessionSecret)}` },
+    body: JSON.stringify({ reference: ownerClaimReferenceValue }),
+  });
+  if (resolvedOwnerlessEndpoint.response.status !== 200 || resolvedOwnerlessEndpoint.body?.ok !== true
+    || resolvedOwnerlessEndpoint.body?.lanEndpoint?.lanAddress !== '192.168.1.76'
+    || resolvedOwnerlessEndpoint.body?.lanEndpoint?.publicHubId !== publicHubId
+    || !resolvedOwnerlessEndpoint.body?.lanEndpoint?.validUntil) {
+    fail(`A current signed ownerless heartbeat did not make the actual authenticated claim resolver usable (${resolvedOwnerlessEndpoint.response.status}/${resolvedOwnerlessEndpoint.body?.error?.code || 'no-code'})`);
+  }
+  await prisma.homeClaimReference.delete({ where: { id: ownerClaimReference.id } });
+  await prisma.home.update({ where: { id: home.id }, data: { lifecycle: 'PENDING_INSTALLATION' } });
+
   const activeState = await machineRequest({ base, path: '/api/hub-agent/token-state', machineSecret, body: { serial, identityGeneration: identity.identityGeneration, agentSeenVersion: 0, operatorCredentialVersion: 0 } });
-  const afterActivationEvent = event(4, 'device.tombstone', 'private-device', { osDeviceId: 'private-device', removedAt: now.toISOString() });
+  const afterActivationEvent = event(5, 'device.tombstone', 'private-device', { osDeviceId: 'private-device', removedAt: now.toISOString() });
   const activeSync = await send([afterActivationEvent]);
   const finalCursor = await prisma.hubInstallation.findUniqueOrThrow({ where: { id: hub.id }, select: { syncAcceptedSequence: true } });
   if (activeState.response.status !== 200 || activeState.body.installationSyncMode !== 'ACTIVE'
-    || activeSync.response.status !== 200 || Number(activeSync.body.acceptedThroughSequence) !== 4 || Number(finalCursor.syncAcceptedSequence) !== 4) {
+    || activeSync.response.status !== 200 || Number(activeSync.body.acceptedThroughSequence) !== 5 || Number(finalCursor.syncAcceptedSequence) !== 5) {
     fail(`The completed installation did not transition to normal ordered sync (${activeState.response.status}/${activeState.body.installationSyncMode}, ${activeSync.response.status}/${activeSync.body.errorCode || 'no-code'})`);
   }
+  console.log('[stage5:integration] PASS: ownerless CLAIMABLE installation receives bounded bootstrap sync with historical tenant device data excluded; private device event has zero effects; actual signed heartbeat refreshes LAN/TLS receipts and the authenticated Home-claim resolver succeeds without changing ownerless state');
   console.log('[stage5:integration] PASS: actual machine-authenticated routes permit only a verified assigned initial installation to sync safe updater status and real Area projection, deny device events with zero rows/cursor/receipt effects, expose the guarded assigned completion action, commit Home/Hub/work atomically and idempotently, then restore normal ordered sync');
 }
 

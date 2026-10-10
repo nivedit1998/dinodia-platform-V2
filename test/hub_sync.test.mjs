@@ -20,7 +20,7 @@ const { isInstallationBootstrapEvent, validateHubSyncEnvelope } = loadTypeScript
 const { parseHubSyncOutboxReport } = loadTypeScript('src/lib/hubSyncTelemetry.ts');
 const { resolveNativeInstallationSyncMode } = loadTypeScript('src/lib/nativeInstallationSyncMode.ts');
 
-test('installation sync mode permits only the current active hub or a verified, assigned, membership-free initial Area bootstrap', () => {
+test('installation sync mode permits current active sync or narrowly bounded ownerless/installer bootstrap', () => {
   const now = new Date('2026-10-05T12:00:00.000Z');
   const base = {
     hubId: '11111111-1111-4111-8111-111111111111', hubState: 'PROVISIONED', hubLifecycleStatus: 'PENDING',
@@ -37,6 +37,13 @@ test('installation sync mode permits only the current active hub or a verified, 
   const active = { ...base, hubLifecycleStatus: 'ACTIVE', hubState: 'ACTIVE', installationStatus: 'COMPLETE', homeLifecycle: 'PENDING_INSTALLATION', activeHubInstallationId: base.hubId };
   assert.equal(resolveNativeInstallationSyncMode(active), 'ACTIVE');
   assert.equal(resolveNativeInstallationSyncMode({ ...active, homeLifecycle: 'ACTIVE' }), 'ACTIVE');
+  assert.equal(resolveNativeInstallationSyncMode({ ...active, homeLifecycle: 'CLAIMABLE' }), 'INSTALLATION_BOOTSTRAP', 'a completed ownerless Home may refresh signed liveness, but not receive full tenant sync');
+  assert.equal(resolveNativeInstallationSyncMode({ ...active, homeLifecycle: 'CLAIM_RESERVED' }), 'INSTALLATION_BOOTSTRAP', 'a reserved initial-owner claim remains ownerless until activation');
+  assert.equal(resolveNativeInstallationSyncMode({ ...active, homeLifecycle: 'CLAIMABLE', activeMembershipCount: 1 }), 'UNAVAILABLE');
+  assert.equal(resolveNativeInstallationSyncMode({ ...active, homeLifecycle: 'CLAIM_RESERVED', activeMembershipCount: 1 }), 'UNAVAILABLE');
+  assert.equal(resolveNativeInstallationSyncMode({ ...active, homeLifecycle: 'CLAIMABLE', activeHubInstallationId: null }), 'UNAVAILABLE');
+  assert.equal(resolveNativeInstallationSyncMode({ ...active, homeLifecycle: 'CLAIMABLE', installationStatus: 'IN_PROGRESS' }), 'UNAVAILABLE');
+  assert.equal(resolveNativeInstallationSyncMode({ ...active, homeLifecycle: 'CLAIMABLE', cloudUrlVerifiedAt: null }), 'UNAVAILABLE');
   assert.equal(resolveNativeInstallationSyncMode({ ...active, installationStatus: 'IN_PROGRESS' }), 'UNAVAILABLE');
   assert.equal(resolveNativeInstallationSyncMode({ ...active, homeLifecycle: 'RETIRED' }), 'UNAVAILABLE');
   assert.equal(resolveNativeInstallationSyncMode({ ...active, hubState: 'REVOKED' }), 'UNAVAILABLE');
