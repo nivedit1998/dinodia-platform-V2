@@ -8896,19 +8896,31 @@ async function operatorMutationChecks() {
     passwordHash: hashPassword(employeePassword),
   } });
   const login = await loginEmployee(base, employee, employeePassword);
-  const makeWork = async (suffix) => prisma.companyOperationalWorkItem.create({ data: {
+  const makeWork = async (suffix, kind = 'INITIAL_HUB_INSTALLATION', assignedEmployeeId = employee.id) => prisma.companyOperationalWorkItem.create({ data: {
     publicReference: `DIN-${sha256(`operator-mutation-${suffix}-${crypto.randomUUID()}`).slice(0, 16).toUpperCase()}`,
-    kind: 'INITIAL_HUB_INSTALLATION',
+    kind,
     state: 'IN_PROGRESS',
     homeId,
     hubInstallationId: hubId,
     certifiedSerialNumber: customerFixture.identityOneSerial,
-    assignedEmployeeId: employee.id,
-    createdByEmployeeId: employee.id,
+    assignedEmployeeId,
+    createdByEmployeeId: assignedEmployeeId,
     reason: `Disposable operator mutation ${suffix}`,
   } });
   const work = await makeWork('primary');
   const alternateWork = await makeWork('alternate');
+  const permanentInstallationWork = await makeWork('permanent-installation-status', 'PERMANENT_DEVICE_INSTALLATION');
+  const recoveryWork = await makeWork('recovery-status', 'HUB_RECOVERY');
+  const otherAssignedEmployeeEmail = `operator-other-${crypto.randomUUID()}@invalid.test`;
+  const otherAssignedEmployee = await prisma.companyEmployeeAccount.create({ data: {
+    displayName: 'Harness other assigned employee',
+    email: otherAssignedEmployeeEmail,
+    emailNormalized: otherAssignedEmployeeEmail,
+    role: 'INSTALLER',
+    status: 'ACTIVE',
+    passwordHash: hashPassword(`harness-other-${crypto.randomUUID()}`),
+  } });
+  const foreignAssignedWork = await makeWork('foreign-assignment-status', 'PERMANENT_DEVICE_INSTALLATION', otherAssignedEmployee.id);
   const idempotencyKeys = [];
   const post = (action, key, workflowId, extra = {}) => {
     idempotencyKeys.push(key);
@@ -8940,6 +8952,18 @@ async function operatorMutationChecks() {
     const visibleStatus = await fetchJson(`${base}/api/installer/home-support/homes/${encodeURIComponent(homeId)}/os-access/status?workflowId=${encodeURIComponent(work.id)}`, { headers: { cookie: cookieHeader(login.jar) } });
     if (visibleStatus.response.status !== 200 || visibleStatus.body.credentials?.[0]?.version !== first.body.version || visibleStatus.body.credentials?.[0]?.state !== 'PENDING') fail('Authenticated operator status did not expose the durable lifecycle state');
     if (/dno_ops_|tokenHash|encryptedDeliveryEnvelope|privateKey|secret/i.test(JSON.stringify(visibleStatus.body))) fail('Operator status response exposed reusable credential material');
+    for (const assignedWork of [permanentInstallationWork, recoveryWork]) {
+      const assignedStatus = await fetchJson(`${base}/api/installer/home-support/homes/${encodeURIComponent(homeId)}/os-access/status?workflowId=${encodeURIComponent(assignedWork.id)}`, { headers: { cookie: cookieHeader(login.jar) } });
+      if (assignedStatus.response.status !== 200 || assignedStatus.body.homeId !== homeId || assignedStatus.body.hubInstallationId !== hubId
+        || !assignedStatus.body.heartbeat || !assignedStatus.body.sync || !assignedStatus.body.update) {
+        fail(`The assigned ${assignedWork.kind} workflow could not read its same-Home hub status (${assignedStatus.response.status}/${assignedStatus.body.errorCode || 'no-code'})`);
+      }
+      if (/dno_ops_|tokenHash|encryptedDeliveryEnvelope|privateKey|secret/i.test(JSON.stringify(assignedStatus.body))) fail(`The assigned ${assignedWork.kind} status exposed reusable credential material`);
+    }
+    const foreignAssignmentStatus = await fetchJson(`${base}/api/installer/home-support/homes/${encodeURIComponent(homeId)}/os-access/status?workflowId=${encodeURIComponent(foreignAssignedWork.id)}`, { headers: { cookie: cookieHeader(login.jar) } });
+    if (foreignAssignmentStatus.response.status !== 403 || foreignAssignmentStatus.body.errorCode !== 'workflow_not_authorized') {
+      fail(`Hub status was disclosed for work assigned to another employee (${foreignAssignmentStatus.response.status}/${foreignAssignmentStatus.body.errorCode || 'no-code'})`);
+    }
     const firstRowCount = await prisma.hubCredentialVersion.count({ where: { hubInstallationId: hubId, purpose: 'operator-credential' } });
     const rateKey = `operator-rotate:${employee.id}:${hubId}`;
     const mutationRecord = await prisma.idempotencyRecord.findUniqueOrThrow({ where: { namespace_keyHash: { namespace: 'operator-rotate:v1', keyHash: sha256(`${employee.id}:${firstKey}`) } }, select: { actorId: true, homeId: true, hubInstallationId: true, requestHash: true } });
@@ -9000,8 +9024,9 @@ async function operatorMutationChecks() {
     await prisma.authRateLimitBucket.deleteMany({ where: { bucketKey: { in: [`operator-rotate:${employee.id}:${hubId}`, `operator-revoke:${employee.id}:${hubId}`] } } }).catch(() => {});
     await prisma.auditEvent.deleteMany({ where: { actorType: 'EMPLOYEE', actorId: employee.id } }).catch(() => {});
     await prisma.hubInstallation.update({ where: { id: hubId }, data: { currentOperatorCredentialVersion: originalHub?.currentOperatorCredentialVersion ?? null, accessPolicyRevision: originalHub?.accessPolicyRevision ?? 0 } }).catch(() => {});
-    await prisma.companyOperationalWorkItem.deleteMany({ where: { id: { in: [work.id, alternateWork.id] } } }).catch(() => {});
+    await prisma.companyOperationalWorkItem.deleteMany({ where: { id: { in: [work.id, alternateWork.id, permanentInstallationWork.id, recoveryWork.id, foreignAssignedWork.id] } } }).catch(() => {});
     await prisma.employeeSession.deleteMany({ where: { employeeId: employee.id } }).catch(() => {});
+    await prisma.companyEmployeeAccount.delete({ where: { id: otherAssignedEmployee.id } }).catch(() => {});
     await prisma.companyEmployeeAccount.delete({ where: { id: employee.id } }).catch(() => {});
   }
 }
@@ -10279,8 +10304,8 @@ try {
     await mobileSessionContractChecks();
     await installationBootstrapChecks();
     await osChecks();
-    await verifyStage11PropertyDisableAcknowledgement();
     await operatorMutationChecks();
+    await verifyStage11PropertyDisableAcknowledgement();
     await tenantMembershipRemovalChecks();
     await ownershipTransferChecks(deliveryEnv);
     await exceptionalOwnershipTransferChecks(deliveryEnv);

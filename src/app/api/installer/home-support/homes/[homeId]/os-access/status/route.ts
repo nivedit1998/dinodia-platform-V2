@@ -5,6 +5,13 @@ import { parseHubSyncOutboxReport } from '@/lib/hubSyncTelemetry';
 
 export const dynamic = 'force-dynamic';
 
+const HUB_STATUS_WORK_KINDS = new Set<string>([
+  'INITIAL_HUB_INSTALLATION',
+  'PERMANENT_DEVICE_INSTALLATION',
+  'PHYSICAL_CONFIGURATION_CORRECTION',
+  'HUB_RECOVERY',
+]);
+
 export async function GET(request: Request, context: { params: Promise<{ homeId: string }> }) {
   try {
     const employee = await requireEmployee(request, ['CXO', 'SENIOR_OPERATIONS_MANAGER', 'INSTALLER']);
@@ -12,7 +19,10 @@ export async function GET(request: Request, context: { params: Promise<{ homeId:
     const workflowId = String(new URL(request.url).searchParams.get('workflowId') ?? '').trim();
     if (!workflowId) throw new Stage1AuthError(400, 'workflow_required', 'An assigned workflow is required');
     const work = await prisma.companyOperationalWorkItem.findUnique({ where: { id: workflowId }, select: { kind: true, assignedEmployeeId: true, homeId: true, hubInstallationId: true, state: true } });
-    if (!work || work.kind !== 'INITIAL_HUB_INSTALLATION' || work.assignedEmployeeId !== employee.id || work.homeId !== homeId || !work.hubInstallationId) throw new Stage1AuthError(403, 'workflow_not_authorized', 'The assigned initial installation workflow is not available to this employee');
+    if (!work || !HUB_STATUS_WORK_KINDS.has(work.kind) || work.state === 'CANCELLED'
+      || work.assignedEmployeeId !== employee.id || work.homeId !== homeId || !work.hubInstallationId) {
+      throw new Stage1AuthError(403, 'workflow_not_authorized', 'The assigned hub work is not available to this employee');
+    }
     const [rows, hub, home, liveDeviceCount, openIncidentCount, activeAreaCount, replacementCandidates, otherActiveHubCount, activeMembershipCount] = await Promise.all([
       prisma.hubCredentialVersion.findMany({ where: { hubInstallationId: work.hubInstallationId, purpose: 'operator-credential' }, orderBy: { version: 'desc' }, select: { version: true, purpose: true, state: true, issuedAt: true, deliveredAt: true, acknowledgedAt: true, activatedAt: true, graceUntil: true, revokedAt: true, deliveryAttempts: true } }),
       prisma.hubInstallation.findFirst({ where: { id: work.hubInstallationId, homeId }, select: { id: true, state: true, lifecycleStatus: true, installationGeneration: true, cloudUrlVerifiedAt: true, remoteVerificationAt: true, lastSeenAt: true, lastSuccessfulSyncAt: true, syncAcceptedSequence: true, lastQueueDepth: true, lastSyncErrorCode: true, syncGapDetected: true, syncCriticalBacklog: true, syncTelemetryPaused: true, syncDroppedTelemetryCount: true, capabilitySummary: true, cloudConfigurationRevision: true, acknowledgedCloudRevision: true, updaterTrustState: true, updatePhase: true, updateAttemptId: true, updateReleaseId: true, activeReleaseVersion: true, updateResultCode: true, updateStatusAt: true, updateBusy: true } }),
