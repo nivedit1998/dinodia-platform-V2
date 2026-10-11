@@ -9,6 +9,15 @@ import { sha256 } from '@/lib/stage1Crypto';
 
 export const dynamic = 'force-dynamic';
 
+class LanEndpointRevisionError extends Stage1AuthError {
+  readonly currentRevision: number;
+
+  constructor(code: 'lan_endpoint_revision_stale' | 'lan_endpoint_revision_conflict', message: string, currentRevision: number) {
+    super(409, code, message);
+    this.currentRevision = currentRevision;
+  }
+}
+
 /**
  * Recovery-only factory-identity path for publishing the current private LAN
  * endpoint when the installation machine credential is unavailable. This is
@@ -51,12 +60,12 @@ export async function POST(request: Request) {
           if (currentRevision > 0 && knownGeneration !== hub.identity.identityGeneration) {
             throw new Stage1AuthError(409, 'lan_endpoint_generation_reset_required', 'LAN endpoint revision recovery is required for this identity generation');
           }
-          if (observation.revision < currentRevision) throw new Stage1AuthError(409, 'lan_endpoint_revision_stale', 'A newer LAN endpoint revision is already recorded');
+          if (observation.revision < currentRevision) throw new LanEndpointRevisionError('lan_endpoint_revision_stale', 'A newer LAN endpoint revision is already recorded', currentRevision);
           const samePayload = installation.lanEndpointState === observation.state
             && (observation.state === 'UNAVAILABLE' || installation.baseUrl === observation.baseUrl)
             && (knownGeneration === null || knownGeneration === hub.identity.identityGeneration);
           if (observation.revision === currentRevision && currentRevision > 0 && !samePayload) {
-            throw new Stage1AuthError(409, 'lan_endpoint_revision_conflict', 'This LAN endpoint revision was already used for different endpoint data');
+            throw new LanEndpointRevisionError('lan_endpoint_revision_conflict', 'This LAN endpoint revision was already used for different endpoint data', currentRevision);
           }
           if (observation.revision === currentRevision && currentRevision === 0) {
             throw new Stage1AuthError(409, 'lan_endpoint_revision_stale', 'The initial LAN endpoint revision must be positive');
@@ -95,6 +104,12 @@ export async function POST(request: Request) {
     if (!accepted) throw new Stage1AuthError(503, 'lan_endpoint_retry_exhausted', 'The signed LAN endpoint update could not be serialized safely');
     return NextResponse.json({ ok: true, lanEndpoint: accepted }, { headers: { 'Cache-Control': 'no-store', Pragma: 'no-cache' } });
   } catch (error) {
+    if (error instanceof LanEndpointRevisionError) {
+      return NextResponse.json({ ok: false, error: error.message, errorCode: error.code, currentRevision: error.currentRevision }, {
+        status: error.status,
+        headers: { 'Cache-Control': 'no-store', Pragma: 'no-cache' },
+      });
+    }
     return authErrorResponse(error);
   }
 }

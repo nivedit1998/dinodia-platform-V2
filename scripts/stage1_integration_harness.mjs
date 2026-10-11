@@ -8991,7 +8991,7 @@ async function osChecks() {
     }
     if (requestPath === '/api/hub-agent/v2/lan-endpoint') {
       const body = await response.clone().json().catch(() => ({}));
-      recoveryEndpointReceipts.push({ status: response.status, errorCode: body.errorCode || body.error?.code || null, endpointRevision: body.lanEndpoint?.revision ?? null, endpointState: body.lanEndpoint?.state ?? null });
+      recoveryEndpointReceipts.push({ status: response.status, errorCode: body.errorCode || body.error?.code || null, currentRevision: body.currentRevision ?? null, endpointRevision: body.lanEndpoint?.revision ?? null, endpointState: body.lanEndpoint?.state ?? null });
     }
     return response;
   };
@@ -9811,13 +9811,21 @@ async function osChecks() {
   const pairedStateBeforeRecovery = hub.store.getPlatform().paired;
   const recoveryOutboxBefore = hub.store.getSyncOutbox();
   const recoveryHubBefore = await prisma.hubInstallation.findUniqueOrThrow({ where: { id: customerFixture.hubOneId }, select: { lastSeenAt: true, lanEndpointRevision: true, baseUrl: true } });
+  const recoveryLocalRevision = Number(hub.store.getPlatform()?.lanEndpointObservation?.revision || 0);
+  const staleServerRevision = Math.max(recoveryHubBefore.lanEndpointRevision, recoveryLocalRevision) + 5;
+  await prisma.hubInstallation.update({ where: { id: customerFixture.hubOneId }, data: { lanEndpointRevision: staleServerRevision } });
   const recoveryReceiptCountBefore = recoveryEndpointReceipts.length;
   await hub.pairing.publishRecoveryLanEndpoint();
   const recoveryHubAfter = await prisma.hubInstallation.findUniqueOrThrow({ where: { id: customerFixture.hubOneId }, select: { lastSeenAt: true, lanEndpointRevision: true, baseUrl: true, lanEndpointState: true, lanEndpointReportedAt: true, lanEndpointIdentityGeneration: true } });
   if (pairedStateBeforeRecovery !== false || hub.store.getPlatform().paired !== false
-    || recoveryEndpointReceipts.length !== recoveryReceiptCountBefore + 1 || recoveryEndpointReceipts.at(-1)?.status !== 200
+    || recoveryEndpointReceipts.length !== recoveryReceiptCountBefore + 2
+    || recoveryEndpointReceipts.at(-2)?.status !== 409 || recoveryEndpointReceipts.at(-2)?.errorCode !== 'lan_endpoint_revision_stale'
+    || recoveryEndpointReceipts.at(-2)?.currentRevision !== staleServerRevision
+    || recoveryEndpointReceipts.at(-1)?.status !== 200
     || recoveryHubAfter.lanEndpointState !== 'CURRENT' || recoveryHubAfter.lanEndpointIdentityGeneration !== customerFixture.identityOneGeneration
-    || recoveryHubAfter.lanEndpointRevision < recoveryHubBefore.lanEndpointRevision || !recoveryHubAfter.lanEndpointReportedAt
+    || recoveryHubAfter.lanEndpointRevision !== staleServerRevision + 1
+    || hub.store.getPlatform()?.lanEndpointObservation?.revision !== staleServerRevision + 1
+    || !recoveryHubAfter.lanEndpointReportedAt
     || recoveryHubAfter.lastSeenAt?.getTime() !== recoveryHubBefore.lastSeenAt?.getTime()
     || JSON.stringify(hub.store.getSyncOutbox()) !== JSON.stringify(recoveryOutboxBefore)) fail(`Unpaired recovery did not refresh only the current signed LAN endpoint while preserving machine-pairing and sync/outbox state (${JSON.stringify({ pairedBefore: pairedStateBeforeRecovery, pairedAfter: hub.store.getPlatform().paired, receipt: recoveryEndpointReceipts.at(-1), receiptCountDelta: recoveryEndpointReceipts.length - recoveryReceiptCountBefore, before: recoveryHubBefore, after: recoveryHubAfter, outboxUnchanged: JSON.stringify(hub.store.getSyncOutbox()) === JSON.stringify(recoveryOutboxBefore) })})`);
   // The homeowner projection case intentionally stopped the background sync
