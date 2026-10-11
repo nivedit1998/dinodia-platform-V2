@@ -127,6 +127,25 @@ test('hub sync accepts a bounded contiguous signed-envelope shape and rejects ma
   assert.equal(validateHubSyncEnvelope(valid, 'x'.repeat(1024 * 1024 + 1)), false);
 });
 
+test('configuration refresh is a distinct empty signed envelope and can never carry events', () => {
+  const refresh = envelope();
+  refresh.events = [];
+  refresh.fromSequence = 1;
+  refresh.toSequence = 0;
+  refresh.queueDepth = 2;
+  refresh.configurationRefreshOnly = true;
+  assert.equal(validateHubSyncEnvelope(refresh), true);
+
+  const eventBearingRefresh = structuredClone(refresh);
+  eventBearingRefresh.events = [envelope().events[0]];
+  eventBearingRefresh.toSequence = 1;
+  assert.equal(validateHubSyncEnvelope(eventBearingRefresh), false, 'configuration refresh cannot accept or acknowledge an event');
+
+  const falseRefresh = structuredClone(refresh);
+  falseRefresh.configurationRefreshOnly = false;
+  assert.equal(validateHubSyncEnvelope(falseRefresh), false, 'the optional mode flag is an exact true-only protocol discriminator');
+});
+
 test('sync validates redacted incident and manual updater status outcomes without accepting authority-shaped extras', () => {
   const incident = envelope();
   incident.events[0] = {

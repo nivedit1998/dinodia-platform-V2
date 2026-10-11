@@ -8676,6 +8676,20 @@ async function installationBootstrapChecks() {
   } });
   const tokenState = await machineRequest({ base, path: '/api/hub-agent/token-state', machineSecret, body: { serial, identityGeneration: identity.identityGeneration, agentSeenVersion: 0, operatorCredentialVersion: 0 } });
   if (tokenState.response.status !== 200 || tokenState.body.installationSyncMode !== 'INSTALLATION_BOOTSTRAP' || tokenState.body.hubInstallId !== hub.id || Number(tokenState.body.syncAcceptedSequence) !== 0) fail(`A verified assigned unclaimed installation did not receive the bounded bootstrap mode (${tokenState.response.status}/${tokenState.body.installationSyncMode || tokenState.body.errorCode || 'no-mode'})`);
+  const refreshOnly = await machineRequest({ base, path: '/api/hub-agent/v2/sync', machineSecret, body: {
+    serial, identityGeneration: identity.identityGeneration, schemaVersion: 1, hubInstallationId: hub.id, streamId,
+    fromSequence: 1, toSequence: 0, events: [], queueDepth: 0, acknowledgedCloudRevision: 0,
+    configurationRefreshOnly: true, runtime, sentAt: new Date().toISOString(),
+  } });
+  const afterDeniedRefresh = await prisma.hubInstallation.findUniqueOrThrow({ where: { id: hub.id }, select: {
+    syncStreamId: true, syncAcceptedSequence: true, acknowledgedCloudRevision: true, cloudConfigurationRevision: true,
+  } });
+  if (refreshOnly.response.status !== 409 || refreshOnly.body.errorCode !== 'hub_sync_configuration_refresh_unavailable'
+    || refreshOnly.body.configuration || afterDeniedRefresh.syncStreamId !== null || Number(afterDeniedRefresh.syncAcceptedSequence) !== 0
+    || Number(afterDeniedRefresh.acknowledgedCloudRevision) !== 0 || Number(afterDeniedRefresh.cloudConfigurationRevision) !== 0
+    || await prisma.hubSyncReceipt.count({ where: { hubInstallationId: hub.id } }) !== 0) {
+    fail('The configuration-only refresh exposed active Home policy or changed state during assigned ownerless bootstrap');
+  }
   const assignedStatusUrl = `${base}/api/installer/home-support/homes/${encodeURIComponent(home.id)}/os-access/status?workflowId=${encodeURIComponent(work.id)}`;
   const unreportedStatus = await fetchJson(assignedStatusUrl, { headers: { 'x-dinodia-employee-session': customerFixture.operatorToken } });
   if (unreportedStatus.response.status !== 200 || unreportedStatus.body.sync?.statusState !== 'UNKNOWN' || unreportedStatus.body.sync?.queueDepth !== null) {
@@ -10202,6 +10216,89 @@ async function osChecks() {
   });
   if (unauthenticatedOperatorStatus !== 401) fail(`Unauthenticated Native operator event stream was not denied (${unauthenticatedOperatorStatus})`);
 }
+async function hubSyncConfigurationRefreshChecks() {
+  if (!customerFixture) fail('The disposable enrolled hub fixture is unavailable for configuration-refresh integration checks');
+  const hubInstallationId = customerFixture.hubOneId;
+  const original = await prisma.hubInstallation.findUniqueOrThrow({ where: { id: hubInstallationId }, select: {
+    syncStreamId: true, syncAcceptedSequence: true, acknowledgedCloudRevision: true, cloudConfigurationRevision: true,
+    cloudConfigurationChecksum: true, lastSuccessfulSyncAt: true, lastQueueDepth: true, lastSyncErrorCode: true,
+  } });
+  const fixtureStreamId = original.syncStreamId || `refresh-${crypto.randomUUID()}`;
+  const acceptedSequence = Number(original.syncAcceptedSequence || 0);
+  const originalReceiptCount = await prisma.hubSyncReceipt.count({ where: { hubInstallationId } });
+  const areaId = `stage-config-refresh-${crypto.randomUUID()}`;
+  try {
+    await prisma.hubInstallation.update({ where: { id: hubInstallationId }, data: {
+      syncStreamId: fixtureStreamId,
+      syncAcceptedSequence: acceptedSequence,
+      acknowledgedCloudRevision: 5,
+      cloudConfigurationRevision: 5,
+      cloudConfigurationChecksum: sha256(`stale-config-checksum:${crypto.randomUUID()}`),
+    } });
+    const baseEnvelope = {
+      schemaVersion: 1, hubInstallationId, streamId: fixtureStreamId,
+      fromSequence: acceptedSequence + 1, toSequence: acceptedSequence,
+      events: [], queueDepth: 2, acknowledgedCloudRevision: 0,
+      runtime: { kind: 'dinodia_os', version: 'configuration-refresh-fixture', capabilities: { nativeSyncOutbox: {
+        queueDepth: 2, gapDetected: false, criticalBacklog: false, telemetryPaused: false,
+        droppedTelemetryCount: 0, lastErrorCode: 'hub_sync_configuration_ack_invalid',
+      } } }, sentAt: new Date().toISOString(),
+    };
+    const staleEvent = { id: crypto.randomUUID(), sequence: acceptedSequence + 1, type: 'area.upsert', aggregateId: areaId,
+      occurredAt: new Date().toISOString(), critical: true, payload: { osAreaId: areaId, name: 'Disposable recovery room', icon: 'room' } };
+    const staleWrite = await machineRequest({ base: `http://127.0.0.1:${appPort}`, path: '/api/hub-agent/v2/sync', machineSecret: customerFixture.machineSecret, body: {
+      serial: customerFixture.identityOneSerial, identityGeneration: customerFixture.identityOneGeneration,
+      ...baseEnvelope, fromSequence: acceptedSequence + 1, toSequence: acceptedSequence + 1,
+      events: [staleEvent], queueDepth: 1,
+    } });
+    const areaAfterStaleWrite = await prisma.area.findUnique({ where: { homeId_osAreaId: { homeId: customerFixture.homeOneId, osAreaId: areaId } }, select: { id: true } });
+    if (staleWrite.response.status !== 409 || staleWrite.body.errorCode !== 'hub_sync_configuration_ack_invalid' || areaAfterStaleWrite) {
+      fail(`The stale-revision reproduction did not deny event effects before refresh (${staleWrite.response.status}/${staleWrite.body.errorCode || 'no-code'})`);
+    }
+    const refresh = await machineRequest({ base: `http://127.0.0.1:${appPort}`, path: '/api/hub-agent/v2/sync', machineSecret: customerFixture.machineSecret, body: {
+      serial: customerFixture.identityOneSerial, identityGeneration: customerFixture.identityOneGeneration,
+      ...baseEnvelope, configurationRefreshOnly: true,
+    } });
+    const afterRefresh = await prisma.hubInstallation.findUniqueOrThrow({ where: { id: hubInstallationId }, select: {
+      syncStreamId: true, syncAcceptedSequence: true, acknowledgedCloudRevision: true, cloudConfigurationRevision: true,
+    } });
+    const receiptsAfterRefresh = await prisma.hubSyncReceipt.count({ where: { hubInstallationId } });
+    if (refresh.response.status !== 200 || refresh.body.configurationRefreshOnly !== true
+      || refresh.body.configuration?.revision !== refresh.body.cloudRevision
+      || refresh.body.configurationAppliedRevision !== 0
+      || refresh.body.syncStreamId !== fixtureStreamId || refresh.body.syncAcceptedSequence !== acceptedSequence
+      || afterRefresh.syncStreamId !== fixtureStreamId || Number(afterRefresh.syncAcceptedSequence) !== acceptedSequence
+      || Number(afterRefresh.acknowledgedCloudRevision) !== 5 || Number(afterRefresh.cloudConfigurationRevision) !== Number(refresh.body.cloudRevision)
+      || receiptsAfterRefresh !== originalReceiptCount || areaAfterStaleWrite) {
+      fail(`Configuration-only refresh mutated event authority or failed to return current configuration (${JSON.stringify({ status: refresh.response.status, code: refresh.body.errorCode || null, refreshOnly: refresh.body.configurationRefreshOnly, cursorStable: Number(afterRefresh.syncAcceptedSequence) === acceptedSequence, cloudAckStable: Number(afterRefresh.acknowledgedCloudRevision) === 5, receiptStable: receiptsAfterRefresh === originalReceiptCount })})`);
+    }
+    const forgedRefresh = await machineRequest({ base: `http://127.0.0.1:${appPort}`, path: '/api/hub-agent/v2/sync', machineSecret: customerFixture.machineSecret, body: {
+      serial: customerFixture.identityOneSerial, identityGeneration: customerFixture.identityOneGeneration,
+      ...baseEnvelope, configurationRefreshOnly: true, fromSequence: acceptedSequence + 1, toSequence: acceptedSequence + 1,
+      events: [staleEvent], queueDepth: 1,
+    } });
+    if (forgedRefresh.response.status !== 400) fail('The configuration-only mode accepted an event-bearing request');
+    const appliedAck = await machineRequest({ base: `http://127.0.0.1:${appPort}`, path: '/api/hub-agent/v2/sync', machineSecret: customerFixture.machineSecret, body: {
+      serial: customerFixture.identityOneSerial, identityGeneration: customerFixture.identityOneGeneration,
+      ...baseEnvelope, fromSequence: acceptedSequence + 1, toSequence: acceptedSequence, events: [], queueDepth: 0,
+      acknowledgedCloudRevision: Number(refresh.body.cloudRevision),
+    } });
+    const afterAppliedAck = await prisma.hubInstallation.findUniqueOrThrow({ where: { id: hubInstallationId }, select: {
+      syncStreamId: true, syncAcceptedSequence: true, acknowledgedCloudRevision: true,
+    } });
+    if (appliedAck.response.status !== 200 || Number(afterAppliedAck.syncAcceptedSequence) !== acceptedSequence
+      || Number(afterAppliedAck.acknowledgedCloudRevision) !== Number(refresh.body.cloudRevision)
+      || (await prisma.area.findUnique({ where: { homeId_osAreaId: { homeId: customerFixture.homeOneId, osAreaId: areaId } }, select: { id: true } }))
+      || await prisma.hubSyncReceipt.count({ where: { hubInstallationId } }) !== originalReceiptCount) {
+      fail('Applying refreshed configuration did not preserve the event cursor, receipts, and domain rows');
+    }
+    console.log('[stage5:integration] PASS: stale configuration acknowledgement is recovered through an authenticated configuration-only refresh; queued events, stream cursor, receipts, and domain rows remain unchanged until a separate current-revision sync');
+  } finally {
+    await prisma.area.deleteMany({ where: { homeId: customerFixture.homeOneId, osAreaId: areaId } }).catch(() => {});
+    await prisma.hubInstallation.update({ where: { id: hubInstallationId }, data: original }).catch(() => {});
+  }
+}
+
 async function verifyStage11PropertyDisableAcknowledgement() {
   if (!pendingStage11AutomationDisableAck || !customerFixture) fail('The property-automation disable acknowledgement scenario was not prepared');
   const expected = pendingStage11AutomationDisableAck.expectedRevision;
@@ -10391,10 +10488,17 @@ try {
   await customerAuthenticationLifecycleChecks(deliveryEnv);
   await customerAuthorizationChecks(deliveryEnv);
   const stage12AlexaOnly = process.env.STAGE12_ALEXA_ONLY === '1';
-  if (stage12AlexaOnly || (process.env.STAGE6_TRANSFER_ONLY !== '1' && process.env.STAGE6_TENANT_REMOVAL_ONLY !== '1')) {
+  const stage5SyncRecoveryOnly = process.env.STAGE5_SYNC_RECOVERY_ONLY === '1';
+  if (!stage5SyncRecoveryOnly && (stage12AlexaOnly || (process.env.STAGE6_TRANSFER_ONLY !== '1' && process.env.STAGE6_TENANT_REMOVAL_ONLY !== '1'))) {
     await nativeAlexaOAuthChecks(deliveryEnv);
   }
-  if (stage12AlexaOnly) {
+  if (stage5SyncRecoveryOnly) {
+    await pendingInvitationRouteChecks(deliveryEnv);
+    await mobileSessionContractChecks();
+    await installationBootstrapChecks();
+    await osChecks();
+    await hubSyncConfigurationRefreshChecks();
+  } else if (stage12AlexaOnly) {
     // Focused development mode still runs the real disposable auth fixture
     // and actual OAuth routes, while the normal maintained package command
     // continues to execute the complete integration suite.
@@ -10407,6 +10511,7 @@ try {
     await mobileSessionContractChecks();
     await installationBootstrapChecks();
     await osChecks();
+    await hubSyncConfigurationRefreshChecks();
     await operatorMutationChecks();
     await verifyStage11PropertyDisableAcknowledgement();
     await tenantMembershipRemovalChecks();
@@ -10415,7 +10520,8 @@ try {
     await fullHomeDeregistrationChecks(deliveryEnv);
   }
   const childTargets = verifyChildOutboundTargets();
-  if (stage12AlexaOnly) console.log(`[stage12:integration] PASS: focused Alexa OAuth route checks completed against disposable PostgreSQL; parent=${[...outboundTargets].sort().join(',')}; children=${childTargets.join(',')}`);
+  if (stage5SyncRecoveryOnly) console.log(`[stage5:integration] PASS: focused signed Native V2 configuration-recovery route checks completed against disposable PostgreSQL; parent=${[...outboundTargets].sort().join(',')}; children=${childTargets.join(',')}`);
+  else if (stage12AlexaOnly) console.log(`[stage12:integration] PASS: focused Alexa OAuth route checks completed against disposable PostgreSQL; parent=${[...outboundTargets].sort().join(',')}; children=${childTargets.join(',')}`);
   else console.log(`[stage1:integration] PASS: live Platform routes, locked Dinodia OS HTTP, browser isolation, authenticated native WebSocket command authorization and denial exercised against disposable PostgreSQL; parent=${[...outboundTargets].sort().join(',')}; children=${childTargets.join(',')}`);
 } finally {
   await cleanup();

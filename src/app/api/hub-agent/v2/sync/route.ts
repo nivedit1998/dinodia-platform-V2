@@ -97,6 +97,41 @@ export async function POST(request: Request) {
             || syncMode === 'UNAVAILABLE') {
             throw new Stage1AuthError(401, 'hub_sync_authority_changed', 'The enrolled hub no longer has current synchronization authority');
           }
+          if (envelope.configurationRefreshOnly === true) {
+            if (syncMode !== 'ACTIVE') throw new Stage1AuthError(409, 'hub_sync_configuration_refresh_unavailable', 'Configuration refresh is available only to an active Home installation');
+            if (envelope.events.length !== 0) throw new Stage1AuthError(400, 'hub_sync_configuration_refresh_invalid', 'A configuration refresh cannot contain event data');
+            const candidate = await buildHubCloudConfiguration(tx, { homeId: current.homeId, hubInstallationId: current.id });
+            const sameRevisionConfiguration = finalizeHubCloudConfiguration(candidate, current.cloudConfigurationRevision);
+            const cloudConfigurationRevision = sameRevisionConfiguration.checksum === current.cloudConfigurationChecksum
+              ? current.cloudConfigurationRevision : current.cloudConfigurationRevision + 1;
+            const configuration = finalizeHubCloudConfiguration(candidate, cloudConfigurationRevision);
+            if (cloudConfigurationRevision !== current.cloudConfigurationRevision
+              || configuration.checksum !== current.cloudConfigurationChecksum) {
+              const updated = await tx.hubInstallation.updateMany({
+                where: { id: current.id, homeId: current.homeId, syncStreamId: current.syncStreamId,
+                  syncAcceptedSequence: current.syncAcceptedSequence, cloudConfigurationRevision: current.cloudConfigurationRevision,
+                  cloudConfigurationChecksum: current.cloudConfigurationChecksum },
+                data: { cloudConfigurationRevision, cloudConfigurationChecksum: configuration.checksum },
+              });
+              if (updated.count !== 1) throw new Stage1AuthError(409, 'hub_sync_configuration_race', 'Cloud policy changed during configuration refresh; request the current configuration again');
+            }
+            // This authenticated read/refresh applies no events and does not
+            // advance the stream, event cursor, acknowledged cloud revision,
+            // or receipt ledger. The hub must separately apply this snapshot
+            // and acknowledge its revision with an ordinary empty/inventory
+            // sync before any queued event can be accepted.
+            return {
+              configurationRefreshOnly: true,
+              streamId: envelope.streamId,
+              syncStreamId: current.syncStreamId,
+              syncAcceptedSequence: Number(current.syncAcceptedSequence),
+              cloudRevision: configuration.revision,
+              configurationAppliedRevision: Number(envelope.acknowledgedCloudRevision),
+              configuration,
+              resnapshotRequired: Boolean(syncStatus?.gapDetected || syncStatus?.criticalBacklog),
+              nextPollAfterSeconds: 30,
+            };
+          }
           if (syncMode === 'INSTALLATION_BOOTSTRAP' && (envelope.events.length === 0 || envelope.events.some((event) => !isInstallationBootstrapEvent(event)))) {
             throw new Stage1AuthError(409, envelope.events.length === 0 ? 'hub_sync_installation_area_required' : 'hub_sync_installation_area_only', 'An ownerless or in-progress installation may synchronize only bounded installer events');
           }

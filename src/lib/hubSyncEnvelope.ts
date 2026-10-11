@@ -23,6 +23,7 @@ export type HubSyncEnvelope = {
   events: HubSyncEvent[];
   queueDepth: number;
   acknowledgedCloudRevision: number;
+  configurationRefreshOnly?: true;
   runtime: { kind: 'dinodia_os'; version: string; capabilities: Record<string, unknown> };
   sentAt: string;
 };
@@ -249,7 +250,10 @@ function validEvent(event: unknown): event is HubSyncEvent {
 
 export function validateHubSyncEnvelope(value: unknown, rawBody?: string): value is HubSyncEnvelope {
   if (rawBody !== undefined && Buffer.byteLength(rawBody, 'utf8') > HUB_SYNC_MAX_BODY_BYTES) return false;
-  if (!object(value) || !exactKeys(value, ['schemaVersion', 'hubInstallationId', 'streamId', 'fromSequence', 'toSequence', 'events', 'queueDepth', 'acknowledgedCloudRevision', 'runtime', 'sentAt'])
+  const baseKeys = ['schemaVersion', 'hubInstallationId', 'streamId', 'fromSequence', 'toSequence', 'events', 'queueDepth', 'acknowledgedCloudRevision', 'runtime', 'sentAt'];
+  const configurationRefreshOnly = object(value) && value.configurationRefreshOnly === true;
+  if (!object(value) || (!exactKeys(value, baseKeys)
+    && !(configurationRefreshOnly && exactKeys(value, [...baseKeys, 'configurationRefreshOnly'])))
     || value.schemaVersion !== 1 || typeof value.hubInstallationId !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value.hubInstallationId)
     || typeof value.streamId !== 'string' || !/^[a-zA-Z0-9._:-]{16,80}$/.test(value.streamId)
     || !Number.isSafeInteger(value.fromSequence) || !Number.isSafeInteger(value.toSequence)
@@ -267,6 +271,7 @@ export function validateHubSyncEnvelope(value: unknown, rawBody?: string): value
     || !(syncStatus.lastErrorCode === null || boundedText(syncStatus.lastErrorCode, 80)))) return false;
   const events = value.events;
   if (!events.every(validEvent)) return false;
+  if (configurationRefreshOnly && events.length !== 0) return false;
   if (new Set(events.map((event) => event.id)).size !== events.length || Number(value.queueDepth) < events.length) return false;
   if (events.length === 0) {
     if (Number(value.fromSequence) !== Number(value.toSequence) + 1) return false;
