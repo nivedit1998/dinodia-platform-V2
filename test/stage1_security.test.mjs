@@ -157,13 +157,13 @@ function loadTypeScriptModule(relativePath, overrides = {}) {
   return module.exports;
 }
 
-test('retired operator-day environment settings cannot change permanent session bounds', () => {
+test('owner-approved Portal and assigned OS session bounds are absolute and ignore retired bypass settings', () => {
   const previousFlag = process.env.STAGE1_INTERNAL_OPERATOR_DAY_SESSION;
   process.env.STAGE1_INTERNAL_OPERATOR_DAY_SESSION = 'true';
   try {
     const { EMPLOYEE_SESSION_SECONDS, OPERATOR_SESSION_SECONDS, stage1NowMs } = loadTypeScriptModule('src/lib/stage1SessionPolicy.ts');
-    assert.equal(EMPLOYEE_SESSION_SECONDS, 8 * 60 * 60);
-    assert.equal(OPERATOR_SESSION_SECONDS, 15 * 60);
+    assert.equal(EMPLOYEE_SESSION_SECONDS, 24 * 60 * 60);
+    assert.equal(OPERATOR_SESSION_SECONDS, 30 * 60);
     assert.equal(stage1NowMs({ NODE_ENV: 'production', V2_ENVIRONMENT: 'production', STAGE1_TEST_NOW_MS: '1900000000000' }) !== 1900000000000, true, 'Production must ignore the test clock');
     assert.equal(stage1NowMs({ NODE_ENV: 'test', V2_ENVIRONMENT: 'test', STAGE1_TEST_NOW_MS: '1900000000000' }), 1900000000000, 'the disposable integration harness retains its controlled-clock seam');
   } finally {
@@ -414,7 +414,7 @@ test('native expiry handlers use stable bounded oldest-first batches and conditi
   assert.deepEqual(conditionalUpdate?.where, { id: 'request:1', status: { in: ['REQUESTED', 'APPROVED', 'ISSUED'] }, codeExpiresAt: { lte: new Date('2026-09-29T12:00:00Z') } });
 });
 
-test('OS admin grants remain 15-minute with the retired flag and reject old one-day grants', () => {
+test('OS grants are 30-minute absolute, preserve genuine authentication time, and reject retired marked grants', () => {
   const crypto = createRequire(import.meta.url)('node:crypto');
   const keys = crypto.generateKeyPairSync('ed25519');
   const privateKey = keys.privateKey.export({ type: 'pkcs8', format: 'pem' }).toString();
@@ -426,7 +426,8 @@ test('OS admin grants remain 15-minute with the retired flag and reject old one-
     const { createHubBoundOperatorGrant, verifyHubBoundOperatorGrant } = loadTypeScriptModule('src/lib/stage1Operator.ts', {
       './hubOperatorCredentials': { encryptToHubKey() { throw new Error('not used'); } },
       './stage1SessionPolicy': {
-        OPERATOR_SESSION_SECONDS: 900,
+        EMPLOYEE_SESSION_SECONDS: 86400,
+        OPERATOR_SESSION_SECONDS: 1800,
         stage1NowMs: () => Date.now(),
       },
     });
@@ -434,10 +435,10 @@ test('OS admin grants remain 15-minute with the retired flag and reject old one-
     const grant = createHubBoundOperatorGrant({ employeeId: 'employee-1', hubId: 'serial-1', workflowId: 'work-1', scope: ['os:admin'], recentAuthAt: issuedAt, issuedAt, expiresAt: issuedAt + 86_400_000 });
     const verifyInput = { hubId: 'serial-1', workflowId: 'work-1', requiredScope: 'os:admin', employeeId: 'employee-1' };
     const decoded = JSON.parse(Buffer.from(grant.split('.')[2], 'base64url').toString('utf8'));
-    assert.equal(decoded.exp - decoded.iat, 900, 'stale opt-in cannot extend a new signed grant');
+    assert.equal(decoded.exp - decoded.iat, 1800, 'retired flags cannot shorten or extend the owner-approved absolute lifetime');
     assert.equal(decoded.sessionPolicy, undefined, 'new grants omit the retired policy marker');
-    assert.ok(verifyHubBoundOperatorGrant(grant, verifyInput, issuedAt + 14 * 60 * 1000));
-    assert.equal(verifyHubBoundOperatorGrant(grant, verifyInput, issuedAt + 15 * 60 * 1000), null);
+    assert.ok(verifyHubBoundOperatorGrant(grant, verifyInput, issuedAt + 29 * 60 * 1000));
+    assert.equal(verifyHubBoundOperatorGrant(grant, verifyInput, issuedAt + 30 * 60 * 1000), null);
     const legacyPayload = { ...decoded, exp: decoded.iat + 86400, sessionPolicy: 'STAGE1_INTERNAL_OPERATOR_DAY_SESSION' };
     const encode = (value) => Buffer.from(JSON.stringify(value), 'utf8').toString('base64url');
     const legacyHeader = encode({ alg: 'EdDSA', typ: 'DNO-OPS-1' });
@@ -499,6 +500,8 @@ test('operator handoff proves a one-use secret inside the hub channel', () => {
   assert.match(launch, /handoffSecret/);
   assert.match(launch, /handoffHash: sha256\(handoffSecret\)/);
   assert.match(launch, /handoffEnvelope/);
+  assert.match(launch, /requireEmployee\(/, 'routine assigned-work launch uses a current active employee session');
+  assert.doesNotMatch(launch, /requireEmployeeRecentAuth/);
   assert.doesNotMatch(launch, /handoffSecret,.*NextResponse/);
   assert.match(consume, /phase === 'prepare'/);
   assert.match(consume, /sha256\(handoffSecret\) !== handoff\.handoffHash/);
@@ -578,12 +581,43 @@ test('employee sessions use the employee lifetime while customer hub tokens rema
   const { signStage1Token, verifyStage1Token } = loadTypeScriptModule('src/lib/stage1Crypto.ts');
   const now = 1_900_000_000_000;
   const issuedAt = Math.floor(now / 1000);
-  const employee = signStage1Token('employee', { id: 'employee-1', sessionId: 'session-1', areaIds: [], scopes: ['company:portal'], policyRevision: 0, issuedAt, expiresAt: issuedAt + 8 * 60 * 60 }, privateKey);
+  const employee = signStage1Token('employee', { id: 'employee-1', sessionId: 'session-1', areaIds: [], scopes: ['company:portal'], policyRevision: 0, issuedAt, expiresAt: issuedAt + 24 * 60 * 60 }, privateKey);
   assert.equal(verifyStage1Token(employee, 'employee', [publicKey], now)?.id, 'employee-1');
+  assert.equal(verifyStage1Token(employee, 'employee', [publicKey], now + 24 * 60 * 60 * 1000 - 1000)?.expiresAt, issuedAt + 24 * 60 * 60,
+    'the same absolute Portal deadline remains valid at 23:59:59 without refresh');
+  assert.equal(verifyStage1Token(employee, 'employee', [publicKey], now + 24 * 60 * 60 * 1000), null,
+    'Portal authentication expires at the exact 24-hour boundary');
+  const overlongEmployee = signStage1Token('employee', { id: 'employee-1', sessionId: 'session-2', areaIds: [], scopes: ['company:portal'], policyRevision: 0, issuedAt, expiresAt: issuedAt + 24 * 60 * 60 + 1 }, privateKey);
+  assert.equal(verifyStage1Token(overlongEmployee, 'employee', [publicKey], now), null);
   const customer = signStage1Token('customer', { id: 'customer-1', sessionId: 'session-1', homeId: 'home-1', membershipId: 'membership-1', trustedDeviceId: 'device-1', hubInstallationId: 'hub-1', role: 'TENANT', areaIds: ['area-1'], scopes: ['tenant:device-command'], policyRevision: 1, issuedAt, expiresAt: issuedAt + 300 }, privateKey);
   assert.equal(verifyStage1Token(customer, 'customer', [publicKey], now)?.id, 'customer-1');
   const overlongCustomer = signStage1Token('customer', { id: 'customer-1', sessionId: 'session-1', homeId: 'home-1', membershipId: 'membership-1', trustedDeviceId: 'device-1', hubInstallationId: 'hub-1', role: 'TENANT', areaIds: [], scopes: [], policyRevision: 1, issuedAt, expiresAt: issuedAt + 301 }, privateKey);
   assert.equal(verifyStage1Token(overlongCustomer, 'customer', [publicKey], now), null);
+});
+
+test('every Company Portal staff page shows a monotonic server-anchored 24-hour absolute expiry', () => {
+  const route = read('src/app/api/company/auth/session/route.ts');
+  const component = read('src/app/PortalSessionStatus.tsx');
+  const layout = read('src/app/layout.tsx');
+  assert.match(route, /expiresAt: new Date\(principal\.expiresAt\)\.toISOString\(\), serverNow: new Date\(stage1NowMs\(\)\)\.toISOString\(\)/);
+  assert.match(layout, /<PortalSessionStatus \/>/);
+  assert.match(component, /performance\.now\(\)/);
+  assert.match(component, /visibilitychange/);
+  assert.match(component, /does not extend it/);
+  assert.match(component, /has not been declared expired/);
+  assert.doesNotMatch(component, /localStorage|sessionStorage|document\.cookie/);
+});
+
+test('routine assigned-work issuance is idempotently reconciled before charging bounded launch quotas', () => {
+  const launch = read('src/app/api/installer/home-support/homes/[homeId]/os-access/launch/route.ts');
+  const replayCheck = launch.indexOf('if (existing)');
+  const quotaCharge = launch.indexOf('await enforcePersistentRateLimitInTransaction');
+  assert.ok(replayCheck >= 0 && quotaCharge > replayCheck, 'same-attempt reconciliation must precede new-issuance quota charges');
+  assert.match(launch, /operator-launch:\$\{employee\.id\}:\$\{homeId\}`, 8, 15 \* 60 \* 1000/);
+  assert.match(launch, /operator-launch-hour:\$\{employee\.id\}`, 32, 60 \* 60 \* 1000/);
+  assert.match(launch, /isolationLevel: 'Serializable'/);
+  assert.match(launch, /transactionAttempt < 3/);
+  assert.match(launch, /P2002.*P2034/);
 });
 
 test('step-up target digests use one canonical representation for issue and consume', () => {

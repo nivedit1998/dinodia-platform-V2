@@ -1,6 +1,6 @@
 import crypto from 'node:crypto';
 import { encryptToHubKey } from './hubOperatorCredentials';
-import { OPERATOR_SESSION_SECONDS, stage1NowMs } from './stage1SessionPolicy';
+import { EMPLOYEE_SESSION_SECONDS, OPERATOR_SESSION_SECONDS, stage1NowMs } from './stage1SessionPolicy';
 
 function encode(value: unknown): string { return Buffer.from(JSON.stringify(value), 'utf8').toString('base64url'); }
 
@@ -119,7 +119,8 @@ export function verifyHubBoundOperatorGrant(token: string, input: { hubId: strin
   const iat = Number(payload.iat);
   const recentAuthAt = Number(payload.recentAuthAt);
   const scopes = Array.isArray(payload.scope) ? payload.scope.map(String) : [];
-  if (!payload.sub || !payload.sid || !payload.jti || payload.hubId !== input.hubId || payload.workflow !== input.workflowId || !scopes.includes(input.requiredScope) || !Number.isSafeInteger(iat) || !Number.isSafeInteger(exp) || exp <= nowSeconds || exp - iat > OPERATOR_SESSION_SECONDS || payload.sessionPolicy !== undefined || !Number.isFinite(recentAuthAt) || recentAuthAt > iat * 1000 + 5000 || iat * 1000 - recentAuthAt > 5 * 60 * 1000) return null;
+  if (!payload.sub || !payload.sid || !payload.jti || payload.hubId !== input.hubId || payload.workflow !== input.workflowId || !scopes.includes(input.requiredScope) || !Number.isSafeInteger(iat) || !Number.isSafeInteger(exp) || exp <= nowSeconds || exp - iat > OPERATOR_SESSION_SECONDS || payload.sessionPolicy !== undefined || !Number.isFinite(recentAuthAt) || recentAuthAt > iat * 1000 + 5000 || iat * 1000 - recentAuthAt > EMPLOYEE_SESSION_SECONDS * 1000) return null;
+  if (scopes.includes('support:redeem') && now - recentAuthAt > 5 * 60 * 1000) return null;
   if (input.employeeId && payload.sub !== input.employeeId) return null;
   if (input.requestId && payload.requestId !== input.requestId) return null;
   if (input.homeId && payload.homeId !== input.homeId) return null;

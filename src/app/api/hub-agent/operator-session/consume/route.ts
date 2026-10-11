@@ -23,7 +23,7 @@ export async function POST(request: Request) {
     if (phase === 'consume' && !/^[A-Za-z0-9_-]{32,256}$/.test(handoffSecret)) throw new Stage1AuthError(401, 'handoff_secret_required', 'The hub must prove possession of the one-use handoff secret');
     const now = new Date(stage1NowMs());
     const result = await prisma.$transaction(async (tx) => {
-      const handoff = await tx.operatorHandoff.findUnique({ where: { id: handoffId }, select: { id: true, employeeId: true, workflowId: true, homeId: true, hubInstallationId: true, operatorBrowserAttemptId: true, setupAttemptId: true, scope: true, expiresAt: true, consumedAt: true, revokedAt: true, browserBindingHash: true, handoffHash: true, handoffEnvelope: true } });
+      const handoff = await tx.operatorHandoff.findUnique({ where: { id: handoffId }, select: { id: true, employeeId: true, workflowId: true, homeId: true, hubInstallationId: true, operatorBrowserAttemptId: true, setupAttemptId: true, scope: true, createdAt: true, expiresAt: true, consumedAt: true, revokedAt: true, browserBindingHash: true, handoffHash: true, handoffEnvelope: true } });
       if (!handoff || handoff.hubInstallationId !== hub.installation.id || handoff.homeId !== hub.installation.homeId || !isStrictlyUnexpired(handoff.expiresAt, now) || handoff.consumedAt || handoff.revokedAt) throw new Stage1AuthError(401, 'handoff_rejected', 'The operator handoff is invalid or expired');
       if (!handoff.operatorBrowserAttemptId) throw new Stage1AuthError(401, 'handoff_attempt_missing', 'The operator handoff has no hub-created browser attempt');
       const browserAttempt = await tx.operatorBrowserAttempt.findUnique({ where: { id: handoff.operatorBrowserAttemptId }, select: { id: true, attemptId: true, homeId: true, hubInstallationId: true, browserBindingHash: true, accessMode: true, endpointOrigin: true, endpointRevision: true, expiresAt: true, consumedAt: true, revokedAt: true } });
@@ -57,6 +57,10 @@ export async function POST(request: Request) {
       const employeeSessionId = String(handoffScope.employeeSessionId ?? '');
       const workRevision = Number(handoffScope.workRevision);
       if (!employeeSessionId || !Number.isInteger(workRevision) || workRevision !== work.workRevision || String(handoffScope.serialNumber ?? '') !== hub.identity.serialNumber || Number(handoffScope.identityGeneration) !== Number(hub.identity.identityGeneration) || work.certifiedSerialNumber !== hub.identity.serialNumber) throw new Stage1AuthError(403, 'workflow_authority_stale', 'The operator workflow authority has changed');
+      const employeeSession = await tx.employeeSession.findUnique({ where: { id: employeeSessionId }, select: { id: true, employeeId: true, status: true, revokedAt: true, createdAt: true, expiresAt: true, recentAuthenticatedAt: true } });
+      if (!employeeSession || employeeSession.employeeId !== handoff.employeeId || employeeSession.status !== 'ACTIVE' || employeeSession.revokedAt
+        || employeeSession.createdAt > handoff.createdAt || handoff.createdAt >= employeeSession.expiresAt
+        || employeeSession.expiresAt.getTime() - employeeSession.createdAt.getTime() > 24 * 60 * 60 * 1000) throw new Stage1AuthError(403, 'employee_session_revoked', 'The employee session that authorized this handoff is no longer active');
       let requestId: string | undefined;
       let areaOptions: Array<{ id: string; name: string }> | undefined;
       if (permanentInstallation) {
@@ -76,9 +80,9 @@ export async function POST(request: Request) {
       const grantExpiresAt = issuedAt + sessionLifetimeSeconds * 1000;
       const operatorJti = crypto.randomUUID();
       const credentialVersion = credential?.version ?? 0;
-      const grant = createHubBoundOperatorGrant({ employeeId: handoff.employeeId, hubId: hub.installation.serialNumberSnapshot, workflowId: handoff.workflowId, scope: permanentInstallation ? scopes : ['os:admin'], ...(areaOptions ? { areaIds: areaOptions.map((area) => area.id), areaOptions } : {}), ...(requestId ? { requestId } : {}), recentAuthAt: issuedAt, issuedAt, expiresAt: grantExpiresAt, credentialVersion, homeId: handoff.homeId, identityGeneration: hub.identity.identityGeneration, handoffId: handoff.id, employeeSessionId, workRevision, operatorJti });
+      const grant = createHubBoundOperatorGrant({ employeeId: handoff.employeeId, hubId: hub.installation.serialNumberSnapshot, workflowId: handoff.workflowId, scope: permanentInstallation ? scopes : ['os:admin'], ...(areaOptions ? { areaIds: areaOptions.map((area) => area.id), areaOptions } : {}), ...(requestId ? { requestId } : {}), recentAuthAt: employeeSession.recentAuthenticatedAt.getTime(), issuedAt, expiresAt: grantExpiresAt, credentialVersion, homeId: handoff.homeId, identityGeneration: hub.identity.identityGeneration, handoffId: handoff.id, employeeSessionId, workRevision, operatorJti });
       const encryptedSessionGrant = encryptOperatorGrant(grant, hub.identity.encryptionPublicKey, 1);
-      const consumed = await tx.operatorHandoff.updateMany({ where: { id: handoff.id, consumedAt: null, revokedAt: null, expiresAt: { gt: now }, setupAttemptId, browserBindingHash: sha256(browserBinding) }, data: { consumedAt: now, scope: { ...handoffScope, operatorJti, credentialVersion } } });
+      const consumed = await tx.operatorHandoff.updateMany({ where: { id: handoff.id, consumedAt: null, revokedAt: null, expiresAt: { gt: now }, setupAttemptId, browserBindingHash: sha256(browserBinding) }, data: { consumedAt: now, scope: { ...handoffScope, operatorJti, credentialVersion, operatorIssuedAt: issuedAt, operatorExpiresAt: grantExpiresAt } } });
       if (consumed.count !== 1) throw new Stage1AuthError(401, 'handoff_replay', 'The operator handoff was already consumed or revoked');
       const attemptConsumed = await tx.operatorBrowserAttempt.updateMany({ where: { id: browserAttempt.id, consumedAt: null, revokedAt: null, expiresAt: { gt: now } }, data: { consumedAt: now } });
       if (attemptConsumed.count !== 1) throw new Stage1AuthError(401, 'handoff_browser_replay', 'The originating browser attempt was already consumed or revoked');

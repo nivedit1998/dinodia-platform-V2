@@ -1,6 +1,6 @@
-/** Permanent Stage 1 session bounds. The retired one-day exception is not read. */
-export const EMPLOYEE_SESSION_SECONDS = 8 * 60 * 60;
-export const OPERATOR_SESSION_SECONDS = 15 * 60;
+/** Owner-approved absolute Company Portal and assigned OS session bounds. */
+export const EMPLOYEE_SESSION_SECONDS = 24 * 60 * 60;
+export const OPERATOR_SESSION_SECONDS = 30 * 60;
 
 /** Test-only clock seam; Production always follows the system clock. */
 export function stage1NowMs(env: NodeJS.ProcessEnv = process.env): number {

@@ -2,8 +2,8 @@ import crypto from 'node:crypto';
 import { NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
 import { verifyPassword } from '@/lib/passwords';
-import { signStage1Token } from '@/lib/stage1Crypto';
-import { authErrorResponse, recordFailedAuthentication, requireEmployee, requireEmployeeToken, Stage1AuthError } from '@/lib/stage1Auth';
+import { parsePublicKeys, sha256, signStage1Token, verifyStage1Token } from '@/lib/stage1Crypto';
+import { authErrorResponse, recordFailedAuthentication, requireEmployee, Stage1AuthError } from '@/lib/stage1Auth';
 import { enforcePersistentRateLimit } from '@/lib/rateLimit';
 import { EMPLOYEE_SESSION_SECONDS, stage1NowMs } from '@/lib/stage1SessionPolicy';
 
@@ -52,14 +52,25 @@ export async function DELETE(request: Request) {
   const value = request.headers.get('cookie')?.split(';').map((part) => part.trim()).find((part) => part.startsWith('dinodia_employee_session='))?.slice('dinodia_employee_session='.length) ?? '';
   if (value) {
     try {
-      const principal = await requireEmployeeToken(decodeURIComponent(value));
+      // A legitimately expired signed cookie may still be presented on an
+      // explicit logout request. Verify its signature and exact durable row,
+      // then revoke only that session and its derivative OS handoffs. Natural
+      // expiry alone never marks the row revoked.
+      const token = decodeURIComponent(value);
+      const verified = verifyStage1Token(token, 'employee', parsePublicKeys(process.env.COMPANY_PORTAL_SESSION_PUBLIC_KEYS), stage1NowMs(), EMPLOYEE_SESSION_SECONDS, true);
+      if (!verified || verified.issuedAt > Math.floor(stage1NowMs() / 1000) + 5) throw new Stage1AuthError(401, 'employee_session_invalid', 'The Company Portal session is invalid');
       const now = new Date(stage1NowMs());
       await prisma.$transaction(async (tx) => {
-        await tx.employeeSession.updateMany({ where: { id: principal.sessionId, employeeId: principal.id, status: 'ACTIVE' }, data: { status: 'REVOKED', revokedAt: now } });
-        const candidates = await tx.operatorHandoff.findMany({ where: { employeeId: principal.id, consumedAt: { not: null }, revokedAt: null }, select: { id: true, scope: true } });
-        const owned = candidates.filter((row) => row.scope && typeof row.scope === 'object' && !Array.isArray(row.scope) && (row.scope as Record<string, unknown>).employeeSessionId === principal.sessionId);
+        const session = await tx.employeeSession.findUnique({ where: { id: verified.sessionId }, select: { id: true, employeeId: true, tokenHash: true, status: true, createdAt: true, expiresAt: true } });
+        const tokenDeadline = verified.expiresAt * 1000;
+        if (!session || session.employeeId !== verified.id || session.tokenHash !== sha256(verified.sessionId)
+          || session.expiresAt.getTime() - tokenDeadline < 0 || session.expiresAt.getTime() - tokenDeadline >= 1000
+          || session.expiresAt.getTime() - session.createdAt.getTime() > EMPLOYEE_SESSION_SECONDS * 1000) return;
+        await tx.employeeSession.updateMany({ where: { id: verified.sessionId, employeeId: verified.id, status: 'ACTIVE' }, data: { status: 'REVOKED', revokedAt: now } });
+        const candidates = await tx.operatorHandoff.findMany({ where: { employeeId: verified.id, consumedAt: { not: null }, revokedAt: null }, select: { id: true, scope: true } });
+        const owned = candidates.filter((row) => row.scope && typeof row.scope === 'object' && !Array.isArray(row.scope) && (row.scope as Record<string, unknown>).employeeSessionId === verified.sessionId);
         for (const row of owned) await tx.operatorHandoff.updateMany({ where: { id: row.id, revokedAt: null }, data: { revokedAt: now } });
-        await tx.auditEvent.create({ data: { actorType: 'EMPLOYEE', actorId: principal.id, category: 'SECURITY', action: 'employee_logout_succeeded', targetType: 'EmployeeSession', targetId: principal.sessionId, metadata: { outcome: 'revoked', affectedOperatorHandoffs: owned.length }, purgeAt: new Date(now.getTime() + 365 * 24 * 60 * 60 * 1000) } });
+        await tx.auditEvent.create({ data: { actorType: 'EMPLOYEE', actorId: verified.id, category: 'SECURITY', action: 'employee_logout_succeeded', targetType: 'EmployeeSession', targetId: verified.sessionId, metadata: { outcome: 'revoked', affectedOperatorHandoffs: owned.length }, purgeAt: new Date(now.getTime() + 365 * 24 * 60 * 60 * 1000) } });
       });
     } catch {
       // Logout is idempotent for an expired or already-invalid cookie.
@@ -71,7 +82,7 @@ export async function DELETE(request: Request) {
 export async function GET(request: Request) {
   try {
     const principal = await requireEmployee(request);
-    return NextResponse.json({ ok: true, expiresAt: new Date(principal.expiresAt).toISOString() }, { headers: { 'Cache-Control': 'no-store', Pragma: 'no-cache' } });
+    return NextResponse.json({ ok: true, expiresAt: new Date(principal.expiresAt).toISOString(), serverNow: new Date(stage1NowMs()).toISOString() }, { headers: { 'Cache-Control': 'no-store', Pragma: 'no-cache' } });
   } catch (error) {
     const response = authErrorResponse(error);
     if (error instanceof Stage1AuthError && ['employee_session_invalid', 'employee_session_revoked', 'employee_revoked'].includes(error.code)

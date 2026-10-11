@@ -18,7 +18,7 @@ export async function POST(request: Request) {
     const jti = String(hub.body.jti ?? '');
     const credentialVersion = Number(hub.body.credentialVersion ?? 0);
     if (!/^[0-9a-f-]{36}$/i.test(handoffId) || !/^[A-Za-z0-9_-]{16,128}$/.test(jti) || !Number.isSafeInteger(credentialVersion) || credentialVersion < 0) throw new Stage1AuthError(400, 'operator_revalidation_fields_invalid', 'The operator session check is invalid');
-    const handoff = await prisma.operatorHandoff.findUnique({ where: { id: handoffId }, select: { id: true, employeeId: true, workflowId: true, homeId: true, hubInstallationId: true, consumedAt: true, revokedAt: true, scope: true } });
+    const handoff = await prisma.operatorHandoff.findUnique({ where: { id: handoffId }, select: { id: true, employeeId: true, workflowId: true, homeId: true, hubInstallationId: true, createdAt: true, consumedAt: true, revokedAt: true, scope: true } });
     if (!handoff || !handoff.consumedAt || handoff.revokedAt || handoff.hubInstallationId !== hub.installation.id || handoff.homeId !== hub.installation.homeId) throw new Stage1AuthError(401, 'operator_session_revoked', 'The Dinodia OS operator session is no longer authorised');
     const scope = handoff.scope && typeof handoff.scope === 'object' && !Array.isArray(handoff.scope) ? handoff.scope as Record<string, unknown> : {};
     if (!machineAuthPresent && String(scope.accessMode ?? '') !== 'local') throw new Stage1AuthError(401, 'operator_revalidation_machine_auth_required', 'Secure operator sessions require the active installation machine credential');
@@ -32,17 +32,33 @@ export async function POST(request: Request) {
       prisma.hubInstallation.findUnique({ where: { id: handoff.hubInstallationId }, select: { id: true, homeId: true, state: true, serialNumberSnapshot: true, manufacturingIdentity: { select: { identityGeneration: true, status: true } } } }),
       credentialVersion > 0 ? prisma.hubCredentialVersion.findFirst({ where: { hubInstallationId: handoff.hubInstallationId, purpose: 'operator-credential', version: credentialVersion }, select: { state: true, revokedReason: true } }) : Promise.resolve(null),
     ]);
-    if (!employee || employee.status !== 'ACTIVE' || !employeeSession || employeeSession.employeeId !== employee.id || employeeSession.status !== 'ACTIVE' || employeeSession.revokedAt || employeeSession.expiresAt.getTime() <= stage1NowMs() || employeeSession.expiresAt.getTime() - employeeSession.createdAt.getTime() > EMPLOYEE_SESSION_SECONDS * 1000) throw new Stage1AuthError(401, 'operator_employee_session_revoked', 'The Company Portal session is expired, retired or the employee is inactive');
+    const operatorIssuedAt = Number(scope.operatorIssuedAt);
+    const operatorExpiresAt = Number(scope.operatorExpiresAt);
+    const nowMs = stage1NowMs();
+    // The signed grant's iat is deliberately whole-second precision. Compare
+    // it against the handoff's creation second, not its millisecond value:
+    // an immediately consumed handoff can legitimately have been created
+    // later in that same second. The consumedAt upper bound still proves the
+    // durable grant was issued no later than the one-use handoff redemption.
+    const handoffCreatedSecond = Math.floor(handoff.createdAt.getTime() / 1000) * 1000;
+    const handoffConsumedSecond = handoff.consumedAt ? Math.floor(handoff.consumedAt.getTime() / 1000) * 1000 : Number.POSITIVE_INFINITY;
+    if (!employee || employee.status !== 'ACTIVE' || !employeeSession || employeeSession.employeeId !== employee.id || employeeSession.status !== 'ACTIVE' || employeeSession.revokedAt
+      || employeeSession.expiresAt.getTime() - employeeSession.createdAt.getTime() > EMPLOYEE_SESSION_SECONDS * 1000
+      || handoff.createdAt >= employeeSession.expiresAt
+      || !Number.isSafeInteger(operatorIssuedAt) || !Number.isSafeInteger(operatorExpiresAt)
+      || operatorIssuedAt < handoffCreatedSecond || operatorIssuedAt > handoffConsumedSecond || operatorIssuedAt > nowMs + 5_000
+      || operatorExpiresAt <= nowMs || operatorExpiresAt - operatorIssuedAt !== 30 * 60 * 1000) throw new Stage1AuthError(401, 'operator_employee_session_revoked', 'The Company Portal session or independently issued OS session is no longer authorised');
     const scopes = Array.isArray(scope.scopes) ? scope.scopes.map(String) : [];
     const permanentInstallation = scopes.length === 1 && scopes[0] === 'os:permanent-installation';
     if (!work || work.assignedEmployeeId !== employee.id || work.homeId !== handoff.homeId || work.hubInstallationId !== handoff.hubInstallationId || work.certifiedSerialNumber !== hub.identity.serialNumber || work.workRevision !== workRevision
       || permanentInstallation && (work.kind !== 'PERMANENT_DEVICE_INSTALLATION' || work.state !== 'IN_PROGRESS' || work.permanentInstallationRequestId !== String(scope.requestId || ''))
       || !permanentInstallation && (scopes.length !== 1 || scopes[0] !== 'os:admin' || !['ASSIGNED', 'IN_PROGRESS', 'REOPENED'].includes(work.state))) throw new Stage1AuthError(401, 'operator_work_revoked', 'The assigned installation work is no longer active');
+    let currentAreaOptions: Array<{ id: string; name: string }> = [];
     if (permanentInstallation) {
       const currentRequest = await prisma.permanentDeviceInstallationRequest.findFirst({ where: { id: String(scope.requestId || ''), homeId: handoff.homeId, status: 'IN_PROGRESS', workItem: { is: { id: work.id, assignedEmployeeId: employee.id, workRevision } } }, select: { id: true, requestedAreaId: true } });
       const areas = currentRequest ? await prisma.area.findMany({ where: { homeId: handoff.homeId, status: 'ACTIVE', ...(currentRequest.requestedAreaId ? { id: currentRequest.requestedAreaId } : {}) }, select: { id: true, originalName: true } }) : [];
-      const options = Array.isArray(scope.areaOptions) ? scope.areaOptions as Array<{ id?: unknown; name?: unknown }> : [];
-      if (!currentRequest || !areas.length || options.length !== areas.length || areas.some((area) => !options.some((option) => option.id === area.id && option.name === area.originalName))) throw new Stage1AuthError(401, 'operator_installation_scope_changed', 'The assigned original Area options changed');
+      if (!currentRequest || !areas.length) throw new Stage1AuthError(401, 'operator_installation_scope_changed', 'The assigned original Area is no longer active');
+      currentAreaOptions = areas.map((area) => ({ id: area.id, name: area.originalName }));
     }
     if (!installation || installation.state !== 'ACTIVE' || installation.homeId !== handoff.homeId || installation.serialNumberSnapshot !== hub.identity.serialNumber || installation.manufacturingIdentity?.status !== 'ACTIVE' || installation.manufacturingIdentity.identityGeneration !== hub.identity.identityGeneration || String(scope.serialNumber ?? '') !== hub.identity.serialNumber || Number(scope.identityGeneration) !== Number(hub.identity.identityGeneration)) throw new Stage1AuthError(401, 'operator_hub_replaced', 'The paired hub identity or installation is no longer active');
     if (credential?.revokedReason === 'emergency_operator_revocation') throw new Stage1AuthError(401, 'operator_credential_emergency_revoked', 'Operator access was emergency-revoked');
@@ -51,6 +67,7 @@ export async function POST(request: Request) {
     // bindings so OS can compare them with its locally paired Platform state;
     // the signed operator token intentionally does not carry a DB installation
     // ID claim.
-    return NextResponse.json({ ok: true, active: true, homeId: handoff.homeId, hubInstallationId: handoff.hubInstallationId }, { headers: { 'Cache-Control': 'no-store', Pragma: 'no-cache' } });
+    return NextResponse.json({ ok: true, active: true, homeId: handoff.homeId, hubInstallationId: handoff.hubInstallationId,
+      ...(permanentInstallation ? { areaOptions: currentAreaOptions } : {}) }, { headers: { 'Cache-Control': 'no-store', Pragma: 'no-cache' } });
   } catch (error) { return authErrorResponse(error); }
 }

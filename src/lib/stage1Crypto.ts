@@ -192,7 +192,8 @@ export function verifyStage1Token(
   kind: Stage1TokenKind,
   publicKeys: crypto.KeyObject[],
   now = Date.now(),
-  maxLifetimeSeconds = kind === 'employee' ? 8 * 60 * 60 : 300,
+  maxLifetimeSeconds = kind === 'employee' ? 24 * 60 * 60 : 300,
+  allowExpired = false,
 ): Stage1Principal | null {
   const parts = String(token ?? '').split('.');
   const expectedPrefix = kind === 'employee' ? 'dno-employee-1' : 'dno-app-1';
@@ -218,7 +219,7 @@ export function verifyStage1Token(
   const nowSeconds = Math.floor(now / 1000);
   const issuedAt = Number(payload.iat);
   const expiresAt = Number(payload.exp);
-  if (!Number.isSafeInteger(issuedAt) || !Number.isSafeInteger(expiresAt) || issuedAt > nowSeconds + 5 || expiresAt <= nowSeconds || expiresAt - issuedAt > maxLifetimeSeconds) return null;
+  if (!Number.isSafeInteger(issuedAt) || !Number.isSafeInteger(expiresAt) || issuedAt > nowSeconds + 5 || (!allowExpired && expiresAt <= nowSeconds) || expiresAt <= issuedAt || expiresAt - issuedAt > maxLifetimeSeconds) return null;
   if (typeof payload.sub !== 'string' || typeof payload.sid !== 'string' || typeof payload.jti !== 'string') return null;
   if (typeof payload.aud !== 'string' || !payload.aud) return null;
   const areas = Array.isArray(payload.areaIds) ? payload.areaIds.map(String) : [];

@@ -4,6 +4,7 @@ import { prisma } from '@/lib/prisma';
 import { authenticateHub } from '@/lib/stage1HubAuth';
 import { sha256 } from '@/lib/stage1Crypto';
 import { Stage1AuthError } from '@/lib/stage1Auth';
+import { EMPLOYEE_SESSION_SECONDS, OPERATOR_SESSION_SECONDS } from '@/lib/stage1SessionPolicy';
 import { observeDeviceSourceAlias } from '@/lib/nativeSourceAliases';
 
 export const dynamic = 'force-dynamic';
@@ -92,15 +93,22 @@ async function currentStaffAuthority(tx: Prisma.TransactionClient, input: Body, 
   const now = new Date();
   const [employee, employeeSession, handoff, work, request, home] = await Promise.all([
     tx.companyEmployeeAccount.findFirst({ where: { id: employeeId, status: 'ACTIVE', role: { in: ['INSTALLER','SENIOR_OPERATIONS_MANAGER','CXO'] } }, select: { id: true, role: true, status: true } }),
-    tx.employeeSession.findFirst({ where: { id: employeeSessionId, employeeId, status: 'ACTIVE', revokedAt: null, expiresAt: { gt: now } }, select: { id: true, employeeId: true, status: true, revokedAt: true, expiresAt: true } }),
-    tx.operatorHandoff.findFirst({ where: { id: handoffId, employeeId, workflowId: workItemId, homeId: hub.installation.homeId, hubInstallationId: hub.installation.id, consumedAt: { not: null }, revokedAt: null }, select: { id: true, scope: true } }),
+    tx.employeeSession.findFirst({ where: { id: employeeSessionId, employeeId, status: 'ACTIVE', revokedAt: null }, select: { id: true, employeeId: true, status: true, revokedAt: true, createdAt: true, expiresAt: true } }),
+    tx.operatorHandoff.findFirst({ where: { id: handoffId, employeeId, workflowId: workItemId, homeId: hub.installation.homeId, hubInstallationId: hub.installation.id, consumedAt: { not: null }, revokedAt: null }, select: { id: true, createdAt: true, scope: true } }),
     tx.companyOperationalWorkItem.findFirst({ where: { id: workItemId, kind: 'PERMANENT_DEVICE_INSTALLATION', homeId: hub.installation.homeId, hubInstallationId: hub.installation.id, assignedEmployeeId: employeeId, state: 'IN_PROGRESS', workRevision: revision, certifiedSerialNumber: hub.identity.serialNumber }, select: { id: true, homeId: true, hubInstallationId: true, assignedEmployeeId: true, state: true, workRevision: true, permanentInstallationRequestId: true } }),
     tx.permanentDeviceInstallationRequest.findFirst({ where: { id: requestId, homeId: hub.installation.homeId, status: 'IN_PROGRESS', workItem: { is: { id: workItemId, assignedEmployeeId: employeeId, state: 'IN_PROGRESS', workRevision: revision } } }, select: { id: true, homeId: true, status: true, requestedAreaId: true, revision: true } }),
     tx.home.findFirst({ where: { id: hub.installation.homeId, lifecycle: 'ACTIVE', installationStatus: 'COMPLETE', activeHubInstallationId: hub.installation.id }, select: { id: true, lifecycle: true, installationStatus: true, activeHubInstallationId: true } }),
   ]);
   const handoffScope = handoff?.scope && typeof handoff.scope === 'object' && !Array.isArray(handoff.scope) ? handoff.scope as Record<string, unknown> : {};
   const scopes = Array.isArray(handoffScope.scopes) ? handoffScope.scopes.map(String) : [];
+  const operatorIssuedAt = Number(handoffScope.operatorIssuedAt);
+  const operatorExpiresAt = Number(handoffScope.operatorExpiresAt);
   if (!employee || !employeeSession || !handoff || !work || !request || !home
+    || employeeSession.expiresAt.getTime() - employeeSession.createdAt.getTime() > EMPLOYEE_SESSION_SECONDS * 1000
+    || handoff.createdAt >= employeeSession.expiresAt
+    || !Number.isSafeInteger(operatorIssuedAt) || !Number.isSafeInteger(operatorExpiresAt)
+    || operatorIssuedAt < handoff.createdAt.getTime() - 1000 || operatorExpiresAt <= now.getTime()
+    || operatorExpiresAt - operatorIssuedAt !== OPERATOR_SESSION_SECONDS * 1000
     || work.permanentInstallationRequestId !== request.id
     || String(handoffScope.employeeSessionId || '') !== employeeSession.id
     || String(handoffScope.operatorJti || '') !== operatorJti

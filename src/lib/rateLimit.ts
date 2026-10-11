@@ -2,6 +2,38 @@ import { prisma } from './prisma';
 import { Stage1AuthError } from './stage1Auth';
 import { Prisma } from '@prisma/client';
 
+/**
+ * Charge a persistent abuse bucket inside the caller's transaction. This is
+ * used when quota consumption must commit atomically with a newly-created
+ * durable operation, and must not be charged for an exact idempotent replay.
+ */
+export async function enforcePersistentRateLimitInTransaction(
+  tx: Prisma.TransactionClient,
+  bucketKey: string,
+  limit: number,
+  windowMs: number,
+  now = new Date(),
+): Promise<void> {
+  const current = await tx.authRateLimitBucket.findUnique({ where: { bucketKey }, select: { id: true, windowStart: true, attempts: true, blockedUntil: true } });
+  if (!current) {
+    await tx.authRateLimitBucket.create({ data: { bucketKey, windowStart: now, attempts: 1 } });
+    return;
+  }
+  if (current.blockedUntil && current.blockedUntil > now) {
+    throw new Stage1AuthError(429, 'rate_limited', `Too many attempts. Retry in ${Math.ceil((current.blockedUntil.getTime() - now.getTime()) / 1000)} seconds`);
+  }
+  if (now.getTime() - current.windowStart.getTime() >= windowMs) {
+    await tx.authRateLimitBucket.update({ where: { id: current.id }, data: { windowStart: now, attempts: 1, blockedUntil: null } });
+    return;
+  }
+  if (current.attempts >= limit) {
+    const blockedUntil = new Date(Math.max(current.windowStart.getTime() + windowMs, now.getTime() + Math.min(windowMs, 5 * 60 * 1000)));
+    await tx.authRateLimitBucket.update({ where: { id: current.id }, data: { blockedUntil } });
+    throw new Stage1AuthError(429, 'rate_limited', `Too many attempts. Retry in ${Math.ceil((blockedUntil.getTime() - now.getTime()) / 1000)} seconds`);
+  }
+  await tx.authRateLimitBucket.update({ where: { id: current.id }, data: { attempts: { increment: 1 } } });
+}
+
 export async function enforcePersistentRateLimit(bucketKey: string, limit: number, windowMs: number): Promise<void> {
   const now = new Date();
   let result: { allowed: boolean; retryAfterMs: number } | undefined;

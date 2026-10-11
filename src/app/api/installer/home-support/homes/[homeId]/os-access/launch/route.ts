@@ -1,8 +1,8 @@
 import { NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
-import { requireEmployeeRecentAuth, Stage1AuthError, authErrorResponse } from '@/lib/stage1Auth';
+import { requireEmployee, Stage1AuthError, authErrorResponse } from '@/lib/stage1Auth';
 import { randomSecret, sha256 } from '@/lib/stage1Crypto';
-import { enforcePersistentRateLimit } from '@/lib/rateLimit';
+import { enforcePersistentRateLimitInTransaction } from '@/lib/rateLimit';
 import { encryptOperatorGrant, isStrictlyUnexpired } from '@/lib/stage1Operator';
 import { stage1NowMs } from '@/lib/stage1SessionPolicy';
 import { lanEndpointFresh } from '@/lib/lanEndpoint';
@@ -11,13 +11,11 @@ export const dynamic = 'force-dynamic';
 
 export async function POST(request: Request, context: { params: Promise<{ homeId: string }> }) {
   try {
-    // This is the sole sensitive route allowed to rely on an active employee
-    // session instead of five-minute recent authentication under the named,
-    // temporary Stage 1 policy. Rotation, revocation and support stay strict.
-    const employee = await requireEmployeeRecentAuth(request, ['CXO', 'SENIOR_OPERATIONS_MANAGER', 'INSTALLER']);
+    // Opening an already-assigned Home workspace is routine use of the
+    // current employee session. Sensitive credential/security actions keep
+    // their separate recent-authentication requirements.
+    const employee = await requireEmployee(request, ['CXO', 'SENIOR_OPERATIONS_MANAGER', 'INSTALLER']);
     const { homeId } = await context.params;
-    await enforcePersistentRateLimit(`operator-launch:${employee.id}:${homeId}`, 5, 15 * 60 * 1000);
-    await enforcePersistentRateLimit(`operator-launch-hour:${employee.id}`, 20, 60 * 60 * 1000);
     const body = await request.json() as Record<string, unknown>;
     const workflowId = String(body.workflowId ?? '').trim();
     const setupAttemptId = String(body.setupAttemptId ?? '').trim();
@@ -28,7 +26,10 @@ export async function POST(request: Request, context: { params: Promise<{ homeId
     if (!workflowId || !/^[A-Za-z0-9_-]{32,160}$/.test(setupAttemptId)) throw new Stage1AuthError(400, 'workflow_or_attempt_required', 'An assigned workflow and hub-created setup attempt are required');
     if (!['secure', 'local'].includes(accessMode)) throw new Stage1AuthError(400, 'operator_access_mode_required', 'Choose the verified secure or current local hub endpoint');
     const now = new Date(stage1NowMs());
-    const handoff = await prisma.$transaction(async (tx) => {
+    let handoff: { id: string; expiresAt: Date; operatorOrigin: string; accessMode: string; endpointRevision: number; endpointReportedAt: Date | null; endpointState: string; destination: string } | undefined;
+    for (let transactionAttempt = 0; transactionAttempt < 3 && !handoff; transactionAttempt += 1) {
+      try {
+        handoff = await prisma.$transaction(async (tx) => {
       const work = await tx.companyOperationalWorkItem.findUnique({ where: { id: workflowId }, select: { id: true, kind: true, assignedEmployeeId: true, homeId: true, hubInstallationId: true, certifiedSerialNumber: true, state: true, workRevision: true, permanentInstallationRequestId: true } });
       if (!work || work.assignedEmployeeId !== employee.id || work.homeId !== homeId || !work.hubInstallationId || !['ASSIGNED', 'IN_PROGRESS', 'REOPENED'].includes(work.state)) throw new Stage1AuthError(403, 'workflow_not_authorized', 'The selected workflow is not assigned to this employee and home');
       const permanentInstallation = work.kind === 'PERMANENT_DEVICE_INSTALLATION';
@@ -70,13 +71,27 @@ export async function POST(request: Request, context: { params: Promise<{ homeId
         if (!Array.isArray(existingScopes) || existingScopes.join('|') !== scopes.join('|')) throw new Stage1AuthError(409, 'operator_handoff_scope_conflict', 'This browser attempt already has a different Dinodia OS scope. Close it and launch a fresh session.');
         return { id: existing.id, expiresAt: existing.expiresAt, operatorOrigin, accessMode, endpointRevision, endpointReportedAt, endpointState, destination: scopes[0] === 'os:permanent-installation' ? '/permanent-installation' : '/' };
       }
+      // Charge only a new authorized handoff. A retry of this same hub-created
+      // browser attempt reconciles the existing row above and consumes no new
+      // issuance budget. Four normal workspace launches plus bounded reopen
+      // headroom fit within 8/Home/15m and 32/employee/hour; login throttles are
+      // separate and unchanged.
+      await enforcePersistentRateLimitInTransaction(tx, `operator-launch:${employee.id}:${homeId}`, 8, 15 * 60 * 1000, now);
+      await enforcePersistentRateLimitInTransaction(tx, `operator-launch-hour:${employee.id}`, 32, 60 * 60 * 1000, now);
       const expiresAt = new Date(now.getTime() + 60 * 1000);
       const handoffSecret = randomSecret(32);
       const handoffEnvelope = JSON.stringify(encryptOperatorGrant(handoffSecret, hub.manufacturingIdentity.encryptionPublicKey, 1, 'operator-handoff'));
       const created = await tx.operatorHandoff.create({ data: { employeeId: employee.id, workflowId: work.id, homeId, hubInstallationId: hub.id, attemptId: browserAttempt.id, operatorBrowserAttemptId: browserAttempt.id, setupAttemptId: browserAttempt.attemptId, browserBindingHash: browserAttempt.browserBindingHash, handoffHash: sha256(handoffSecret), handoffEnvelope, scope: { scopes, workRevision: work.workRevision, employeeSessionId: employee.sessionId, serialNumber: hub.serialNumberSnapshot, identityGeneration: hub.manufacturingIdentity.identityGeneration, accessMode, endpointOrigin: operatorOrigin, endpointRevision, ...(requestId ? { requestId } : {}), ...(areaOptions ? { areaOptions } : {}) }, expiresAt }, select: { id: true, expiresAt: true } });
       await tx.auditEvent.create({ data: { homeId, actorType: 'EMPLOYEE', actorId: employee.id, category: 'SECURITY', action: 'operator_handoff_issued', targetType: 'OperatorHandoff', targetId: created.id, metadata: { workflowId: work.id, scope: scopes[0], outcome: 'issued', expiresAt: created.expiresAt.toISOString() }, purgeAt: new Date(now.getTime() + 365 * 24 * 60 * 60 * 1000) } });
       return { id: created.id, expiresAt: created.expiresAt, operatorOrigin, accessMode, endpointRevision, endpointReportedAt, endpointState, destination: scopes[0] === 'os:permanent-installation' ? '/permanent-installation' : '/' };
-    });
+        }, { isolationLevel: 'Serializable' });
+      } catch (error) {
+        const code = typeof error === 'object' && error && 'code' in error ? String((error as { code?: unknown }).code) : '';
+        if ((code === 'P2002' || code === 'P2034') && transactionAttempt < 2) continue;
+        throw error;
+      }
+    }
+    if (!handoff) throw new Stage1AuthError(503, 'operator_launch_reconciliation_failed', 'The assigned-work launch could not be reconciled safely; retry the same browser attempt');
     // Only an opaque handoff identifier is returned. The setup attempt and
     // browser binding were created by the paired hub before this transaction;
     // Portal cannot invent or replace either authority-bearing value.
