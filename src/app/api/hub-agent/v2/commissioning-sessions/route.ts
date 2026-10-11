@@ -4,6 +4,7 @@ import { prisma } from '@/lib/prisma';
 import { authenticateHub } from '@/lib/stage1HubAuth';
 import { sha256 } from '@/lib/stage1Crypto';
 import { Stage1AuthError } from '@/lib/stage1Auth';
+import { observeDeviceSourceAlias } from '@/lib/nativeSourceAliases';
 
 export const dynamic = 'force-dynamic';
 const HASH = /^[a-f0-9]{64}$/i;
@@ -15,10 +16,17 @@ type Body = Record<string, unknown>;
 function fail(status: number, code: string, message: string): never { throw new Stage1AuthError(status, code, message); }
 function exactKeys(value: Body, keys: string[]) { return Object.keys(value).sort().join('|') === [...keys].sort().join('|'); }
 function protocolValue(value: unknown) { return value === 'zigbee' ? 'ZIGBEE' : value === 'matter' ? 'MATTER_THREAD' : null; }
-function assertCommissioningProtocolEnabled(hub: Awaited<ReturnType<typeof authenticateHub>>, protocol: 'ZIGBEE'|'MATTER_THREAD') {
+function assertCommissioningProtocolEnabled(hub: Awaited<ReturnType<typeof authenticateHub>>, protocol: 'ZIGBEE'|'MATTER_THREAD', isStaff: boolean, operationKind: 'PAIR_NEW'|'REGISTER_EXISTING' = 'PAIR_NEW') {
   const summary = hub.installation.capabilitySummary && typeof hub.installation.capabilitySummary === 'object' && !Array.isArray(hub.installation.capabilitySummary)
     ? hub.installation.capabilitySummary as Record<string, unknown> : {};
-  const flag = protocol === 'ZIGBEE' ? 'nativeZigbeeCommissioningV1' : 'nativeMatterCommissioningV1';
+  if (isStaff && summary.nativeStaffDeviceRegistrationV1 !== true) fail(503, 'commissioning_registration_disabled', 'Assigned-staff permanent-device registration is held by the current hub policy');
+  // Existing-device adoption does not open a radio session. It is still
+  // governed by current staff registration policy and the live descriptor,
+  // but must not be made unavailable by a radio-pairing maintenance hold.
+  if (isStaff && operationKind === 'REGISTER_EXISTING') return;
+  const flag = isStaff
+    ? protocol === 'ZIGBEE' ? 'nativeStaffZigbeeCommissioningV1' : 'nativeStaffMatterCommissioningV1'
+    : protocol === 'ZIGBEE' ? 'nativeZigbeeCommissioningV1' : 'nativeMatterCommissioningV1';
   if (summary[flag] !== true) {
     fail(503, 'commissioning_protocol_disabled', 'This commissioning protocol is not enabled for the enrolled hub');
   }
@@ -138,12 +146,24 @@ export async function POST(request: Request) {
         : { requestingMembershipId: authority.membership!.id, requestingEmployeeId: null };
       const sessionId = String(body.sessionId);
       if (action === 'create') {
-        const allowed = ['action','sessionId','homeId','hubInstallationId','identityGeneration','protocol','expiresAt','expectedRevision','idempotencyHash','requestHash', ...actorKeys];
+        const legacyPairNewRequest = !Object.hasOwn(body, 'operationKind');
+        const operationKind = legacyPairNewRequest ? 'PAIR_NEW' : String(body.operationKind || '');
+        const registerExisting = operationKind === 'REGISTER_EXISTING';
+        const operationKeys = registerExisting ? ['candidateRef','targetOsDeviceId','targetIdentityHash'] : [];
+        const allowed = ['action','sessionId','homeId','hubInstallationId','identityGeneration','protocol','expiresAt','expectedRevision','idempotencyHash','requestHash',
+          ...(legacyPairNewRequest ? [] : ['operationKind']), ...operationKeys, ...actorKeys];
         if (!exactKeys(body, allowed) || !HASH.test(String(body.idempotencyHash || '')) || !HASH.test(String(body.requestHash || ''))
-          || Number(body.expectedRevision) !== 1) fail(400, 'commissioning_request_invalid', 'The commissioning request is invalid');
-        assertCommissioningProtocolEnabled(hub, protocol);
-        const expectedRequestHash = sha256(JSON.stringify({ protocol: protocol === 'ZIGBEE' ? 'zigbee' : 'matter' }));
+          || Number(body.expectedRevision) !== 1 || !['PAIR_NEW','REGISTER_EXISTING'].includes(operationKind)
+          || registerExisting && (!isStaff || typeof body.candidateRef !== 'string' || !UUID.test(body.candidateRef)
+            || typeof body.targetOsDeviceId !== 'string' || !/^[A-Za-z0-9:_-]{1,160}$/.test(body.targetOsDeviceId)
+            || !HASH.test(String(body.targetIdentityHash || '')))) fail(400, 'commissioning_request_invalid', 'The commissioning request is invalid');
+        const protocolName = protocol === 'ZIGBEE' ? 'zigbee' : 'matter';
+        const expectedRequestHash = legacyPairNewRequest ? sha256(JSON.stringify({ protocol: protocolName })) : sha256(JSON.stringify({ operationKind, protocol: protocolName,
+          ...(registerExisting ? { candidateRef: String(body.candidateRef), targetOsDeviceId: String(body.targetOsDeviceId), targetIdentityHash: String(body.targetIdentityHash) } : {}) }));
         if (String(body.requestHash) !== expectedRequestHash) fail(409, 'commissioning_idempotency_conflict', 'This commissioning operation key is already bound to another request');
+        if (!registerExisting && (Object.hasOwn(body, 'candidateRef') || Object.hasOwn(body, 'targetOsDeviceId') || Object.hasOwn(body, 'targetIdentityHash'))) {
+          fail(400, 'commissioning_request_invalid', 'A new-radio operation cannot target an existing device');
+        }
         const requestedExpiry = new Date(String(body.expiresAt || ''));
         const now = new Date();
         if (!Number.isFinite(requestedExpiry.getTime()) || requestedExpiry <= now || requestedExpiry.getTime() - now.getTime() > 15 * 60 * 1000 + 30_000) fail(400, 'commissioning_expiry_invalid', 'The commissioning session expiry is invalid');
@@ -152,18 +172,35 @@ export async function POST(request: Request) {
           if (prior.id !== sessionId || prior.requestingMembershipId !== (authority.membership?.id ?? null)
             || prior.requestingEmployeeId !== (authority.employee?.id ?? null) || prior.workItemId !== (authority.work?.id ?? null)
             || prior.permanentInstallationRequestId !== (authority.request?.id ?? null) || prior.protocol !== protocol || prior.expiresAt <= now) fail(409, 'commissioning_idempotency_conflict', 'This commissioning operation key is already bound');
+          const priorBinding = await tx.idempotencyRecord.findUnique({ where: { namespace_keyHash: { namespace: SESSION_NAMESPACE, keyHash: String(body.idempotencyHash) } }, select: { requestHash: true, responseBody: true } });
+          const priorBody = priorBinding?.responseBody && typeof priorBinding.responseBody === 'object' ? priorBinding.responseBody as Record<string, unknown> : {};
+          if (priorBinding?.requestHash !== expectedRequestHash || String(priorBody.operationKind || (legacyPairNewRequest ? 'PAIR_NEW' : '')) !== operationKind
+            || registerExisting && (priorBody.candidateRef !== body.candidateRef || priorBody.targetOsDeviceId !== body.targetOsDeviceId || priorBody.targetIdentityHash !== body.targetIdentityHash)) {
+            fail(409, 'commissioning_idempotency_conflict', 'This commissioning operation key is already bound to another device or operation');
+          }
           return NextResponse.json({ ok: true, sessionId: prior.id, revision: prior.revision, expiresAt: prior.expiresAt.toISOString(), state: prior.state }, { headers: { 'Cache-Control': 'no-store' } });
         }
         const bound = await tx.idempotencyRecord.findUnique({ where: { namespace_keyHash: { namespace: SESSION_NAMESPACE, keyHash: String(body.idempotencyHash) } }, select: { actorId: true, homeId: true, hubInstallationId: true, requestHash: true } });
         if (bound) fail(409, 'commissioning_idempotency_conflict', 'This commissioning operation key is already bound');
+        assertCommissioningProtocolEnabled(hub, protocol, isStaff, operationKind as 'PAIR_NEW'|'REGISTER_EXISTING');
+        if (registerExisting) {
+          const existingDevice = await tx.nativeDevice.findUnique({ where: { hubInstallationId_osDeviceId: { hubInstallationId: hub.installation.id, osDeviceId: String(body.targetOsDeviceId) } }, select: { id: true } });
+          const sourceDeviceId = sha256(String(body.targetOsDeviceId).normalize('NFC').trim());
+          const [sourceAlias, identityAlias] = await Promise.all([
+            tx.nativeDeviceSourceAlias.findUnique({ where: { hubInstallationId_protocol_sourceDeviceId: { hubInstallationId: hub.installation.id, protocol: protocolName, sourceDeviceId } }, select: { id: true, deviceId: true } }),
+            tx.nativeDeviceSourceAlias.findFirst({ where: { hubInstallationId: hub.installation.id, protocolIdentityHash: String(body.targetIdentityHash), retiredAt: null }, select: { id: true, deviceId: true } }),
+          ]);
+          if (existingDevice || sourceAlias || identityAlias) fail(409, 'device_identity_conflict', 'This radio identity is already registered or bound to another property record');
+        }
         const created = await tx.nativeCommissioningSession.create({ data: {
           id: sessionId, homeId: authority.home.id, hubInstallationId: hub.installation.id, ...actorWhere,
           requestedName: 'New device', managementClass: authority.managementClass, protocol, state: 'REQUESTED', revision: 1, expiresAt: requestedExpiry,
           idempotencyKeyHash: String(body.idempotencyHash),
         }, select: { id: true, state: true, revision: true, expiresAt: true } });
         const bindingBody = isStaff
-          ? { sessionId: created.id, actorType: authority.actorType, employeeId: authority.employee!.id, employeeSessionId: authority.employeeSession!.id, operatorHandoffId: authority.handoff!.id, workItemId: authority.work!.id, requestId: authority.request!.id, workRevision: authority.work!.workRevision, identityGeneration: hub.identity.identityGeneration }
-          : { sessionId: created.id, customerSessionId: authority.session!.id, trustedDeviceId: authority.device!.id, membershipId: authority.membership!.id, identityGeneration: hub.identity.identityGeneration };
+          ? { sessionId: created.id, actorType: authority.actorType, employeeId: authority.employee!.id, employeeSessionId: authority.employeeSession!.id, operatorHandoffId: authority.handoff!.id, workItemId: authority.work!.id, requestId: authority.request!.id, workRevision: authority.work!.workRevision, identityGeneration: hub.identity.identityGeneration, operationKind,
+            ...(registerExisting ? { candidateRef: String(body.candidateRef), targetOsDeviceId: String(body.targetOsDeviceId), targetIdentityHash: String(body.targetIdentityHash) } : {}) }
+          : { sessionId: created.id, customerSessionId: authority.session!.id, trustedDeviceId: authority.device!.id, membershipId: authority.membership!.id, identityGeneration: hub.identity.identityGeneration, operationKind };
         await tx.idempotencyRecord.create({ data: { namespace: SESSION_NAMESPACE, keyHash: String(body.idempotencyHash), actorId: authority.actorId, homeId: authority.home.id,
           hubInstallationId: hub.installation.id, requestHash: expectedRequestHash, responseStatus: 201,
           responseBody: bindingBody, responseDigest: sha256(JSON.stringify(bindingBody)), expiresAt: requestedExpiry } });
@@ -174,20 +211,30 @@ export async function POST(request: Request) {
       if (!row) fail(404, 'commissioning_session_unavailable', 'This commissioning session is unavailable');
       const binding = await tx.idempotencyRecord.findUnique({ where: { namespace_keyHash: { namespace: SESSION_NAMESPACE, keyHash: row.idempotencyKeyHash } }, select: { actorId: true, homeId: true, hubInstallationId: true, responseBody: true } });
       const owner = binding?.responseBody && typeof binding.responseBody === 'object' ? binding.responseBody as Record<string, unknown> : {};
+      const ownerOperationKind = String(owner.operationKind || 'PAIR_NEW');
       const ownerMatches = isStaff
         ? owner.actorType === authority.actorType && owner.employeeId === authority.employee!.id && owner.employeeSessionId === authority.employeeSession!.id
           && owner.operatorHandoffId === authority.handoff!.id && owner.workItemId === authority.work!.id && owner.requestId === authority.request!.id
           && owner.workRevision === authority.work!.workRevision && owner.identityGeneration === hub.identity.identityGeneration
-        : owner.customerSessionId === authority.session!.id && owner.trustedDeviceId === authority.device!.id && owner.membershipId === authority.membership!.id && owner.identityGeneration === hub.identity.identityGeneration;
+          && (ownerOperationKind === 'PAIR_NEW' || ownerOperationKind === 'REGISTER_EXISTING')
+        : owner.customerSessionId === authority.session!.id && owner.trustedDeviceId === authority.device!.id && owner.membershipId === authority.membership!.id && owner.identityGeneration === hub.identity.identityGeneration
+          && ownerOperationKind === 'PAIR_NEW';
       if (!binding || binding.actorId !== authority.actorId || binding.homeId !== authority.home.id || binding.hubInstallationId !== hub.installation.id || !ownerMatches) fail(403, 'commissioning_authority_denied', 'The commissioning session belongs to another current authority');
       if (!Number.isSafeInteger(body.expectedRevision)) fail(409, 'commissioning_revision_conflict', 'The commissioning session changed; refresh it before continuing');
 
       if (action === 'transition') {
-        const allowed = ['action','sessionId','homeId','hubInstallationId','identityGeneration','protocol','expiresAt','expectedRevision','status','selectedAreaId','candidateRef','osDeviceId','requestedName','customerLabel','catalogueStatus','catalogueRevision','descriptorDigest','result', ...actorKeys];
+        const registerExisting = ownerOperationKind === 'REGISTER_EXISTING';
+        const allowed = ['action','sessionId','homeId','hubInstallationId','identityGeneration','protocol','expiresAt','expectedRevision',...(Object.hasOwn(body, 'operationKind') ? ['operationKind'] : []),'status','selectedAreaId','candidateRef','osDeviceId','requestedName','customerLabel','catalogueStatus','catalogueRevision','descriptorDigest','result',
+          ...(registerExisting ? ['targetOsDeviceId','targetIdentityHash'] : []), ...actorKeys];
         const nextStatus = String(body.status || '');
         const state = ({ ADVERTISING: 'ADVERTISING', READY: 'READY', COMPLETED: 'COMPLETED', CANCELLED: 'CANCELLED', EXPIRED: 'EXPIRED', FAILED: 'FAILED' } as Record<string,string>)[nextStatus];
         const optional = ['selectedAreaId','candidateRef','osDeviceId','requestedName','customerLabel','catalogueStatus','catalogueRevision','descriptorDigest','result'];
-        if (!exactKeys(body, allowed.filter((key) => !optional.includes(key)).concat(optional.filter((key) => Object.hasOwn(body, key)))) || !state) fail(400, 'commissioning_transition_invalid', 'The commissioning state change is invalid');
+        const operationKeys = registerExisting ? ['targetOsDeviceId','targetIdentityHash'] : [];
+        if (!exactKeys(body, allowed.filter((key) => !optional.includes(key) && !operationKeys.includes(key))
+          .concat(optional.filter((key) => Object.hasOwn(body, key)), operationKeys)) || !state
+          || Object.hasOwn(body, 'operationKind') && body.operationKind !== ownerOperationKind
+          || registerExisting && !Object.hasOwn(body, 'operationKind')
+          || registerExisting && (body.targetOsDeviceId !== owner.targetOsDeviceId || body.targetIdentityHash !== owner.targetIdentityHash)) fail(400, 'commissioning_transition_invalid', 'The commissioning state change is invalid');
         if (state === 'READY' && row.state === 'READY' && row.revision === Number(body.expectedRevision) + 1
           && row.requestedAreaId === body.selectedAreaId && row.selectedCandidateRef === body.candidateRef && row.selectedOsDeviceId === body.osDeviceId
           && row.customerLabel === body.customerLabel && row.catalogueStatus === body.catalogueStatus && row.catalogueRevision === body.catalogueRevision
@@ -200,10 +247,10 @@ export async function POST(request: Request) {
         }
         if (Number(body.expectedRevision) !== row.revision) fail(409, 'commissioning_revision_conflict', 'The commissioning session changed; refresh it before continuing');
         if ((row.closedAt || row.expiresAt <= new Date()) && state !== 'EXPIRED') fail(404, 'commissioning_session_unavailable', 'This commissioning session is unavailable');
-        const allowedTransitions: Record<string, string[]> = { REQUESTED: ['ADVERTISING','FAILED','CANCELLED','EXPIRED'], ADVERTISING: ['READY','FAILED','CANCELLED','EXPIRED'], READY: ['COMPLETED','CANCELLED','EXPIRED'] };
+        const allowedTransitions: Record<string, string[]> = { REQUESTED: [ ...(registerExisting ? ['READY'] : ['ADVERTISING']), 'FAILED','CANCELLED','EXPIRED'], ADVERTISING: ['READY','FAILED','CANCELLED','EXPIRED'], READY: ['COMPLETED','CANCELLED','EXPIRED'] };
         if (!allowedTransitions[row.state]?.includes(state)) fail(409, 'commissioning_transition_conflict', 'The commissioning session cannot make that state change');
         if (state === 'READY') {
-          assertCommissioningProtocolEnabled(hub, protocol);
+          assertCommissioningProtocolEnabled(hub, protocol, isStaff, ownerOperationKind as 'PAIR_NEW'|'REGISTER_EXISTING');
           const areaId = String(body.selectedAreaId || '');
           const catalogueStatus = String(body.catalogueStatus || '');
           if (!UUID.test(areaId) || !authority.areaIds.has(areaId) || !await tx.area.findFirst({ where: { id: areaId, homeId: authority.home.id, status: 'ACTIVE' }, select: { id: true } })
@@ -213,8 +260,14 @@ export async function POST(request: Request) {
             || typeof body.customerLabel !== 'string' || !body.customerLabel.trim() || [...body.customerLabel].length > 40
             || !['ready','no_safe_controls','unsupported'].includes(catalogueStatus)
             || !Number.isSafeInteger(body.catalogueRevision) || Number(body.catalogueRevision) < 1 || !HASH.test(String(body.descriptorDigest || ''))) fail(403, 'commissioning_area_denied', 'The selected device or Area is not currently permitted');
+          if (registerExisting && (body.candidateRef !== owner.candidateRef || body.osDeviceId !== owner.targetOsDeviceId
+            || body.targetIdentityHash !== owner.targetIdentityHash)) fail(409, 'commissioning_finalize_invalid', 'The existing local device changed before its registration review');
+          if (registerExisting) {
+            const alreadyRegistered = await tx.nativeDevice.findUnique({ where: { hubInstallationId_osDeviceId: { hubInstallationId: hub.installation.id, osDeviceId: String(body.osDeviceId) } }, select: { id: true } });
+            if (alreadyRegistered) fail(409, 'device_identity_conflict', 'This local device is already registered');
+          }
         }
-        if (state === 'COMPLETED' && (row.state !== 'READY' || body.result !== 'REMOVED' || Object.keys(body).some((key) => !['action','sessionId','homeId','hubInstallationId','identityGeneration','protocol','expiresAt','expectedRevision','status','result', ...actorKeys].includes(key)))) fail(409, 'commissioning_transition_invalid', 'Only an explicitly removed unsupported device can complete without a device record');
+        if (state === 'COMPLETED' && (row.state !== 'READY' || body.result !== 'REMOVED' || registerExisting || Object.keys(body).some((key) => !['action','sessionId','homeId','hubInstallationId','identityGeneration','protocol','expiresAt','expectedRevision','operationKind','status','result', ...actorKeys].includes(key)))) fail(409, 'commissioning_transition_invalid', 'Only an explicitly removed unsupported new candidate can complete without a device record');
         const transitionNow = new Date();
         const changed = await tx.nativeCommissioningSession.updateMany({ where: { id: row.id, revision: row.revision, state: row.state, ...(state === 'EXPIRED' ? {} : { expiresAt: { gt: transitionNow } }) }, data: { state: state as never,
           ...(state === 'READY' ? { requestedAreaId: String(body.selectedAreaId), selectedCandidateRef: String(body.candidateRef), selectedOsDeviceId: String(body.osDeviceId), requestedName: body.requestedName == null ? '' : String(body.requestedName), customerLabel: String(body.customerLabel), catalogueStatus: String(body.catalogueStatus), catalogueRevision: Number(body.catalogueRevision), catalogueDigest: String(body.descriptorDigest) } : {}),
@@ -223,10 +276,15 @@ export async function POST(request: Request) {
         return NextResponse.json({ ok: true, sessionId: row.id, revision: row.revision + 1, state }, { headers: { 'Cache-Control': 'no-store' } });
       }
 
-      const allowed = ['action','sessionId','homeId','hubInstallationId','identityGeneration','protocol','expiresAt','expectedRevision','candidateRef','disposition','device', ...actorKeys];
-      if (!exactKeys(body, allowed) || !body.device || typeof body.device !== 'object' || Array.isArray(body.device)) fail(409, 'commissioning_finalize_invalid', 'The device is not ready for ownership registration');
+      const registerExisting = ownerOperationKind === 'REGISTER_EXISTING';
+      const allowed = ['action','sessionId','homeId','hubInstallationId','identityGeneration','protocol','expiresAt','expectedRevision',...(Object.hasOwn(body, 'operationKind') ? ['operationKind'] : []),'candidateRef','disposition','device',
+        ...(registerExisting ? ['targetOsDeviceId','targetIdentityHash'] : []), ...actorKeys];
+      if (!exactKeys(body, allowed) || Object.hasOwn(body, 'operationKind') && body.operationKind !== ownerOperationKind
+        || registerExisting && !Object.hasOwn(body, 'operationKind')
+        || registerExisting && (body.targetOsDeviceId !== owner.targetOsDeviceId || body.targetIdentityHash !== owner.targetIdentityHash)
+        || !body.device || typeof body.device !== 'object' || Array.isArray(body.device)) fail(409, 'commissioning_finalize_invalid', 'The device is not ready for ownership registration');
       const device = body.device as Record<string, unknown>;
-      const keys = ['osDeviceId','originalName','technicalLabel','deviceType','manufacturer','model','protocol','descriptorRevision','descriptorDigest','capabilitySummary','areaId','name','customerLabel','catalogueStatus','usefulReadings'];
+      const keys = ['osDeviceId','originalName','technicalLabel','deviceType','manufacturer','model','protocol',...(Object.hasOwn(device, 'protocolIdentityHash') ? ['protocolIdentityHash'] : []),'descriptorRevision','descriptorDigest','capabilitySummary','areaId','name','customerLabel','catalogueStatus','usefulReadings'];
       if (!exactKeys(device, keys) || typeof body.candidateRef !== 'string' || body.candidateRef.length > 80 || !['install','view_only'].includes(String(body.disposition))
         || typeof device.osDeviceId !== 'string' || !/^[A-Za-z0-9:_-]{1,160}$/.test(device.osDeviceId)
         || ![device.originalName,device.technicalLabel,device.deviceType].every((v) => typeof v === 'string' && v.trim().length > 0)
@@ -235,30 +293,45 @@ export async function POST(request: Request) {
         || typeof device.customerLabel !== 'string' || !String(device.customerLabel).trim() || [...String(device.customerLabel)].length > 40
         || (device.manufacturer !== null && (typeof device.manufacturer !== 'string' || String(device.manufacturer).length > 160))
         || (device.model !== null && (typeof device.model !== 'string' || String(device.model).length > 160))
-        || device.protocol !== protocol || !Number.isSafeInteger(device.descriptorRevision) || Number(device.descriptorRevision) < 1
+        || device.protocol !== protocol || Object.hasOwn(device, 'protocolIdentityHash') && !HASH.test(String(device.protocolIdentityHash || ''))
+        || registerExisting && !HASH.test(String(device.protocolIdentityHash || '')) || !Number.isSafeInteger(device.descriptorRevision) || Number(device.descriptorRevision) < 1
         || !HASH.test(String(device.descriptorDigest || '')) || !safeControlSummary(device.capabilitySummary)) fail(400, 'commissioning_finalize_invalid', 'The device projection is invalid');
-      assertCommissioningProtocolEnabled(hub, protocol);
+      if (registerExisting && (device.osDeviceId !== owner.targetOsDeviceId || device.protocolIdentityHash !== owner.targetIdentityHash
+        || body.candidateRef !== owner.candidateRef)) fail(409, 'commissioning_finalize_invalid', 'The reviewed local radio identity changed before finalization');
       const controls = (device.capabilitySummary as { controls: Array<{ readable: boolean; writable: boolean }> }).controls;
       const hasWritable = controls.some((control) => control.readable && control.writable);
-      if (body.disposition === 'install' && (device.catalogueStatus !== 'ready' || !hasWritable)
+      const hasAnyWritable = controls.some((control) => control.writable);
+      if (typeof device.usefulReadings !== 'boolean'
+        || body.disposition === 'install' && (device.catalogueStatus !== 'ready' || !hasWritable)
         || body.disposition === 'view_only' && hasWritable
         || body.disposition === 'view_only' && device.catalogueStatus === 'no_safe_controls' && device.usefulReadings !== true
-        || body.disposition === 'view_only' && device.catalogueStatus === 'unsupported' && device.usefulReadings !== false
+        || body.disposition === 'view_only' && hasAnyWritable
         || body.disposition === 'view_only' && !['no_safe_controls','unsupported'].includes(String(device.catalogueStatus))) fail(409, 'commissioning_catalogue_invalid', 'The current device descriptor does not support this safe retained state');
       const areaId = String(device.areaId || '');
       if (!authority.areaIds.has(areaId) || !await tx.area.findFirst({ where: { id: areaId, homeId: authority.home.id, status: 'ACTIVE' }, select: { id: true } })) fail(403, 'commissioning_area_denied', 'The selected Area is not currently granted to this tenant');
       const finalHash = sessionBinding(COMPLETE_NAMESPACE, row);
-      const finalRequest = sha256(JSON.stringify({ device, candidateRef: body.candidateRef, disposition: body.disposition, actorId: authority.actorId, sessionId: row.id }));
+      const finalRequest = owner.operationKind === undefined
+        ? sha256(JSON.stringify({ device, candidateRef: body.candidateRef, disposition: body.disposition, actorId: authority.actorId, sessionId: row.id }))
+        : sha256(JSON.stringify({ device, candidateRef: body.candidateRef, disposition: body.disposition,
+          operationKind: ownerOperationKind, targetIdentityHash: registerExisting ? owner.targetIdentityHash : null, actorId: authority.actorId, sessionId: row.id }));
       const existingReceipt = await tx.idempotencyRecord.findUnique({ where: { namespace_keyHash: { namespace: COMPLETE_NAMESPACE, keyHash: finalHash } }, select: { requestHash: true, responseBody: true } });
       if (existingReceipt) {
         if (existingReceipt.requestHash !== finalRequest || !existingReceipt.responseBody || typeof existingReceipt.responseBody !== 'object') fail(409, 'commissioning_idempotency_conflict', 'This device result was already bound to different commissioning details');
         return NextResponse.json(existingReceipt.responseBody, { headers: { 'Cache-Control': 'no-store' } });
       }
+      assertCommissioningProtocolEnabled(hub, protocol, isStaff, ownerOperationKind as 'PAIR_NEW'|'REGISTER_EXISTING');
       if (row.state !== 'READY' || row.closedAt || row.expiresAt <= new Date() || Number(body.expectedRevision) !== row.revision
         || row.requestedAreaId !== areaId || row.selectedCandidateRef !== body.candidateRef || row.selectedOsDeviceId !== device.osDeviceId
         || row.customerLabel !== device.customerLabel || row.catalogueStatus !== device.catalogueStatus || row.catalogueRevision !== device.descriptorRevision || row.catalogueDigest !== device.descriptorDigest) fail(409, 'commissioning_finalize_invalid', 'The device is not ready for ownership registration');
       const preexisting = await tx.nativeDevice.findUnique({ where: { hubInstallationId_osDeviceId: { hubInstallationId: hub.installation.id, osDeviceId: device.osDeviceId } }, select: { id: true } });
       if (preexisting) fail(409, 'device_identity_conflict', 'This radio identity is already registered; use the existing device recovery flow');
+      const sourceProtocol = protocol === 'ZIGBEE' ? 'zigbee' : 'matter';
+      const sourceDeviceId = sha256(String(device.osDeviceId).normalize('NFC').trim());
+      const [sourceAlias, identityAlias] = await Promise.all([
+        tx.nativeDeviceSourceAlias.findUnique({ where: { hubInstallationId_protocol_sourceDeviceId: { hubInstallationId: hub.installation.id, protocol: sourceProtocol, sourceDeviceId } }, select: { id: true, deviceId: true } }),
+        device.protocolIdentityHash ? tx.nativeDeviceSourceAlias.findFirst({ where: { hubInstallationId: hub.installation.id, protocolIdentityHash: String(device.protocolIdentityHash), retiredAt: null }, select: { id: true, deviceId: true } }) : Promise.resolve(null),
+      ]);
+      if (sourceAlias || identityAlias) fail(409, 'device_identity_conflict', 'This radio identity is already bound to another canonical device');
       const now = new Date();
       const safeSummary = safeControlSummary(device.capabilitySummary) as Record<string, unknown>;
       const created = await tx.nativeDevice.create({ data: {
@@ -270,13 +343,21 @@ export async function POST(request: Request) {
         descriptorRevision: Number(device.descriptorRevision), descriptorDigest: String(device.descriptorDigest),
         lifecycle: body.disposition === 'view_only' ? 'VIEW_ONLY' : 'INSTALLED', onlineState: 'UNKNOWN', installedAt: now,
         ...(isStaff ? { installationRequestId: authority.request!.id } : {}),
-        assignments: { create: { areaId, homeId: authority.home.id, source: isStaff ? 'NATIVE_STAFF_COMMISSIONING' : 'NATIVE_TENANT_COMMISSIONING' } },
+        assignments: { create: { areaId, homeId: authority.home.id, source: isStaff ? (registerExisting ? 'NATIVE_STAFF_EXISTING_DEVICE_ADOPTION' : 'NATIVE_STAFF_COMMISSIONING') : 'NATIVE_TENANT_COMMISSIONING' } },
       }, select: { id: true, homeId: true, osDeviceId: true, ownerMembershipId: true, managementClass: true, lifecycle: true, customerLabel: true, descriptorRevision: true } });
+      await observeDeviceSourceAlias(tx, { homeId: authority.home.id, deviceId: created.id, hubInstallationId: hub.installation.id,
+        protocol: sourceProtocol, sourceDeviceId: String(device.osDeviceId),
+        ...(typeof device.protocolIdentityHash === 'string' ? { protocolIdentityHash: device.protocolIdentityHash } : {}), now });
       const updated = await tx.nativeCommissioningSession.updateMany({ where: { id: row.id, state: 'READY', revision: row.revision, expiresAt: { gt: now } }, data: { state: 'COMPLETED', closedAt: now, finalDeviceId: created.id, revision: { increment: 1 } } });
       if (updated.count !== 1) fail(409, 'commissioning_revision_conflict', 'The commissioning session changed before ownership could be recorded');
-      await tx.nativeDomainOutbox.create({ data: { homeId: authority.home.id, aggregateType: 'NativeDevice', aggregateId: created.id, eventType: isStaff ? 'PROPERTY_DEVICE_COMMISSIONED' : 'TENANT_DEVICE_COMMISSIONED', idempotencyKey: `commissioning:${row.id}:device-created`, payload: { deviceId: created.id, ownerMembershipId: authority.ownerMembershipId, areaId }, expiresAt: new Date(now.getTime() + 29 * 24 * 60 * 60 * 1000) } });
-      await tx.auditEvent.create({ data: { homeId: authority.home.id, actorType: isStaff ? 'EMPLOYEE' : 'CUSTOMER', actorId: authority.actorId, category: 'INSTALLATION', action: isStaff ? 'property_device_commissioned_by_assigned_staff' : 'tenant_device_commissioned', targetType: 'NativeDevice', targetId: created.id, metadata: { protocol, areaId, outcome: 'installed', requestId: authority.request?.id || null, workItemId: authority.work?.id || null }, purgeAt: new Date(now.getTime() + 365 * 24 * 60 * 60 * 1000) } });
-      const response = { ok: true, sessionId: row.id, revision: row.revision + 1, state: 'COMPLETED', device: { id: created.id, osDeviceId: created.osDeviceId, managementClass: created.managementClass, ownerMembershipId: created.ownerMembershipId, lifecycle: created.lifecycle, customerLabel: created.customerLabel, descriptorRevision: created.descriptorRevision } };
+      await tx.nativeDomainOutbox.create({ data: { homeId: authority.home.id, aggregateType: 'NativeDevice', aggregateId: created.id,
+        eventType: isStaff ? (registerExisting ? 'PROPERTY_DEVICE_ADOPTED' : 'PROPERTY_DEVICE_COMMISSIONED') : 'TENANT_DEVICE_COMMISSIONED',
+        idempotencyKey: `commissioning:${row.id}:device-created`, payload: { deviceId: created.id, ownerMembershipId: authority.ownerMembershipId, areaId, operationKind: ownerOperationKind }, expiresAt: new Date(now.getTime() + 29 * 24 * 60 * 60 * 1000) } });
+      await tx.auditEvent.create({ data: { homeId: authority.home.id, actorType: isStaff ? 'EMPLOYEE' : 'CUSTOMER', actorId: authority.actorId, category: 'INSTALLATION',
+        action: isStaff ? (registerExisting ? 'property_device_adopted_by_assigned_staff' : 'property_device_commissioned_by_assigned_staff') : 'tenant_device_commissioned',
+        targetType: 'NativeDevice', targetId: created.id, metadata: { protocol, areaId, outcome: 'installed', operationKind: ownerOperationKind, requestId: authority.request?.id || null, workItemId: authority.work?.id || null }, purgeAt: new Date(now.getTime() + 365 * 24 * 60 * 60 * 1000) } });
+      const response = { ok: true, sessionId: row.id, revision: row.revision + 1, state: 'COMPLETED', operationKind: ownerOperationKind,
+        device: { id: created.id, osDeviceId: created.osDeviceId, managementClass: created.managementClass, ownerMembershipId: created.ownerMembershipId, lifecycle: created.lifecycle, customerLabel: created.customerLabel, descriptorRevision: created.descriptorRevision } };
       await tx.idempotencyRecord.create({ data: { namespace: COMPLETE_NAMESPACE, keyHash: finalHash, actorId: authority.actorId, homeId: authority.home.id, hubInstallationId: hub.installation.id, requestHash: finalRequest, responseStatus: 200, responseBody: response, responseDigest: sha256(JSON.stringify(response)), expiresAt: new Date(now.getTime() + 24 * 60 * 60 * 1000) } });
       return NextResponse.json(response, { headers: { 'Cache-Control': 'no-store' } });
     }, { isolationLevel: 'Serializable', maxWait: 5000, timeout: 12000 });

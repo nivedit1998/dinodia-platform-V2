@@ -9087,7 +9087,10 @@ async function osChecks() {
           const osPolicy = hub?.store.getPlatform?.()?.devicePolicies?.[String(event.payload?.osDeviceId || '')];
           return { sequence: Number(event.sequence) || null, knownForHub: Boolean(device), propertyClass: device?.managementClass === 'PROPERTY_DEVICE', homeMatches: device?.homeId === customerFixture.homeOneId, osDevicePresent: Boolean(osDevice), osSetupReady: osDevice?.setup?.status === 'ready', osPlatformPolicyPresent: Boolean(osPolicy), osPolicyPropertyClass: osPolicy?.managementClass === 'PROPERTY_DEVICE', osProtocolAllowed: ['zigbee', 'matter', 'thread', 'hive', 'google_nest', 'unknown'].includes(String(event.payload?.protocol)) };
         })) : undefined;
-      stageHomeSyncReceipts.push({ status: response.status, requestAck: Number(requestBody.acknowledgedCloudRevision), from: Number(requestBody.fromSequence), to: Number(requestBody.toSequence), errorCode, cloudRevision: Number(responseBody.cloudRevision) || null, appliedRevision: Number(responseBody.configurationAppliedRevision) || null, acceptedThrough: Number(responseBody.acceptedThroughSequence) || null, duplicate: responseBody.duplicate === true, ...(response.status === 400 ? inspectRejectedSyncEnvelope(requestBody) : {}), ...(uncommissionedDevices ? { uncommissionedDevices } : {}) });
+      const rejectedAreaEvidence = response.status === 409 && errorCode === 'hub_sync_area_assignment_invalid'
+        ? (Array.isArray(requestBody.events) ? requestBody.events : []).filter((event) => ['device.state','temperature.sample','usage.bucket'].includes(String(event.type)))
+          .map((event) => ({ sequence: Number(event.sequence) || null, type: String(event.type), aggregateHash: sha256(String(event.aggregateId || '')).slice(0, 12), areaHash: sha256(String(event.payload?.areaId || '')).slice(0, 12), observedAt: String(event.payload?.observedAt || event.payload?.bucketStart || event.payload?.sourceObservedAt || '').slice(0, 32) })) : undefined;
+      stageHomeSyncReceipts.push({ status: response.status, requestAck: Number(requestBody.acknowledgedCloudRevision), from: Number(requestBody.fromSequence), to: Number(requestBody.toSequence), errorCode, cloudRevision: Number(responseBody.cloudRevision) || null, appliedRevision: Number(responseBody.configurationAppliedRevision) || null, acceptedThrough: Number(responseBody.acceptedThroughSequence) || null, duplicate: responseBody.duplicate === true, ...(response.status === 400 ? inspectRejectedSyncEnvelope(requestBody) : {}), ...(uncommissionedDevices ? { uncommissionedDevices } : {}), ...(rejectedAreaEvidence ? { rejectedAreaEvidence } : {}) });
       if (stageHomeSyncReceipts.length > 12) stageHomeSyncReceipts.shift();
     }
     if (requestPath === '/api/hub-agent/v2/heartbeat') {
@@ -9196,6 +9199,21 @@ async function osChecks() {
   const areasBefore = await fetchJsonLoopback(`${base}/_dinodia/admin/api/areas`, { headers: { ...remoteOsHeaders, cookie: cookieHeader(areaAdminBrowser) } });
   if (areaAdminEstablished.response.status !== 200 || areaAdminEstablished.body.destination !== '/' || areasBefore.response.status !== 200
     || !areasBefore.body.areas?.some((area) => area.id === customerFixture.areaOneOsId)) fail('The full dashboard did not expose the current OS Area registry to assigned staff');
+  const dashboardAdoptionDeviceId = `zigbee:dashboard-${crypto.randomUUID()}`;
+  const dashboardAdoptionIeee = `0x00124b${crypto.randomBytes(5).toString('hex')}`;
+  await hub.store.upsertDevice({ id: dashboardAdoptionDeviceId, protocol: 'zigbee', available: true, interviewStatus: 'successful', originalName: 'UAT unregistered radiator',
+    name: 'UAT unregistered radiator', areaId: customerFixture.areaOneOsId, protocolIdentity: { ieeeAddress: dashboardAdoptionIeee }, setup: { status: 'ready' },
+    entities: { climate: { name: 'Heating', capability: { category: 'control', semanticRole: 'target_temperature', readable: true, writable: true } } },
+    metadata: { manufacturer: 'Disposable test fixture', model: 'Virtual TRV' } });
+  await hub.store.addEvent({ type: 'device_setup_completed', deviceId: dashboardAdoptionDeviceId, protocol: 'zigbee', areaId: customerFixture.areaOneOsId, timestamp: new Date().toISOString() });
+  const dashboardUnregistered = await fetchJsonLoopback(`${base}/_dinodia/admin/api/commissioning/unregistered-devices`, { headers: { ...remoteOsHeaders, cookie: cookieHeader(areaAdminBrowser) } });
+  const assignedAreaName = areasBefore.body.areas?.find((area) => area.id === customerFixture.areaOneOsId)?.name;
+  if (dashboardUnregistered.response.status !== 200 || !dashboardUnregistered.body.devices?.some((device) => device.name === 'UAT unregistered radiator'
+    && device.status === 'not_registered' && device.areaName === assignedAreaName)
+    || JSON.stringify(dashboardUnregistered.body).includes(dashboardAdoptionDeviceId)
+    || JSON.stringify(dashboardUnregistered.body).includes(dashboardAdoptionIeee)) fail(`The assigned full dashboard did not safely list the eligible local unregistered fixture (${dashboardUnregistered.response.status})`);
+  const dashboardUnregisteredAnonymous = await fetchJsonLoopback(`${base}/_dinodia/admin/api/commissioning/unregistered-devices`, { headers: remoteOsHeaders });
+  if (![401, 403].includes(dashboardUnregisteredAnonymous.response.status)) fail('The full-dashboard local inventory route disclosed devices without assigned operator authority');
   const createdAreaOsId = crypto.randomUUID();
   createdAreaName = `UAT room ${createdAreaOsId.slice(0, 8)}`;
   const areaPayload = JSON.stringify({ id: createdAreaOsId, name: createdAreaName, icon: 'room' });
@@ -9726,7 +9744,8 @@ async function osChecks() {
   const commissioningFixtureDrainDeadline = Date.now() + 8_000;
   while ((hub.pairing.syncing || hub.pairing.queuedImmediateSync || hub.pairing.recoveryEndpointInFlight) && Date.now() < commissioningFixtureDrainDeadline) await sleep(25);
   if (hub.pairing.syncing || hub.pairing.queuedImmediateSync || hub.pairing.recoveryEndpointInFlight) fail('The disposable hub sync/recovery request did not settle before the commissioning protocol fixture');
-  await prisma.hubInstallation.update({ where: { id: customerFixture.hubOneId }, data: { capabilitySummary: { nativeZigbeeCommissioningV1: true, nativeMatterCommissioningV1: true } } });
+  await prisma.hubInstallation.update({ where: { id: customerFixture.hubOneId }, data: { capabilitySummary: { nativeZigbeeCommissioningV1: true, nativeMatterCommissioningV1: true,
+    nativeStaffZigbeeCommissioningV1: true, nativeStaffMatterCommissioningV1: true, nativeStaffDeviceRegistrationV1: true } } });
   const consumedRestrictedAuthority = await prisma.operatorHandoff.findUniqueOrThrow({ where: { id: restrictedLaunch.body.handoffId }, select: { scope: true } });
   const restrictedScope = consumedRestrictedAuthority.scope && typeof consumedRestrictedAuthority.scope === 'object' ? consumedRestrictedAuthority.scope : {};
   const operationId = crypto.randomUUID();
@@ -9736,9 +9755,32 @@ async function osChecks() {
     operatorHandoffId: restrictedLaunch.body.handoffId, operatorJti: restrictedScope.operatorJti, workItemId: handoffWork.id, workRevision: handoffWork.workRevision,
     requestId: newInstallationRequest.body.request.id };
   const commissioningBase = { serial: customerFixture.identityOneSerial, identityGeneration: customerFixture.identityOneGeneration, sessionId: commissioningId,
-    homeId: customerFixture.homeOneId, hubInstallationId: customerFixture.hubOneId, protocol: 'zigbee', expiresAt: commissioningExpiry, ...commissioningActor };
+    homeId: customerFixture.homeOneId, hubInstallationId: customerFixture.hubOneId, protocol: 'zigbee', operationKind: 'PAIR_NEW', expiresAt: commissioningExpiry, ...commissioningActor };
+  // Backwards-compatibility guard: the currently installed Pi may still send
+  // the pre-operationKind Pair New wire contract until the reviewed OS bundle
+  // is installed. Exercise the actual authenticated route with that exact
+  // legacy shape, then cancel the disposable session before any radio action.
+  const legacySessionId = crypto.randomUUID();
+  const legacyExpiry = new Date(Date.now() + 10 * 60 * 1000).toISOString();
+  const legacyCommissioningBase = { ...commissioningBase, sessionId: legacySessionId, expiresAt: legacyExpiry };
+  delete legacyCommissioningBase.operationKind;
+  const legacyCreate = await machineRequest({ base: platformBase, path: '/api/hub-agent/v2/commissioning-sessions', machineSecret: customerFixture.machineSecret, body: {
+    ...legacyCommissioningBase, action: 'create', expectedRevision: 1, idempotencyHash: sha256(`stage-home-legacy-pair:${crypto.randomUUID()}`),
+    requestHash: sha256(JSON.stringify({ protocol: 'zigbee' })),
+  } });
+  const legacyAdvertising = await machineRequest({ base: platformBase, path: '/api/hub-agent/v2/commissioning-sessions', machineSecret: customerFixture.machineSecret, body: {
+    ...legacyCommissioningBase, action: 'transition', expectedRevision: 1, status: 'ADVERTISING',
+  } });
+  const legacyCancelled = await machineRequest({ base: platformBase, path: '/api/hub-agent/v2/commissioning-sessions', machineSecret: customerFixture.machineSecret, body: {
+    ...legacyCommissioningBase, action: 'transition', expectedRevision: 2, status: 'CANCELLED',
+  } });
+  const legacySession = await prisma.nativeCommissioningSession.findUnique({ where: { id: legacySessionId }, select: { state: true, finalDeviceId: true } });
+  if (legacyCreate.response.status !== 201 || legacyAdvertising.response.status !== 200 || legacyCancelled.response.status !== 200
+    || legacySession?.state !== 'CANCELLED' || legacySession.finalDeviceId !== null) {
+    fail(`The current route did not safely accept and cancel the prior installed-Pi Pair New contract (${legacyCreate.response.status}/${legacyAdvertising.response.status}/${legacyCancelled.response.status})`);
+  }
   const commissioningCreate = await machineRequest({ base: platformBase, path: '/api/hub-agent/v2/commissioning-sessions', machineSecret: customerFixture.machineSecret, body: {
-    ...commissioningBase, action: 'create', expectedRevision: 1, idempotencyHash: sha256(`stage-home-commission:${operationId}`), requestHash: sha256(JSON.stringify({ protocol: 'zigbee' })),
+    ...commissioningBase, action: 'create', expectedRevision: 1, idempotencyHash: sha256(`stage-home-commission:${operationId}`), requestHash: sha256(JSON.stringify({ operationKind: 'PAIR_NEW', protocol: 'zigbee' })),
   } });
   if (commissioningCreate.response.status !== 201 || commissioningCreate.body.state !== 'REQUESTED') fail(`The actual commissioning owner rejected an enabled Zigbee request without any catalogue approval marker (${commissioningCreate.response.status}/${commissioningCreate.body.error?.code || 'no-code'})`);
   const commissioningAdvertise = await machineRequest({ base: platformBase, path: '/api/hub-agent/v2/commissioning-sessions', machineSecret: customerFixture.machineSecret, body: { ...commissioningBase, action: 'transition', expectedRevision: 1, status: 'ADVERTISING' } });
@@ -9755,16 +9797,77 @@ async function osChecks() {
   const unsupportedFinalize = await machineRequest({ base: platformBase, path: '/api/hub-agent/v2/commissioning-sessions', machineSecret: customerFixture.machineSecret, body: {
     ...commissioningBase, action: 'finalize', expectedRevision: 3, candidateRef: unsupportedCandidateRef, disposition: 'view_only', device: {
       osDeviceId: unsupportedDeviceId, originalName: 'Unfamiliar Zigbee accessory', technicalLabel: 'property_device', deviceType: 'unknown_accessory',
-      manufacturer: 'Unlisted manufacturer', model: 'Unlisted model', protocol: 'ZIGBEE', descriptorRevision: 1, descriptorDigest: unsupportedDigest,
-      capabilitySummary: { controls: [] }, areaId: syncedArea.id, name: 'Unclassified accessory', customerLabel: 'Unclassified accessory',
-      catalogueStatus: 'unsupported', usefulReadings: false,
+      manufacturer: 'Unlisted manufacturer', model: 'Unlisted model', protocol: 'ZIGBEE', protocolIdentityHash: sha256(`identity:${unsupportedDeviceId}`), descriptorRevision: 1, descriptorDigest: unsupportedDigest,
+      capabilitySummary: { controls: [{ controlId: 'temperature-reading', kind: 'number', readable: true, writable: false, domain: 'temperature' }] },
+      areaId: syncedArea.id, name: 'Unclassified accessory', customerLabel: 'Unclassified accessory',
+      catalogueStatus: 'unsupported', usefulReadings: true,
     },
   } });
   const retainedUnsupported = await prisma.nativeDevice.findFirst({ where: { homeId: customerFixture.homeOneId, hubInstallationId: customerFixture.hubOneId, osDeviceId: unsupportedDeviceId }, select: { id: true, lifecycle: true, capabilitySummary: true, assignments: { select: { areaId: true, source: true } } } });
   if (unsupportedFinalize.response.status !== 200 || unsupportedFinalize.body.device?.lifecycle !== 'VIEW_ONLY' || !retainedUnsupported || retainedUnsupported.lifecycle !== 'VIEW_ONLY'
-    || retainedUnsupported.capabilitySummary?.commissioning?.status !== 'unsupported' || retainedUnsupported.capabilitySummary?.commissioning?.usefulReadings !== false
+    || retainedUnsupported.capabilitySummary?.commissioning?.status !== 'unsupported' || retainedUnsupported.capabilitySummary?.commissioning?.usefulReadings !== true
+    || retainedUnsupported.capabilitySummary?.controls?.[0]?.readable !== true || retainedUnsupported.capabilitySummary?.controls?.[0]?.writable !== false
     || retainedUnsupported.assignments.length !== 1 || retainedUnsupported.assignments[0].areaId !== syncedArea.id
     || retainedUnsupported.assignments[0].source !== 'NATIVE_STAFF_COMMISSIONING') fail(`The canonical registration path did not preserve the unsupported device honestly and safely (${unsupportedFinalize.response.status}/${unsupportedFinalize.body.error?.code || 'no-device'}: ${unsupportedFinalize.body.error?.message || 'no-message'})`);
+  const adoptionId = crypto.randomUUID();
+  await prisma.hubInstallation.update({ where: { id: customerFixture.hubOneId }, data: { capabilitySummary: { nativeStaffZigbeeCommissioningV1: false,
+    nativeStaffMatterCommissioningV1: false, nativeStaffDeviceRegistrationV1: true } } });
+  const adoptionSessionId = crypto.randomUUID();
+  const adoptionCandidateRef = crypto.randomUUID();
+  const adoptionDeviceId = `zigbee:stage-home-adoption-${crypto.randomUUID()}`;
+  const adoptionIdentityHash = sha256(`stage-home-existing-radio:${crypto.randomUUID()}`);
+  const adoptionExpiry = new Date(Date.now() + 10 * 60 * 1000).toISOString();
+  const adoptionBase = { ...commissioningBase, sessionId: adoptionSessionId, operationKind: 'REGISTER_EXISTING', expiresAt: adoptionExpiry };
+  const adoptionRequestHash = sha256(JSON.stringify({ operationKind: 'REGISTER_EXISTING', protocol: 'zigbee', candidateRef: adoptionCandidateRef,
+    targetOsDeviceId: adoptionDeviceId, targetIdentityHash: adoptionIdentityHash }));
+  const adoptionCreateBody = { ...adoptionBase, action: 'create', expectedRevision: 1, idempotencyHash: sha256(`stage-home-existing-adoption:${adoptionId}`), requestHash: adoptionRequestHash,
+    candidateRef: adoptionCandidateRef, targetOsDeviceId: adoptionDeviceId, targetIdentityHash: adoptionIdentityHash };
+  const adoptionCreate = await machineRequest({ base: platformBase, path: '/api/hub-agent/v2/commissioning-sessions', machineSecret: customerFixture.machineSecret, body: adoptionCreateBody });
+  const adoptionCreateRetry = await machineRequest({ base: platformBase, path: '/api/hub-agent/v2/commissioning-sessions', machineSecret: customerFixture.machineSecret, body: adoptionCreateBody });
+  if (adoptionCreate.response.status !== 201 || adoptionCreate.body.state !== 'REQUESTED'
+    || adoptionCreateRetry.response.status !== 200 || adoptionCreateRetry.body.sessionId !== adoptionSessionId) fail('The existing-local-device operation did not establish and exact-retry its one durable staff session');
+  const changedAdoptionReplayBody = { ...adoptionCreateBody, candidateRef: crypto.randomUUID() };
+  changedAdoptionReplayBody.requestHash = sha256(JSON.stringify({ operationKind: 'REGISTER_EXISTING', protocol: 'zigbee', candidateRef: changedAdoptionReplayBody.candidateRef,
+    targetOsDeviceId: adoptionDeviceId, targetIdentityHash: adoptionIdentityHash }));
+  const changedAdoptionReplay = await machineRequest({ base: platformBase, path: '/api/hub-agent/v2/commissioning-sessions', machineSecret: customerFixture.machineSecret, body: changedAdoptionReplayBody });
+  if (changedAdoptionReplay.response.status !== 409) fail('The existing-device session key was redirected to a different candidate');
+  const adoptionDescriptorDigest = sha256(`stage-home-adoption-descriptor:${adoptionDeviceId}`);
+  const adoptionReady = await machineRequest({ base: platformBase, path: '/api/hub-agent/v2/commissioning-sessions', machineSecret: customerFixture.machineSecret, body: {
+    ...adoptionBase, action: 'transition', expectedRevision: 1, operationKind: 'REGISTER_EXISTING', status: 'READY', selectedAreaId: syncedArea.id,
+    candidateRef: adoptionCandidateRef, osDeviceId: adoptionDeviceId, targetOsDeviceId: adoptionDeviceId, targetIdentityHash: adoptionIdentityHash,
+    requestedName: 'Existing radiator', customerLabel: 'Living room radiator', catalogueStatus: 'ready', catalogueRevision: 1, descriptorDigest: adoptionDescriptorDigest,
+  } });
+  if (adoptionReady.response.status !== 200 || adoptionReady.body.state !== 'READY') fail(`The Platform owner rejected the current assigned Area/descriptor review for an already-paired device (${adoptionReady.response.status}/${adoptionReady.body.error?.code || 'no-code'})`);
+  const adoptionFinalizeBody = { ...adoptionBase, action: 'finalize', operationKind: 'REGISTER_EXISTING', expectedRevision: 2,
+    candidateRef: adoptionCandidateRef, targetOsDeviceId: adoptionDeviceId, targetIdentityHash: adoptionIdentityHash, disposition: 'install', device: {
+      osDeviceId: adoptionDeviceId, originalName: 'Existing radiator', technicalLabel: 'property_device', deviceType: 'radiator', manufacturer: 'Fixture', model: 'TRV', protocol: 'ZIGBEE',
+      protocolIdentityHash: adoptionIdentityHash, descriptorRevision: 1, descriptorDigest: adoptionDescriptorDigest,
+      capabilitySummary: { controls: [{ controlId: 'target-temperature', kind: 'number', readable: true, writable: true, domain: 'target_temperature' }] },
+      areaId: syncedArea.id, name: 'Living room radiator', customerLabel: 'Living room radiator', catalogueStatus: 'ready', usefulReadings: true,
+    } };
+  const adoptionFinalize = await machineRequest({ base: platformBase, path: '/api/hub-agent/v2/commissioning-sessions', machineSecret: customerFixture.machineSecret, body: adoptionFinalizeBody });
+  const adoptionFinalizeRetry = await machineRequest({ base: platformBase, path: '/api/hub-agent/v2/commissioning-sessions', machineSecret: customerFixture.machineSecret, body: adoptionFinalizeBody });
+  const adoptedCanonical = adoptionFinalize.body.device?.id ? await prisma.nativeDevice.findUnique({ where: { id: adoptionFinalize.body.device.id }, select: {
+    id: true, homeId: true, hubInstallationId: true, osDeviceId: true, managementClass: true, ownerMembershipId: true, lifecycle: true,
+    installationRequestId: true, assignments: { select: { areaId: true, source: true } }, sourceAliases: { select: { protocol: true, protocolIdentityHash: true } },
+  } }) : null;
+  const adoptionDomainEvent = await prisma.nativeDomainOutbox.findFirst({ where: { aggregateId: adoptionFinalize.body.device?.id, eventType: 'PROPERTY_DEVICE_ADOPTED' }, select: { id: true, payload: true } });
+  if (adoptionFinalize.response.status !== 200 || adoptionFinalize.body.operationKind !== 'REGISTER_EXISTING'
+    || adoptionFinalizeRetry.response.status !== 200 || adoptionFinalizeRetry.body.device?.id !== adoptionFinalize.body.device?.id
+    || !adoptedCanonical || adoptedCanonical.homeId !== customerFixture.homeOneId || adoptedCanonical.hubInstallationId !== customerFixture.hubOneId
+    || adoptedCanonical.osDeviceId !== adoptionDeviceId || adoptedCanonical.managementClass !== 'PROPERTY_DEVICE' || adoptedCanonical.ownerMembershipId !== null
+    || adoptedCanonical.lifecycle !== 'INSTALLED' || adoptedCanonical.installationRequestId !== newInstallationRequest.body.request.id
+    || adoptedCanonical.assignments.length !== 1 || adoptedCanonical.assignments[0].areaId !== syncedArea.id
+    || adoptedCanonical.assignments[0].source !== 'NATIVE_STAFF_EXISTING_DEVICE_ADOPTION'
+    || adoptedCanonical.sourceAliases.length !== 1 || adoptedCanonical.sourceAliases[0].protocol !== 'zigbee'
+    || adoptedCanonical.sourceAliases[0].protocolIdentityHash !== adoptionIdentityHash || !adoptionDomainEvent) fail(`Existing local device adoption did not create one canonical property record, identity alias and durable receipt (${adoptionFinalize.response.status}/${adoptionFinalize.body.error?.code || 'no-device'})`);
+  const adoptionHomeowner = await fetchJson(`${platformBase}/api/v2/homes/${encodeURIComponent(customerFixture.homeOneId)}/homeowner-context`, { headers: { authorization: `Bearer ${homeownerLogin.body.accessToken}`, 'x-dinodia-home-id': customerFixture.homeOneId } });
+  const homeownerAdopted = adoptionHomeowner.body?.devices?.find((device) => device.id === adoptionFinalize.body.device.id);
+  if (adoptionHomeowner.response.status !== 200 || !homeownerAdopted || homeownerAdopted.lifecycle !== 'INSTALLED'
+    || !homeownerAdopted.canonicalAreaIds.includes(syncedArea.id) || JSON.stringify(adoptionHomeowner.body).includes(adoptionDeviceId)
+    || JSON.stringify(adoptionHomeowner.body).includes(adoptionIdentityHash)) fail('The homeowner projection did not expose the newly canonicalized adopted device only through its property record and selected Area');
+  await prisma.hubInstallation.update({ where: { id: customerFixture.hubOneId }, data: { capabilitySummary: { nativeZigbeeCommissioningV1: true, nativeMatterCommissioningV1: true,
+    nativeStaffZigbeeCommissioningV1: true, nativeStaffMatterCommissioningV1: true, nativeStaffDeviceRegistrationV1: true } } });
   hub.pairing.stop();
   const tunnelProjectionSyncDeadline = Date.now() + 8_000;
   while ((hub.pairing.syncing || hub.pairing.queuedImmediateSync || hub.pairing.recoveryEndpointInFlight) && Date.now() < tunnelProjectionSyncDeadline) await sleep(25);
