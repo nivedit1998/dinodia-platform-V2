@@ -12,7 +12,8 @@ export const dynamic = 'force-dynamic';
 export async function POST(request: Request) {
   try {
     const raw = await request.text();
-    const hub = await authenticateHub(request, raw);
+    const machineAuthPresent = request.headers.has('x-dinodia-machine-version') || request.headers.has('x-dinodia-machine-signature');
+    const hub = await authenticateHub(request, raw, { allowIdentity: !machineAuthPresent, maxBodyBytes: 16 * 1024 });
     const handoffId = String(hub.body.handoffId ?? '');
     const jti = String(hub.body.jti ?? '');
     const credentialVersion = Number(hub.body.credentialVersion ?? 0);
@@ -20,6 +21,7 @@ export async function POST(request: Request) {
     const handoff = await prisma.operatorHandoff.findUnique({ where: { id: handoffId }, select: { id: true, employeeId: true, workflowId: true, homeId: true, hubInstallationId: true, consumedAt: true, revokedAt: true, scope: true } });
     if (!handoff || !handoff.consumedAt || handoff.revokedAt || handoff.hubInstallationId !== hub.installation.id || handoff.homeId !== hub.installation.homeId) throw new Stage1AuthError(401, 'operator_session_revoked', 'The Dinodia OS operator session is no longer authorised');
     const scope = handoff.scope && typeof handoff.scope === 'object' && !Array.isArray(handoff.scope) ? handoff.scope as Record<string, unknown> : {};
+    if (!machineAuthPresent && String(scope.accessMode ?? '') !== 'local') throw new Stage1AuthError(401, 'operator_revalidation_machine_auth_required', 'Secure operator sessions require the active installation machine credential');
     const employeeSessionId = String(scope.employeeSessionId ?? '');
     const workRevision = Number(scope.workRevision);
     if (!employeeSessionId || !Number.isInteger(workRevision) || String(scope.operatorJti ?? '') !== jti || Number(scope.credentialVersion) !== credentialVersion) throw new Stage1AuthError(401, 'operator_session_authority_invalid', 'The Dinodia OS operator session authority is invalid');

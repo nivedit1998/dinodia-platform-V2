@@ -417,6 +417,18 @@ function machineRequest({ base, path: requestPath, body, machineSecret, machineV
   const machineSignature = crypto.createHmac('sha256', sha256(machineSecret)).update(canonicalHubRequest({ method: 'POST', path: requestPath, timestamp, nonce, bodyHash }), 'utf8').digest('base64url');
   return fetchJson(`${base}${requestPath}`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-machine-version': String(machineVersion), 'x-dinodia-machine-signature': machineSignature, 'x-dinodia-hub-timestamp': timestamp, 'x-dinodia-hub-nonce': nonce, 'x-dinodia-body-sha256': bodyHash }, body: raw });
 }
+function signedManufacturingIdentityRequest({ base, path: requestPath, body, signingPrivateKeyPem }) {
+  const raw = JSON.stringify(body);
+  const timestamp = String(Date.now());
+  const nonce = `harness-identity-${crypto.randomUUID()}`;
+  const bodyHash = sha256(raw);
+  const signature = crypto.sign(null, Buffer.from(canonicalHubRequest({ method: 'POST', path: requestPath, timestamp, nonce, bodyHash }), 'utf8'), crypto.createPrivateKey(signingPrivateKeyPem)).toString('base64url');
+  return { url: `${base}${requestPath}`, init: { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-hub-timestamp': timestamp, 'x-dinodia-hub-nonce': nonce, 'x-dinodia-body-sha256': bodyHash, 'x-dinodia-hub-signature': signature }, body: raw } };
+}
+function manufacturingIdentityRequest(input) {
+  const signed = signedManufacturingIdentityRequest(input);
+  return fetchJson(signed.url, signed.init);
+}
 function baseEnv() {
   const company = keyPair();
   const app = keyPair();
@@ -1048,8 +1060,50 @@ async function customerAuthorizationChecks(deliveryEnv) {
   // CloudURL protocol itself is tested by the dedicated pairing tests.
   const verifiedAt = new Date(now.getTime() - 1000);
   const hubOne = await prisma.hubInstallation.create({ data: { id: harnessHubInstallationId, homeId: homeOne.id, manufacturingIdentityId: identityOne.id, serialNumberSnapshot: identityOne.serialNumber, state: 'ACTIVE', lifecycleStatus: 'ACTIVE', baseUrl: 'http://192.168.1.76:8123', cloudUrl: 'https://dinodia-harness-one.dinodiasmartliving.com', reservedHostname: 'dinodia-harness-one.dinodiasmartliving.com', cloudUrlVerifiedAt: verifiedAt, remoteChallengeAt: verifiedAt, remoteVerificationAt: verifiedAt } });
-  const hubTwo = await prisma.hubInstallation.create({ data: { homeId: homeTwo.id, manufacturingIdentityId: identityTwo.id, serialNumberSnapshot: identityTwo.serialNumber, state: 'ACTIVE', lifecycleStatus: 'ACTIVE', cloudUrl: 'https://dinodia-harness-two.dinodiasmartliving.com', reservedHostname: 'dinodia-harness-two.dinodiasmartliving.com', cloudUrlVerifiedAt: verifiedAt, remoteChallengeAt: verifiedAt, remoteVerificationAt: verifiedAt } });
   await prisma.home.update({ where: { id: homeOne.id }, data: { activeHubInstallationId: hubOne.id } });
+  const recoveryEndpointPath = '/api/hub-agent/v2/lan-endpoint';
+  const recoveryEndpoint = { version: 1, revision: 1, state: 'CURRENT', baseUrl: 'http://192.168.1.76:8123', discoveryHost: `dinodia-${identityOne.serialNumber.toLowerCase()}.local` };
+  const recoveryBody = { serial: identityOne.serialNumber, identityGeneration: identityOne.identityGeneration, lanEndpoint: recoveryEndpoint };
+  const recoveryBefore = await prisma.hubInstallation.findUniqueOrThrow({ where: { id: hubOne.id }, select: { lastSeenAt: true, baseUrl: true, lanEndpointRevision: true, lanEndpointReportedAt: true, lanEndpointState: true, lanEndpointIdentityGeneration: true, capabilitySummary: true } });
+  const recoveryAuditBefore = await prisma.auditEvent.findMany({ where: { actorType: 'HUB', actorId: hubOne.id, action: 'hub_lan_endpoint_changed', targetType: 'HubInstallation', targetId: hubOne.id }, select: { id: true } });
+  const recoveryAuditBeforeIds = new Set(recoveryAuditBefore.map((row) => row.id));
+  const forgedRecoveryReport = await manufacturingIdentityRequest({ base: `http://127.0.0.1:${appPort}`, path: recoveryEndpointPath, body: recoveryBody, signingPrivateKeyPem: identityTwoSigning.privateKey });
+  const wrongGenerationRecoveryReport = await manufacturingIdentityRequest({ base: `http://127.0.0.1:${appPort}`, path: recoveryEndpointPath, body: { ...recoveryBody, identityGeneration: identityOne.identityGeneration + 1 }, signingPrivateKeyPem: identityOneSigning.privateKey });
+  const extraAuthorityRecoveryReport = await manufacturingIdentityRequest({ base: `http://127.0.0.1:${appPort}`, path: recoveryEndpointPath, body: { ...recoveryBody, hubRuntime: { version: 'forged-liveness' } }, signingPrivateKeyPem: identityOneSigning.privateKey });
+  if (forgedRecoveryReport.response.status !== 401 || wrongGenerationRecoveryReport.response.status !== 401 || extraAuthorityRecoveryReport.response.status !== 400) fail(`Identity-only LAN recovery admitted a mismatched identity/generation or extra runtime authority (${forgedRecoveryReport.response.status}/${wrongGenerationRecoveryReport.response.status}/${extraAuthorityRecoveryReport.response.status})`);
+  const acceptedRecoveryReport = await manufacturingIdentityRequest({ base: `http://127.0.0.1:${appPort}`, path: recoveryEndpointPath, body: recoveryBody, signingPrivateKeyPem: identityOneSigning.privateKey });
+  const recoveryAfter = await prisma.hubInstallation.findUniqueOrThrow({ where: { id: hubOne.id }, select: { homeId: true, serialNumberSnapshot: true, lastSeenAt: true, baseUrl: true, lanEndpointRevision: true, lanEndpointReportedAt: true, lanEndpointState: true, lanEndpointIdentityGeneration: true, capabilitySummary: true } });
+  if (acceptedRecoveryReport.response.status !== 200 || acceptedRecoveryReport.body?.ok !== true
+    || acceptedRecoveryReport.body?.lanEndpoint?.revision !== 1 || acceptedRecoveryReport.body?.lanEndpoint?.state !== 'CURRENT'
+    || recoveryAfter.homeId !== homeOne.id || recoveryAfter.serialNumberSnapshot !== identityOne.serialNumber
+    || recoveryAfter.baseUrl !== recoveryEndpoint.baseUrl || recoveryAfter.lanEndpointRevision !== 1
+    || recoveryAfter.lanEndpointState !== 'CURRENT' || recoveryAfter.lanEndpointIdentityGeneration !== identityOne.identityGeneration
+    || !recoveryAfter.lanEndpointReportedAt || recoveryAfter.lastSeenAt?.getTime() !== recoveryBefore.lastSeenAt?.getTime()
+    || JSON.stringify(recoveryAfter.capabilitySummary) !== JSON.stringify(recoveryBefore.capabilitySummary)) fail(`Identity-only recovery did not update only the current-generation LAN endpoint (${acceptedRecoveryReport.response.status}/${JSON.stringify({ baseUrl: recoveryAfter.baseUrl, revision: recoveryAfter.lanEndpointRevision, state: recoveryAfter.lanEndpointState, generation: recoveryAfter.lanEndpointIdentityGeneration, lastSeenUnchanged: recoveryAfter.lastSeenAt?.getTime() === recoveryBefore.lastSeenAt?.getTime() })})`);
+  const recoveryConflict = await manufacturingIdentityRequest({ base: `http://127.0.0.1:${appPort}`, path: recoveryEndpointPath, body: { ...recoveryBody, lanEndpoint: { ...recoveryEndpoint, baseUrl: 'http://192.168.1.77:8123' } }, signingPrivateKeyPem: identityOneSigning.privateKey });
+  const recoveryStale = await manufacturingIdentityRequest({ base: `http://127.0.0.1:${appPort}`, path: recoveryEndpointPath, body: { ...recoveryBody, lanEndpoint: { ...recoveryEndpoint, revision: 0 } }, signingPrivateKeyPem: identityOneSigning.privateKey });
+  const recoveryPublicAddress = await manufacturingIdentityRequest({ base: `http://127.0.0.1:${appPort}`, path: recoveryEndpointPath, body: { ...recoveryBody, lanEndpoint: { ...recoveryEndpoint, baseUrl: 'http://8.8.8.8:8123' } }, signingPrivateKeyPem: identityOneSigning.privateKey });
+  const exactRecoveryRequest = signedManufacturingIdentityRequest({ base: `http://127.0.0.1:${appPort}`, path: recoveryEndpointPath, body: recoveryBody, signingPrivateKeyPem: identityOneSigning.privateKey });
+  const originalRecoveryRequest = await fetchJson(exactRecoveryRequest.url, exactRecoveryRequest.init);
+  const replayedRecoveryReport = await fetchJson(exactRecoveryRequest.url, exactRecoveryRequest.init);
+  await prisma.home.update({ where: { id: homeOne.id }, data: { activeHubInstallationId: null } });
+  const inactiveInstallationRecovery = await manufacturingIdentityRequest({ base: `http://127.0.0.1:${appPort}`, path: recoveryEndpointPath, body: { ...recoveryBody, lanEndpoint: { ...recoveryEndpoint, revision: 2, baseUrl: 'http://192.168.1.78:8123' } }, signingPrivateKeyPem: identityOneSigning.privateKey });
+  await prisma.home.update({ where: { id: homeOne.id }, data: { activeHubInstallationId: hubOne.id } });
+  if (recoveryConflict.response.status !== 409 || recoveryStale.response.status !== 400 || recoveryPublicAddress.response.status !== 400
+    || originalRecoveryRequest.response.status !== 200 || replayedRecoveryReport.response.status !== 401 || inactiveInstallationRecovery.response.status !== 409
+    || (await prisma.hubInstallation.findUniqueOrThrow({ where: { id: hubOne.id }, select: { baseUrl: true, lanEndpointRevision: true } })).baseUrl !== recoveryEndpoint.baseUrl) {
+    fail(`LAN recovery did not fail closed for revision conflict/staleness, public origin, exact nonce replay or inactive installation (${recoveryConflict.response.status}/${recoveryStale.response.status}/${recoveryPublicAddress.response.status}/${originalRecoveryRequest.response.status}/${replayedRecoveryReport.response.status}/${inactiveInstallationRecovery.response.status})`);
+  }
+  console.log('[stage1:integration] PASS: the existing factory identity can refresh only its exact private LAN endpoint; mismatched identity, extra runtime authority, stale/conflicting revisions, public origins and invalid signatures deny without heartbeat or household state effects');
+  await prisma.hubInstallation.update({ where: { id: hubOne.id }, data: {
+    baseUrl: recoveryBefore.baseUrl, lanEndpointRevision: recoveryBefore.lanEndpointRevision,
+    lanEndpointReportedAt: recoveryBefore.lanEndpointReportedAt, lanEndpointState: recoveryBefore.lanEndpointState,
+    lanEndpointIdentityGeneration: recoveryBefore.lanEndpointIdentityGeneration,
+  } });
+  const recoveryAuditCreated = await prisma.auditEvent.findMany({ where: { actorType: 'HUB', actorId: hubOne.id, action: 'hub_lan_endpoint_changed', targetType: 'HubInstallation', targetId: hubOne.id }, select: { id: true } });
+  const recoveryAuditCreatedIds = recoveryAuditCreated.map((row) => row.id).filter((id) => !recoveryAuditBeforeIds.has(id));
+  if (recoveryAuditCreatedIds.length) await prisma.auditEvent.deleteMany({ where: { id: { in: recoveryAuditCreatedIds } } });
+  const hubTwo = await prisma.hubInstallation.create({ data: { homeId: homeTwo.id, manufacturingIdentityId: identityTwo.id, serialNumberSnapshot: identityTwo.serialNumber, state: 'ACTIVE', lifecycleStatus: 'ACTIVE', cloudUrl: 'https://dinodia-harness-two.dinodiasmartliving.com', reservedHostname: 'dinodia-harness-two.dinodiasmartliving.com', cloudUrlVerifiedAt: verifiedAt, remoteChallengeAt: verifiedAt, remoteVerificationAt: verifiedAt } });
   await prisma.home.update({ where: { id: homeTwo.id }, data: { activeHubInstallationId: hubTwo.id } });
   const claimReferenceValue = `DNO-HOME-${crypto.randomBytes(32).toString('base64url')}`;
   const claimReferenceHashValue = claimReferenceHash(claimReferenceValue, env.CLAIM_REFERENCE_PEPPER);
@@ -6320,10 +6374,13 @@ async function pendingInvitationRouteChecks(deliveryEnv) {
   // F10-B: queue a second real Store-produced Radiator sample whose source
   // validity expired before this signed route delivery. It must be retained
   // as historical evidence, must not become current, and must not replace the
-  // newer fresh reading from the first telemetry device.
+  // newer fresh reading from the first telemetry device. The preceding
+  // assignment-boundary cases are complete; extend only this disposable
+  // assignment backward to cover the historical temperature's source time.
   const delayedDeliveredAt = new Date();
   const delayedObservedAt = new Date(delayedDeliveredAt.getTime() - 31 * 60_000);
   const delayedTemperature = 20.8;
+  await prisma.deviceAreaAssignment.update({ where: { id: partialAssignment.id }, data: { validFrom: new Date(delayedObservedAt.getTime() - 1) } });
   await hub.store.upsertDevice({
     id: partialOsDeviceId, name: 'Disposable partial-hour radiator', protocol: 'zigbee', deviceType: 'radiator',
     technicalLabel: 'radiator', areaId: telemetryOsAreaId,
@@ -8907,6 +8964,7 @@ async function osChecks() {
     },
   };
   const heartbeatReceipts = [];
+  const recoveryEndpointReceipts = [];
   stageHomeSyncReceipts = [];
   const pairingFetch = hub.pairing.fetchImpl;
   hub.pairing.fetchImpl = async (input, init) => {
@@ -8928,7 +8986,12 @@ async function osChecks() {
     }
     if (requestPath === '/api/hub-agent/v2/heartbeat') {
       const body = await response.clone().json().catch(() => ({}));
-      heartbeatReceipts.push({ status: response.status, errorCode: body.errorCode || body.error?.code || null, endpointRevision: body.lanEndpoint?.revision ?? null, endpointState: body.lanEndpoint?.state ?? null });
+      const requestBody = JSON.parse(String(init?.body || '{}'));
+      heartbeatReceipts.push({ status: response.status, errorCode: body.errorCode || body.error?.code || null, endpointRevision: body.lanEndpoint?.revision ?? null, endpointState: body.lanEndpoint?.state ?? null, requestRevision: requestBody.lanEndpoint?.revision ?? null, requestBaseUrl: requestBody.lanEndpoint?.baseUrl ?? null });
+    }
+    if (requestPath === '/api/hub-agent/v2/lan-endpoint') {
+      const body = await response.clone().json().catch(() => ({}));
+      recoveryEndpointReceipts.push({ status: response.status, errorCode: body.errorCode || body.error?.code || null, endpointRevision: body.lanEndpoint?.revision ?? null, endpointState: body.lanEndpoint?.state ?? null });
     }
     return response;
   };
@@ -9129,10 +9192,15 @@ async function osChecks() {
   const expectedAreaBindings = (areaTokenState.body?.areaBindings || [])
     .map(({ areaId, hubAreaId }) => ({ areaId, hubAreaId }))
     .sort((left, right) => left.areaId.localeCompare(right.areaId));
+  const localLanObservationAfterTokenState = hub.store.getPlatform().lanEndpointObservation || null;
+  const platformLanObservationAfterTokenState = await prisma.hubInstallation.findUniqueOrThrow({ where: { id: customerFixture.hubOneId }, select: { baseUrl: true, lanEndpointRevision: true, lanEndpointState: true, lanEndpointIdentityGeneration: true } });
   if (JSON.stringify(sortedAreaBindings) !== JSON.stringify(expectedAreaBindings) || heartbeatReceipts.length <= tokenStateHeartbeatCount
     || heartbeatReceipts.at(-1)?.status !== 200) fail(`Machine-authenticated token-state did not synchronize the canonical Area UUID to private OS alias mapping (${JSON.stringify({
       areaBindings: sortedAreaBindings, expectedAreaBindings, heartbeatCountDelta: heartbeatReceipts.length - tokenStateHeartbeatCount,
       latestHeartbeatStatus: heartbeatReceipts.at(-1)?.status ?? null,
+      heartbeatReceiptsSinceTokenState: heartbeatReceipts.slice(tokenStateHeartbeatCount),
+      localLanEndpointObservation: localLanObservationAfterTokenState,
+      platformLanEndpointObservation: platformLanObservationAfterTokenState,
       pairingSyncing: hub.pairing.syncing, queuedImmediateSync: hub.pairing.queuedImmediateSync,
       lastErrorClass: String(hub.pairing.lastError || '').includes('HTTP 401') ? 'platform_401' : String(hub.pairing.lastError || '').includes('HTTP 409') ? 'platform_409' : hub.pairing.lastError ? 'other' : null,
     })})`);
@@ -9545,6 +9613,13 @@ async function osChecks() {
   const restrictedAreaCreate = await fetchJsonLoopback(`${base}/_dinodia/admin/api/areas`, { method: 'POST', headers: { ...remoteOsHeaders, cookie: cookieHeader(restrictedBrowser), 'content-type': 'application/json' }, body: JSON.stringify({ id: restrictedAreaId, name: 'Must not be created from restricted commissioning', icon: 'room' }) });
   const restrictedAreaLookup = await prisma.area.findUnique({ where: { homeId_osAreaId: { homeId: customerFixture.homeOneId, osAreaId: restrictedAreaId } }, select: { id: true } });
   if (restrictedAreaCreate.response.status !== 403 || restrictedAreaLookup) fail('The restricted commissioning session created an Area or left a durable Platform record');
+  // Freeze the disposable hub's scheduled status reports before enabling the
+  // explicit protocol fixture; otherwise a concurrent heartbeat can replace
+  // these test-only capabilities with the hub's held real configuration.
+  hub.pairing.stop();
+  const commissioningFixtureDrainDeadline = Date.now() + 8_000;
+  while ((hub.pairing.syncing || hub.pairing.queuedImmediateSync || hub.pairing.recoveryEndpointInFlight) && Date.now() < commissioningFixtureDrainDeadline) await sleep(25);
+  if (hub.pairing.syncing || hub.pairing.queuedImmediateSync || hub.pairing.recoveryEndpointInFlight) fail('The disposable hub sync/recovery request did not settle before the commissioning protocol fixture');
   await prisma.hubInstallation.update({ where: { id: customerFixture.hubOneId }, data: { capabilitySummary: { nativeZigbeeCommissioningV1: true, nativeMatterCommissioningV1: true } } });
   const consumedRestrictedAuthority = await prisma.operatorHandoff.findUniqueOrThrow({ where: { id: restrictedLaunch.body.handoffId }, select: { scope: true } });
   const restrictedScope = consumedRestrictedAuthority.scope && typeof consumedRestrictedAuthority.scope === 'object' ? consumedRestrictedAuthority.scope : {};
@@ -9584,6 +9659,10 @@ async function osChecks() {
     || retainedUnsupported.capabilitySummary?.commissioning?.status !== 'unsupported' || retainedUnsupported.capabilitySummary?.commissioning?.usefulReadings !== false
     || retainedUnsupported.assignments.length !== 1 || retainedUnsupported.assignments[0].areaId !== syncedArea.id
     || retainedUnsupported.assignments[0].source !== 'NATIVE_STAFF_COMMISSIONING') fail(`The canonical registration path did not preserve the unsupported device honestly and safely (${unsupportedFinalize.response.status}/${unsupportedFinalize.body.error?.code || 'no-device'}: ${unsupportedFinalize.body.error?.message || 'no-message'})`);
+  hub.pairing.stop();
+  const tunnelProjectionSyncDeadline = Date.now() + 8_000;
+  while ((hub.pairing.syncing || hub.pairing.queuedImmediateSync || hub.pairing.recoveryEndpointInFlight) && Date.now() < tunnelProjectionSyncDeadline) await sleep(25);
+  if (hub.pairing.syncing || hub.pairing.queuedImmediateSync || hub.pairing.recoveryEndpointInFlight) fail('The scheduled OS sync/recovery endpoint did not settle before the deterministic homeowner tunnel-status projection fixture');
   const tunnelSampledAt = new Date();
   const tunnelReport = { schemaVersion: 1, recoveryState: 'RECONNECTING', childRunning: true, originState: 'HEALTHY', edgeState: 'DISCONNECTED', activeConnections: 0,
     sampledAt: tunnelSampledAt.toISOString(), validUntil: new Date(tunnelSampledAt.getTime() + 420_000).toISOString(), identityGeneration: customerFixture.identityOneGeneration };
@@ -9601,7 +9680,7 @@ async function osChecks() {
     || !homeownerResult.body.areas?.some((area) => area.id === syncedArea.id && area.originalName === createdAreaName)
     || !homeownerUnsupported || homeownerUnsupported.lifecycle !== 'VIEW_ONLY' || !homeownerUnsupported.canonicalAreaIds.includes(syncedArea.id)
     || homeownerUnsupported.readings.length !== 0 || homeownerUnsupported.onlineState !== 'UNKNOWN'
-    || homeownerResult.body.devices.some((device) => device.id === customerFixture.tenantDeviceId)) fail(`The homeowner app projection did not show the synchronized Area and truthful read-only unsupported device without tenant-private inventory (${JSON.stringify({ status: homeownerResult.response.status, errorCode: homeownerResult.body.errorCode ?? homeownerResult.body.error?.code ?? null, expectedArea: { id: syncedArea.id, originalName: createdAreaName }, returnedAreas: homeownerResult.body.areas?.map((area) => ({ id: area.id, originalName: area.originalName })) ?? null, areaPresent: Boolean(homeownerResult.body.areas?.some((area) => area.id === syncedArea.id && area.originalName === createdAreaName)), expectedDeviceId: unsupportedFinalize.body.device?.id ?? null, deviceFound: Boolean(homeownerUnsupported), lifecycle: homeownerUnsupported?.lifecycle ?? null, areaIds: homeownerUnsupported?.canonicalAreaIds ?? null, readingsCount: homeownerUnsupported?.readings?.length ?? null, onlineState: homeownerUnsupported?.onlineState ?? null, privateDevicePresent: homeownerResult.body.devices?.some((device) => device.id === customerFixture.tenantDeviceId) ?? null })})`);
+    || homeownerResult.body.devices.some((device) => device.id === customerFixture.tenantDeviceId)) fail(`The homeowner app projection did not show the synchronized Area and truthful read-only unsupported device without tenant-private inventory (${JSON.stringify({ status: homeownerResult.response.status, errorCode: homeownerResult.body.errorCode ?? homeownerResult.body.error?.code ?? null, remoteAccessState: homeownerResult.body.hub?.remoteAccessState ?? null, reservationTokenLeaked: JSON.stringify(homeownerResult.body).includes('reservationToken'), identitySerialLeaked: JSON.stringify(homeownerResult.body).includes(customerFixture.identityOneSerial), expectedArea: { id: syncedArea.id, originalName: createdAreaName }, returnedAreas: homeownerResult.body.areas?.map((area) => ({ id: area.id, originalName: area.originalName })) ?? null, areaPresent: Boolean(homeownerResult.body.areas?.some((area) => area.id === syncedArea.id && area.originalName === createdAreaName)), expectedDeviceId: unsupportedFinalize.body.device?.id ?? null, deviceFound: Boolean(homeownerUnsupported), lifecycle: homeownerUnsupported?.lifecycle ?? null, areaIds: homeownerUnsupported?.canonicalAreaIds ?? null, readingsCount: homeownerUnsupported?.readings?.length ?? null, onlineState: homeownerUnsupported?.onlineState ?? null, privateDevicePresent: homeownerResult.body.devices?.some((device) => device.id === customerFixture.tenantDeviceId) ?? null })})`);
   console.log('[stage-home:integration] PASS: assigned full OS dashboard created and exact-retried a disposable Area; signed sync preserved OS↔Platform IDs, refreshed whole-property commissioning options, restricted scope could not create Areas, and the homeowner projection showed the unsupported VIEW_ONLY device as UNKNOWN with no invented readings or tenant-private inventory');
   const poisonedRecoveryReport = { ...tunnelReport, identityGeneration: customerFixture.identityOneGeneration - 1, reservationToken: 'fixture-secret-must-not-persist' };
   const staleRecoveryHeartbeat = await machineRequest({ base: platformBase, path: '/api/hub-agent/v2/heartbeat', machineSecret: customerFixture.machineSecret, body: {
@@ -9722,11 +9801,49 @@ async function osChecks() {
   // BaseURL, even though the disposable OS listener is reached through a
   // loopback socket. The Host/Origin are the private endpoint recorded by the
   // signed heartbeat; no production route accepts loopback as a LAN report.
+  simulatedLanAddress = '192.168.0.111';
+  hub.pairing.stop();
+  const recoverySyncDrainDeadline = Date.now() + 8_000;
+  while ((hub.pairing.syncing || hub.pairing.queuedImmediateSync || hub.pairing.recoveryEndpointInFlight) && Date.now() < recoverySyncDrainDeadline) await sleep(25);
+  if (hub.pairing.syncing || hub.pairing.queuedImmediateSync || hub.pairing.recoveryEndpointInFlight) fail('The prior scheduled sync/recovery endpoint did not settle before the unpaired-recovery fixture');
+  const platformBeforeRecovery = hub.store.getPlatform();
+  await hub.store.savePlatform({ paired: false, provisioningAttemptId: null });
+  const pairedStateBeforeRecovery = hub.store.getPlatform().paired;
+  const recoveryOutboxBefore = hub.store.getSyncOutbox();
+  const recoveryHubBefore = await prisma.hubInstallation.findUniqueOrThrow({ where: { id: customerFixture.hubOneId }, select: { lastSeenAt: true, lanEndpointRevision: true, baseUrl: true } });
+  const recoveryReceiptCountBefore = recoveryEndpointReceipts.length;
+  await hub.pairing.publishRecoveryLanEndpoint();
+  const recoveryHubAfter = await prisma.hubInstallation.findUniqueOrThrow({ where: { id: customerFixture.hubOneId }, select: { lastSeenAt: true, lanEndpointRevision: true, baseUrl: true, lanEndpointState: true, lanEndpointReportedAt: true, lanEndpointIdentityGeneration: true } });
+  if (pairedStateBeforeRecovery !== false || hub.store.getPlatform().paired !== false
+    || recoveryEndpointReceipts.length !== recoveryReceiptCountBefore + 1 || recoveryEndpointReceipts.at(-1)?.status !== 200
+    || recoveryHubAfter.lanEndpointState !== 'CURRENT' || recoveryHubAfter.lanEndpointIdentityGeneration !== customerFixture.identityOneGeneration
+    || recoveryHubAfter.lanEndpointRevision < recoveryHubBefore.lanEndpointRevision || !recoveryHubAfter.lanEndpointReportedAt
+    || recoveryHubAfter.lastSeenAt?.getTime() !== recoveryHubBefore.lastSeenAt?.getTime()
+    || JSON.stringify(hub.store.getSyncOutbox()) !== JSON.stringify(recoveryOutboxBefore)) fail(`Unpaired recovery did not refresh only the current signed LAN endpoint while preserving machine-pairing and sync/outbox state (${JSON.stringify({ pairedBefore: pairedStateBeforeRecovery, pairedAfter: hub.store.getPlatform().paired, receipt: recoveryEndpointReceipts.at(-1), receiptCountDelta: recoveryEndpointReceipts.length - recoveryReceiptCountBefore, before: recoveryHubBefore, after: recoveryHubAfter, outboxUnchanged: JSON.stringify(hub.store.getSyncOutbox()) === JSON.stringify(recoveryOutboxBefore) })})`);
+  // The homeowner projection case intentionally stopped the background sync
+  // timer to keep its heartbeat fixture deterministic. Refresh the same
+  // recovery-only endpoint before the later local handoff so it proves a
+  // fresh, not merely previously-current, LAN report.
+  const localHandoffEndpointReceiptCount = recoveryEndpointReceipts.length;
+  const freshLocalEndpointReport = await hub.pairing.publishRecoveryLanEndpoint();
+  const localHandoffEndpoint = await prisma.hubInstallation.findUniqueOrThrow({ where: { id: customerFixture.hubOneId }, select: { lanEndpointState: true, lanEndpointIdentityGeneration: true, lanEndpointReportedAt: true } });
+  if (!freshLocalEndpointReport || recoveryEndpointReceipts.length !== localHandoffEndpointReceiptCount + 1 || localHandoffEndpoint.lanEndpointState !== 'CURRENT'
+    || localHandoffEndpoint.lanEndpointIdentityGeneration !== customerFixture.identityOneGeneration
+    || !localHandoffEndpoint.lanEndpointReportedAt || Date.now() - localHandoffEndpoint.lanEndpointReportedAt.getTime() > 30_000) fail('The fresh local-handoff fixture did not publish a current identity-signed LAN endpoint');
+  const localPortalWorkflows = await fetchJson(`${platformBase}/api/installer/workflows`, { headers: { 'x-dinodia-employee-session': customerFixture.operatorToken } });
+  const localPortalWork = localPortalWorkflows.body.workflows?.find((work) => work.id === customerFixture.operatorWorkId);
+  if (localPortalWorkflows.response.status !== 200 || localPortalWork?.hubInstallation?.localState !== 'CURRENT'
+    || localPortalWork?.hubInstallation?.localUrl !== recoveryHubAfter.baseUrl) fail('Assigned Company Portal did not expose the fresh local endpoint for the exact current work item');
+  localHost = new URL(recoveryHubAfter.baseUrl).host;
+  localOsHeaders = { host: localHost, origin: `http://${localHost}` };
   const localSetupPage = await fetchLoopback(`${base}/support-access`, { headers: localOsHeaders });
   const localBrowser = {};
   updateCookieJar(localBrowser, localSetupPage);
   const localAttempt = await fetchJsonLoopback(`${base}/_dinodia/setup/operator-attempt`, { method: 'POST', headers: { ...localOsHeaders, cookie: cookieHeader(localBrowser), 'x-dinodia-setup-csrf': decodeURIComponent(cookieValue(localBrowser, 'dinodia_setup_csrf')) } });
-  if (localAttempt.response.status !== 200 || !localAttempt.body.setupAttemptId) fail(`Fresh local endpoint could not register a bound browser attempt (${localAttempt.response.status}/${localAttempt.body.errorCode || 'unknown'})`);
+  if (localAttempt.response.status !== 200 || !localAttempt.body.setupAttemptId) {
+    const endpointAtLocalAttempt = await prisma.hubInstallation.findUniqueOrThrow({ where: { id: customerFixture.hubOneId }, select: { baseUrl: true, lanEndpointState: true, lanEndpointRevision: true, lanEndpointReportedAt: true, lanEndpointIdentityGeneration: true, manufacturingIdentity: { select: { identityGeneration: true, status: true } } } });
+    fail(`Fresh local endpoint could not register a bound browser attempt (${localAttempt.response.status}/${localAttempt.body.errorCode || 'unknown'}; ${JSON.stringify({ endpointOrigin: `http://${localHost}`, storedBaseUrl: endpointAtLocalAttempt.baseUrl, state: endpointAtLocalAttempt.lanEndpointState, revision: endpointAtLocalAttempt.lanEndpointRevision, reportedAt: endpointAtLocalAttempt.lanEndpointReportedAt?.toISOString() ?? null, ageMs: endpointAtLocalAttempt.lanEndpointReportedAt ? Date.now() - endpointAtLocalAttempt.lanEndpointReportedAt.getTime() : null, endpointGeneration: endpointAtLocalAttempt.lanEndpointIdentityGeneration, currentIdentityGeneration: endpointAtLocalAttempt.manufacturingIdentity?.identityGeneration, identityStatus: endpointAtLocalAttempt.manufacturingIdentity?.status })})`);
+  }
   // The independent secure/full-dashboard/restricted-scope cases above each
   // exercise the real launch limiter. Clear only their disposable buckets so
   // this separate local-origin composition case gets its own five-attempt
@@ -9747,6 +9864,9 @@ async function osChecks() {
   const localEnd = await fetchJsonLoopback(`${base}/_dinodia/operator-session/end`, { method: 'POST', headers: { ...localOsHeaders, cookie: cookieHeader(localBrowser) } });
   const localAfterEnd = await fetchJsonLoopback(`${base}/_dinodia/admin/api/devices`, { headers: { ...localOsHeaders, cookie: cookieHeader(localBrowser) } });
   if (localEnd.response.status !== 200 || localAfterEnd.response.status !== 401) fail('Local BaseURL session did not revoke before expiry');
+  await hub.store.savePlatform({ paired: platformBeforeRecovery.paired === true, provisioningAttemptId: platformBeforeRecovery.provisioningAttemptId ?? null });
+  if (hub.store.getPlatform().paired !== (platformBeforeRecovery.paired === true)) fail('The disposable unpaired-local handoff fixture did not restore its original paired state for subsequent secure-path checks');
+  hub.pairing.start();
   const lastCurrentSetupEndpoint = await prisma.hubInstallation.findUniqueOrThrow({ where: { id: customerFixture.hubOneId }, select: { baseUrl: true, lanEndpointRevision: true } });
   const lastCurrentEndpointState = await prisma.hubInstallation.findUniqueOrThrow({ where: { id: customerFixture.hubOneId }, select: { lanEndpointState: true, lanEndpointIdentityGeneration: true } });
   if (lastCurrentEndpointState.lanEndpointState !== 'CURRENT' || lastCurrentEndpointState.lanEndpointIdentityGeneration !== customerFixture.identityOneGeneration || !lastCurrentSetupEndpoint.baseUrl) fail('A current identity-bound installer endpoint was not retained before simulating interface loss');

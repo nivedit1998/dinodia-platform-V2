@@ -12,7 +12,8 @@ export const dynamic = 'force-dynamic';
 export async function POST(request: Request) {
   try {
     const raw = await request.text();
-    const hub = await authenticateHub(request, raw);
+    const machineAuthPresent = request.headers.has('x-dinodia-machine-version') || request.headers.has('x-dinodia-machine-signature');
+    const hub = await authenticateHub(request, raw, { allowIdentity: !machineAuthPresent, maxBodyBytes: 16 * 1024 });
     const handoffId = String(hub.body.handoffId ?? '').trim();
     const browserBinding = String(hub.body.browserBinding ?? '').trim();
     const setupAttemptId = String(hub.body.setupAttemptId ?? '').trim();
@@ -29,6 +30,7 @@ export async function POST(request: Request) {
       if (!browserAttempt || browserAttempt.homeId !== handoff.homeId || browserAttempt.hubInstallationId !== handoff.hubInstallationId || browserAttempt.attemptId !== setupAttemptId || browserAttempt.browserBindingHash !== sha256(browserBinding) || !isStrictlyUnexpired(browserAttempt.expiresAt, now) || browserAttempt.consumedAt || browserAttempt.revokedAt || handoff.browserBindingHash !== browserAttempt.browserBindingHash) throw new Stage1AuthError(401, 'handoff_rejected', 'The operator handoff is not bound to this hub browser');
       const handoffScope = handoff.scope && typeof handoff.scope === 'object' && !Array.isArray(handoff.scope) ? handoff.scope as Record<string, unknown> : {};
       const accessMode = String(handoffScope.accessMode ?? '');
+      if (!machineAuthPresent && accessMode !== 'local') throw new Stage1AuthError(401, 'handoff_machine_auth_required', 'Secure operator handoffs require the active installation machine credential');
       const endpointOrigin = String(handoffScope.endpointOrigin ?? '');
       const endpointRevision = Number(handoffScope.endpointRevision);
       const endpoint = await tx.hubInstallation.findUnique({ where: { id: handoff.hubInstallationId }, select: { baseUrl: true, cloudUrl: true, cloudUrlVerifiedAt: true, remoteVerificationAt: true, lanEndpointRevision: true, lanEndpointReportedAt: true, lanEndpointState: true, lanEndpointIdentityGeneration: true, manufacturingIdentity: { select: { identityGeneration: true, status: true } } } });

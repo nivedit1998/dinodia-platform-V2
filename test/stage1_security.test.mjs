@@ -549,14 +549,20 @@ test('normal hub routes require the acknowledged machine credential', () => {
     'src/app/api/hub-agent/v2/heartbeat/route.ts',
     'src/app/api/hub-agent/token-state/route.ts',
     'src/app/api/hub-agent/support/v2/status/route.ts',
-    'src/app/api/hub-agent/operator-session/consume/route.ts',
     'src/app/api/hub-agent/v2/pairing/cloud-url/route.ts',
   ]) assert.doesNotMatch(read(route), /allowIdentity/);
   for (const route of [
     'src/app/api/hub-agent/v2/pairing/challenge/route.ts',
     'src/app/api/hub-agent/v2/pairing/prove/route.ts',
     'src/app/api/hub-agent/v2/pairing/acknowledge/route.ts',
-  ]) assert.match(read(route), /allowIdentity: true/);
+    'src/app/api/hub-agent/v2/lan-endpoint/route.ts',
+    'src/app/api/hub-agent/operator-session/attempt/route.ts',
+    'src/app/api/hub-agent/operator-session/consume/route.ts',
+    'src/app/api/hub-agent/operator-session/revalidate/route.ts',
+  ]) assert.match(read(route), /allowIdentity:/);
+  assert.match(read('src/app/api/hub-agent/operator-session/attempt/route.ts'), /accessMode !== 'local'/);
+  assert.match(read('src/app/api/hub-agent/operator-session/consume/route.ts'), /accessMode !== 'local'/);
+  assert.match(read('src/app/api/hub-agent/operator-session/revalidate/route.ts'), /!machineAuthPresent[\s\S]{0,80}scope\.accessMode[\s\S]{0,40}!== 'local'/);
 });
 
 test('offline authority cannot replace the enrolled trusted-phone key', () => {
@@ -826,7 +832,8 @@ test('installer UI separates verified secure launch from fresh local endpoint la
   assert.match(launch, /lanEndpointFresh\(hub\.lanEndpointState/);
   assert.match(launch, /endpointOrigin: operatorOrigin, endpointRevision/);
   assert.match(attempt, /endpointOrigin !== secureOrigin/);
-  assert.match(attempt, /endpointOrigin !== installation\.baseUrl/);
+  assert.match(attempt, /const local = new URL\(installation\.baseUrl \|\| ''\)/);
+  assert.match(attempt, /endpointOrigin !== localOrigin/);
   assert.match(attempt, /lanEndpointIdentityGeneration !== installation\.manufacturingIdentity\.identityGeneration/);
   assert.match(attempt, /lanEndpointFresh\(installation\.lanEndpointState/);
   assert.match(consume, /handoffScope\.accessMode/);

@@ -7,18 +7,27 @@ import { lanEndpointFresh } from '@/lib/lanEndpoint';
 export const dynamic = 'force-dynamic';
 
 /**
- * Registers the browser attempt created by the paired hub. This endpoint is
- * deliberately machine-authenticated: Company Portal cannot invent the
+ * Registers the browser attempt created by the hub. Secure attempts require
+ * the active machine credential; the enrolled manufacturing identity may
+ * register only a local recovery attempt. Company Portal cannot invent the
  * attempt id or browser binding and a second browser cannot replace it.
  */
 export async function POST(request: Request) {
   try {
     const raw = await request.text();
-    const hub = await authenticateHub(request, raw);
+    const machineAuthPresent = request.headers.has('x-dinodia-machine-version') || request.headers.has('x-dinodia-machine-signature');
+    const hub = await authenticateHub(request, raw, { allowIdentity: !machineAuthPresent, maxBodyBytes: 16 * 1024 });
     const attemptId = String(hub.body.setupAttemptId ?? '').trim();
     const browserBindingHash = String(hub.body.browserBindingHash ?? '').trim().toLowerCase();
     const accessMode = String(hub.body.accessMode ?? '');
     const endpointOrigin = String(hub.body.operatorOrigin ?? '').trim();
+    const expectedKeys = ['serial', 'identityGeneration', 'setupAttemptId', 'browserBindingHash', 'accessMode', 'operatorOrigin'];
+    if (Object.keys(hub.body).length !== expectedKeys.length || Object.keys(hub.body).some((key) => !expectedKeys.includes(key))) {
+      throw new Stage1AuthError(400, 'operator_attempt_invalid', 'The browser attempt contains unsupported authority');
+    }
+    if (!machineAuthPresent && accessMode !== 'local') {
+      throw new Stage1AuthError(401, 'operator_attempt_machine_auth_required', 'Secure browser attempts require the active installation machine credential');
+    }
     if (!/^[A-Za-z0-9_-]{32,160}$/.test(attemptId) || !/^[a-f0-9]{64}$/.test(browserBindingHash)
       || !['secure', 'local'].includes(accessMode) || endpointOrigin.length > 500) {
       throw new Stage1AuthError(400, 'operator_attempt_invalid', 'A valid hub-created setup attempt is required');
@@ -42,9 +51,14 @@ export async function POST(request: Request) {
         try { const secure = new URL(installation.cloudUrl); if (secure.protocol === 'https:' && secure.pathname === '/' && !secure.search && !secure.hash && !secure.username && !secure.password) secureOrigin = secure.origin; } catch { /* fail closed below */ }
         if (!secureOrigin || endpointOrigin !== secureOrigin) throw new Stage1AuthError(403, 'operator_origin_mismatch', 'This browser is not using the verified secure hub endpoint');
       } else {
+        let localOrigin = '';
+        try {
+          const local = new URL(installation.baseUrl || '');
+          if (local.protocol === 'http:' && local.pathname === '/' && !local.search && !local.hash && !local.username && !local.password) localOrigin = local.origin;
+        } catch { /* fail closed below */ }
         if (installation.lanEndpointIdentityGeneration !== installation.manufacturingIdentity.identityGeneration
           || !lanEndpointFresh(installation.lanEndpointState, installation.lanEndpointReportedAt, now.getTime())
-          || !installation.baseUrl || endpointOrigin !== installation.baseUrl) {
+          || !localOrigin || endpointOrigin !== localOrigin) {
           throw new Stage1AuthError(409, 'local_endpoint_stale', 'The paired hub has no current local endpoint for this browser');
         }
       }
