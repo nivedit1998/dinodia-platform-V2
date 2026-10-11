@@ -1118,6 +1118,87 @@ async function customerAuthorizationChecks(deliveryEnv) {
   await prisma.hubCredentialVersion.create({ data: { hubInstallationId: claimHub.id, version: 1, purpose: 'machine-credential', state: 'ACTIVE', tokenHash: sha256(claimMachineSecret), encryptedDeliveryEnvelope: { harness: true }, ciphertextKeyVersion: 1, deliveredAt: verifiedAt, acknowledgedAt: verifiedAt, activatedAt: verifiedAt } });
   const machineSecret = `harness-machine-${crypto.randomUUID()}`;
   await prisma.hubCredentialVersion.create({ data: { hubInstallationId: hubOne.id, version: 1, purpose: 'machine-credential', state: 'ACTIVE', tokenHash: sha256(machineSecret), encryptedDeliveryEnvelope: { harness: true }, ciphertextKeyVersion: 1, deliveredAt: verifiedAt, acknowledgedAt: verifiedAt, activatedAt: verifiedAt } });
+  // Existing-installation metadata reconciliation is deliberately separate
+  // from provisioning. Exercise the real signed route against an isolated,
+  // completed Home and an already-active credential; the request may only
+  // prove the exact retained credential fingerprint and recover its current
+  // local binding. It must not issue credentials or create a pairing attempt.
+  const reconcileIdentitySigning = keyPair();
+  const reconcileIdentityEncryption = x25519KeyPair();
+  const reconcileIdentity = await prisma.hubManufacturingIdentity.create({ data: {
+    serialNumber: `harness-reconcile-${crypto.randomUUID()}`,
+    signingPublicKey: reconcileIdentitySigning.publicKey,
+    encryptionPublicKey: reconcileIdentityEncryption.publicKey,
+    signingKeyFingerprint: publicKeyFingerprint(reconcileIdentitySigning.publicKey),
+    encryptionKeyFingerprint: publicKeyFingerprint(reconcileIdentityEncryption.publicKey),
+  } });
+  const reconcileHome = await prisma.home.create({ data: {
+    lifecycle: 'INSTALLING', installationStatus: 'DRAFT', addressStatus: 'VERIFIED',
+    addressLine1: '3 Reconcile Harness Road', city: 'London', postcode: 'N1 2AA', country: 'GB', timezone: 'Europe/London',
+  } });
+  await prisma.area.create({ data: {
+    homeId: reconcileHome.id, osAreaId: `reconcile-area-${crypto.randomUUID()}`, originalName: 'Reconcile Harness Area', status: 'ACTIVE',
+  } });
+  const reconcileOwnerName = `reconcile-owner-${crypto.randomUUID().slice(0, 8)}`;
+  const reconcileOwnerAccount = await prisma.customerAccount.create({ data: {
+    displayName: 'Reconcile Harness Owner', username: reconcileOwnerName, usernameNormalized: reconcileOwnerName,
+    email: `${reconcileOwnerName}@invalid.test`, emailNormalized: `${reconcileOwnerName}@invalid.test`,
+    emailVerifiedAt: verifiedAt, passwordHash: hashPassword(`reconcile-only-${crypto.randomUUID()}`),
+  } });
+  await prisma.homeMembership.create({ data: { customerAccountId: reconcileOwnerAccount.id, homeId: reconcileHome.id, role: 'OWNER' } });
+  const reconcileHub = await prisma.hubInstallation.create({ data: {
+    homeId: reconcileHome.id, manufacturingIdentityId: reconcileIdentity.id,
+    serialNumberSnapshot: reconcileIdentity.serialNumber, state: 'ACTIVE', lifecycleStatus: 'ACTIVE',
+    cloudUrl: 'https://dinodia-reconcile-harness.dinodiasmartliving.com', reservedHostname: 'dinodia-reconcile-harness.dinodiasmartliving.com',
+    cloudUrlVerifiedAt: verifiedAt, remoteChallengeAt: verifiedAt, remoteVerificationAt: verifiedAt,
+    currentMachineCredentialVersion: 1,
+  } });
+  const reconcileMachineSecret = `harness-reconcile-machine-${crypto.randomUUID()}`;
+  const reconcileCredential = await prisma.hubCredentialVersion.create({ data: {
+    hubInstallationId: reconcileHub.id, version: 1, purpose: 'machine-credential', state: 'ACTIVE',
+    tokenHash: sha256(reconcileMachineSecret), deliveredAt: verifiedAt, acknowledgedAt: verifiedAt, activatedAt: verifiedAt,
+  } });
+  await prisma.home.update({ where: { id: reconcileHome.id }, data: {
+    lifecycle: 'ACTIVE', installationStatus: 'COMPLETE', installationCompletedAt: verifiedAt, activeHubInstallationId: reconcileHub.id,
+  } });
+  const reconcilePath = '/api/hub-agent/v2/pairing/reconcile';
+  const reconcileBody = { serial: reconcileIdentity.serialNumber, identityGeneration: reconcileIdentity.identityGeneration, credentialFingerprint: sha256(reconcileMachineSecret) };
+  try {
+    const initialCredentialCount = await prisma.hubCredentialVersion.count({ where: { hubInstallationId: reconcileHub.id } });
+    const initialAttemptCount = await prisma.hubProvisioningAttempt.count({ where: { hubInstallationId: reconcileHub.id } });
+    const acceptedReconcile = await manufacturingIdentityRequest({ base, path: reconcilePath, body: reconcileBody, signingPrivateKeyPem: reconcileIdentitySigning.privateKey });
+    const retryReconcile = await manufacturingIdentityRequest({ base, path: reconcilePath, body: reconcileBody, signingPrivateKeyPem: reconcileIdentitySigning.privateKey });
+    const wrongFingerprintReconcile = await manufacturingIdentityRequest({ base, path: reconcilePath, body: { ...reconcileBody, credentialFingerprint: sha256(`${reconcileMachineSecret}-wrong`) }, signingPrivateKeyPem: reconcileIdentitySigning.privateKey });
+    const extraAuthorityReconcile = await manufacturingIdentityRequest({ base, path: reconcilePath, body: { ...reconcileBody, homeId: reconcileHome.id }, signingPrivateKeyPem: reconcileIdentitySigning.privateKey });
+    const forgedIdentityReconcile = await manufacturingIdentityRequest({ base, path: reconcilePath, body: reconcileBody, signingPrivateKeyPem: identityOneSigning.privateKey });
+    const acceptedKeys = Object.keys(acceptedReconcile.body || {}).sort().join(',');
+    if (acceptedReconcile.response.status !== 200 || acceptedReconcile.body?.ok !== true || acceptedReconcile.body?.paired !== true
+      || acceptedReconcile.body?.version !== 1 || acceptedReconcile.body?.hubInstallId !== reconcileHub.id || acceptedReconcile.body?.homeId !== reconcileHome.id
+      || acceptedKeys !== 'homeId,hubInstallId,ok,paired,version'
+      || retryReconcile.response.status !== 200 || JSON.stringify(retryReconcile.body) !== JSON.stringify(acceptedReconcile.body)
+      || wrongFingerprintReconcile.response.status !== 409 || wrongFingerprintReconcile.body?.errorCode !== 'machine_credential_reconciliation_denied'
+      || extraAuthorityReconcile.response.status !== 400 || forgedIdentityReconcile.response.status !== 401) {
+      fail(`Existing-credential reconciliation did not bind exact active identity/credential or deny invalid proof (${acceptedReconcile.response.status}/${retryReconcile.response.status}/${wrongFingerprintReconcile.response.status}/${extraAuthorityReconcile.response.status}/${forgedIdentityReconcile.response.status})`);
+    }
+    await prisma.hubCredentialVersion.update({ where: { id: reconcileCredential.id }, data: { state: 'REVOKED', revokedAt: new Date() } });
+    const revokedReconcile = await manufacturingIdentityRequest({ base, path: reconcilePath, body: reconcileBody, signingPrivateKeyPem: reconcileIdentitySigning.privateKey });
+    await prisma.hubCredentialVersion.update({ where: { id: reconcileCredential.id }, data: { state: 'ACTIVE', revokedAt: null } });
+    if (revokedReconcile.response.status !== 409 || revokedReconcile.body?.errorCode !== 'machine_credential_reconciliation_denied') fail('A revoked machine credential was accepted for metadata reconciliation');
+    if (await prisma.hubCredentialVersion.count({ where: { hubInstallationId: reconcileHub.id } }) !== initialCredentialCount
+      || await prisma.hubProvisioningAttempt.count({ where: { hubInstallationId: reconcileHub.id } }) !== initialAttemptCount) {
+      fail('Credential reconciliation created/deleted a credential or provisioning attempt');
+    }
+    console.log('[stage1:integration] PASS: existing machine-credential reconciliation is identity-signed, exact-current-fingerprint-bound, idempotent, non-provisioning, and denies wrong identity, extra authority, wrong fingerprint, and revoked credentials');
+  } finally {
+    await prisma.replayNonce.deleteMany({ where: { principalKind: 'HUB', principalId: reconcileIdentity.id } });
+    await prisma.home.update({ where: { id: reconcileHome.id }, data: {
+      lifecycle: 'INSTALLING', installationStatus: 'IN_PROGRESS', installationCompletedAt: null, activeHubInstallationId: null,
+    } });
+    await prisma.hubInstallation.delete({ where: { id: reconcileHub.id } });
+    await prisma.home.delete({ where: { id: reconcileHome.id } });
+    await prisma.customerAccount.delete({ where: { id: reconcileOwnerAccount.id } });
+    await prisma.hubManufacturingIdentity.delete({ where: { id: reconcileIdentity.id } });
+  }
   await prisma.hubCredentialVersion.create({ data: { hubInstallationId: hubOne.id, version: 1, purpose: 'operator-credential', state: 'ACTIVE', tokenHash: sha256(`harness-operator-v1-${crypto.randomUUID()}`), encryptedDeliveryEnvelope: { harness: true }, ciphertextKeyVersion: 1, issuedAt: new Date(Date.now() - 61 * 60 * 1000), deliveredAt: verifiedAt, acknowledgedAt: verifiedAt, activatedAt: new Date(Date.now() - 61 * 60 * 1000) } });
   const { reconcileCredentialLifecycle, OPERATOR_ROTATION_MS } = loadOperatorLifecycleService();
   const operatorV1BeforeBoundary = await prisma.hubCredentialVersion.findUniqueOrThrow({ where: { HubCredentialVersion_hub_purpose_version_key: { hubInstallationId: hubOne.id, purpose: 'operator-credential', version: 1 } }, select: { issuedAt: true } });

@@ -48,6 +48,7 @@ export const stage1RouteInventory = [
   ['POST', '/api/hub-agent/v2/pairing/acknowledge', 'manufacturing-or-machine'],
   ['POST', '/api/hub-agent/v2/pairing/challenge', 'manufacturing-or-machine'],
   ['POST', '/api/hub-agent/v2/pairing/cloud-url', 'machine'],
+  ['POST', '/api/hub-agent/v2/pairing/reconcile', 'manufacturing-identity-recovery'],
   ['POST', '/api/hub-agent/v2/pairing/prove', 'manufacturing-or-machine'],
   ['POST', '/api/hub-agent/v2/pairing/register', 'signed-manufacturing-bootstrap'],
   ['POST', '/api/hub-agent/v2/pairing/reservation', 'machine'],
