@@ -1,6 +1,7 @@
 import type { Prisma } from '@prisma/client';
 import { currentNativeDisplayName } from './nativeDisplayNames';
 import { nativeDisplayGroups } from './nativeDisplayGroups';
+import { currentCloudflareTunnelStatus } from './hubSyncTelemetry';
 
 const HEARTBEAT_ONLINE_SECONDS = 420;
 const RADIATOR_FRESH_MS = 30 * 60 * 1000;
@@ -68,7 +69,7 @@ export async function readHomeownerProjection(db: Prisma.TransactionClient, inpu
   const [hub, floorplanRow, deviceRows, members, tenantCount, pendingRoomRequestRows, pendingRoomRequestCount, requests, pendingTransfers] = await Promise.all([
     db.hubInstallation.findFirst({
       where: { id: home.activeHubInstallationId, homeId: home.id, lifecycleStatus: 'ACTIVE' },
-      select: { id: true, state: true, lastSeenAt: true, onlineStateEvaluatedAt: true, cleanupState: true, cleanupGeneration: true, runtimeVersion: true, updatePhase: true, updateStatusAt: true },
+      select: { id: true, state: true, lastSeenAt: true, onlineStateEvaluatedAt: true, cleanupState: true, cleanupGeneration: true, runtimeVersion: true, updatePhase: true, updateStatusAt: true, capabilitySummary: true, manufacturingIdentity: { select: { identityGeneration: true, status: true } } },
     }),
     db.homeDocument.findUnique({ where: { homeId_kind: { homeId: home.id, kind: 'FLOORPLAN' } }, select: { revision: true, document: true } }),
     db.nativeDevice.findMany({
@@ -135,6 +136,10 @@ export async function readHomeownerProjection(db: Prisma.TransactionClient, inpu
   const heartbeatState = heartbeatAge === null || heartbeatAge < -30 ? 'UNKNOWN'
     : heartbeatAge <= HEARTBEAT_ONLINE_SECONDS ? 'ONLINE' : 'OFFLINE';
   const activeFloorplan = completeFloorplan(grouped.areas.map((area) => area.id), floorplanRow?.document);
+  const capabilities = hub.capabilitySummary && typeof hub.capabilitySummary === 'object' && !Array.isArray(hub.capabilitySummary)
+    ? hub.capabilitySummary as Record<string, unknown> : {};
+  const cloudflareStatus = hub.manufacturingIdentity?.status === 'ACTIVE'
+    ? currentCloudflareTunnelStatus(capabilities.cloudflareTunnel, hub.manufacturingIdentity.identityGeneration, now.getTime()) : null;
 
   return {
     schemaVersion: 'dinodia.v1', ok: true, generatedAt: now.toISOString(), homeId: home.id,
@@ -155,6 +160,7 @@ export async function readHomeownerProjection(db: Prisma.TransactionClient, inpu
       lastOnlineAt: hub.lastSeenAt?.toISOString() ?? null, cleanupState: hub.cleanupState,
       cleanupGeneration: hub.cleanupGeneration, runtimeVersion: hub.runtimeVersion,
       updatePhase: hub.updatePhase, updateStatusAt: hub.updateStatusAt?.toISOString() ?? null,
+      remoteAccessState: cloudflareStatus?.recoveryState ?? 'UNKNOWN',
     },
     areas: grouped.areas.map((area) => ({ id: area.id, originalName: area.originalName, overrideName: area.overrideName, displayName: area.displayName, revision: area.revision, displayGroupId: area.displayGroupId })),
     displayGroups: grouped.groups,

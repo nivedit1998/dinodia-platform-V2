@@ -17,7 +17,7 @@ function loadTypeScript(relative) {
 }
 
 const { isInstallationBootstrapEvent, validateHubSyncEnvelope } = loadTypeScript('src/lib/hubSyncEnvelope.ts');
-const { parseHubSyncOutboxReport } = loadTypeScript('src/lib/hubSyncTelemetry.ts');
+const { parseHubSyncOutboxReport, parseCloudflareTunnelStatus, currentCloudflareTunnelStatus } = loadTypeScript('src/lib/hubSyncTelemetry.ts');
 const { resolveNativeInstallationSyncMode } = loadTypeScript('src/lib/nativeInstallationSyncMode.ts');
 
 test('installation sync mode permits current active sync or narrowly bounded ownerless/installer bootstrap', () => {
@@ -83,6 +83,22 @@ test('queue telemetry distinguishes a valid empty report from missing or malform
   assert.equal(parseHubSyncOutboxReport({ queueDepth: -1, gapDetected: false, criticalBacklog: false, telemetryPaused: false, droppedTelemetryCount: 0, lastErrorCode: null }), null);
   assert.equal(parseHubSyncOutboxReport({ queueDepth: 5, gapDetected: false, criticalBacklog: false, telemetryPaused: false, droppedTelemetryCount: 0, lastErrorCode: 'secret=never' }), null);
   assert.equal(parseHubSyncOutboxReport({ queueDepth: 5, gapDetected: false, criticalBacklog: false, telemetryPaused: false, droppedTelemetryCount: 0, lastErrorCode: null, privateText: 'rejected' }), null);
+});
+
+test('tunnel telemetry is bounded, secret-free and scoped to the current hub identity', () => {
+  const current = {
+    schemaVersion: 1, recoveryState: 'RECONNECTING', childRunning: true,
+    originState: 'HEALTHY', edgeState: 'DISCONNECTED', activeConnections: 0,
+    sampledAt: '2026-10-11T12:00:00.000Z', validUntil: '2026-10-11T12:07:00.000Z', identityGeneration: 4,
+  };
+  assert.deepEqual(parseCloudflareTunnelStatus(current), current);
+  assert.equal(parseCloudflareTunnelStatus({ ...current, reservationToken: 'must-not-pass' }), null);
+  assert.equal(parseCloudflareTunnelStatus({ ...current, validUntil: '2026-10-11T12:30:00.000Z' }), null);
+  assert.equal(parseCloudflareTunnelStatus({ ...current, identityGeneration: -1 }), null);
+  assert.equal(currentCloudflareTunnelStatus(current, 4, Date.parse('2026-10-11T12:01:00.000Z'))?.recoveryState, 'RECONNECTING');
+  assert.equal(currentCloudflareTunnelStatus(current, 5, Date.parse('2026-10-11T12:01:00.000Z')), null, 'a replacement identity cannot inherit old recovery status');
+  assert.equal(currentCloudflareTunnelStatus(current, 4, Date.parse('2026-10-11T12:08:00.000Z')), null, 'expired transport state is not current');
+  assert.equal(currentCloudflareTunnelStatus({ ...current, recoveryState: 'READY', edgeState: 'DISCONNECTED' }, 4, Date.parse('2026-10-11T12:01:00.000Z')), null, 'contradictory ready state is rejected');
 });
 
 test('hub sync accepts a bounded contiguous signed-envelope shape and rejects malformed, stale and contradictory bodies', () => {

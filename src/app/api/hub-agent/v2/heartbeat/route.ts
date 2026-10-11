@@ -6,7 +6,7 @@ import { authenticateHub } from '@/lib/stage1HubAuth';
 import { validateLanEndpointObservation, validateLanTlsIdentity } from '@/lib/lanEndpoint';
 import { enforcePersistentRateLimit } from '@/lib/rateLimit';
 import { sha256 } from '@/lib/stage1Crypto';
-import { parseHubSyncOutboxReport } from '@/lib/hubSyncTelemetry';
+import { currentCloudflareTunnelStatus, parseHubSyncOutboxReport } from '@/lib/hubSyncTelemetry';
 
 export const dynamic = 'force-dynamic';
 
@@ -21,6 +21,14 @@ export async function POST(request: Request) {
     const raw = await request.text();
     const hub = await authenticateHub(request, raw);
     const runtime = hub.body.hubRuntime && typeof hub.body.hubRuntime === 'object' ? hub.body.hubRuntime as Record<string, unknown> : {};
+    const suppliedCapabilities = runtime.capabilities && typeof runtime.capabilities === 'object' && !Array.isArray(runtime.capabilities)
+      ? runtime.capabilities as Record<string, unknown> : null;
+    const safeCapabilities = suppliedCapabilities ? { ...suppliedCapabilities } : null;
+    if (safeCapabilities) {
+      delete safeCapabilities.cloudflareTunnel;
+      const tunnelStatus = currentCloudflareTunnelStatus(suppliedCapabilities?.cloudflareTunnel, hub.identity.identityGeneration);
+      if (tunnelStatus) safeCapabilities.cloudflareTunnel = tunnelStatus;
+    }
     const syncReport = nativeSyncOutboxReport(runtime);
     const now = new Date();
 
@@ -30,7 +38,7 @@ export async function POST(request: Request) {
       lastSeenAt: now,
       onlineStateEvaluatedAt: now,
       runtimeVersion: String(runtime.version ?? '').slice(0, 120) || undefined,
-      capabilitySummary: runtime.capabilities && typeof runtime.capabilities === 'object' ? runtime.capabilities : undefined,
+      capabilitySummary: safeCapabilities ? safeCapabilities as Prisma.InputJsonValue : undefined,
       ...(syncReport ? {
         lastQueueDepth: syncReport.queueDepth,
         lastSyncErrorCode: syncReport.lastErrorCode,

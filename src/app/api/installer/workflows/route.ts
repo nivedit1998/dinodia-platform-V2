@@ -5,6 +5,7 @@ import { enforcePersistentRateLimit } from '@/lib/rateLimit';
 import { sha256 } from '@/lib/stage1Crypto';
 import { Prisma } from '@prisma/client';
 import { lanEndpointFresh } from '@/lib/lanEndpoint';
+import { currentCloudflareTunnelStatus } from '@/lib/hubSyncTelemetry';
 
 export const dynamic = 'force-dynamic';
 
@@ -38,7 +39,7 @@ export async function GET(request: Request) {
         notes: true,
         workRevision: true,
         updatedAt: true,
-        hubInstallation: { select: { baseUrl: true, cloudUrl: true, cloudUrlVerifiedAt: true, remoteVerificationAt: true, lastSeenAt: true, lanEndpointRevision: true, lanEndpointReportedAt: true, lanEndpointState: true, lanEndpointIdentityGeneration: true, manufacturingIdentity: { select: { identityGeneration: true, status: true } } } },
+        hubInstallation: { select: { baseUrl: true, cloudUrl: true, cloudUrlVerifiedAt: true, remoteVerificationAt: true, lastSeenAt: true, capabilitySummary: true, lanEndpointRevision: true, lanEndpointReportedAt: true, lanEndpointState: true, lanEndpointIdentityGeneration: true, manufacturingIdentity: { select: { identityGeneration: true, status: true } } } },
       },
     });
     const observedAt = Date.now();
@@ -49,6 +50,10 @@ export async function GET(request: Request) {
         && hubInstallation.lanEndpointIdentityGeneration === hubInstallation.manufacturingIdentity?.identityGeneration
         && hubInstallation.manufacturingIdentity?.status === 'ACTIVE'
         && lanEndpointFresh(hubInstallation.lanEndpointState, hubInstallation.lanEndpointReportedAt, observedAt));
+      const capabilities = hubInstallation?.capabilitySummary && typeof hubInstallation.capabilitySummary === 'object' && !Array.isArray(hubInstallation.capabilitySummary)
+        ? hubInstallation.capabilitySummary as Record<string, unknown> : {};
+      const tunnelStatus = hubInstallation?.manufacturingIdentity?.status === 'ACTIVE'
+        ? currentCloudflareTunnelStatus(capabilities.cloudflareTunnel, hubInstallation.manufacturingIdentity.identityGeneration, observedAt) : null;
       return {
         ...item,
         hubInstallation: hubInstallation ? {
@@ -61,6 +66,7 @@ export async function GET(request: Request) {
           localState: localFresh ? 'CURRENT' : 'STALE',
           localReportedAt: hubInstallation.lanEndpointReportedAt?.toISOString() ?? null,
           localRevision: hubInstallation.lanEndpointRevision,
+          remoteAccess: tunnelStatus ? { state: tunnelStatus.recoveryState, reportedAt: tunnelStatus.sampledAt, retryAvailableLocally: localFresh } : { state: 'UNKNOWN', reportedAt: null, retryAvailableLocally: localFresh },
         } : null,
       };
     });

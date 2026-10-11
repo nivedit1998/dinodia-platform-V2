@@ -837,7 +837,7 @@ async function platformChecks() {
   const tamperedEmployeeToken = `${token.slice(0, signatureOffset)}${signatureByte === 'a' ? 'b' : 'a'}${token.slice(signatureOffset + 1)}`;
   const wrongSignature = await fetchJson(`${base}/api/installer/workflows`, { headers: { 'x-dinodia-employee-session': tamperedEmployeeToken } });
   if (wrongSignature.response.status !== 401) fail(`Wrong-signature employee session was not denied (${wrongSignature.response.status})`);
-  const identity = await prisma.hubManufacturingIdentity.findFirstOrThrow({ where: { serialNumber: harnessProvisioningIdentity.serial }, select: { id: true, serialNumber: true } });
+  const identity = await prisma.hubManufacturingIdentity.findFirstOrThrow({ where: { serialNumber: harnessProvisioningIdentity.serial }, select: { id: true, serialNumber: true, identityGeneration: true } });
   const tokenJar = employeeLogin.jar;
   const internalIdSubmission = await fetchJson(`${base}/api/installer/workflows`, { method: 'POST', headers: { 'content-type': 'application/json', cookie: cookieHeader(tokenJar), 'idempotency-key': crypto.randomUUID() }, body: JSON.stringify({ attemptId: 'internal-attempt-id-is-not-a-pairing-code', assignedEmployeeId: employee.id, reason: 'internal id denial' }) });
   if (internalIdSubmission.response.status !== 400 || internalIdSubmission.body.errorCode !== 'pairing_code_required') fail(`Internal attempt ID was accepted as browser authority (${internalIdSubmission.response.status}/${internalIdSubmission.body.errorCode})`);
@@ -885,6 +885,20 @@ async function platformChecks() {
   if (replay.response.status !== 200 || replay.body.work?.id !== assignment.body.work?.id || replay.body.work?.idempotentReplay !== true) fail(`Authenticated work assignment replay was not idempotent (${replay.response.status})`);
   const assigned = await fetchJson(`${base}/api/installer/workflows`, { headers: { cookie: cookieHeader(employeeLogin.jar) } });
   if (assigned.response.status !== 200 || !assigned.body.workflows?.some((work) => work.id === assignment.body.work.id)) fail(`Assigned work was not returned to the authenticated employee (${assigned.response.status})`);
+  const portalSampledAt = new Date();
+  const portalTunnelReport = { schemaVersion: 1, recoveryState: 'RECONNECTING', childRunning: true, originState: 'HEALTHY', edgeState: 'DISCONNECTED', activeConnections: 0,
+    sampledAt: portalSampledAt.toISOString(), validUntil: new Date(portalSampledAt.getTime() + 420_000).toISOString(), identityGeneration: identity.identityGeneration };
+  await prisma.hubInstallation.update({ where: { id: provision.body.hubInstallationId }, data: { capabilitySummary: { cloudflareTunnel: portalTunnelReport }, baseUrl: null, lanEndpointState: 'UNAVAILABLE', lanEndpointRevision: 1, lanEndpointReportedAt: portalSampledAt, lanEndpointIdentityGeneration: identity.identityGeneration } });
+  const assignedRecovery = await fetchJson(`${base}/api/installer/workflows`, { headers: { cookie: cookieHeader(employeeLogin.jar) } });
+  const recoveryWork = assignedRecovery.body.workflows?.find((work) => work.id === assignment.body.work.id);
+  const remoteAccessKeys = Object.keys(recoveryWork?.hubInstallation?.remoteAccess || {}).sort().join(',');
+  if (assignedRecovery.response.status !== 200 || recoveryWork?.hubInstallation?.remoteAccess?.state !== 'RECONNECTING'
+    || recoveryWork.hubInstallation.remoteAccess.retryAvailableLocally !== false
+    || remoteAccessKeys !== 'reportedAt,retryAvailableLocally,state'
+    || JSON.stringify(recoveryWork).includes('reservationToken')) fail(`Assigned Portal did not show current bounded status or incorrectly implied an unreachable remote retry path (${JSON.stringify({ status: assignedRecovery.response.status, remoteAccess: recoveryWork?.hubInstallation?.remoteAccess ?? null, localState: recoveryWork?.hubInstallation?.localState ?? null, remoteAccessKeys, hasTunnelToken: JSON.stringify(recoveryWork || {}).includes('reservationToken') })})`);
+  await prisma.hubInstallation.update({ where: { id: provision.body.hubInstallationId }, data: { capabilitySummary: { cloudflareTunnel: { ...portalTunnelReport, sampledAt: new Date(Date.now() - 500_000).toISOString(), validUntil: new Date(Date.now() - 80_000).toISOString() } } } });
+  const staleAssignedRecovery = await fetchJson(`${base}/api/installer/workflows`, { headers: { cookie: cookieHeader(employeeLogin.jar) } });
+  if (staleAssignedRecovery.body.workflows?.find((work) => work.id === assignment.body.work.id)?.hubInstallation?.remoteAccess?.state !== 'UNKNOWN') fail('Assigned Portal presented expired tunnel state as current');
   const logout = await fetchJson(`${base}/api/company/auth/session`, { method: 'DELETE', headers: { cookie: cookieHeader(employeeLogin.jar) } });
   if (logout.response.status !== 204) fail(`Real employee logout failed (${logout.response.status})`);
   const afterLogout = await fetchJson(`${base}/api/installer/workflows`, { headers: { cookie: cookieHeader(employeeLogin.jar) } });
@@ -9570,13 +9584,35 @@ async function osChecks() {
     || retainedUnsupported.capabilitySummary?.commissioning?.status !== 'unsupported' || retainedUnsupported.capabilitySummary?.commissioning?.usefulReadings !== false
     || retainedUnsupported.assignments.length !== 1 || retainedUnsupported.assignments[0].areaId !== syncedArea.id
     || retainedUnsupported.assignments[0].source !== 'NATIVE_STAFF_COMMISSIONING') fail(`The canonical registration path did not preserve the unsupported device honestly and safely (${unsupportedFinalize.response.status}/${unsupportedFinalize.body.error?.code || 'no-device'}: ${unsupportedFinalize.body.error?.message || 'no-message'})`);
+  const tunnelSampledAt = new Date();
+  const tunnelReport = { schemaVersion: 1, recoveryState: 'RECONNECTING', childRunning: true, originState: 'HEALTHY', edgeState: 'DISCONNECTED', activeConnections: 0,
+    sampledAt: tunnelSampledAt.toISOString(), validUntil: new Date(tunnelSampledAt.getTime() + 420_000).toISOString(), identityGeneration: customerFixture.identityOneGeneration };
+  const recoveryHeartbeat = await machineRequest({ base: platformBase, path: '/api/hub-agent/v2/heartbeat', machineSecret: customerFixture.machineSecret, body: {
+    serial: customerFixture.identityOneSerial, identityGeneration: customerFixture.identityOneGeneration,
+    hubRuntime: { kind: 'dinodia_os', version: 'tunnel-recovery-test', capabilities: { cloudflareTunnel: tunnelReport } },
+  } });
+  if (recoveryHeartbeat.response.status !== 200) fail(`The actual signed heartbeat rejected bounded tunnel recovery status (${recoveryHeartbeat.response.status})`);
+  const storedRecoveryCapabilities = await prisma.hubInstallation.findUniqueOrThrow({ where: { id: customerFixture.hubOneId }, select: { capabilitySummary: true } });
+  if (canonicalValue(storedRecoveryCapabilities.capabilitySummary?.cloudflareTunnel) !== canonicalValue(tunnelReport)) fail('The authenticated current-generation tunnel status was not retained for its selected Home');
   const homeownerResult = await fetchJson(`${platformBase}/api/v2/homes/${encodeURIComponent(customerFixture.homeOneId)}/homeowner-context`, { headers: { authorization: `Bearer ${homeownerLogin.body.accessToken}`, 'x-dinodia-home-id': customerFixture.homeOneId } });
   const homeownerUnsupported = homeownerResult.body?.devices?.find((device) => device.id === unsupportedFinalize.body.device?.id);
-  if (homeownerResult.response.status !== 200 || !homeownerResult.body.areas?.some((area) => area.id === syncedArea.id && area.originalName === createdAreaName)
+  if (homeownerResult.response.status !== 200 || homeownerResult.body.hub?.remoteAccessState !== 'RECONNECTING'
+    || JSON.stringify(homeownerResult.body).includes('reservationToken') || JSON.stringify(homeownerResult.body).includes(customerFixture.identityOneSerial)
+    || !homeownerResult.body.areas?.some((area) => area.id === syncedArea.id && area.originalName === createdAreaName)
     || !homeownerUnsupported || homeownerUnsupported.lifecycle !== 'VIEW_ONLY' || !homeownerUnsupported.canonicalAreaIds.includes(syncedArea.id)
     || homeownerUnsupported.readings.length !== 0 || homeownerUnsupported.onlineState !== 'UNKNOWN'
     || homeownerResult.body.devices.some((device) => device.id === customerFixture.tenantDeviceId)) fail(`The homeowner app projection did not show the synchronized Area and truthful read-only unsupported device without tenant-private inventory (${JSON.stringify({ status: homeownerResult.response.status, errorCode: homeownerResult.body.errorCode ?? homeownerResult.body.error?.code ?? null, expectedArea: { id: syncedArea.id, originalName: createdAreaName }, returnedAreas: homeownerResult.body.areas?.map((area) => ({ id: area.id, originalName: area.originalName })) ?? null, areaPresent: Boolean(homeownerResult.body.areas?.some((area) => area.id === syncedArea.id && area.originalName === createdAreaName)), expectedDeviceId: unsupportedFinalize.body.device?.id ?? null, deviceFound: Boolean(homeownerUnsupported), lifecycle: homeownerUnsupported?.lifecycle ?? null, areaIds: homeownerUnsupported?.canonicalAreaIds ?? null, readingsCount: homeownerUnsupported?.readings?.length ?? null, onlineState: homeownerUnsupported?.onlineState ?? null, privateDevicePresent: homeownerResult.body.devices?.some((device) => device.id === customerFixture.tenantDeviceId) ?? null })})`);
   console.log('[stage-home:integration] PASS: assigned full OS dashboard created and exact-retried a disposable Area; signed sync preserved OS↔Platform IDs, refreshed whole-property commissioning options, restricted scope could not create Areas, and the homeowner projection showed the unsupported VIEW_ONLY device as UNKNOWN with no invented readings or tenant-private inventory');
+  const poisonedRecoveryReport = { ...tunnelReport, identityGeneration: customerFixture.identityOneGeneration - 1, reservationToken: 'fixture-secret-must-not-persist' };
+  const staleRecoveryHeartbeat = await machineRequest({ base: platformBase, path: '/api/hub-agent/v2/heartbeat', machineSecret: customerFixture.machineSecret, body: {
+    serial: customerFixture.identityOneSerial, identityGeneration: customerFixture.identityOneGeneration,
+    hubRuntime: { kind: 'dinodia_os', version: 'tunnel-recovery-test', capabilities: { cloudflareTunnel: poisonedRecoveryReport } },
+  } });
+  const storedAfterStaleRecovery = await prisma.hubInstallation.findUniqueOrThrow({ where: { id: customerFixture.hubOneId }, select: { capabilitySummary: true } });
+  const homeownerAfterStaleRecovery = await fetchJson(`${platformBase}/api/v2/homes/${encodeURIComponent(customerFixture.homeOneId)}/homeowner-context`, { headers: { authorization: `Bearer ${homeownerLogin.body.accessToken}`, 'x-dinodia-home-id': customerFixture.homeOneId } });
+  if (staleRecoveryHeartbeat.response.status !== 200 || storedAfterStaleRecovery.capabilitySummary?.cloudflareTunnel !== undefined
+    || homeownerAfterStaleRecovery.body?.hub?.remoteAccessState !== 'UNKNOWN'
+    || JSON.stringify(storedAfterStaleRecovery.capabilitySummary).includes('fixture-secret-must-not-persist')) fail('The signed heartbeat stored or exposed stale-generation/secret-shaped tunnel data');
   const restrictedAdminRead = await fetchJsonLoopback(`${base}/_dinodia/admin/api/devices`, { headers: { ...remoteOsHeaders, cookie: cookieHeader(restrictedBrowser) } });
   if (restrictedAdminRead.response.status !== 403) fail(`The restricted installation handoff gained the full OS admin device API (${restrictedAdminRead.response.status})`);
   const setupB = await fetchLoopback(`${base}/support-access`, { headers: remoteOsHeaders });
