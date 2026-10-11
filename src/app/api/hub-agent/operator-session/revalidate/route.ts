@@ -46,6 +46,11 @@ export async function POST(request: Request) {
     }
     if (!installation || installation.state !== 'ACTIVE' || installation.homeId !== handoff.homeId || installation.serialNumberSnapshot !== hub.identity.serialNumber || installation.manufacturingIdentity?.status !== 'ACTIVE' || installation.manufacturingIdentity.identityGeneration !== hub.identity.identityGeneration || String(scope.serialNumber ?? '') !== hub.identity.serialNumber || Number(scope.identityGeneration) !== Number(hub.identity.identityGeneration)) throw new Stage1AuthError(401, 'operator_hub_replaced', 'The paired hub identity or installation is no longer active');
     if (credential?.revokedReason === 'emergency_operator_revocation') throw new Stage1AuthError(401, 'operator_credential_emergency_revoked', 'Operator access was emergency-revoked');
-    return NextResponse.json({ ok: true, active: true }, { headers: { 'Cache-Control': 'no-store', Pragma: 'no-cache' } });
+    // The hub has already proved its enrolled machine identity and this grant
+    // was re-bound to that exact installation/Home above. Return those current
+    // bindings so OS can compare them with its locally paired Platform state;
+    // the signed operator token intentionally does not carry a DB installation
+    // ID claim.
+    return NextResponse.json({ ok: true, active: true, homeId: handoff.homeId, hubInstallationId: handoff.hubInstallationId }, { headers: { 'Cache-Control': 'no-store', Pragma: 'no-cache' } });
   } catch (error) { return authErrorResponse(error); }
 }
