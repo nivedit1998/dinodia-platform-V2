@@ -24,8 +24,23 @@ export type HubSyncEnvelope = {
   queueDepth: number;
   acknowledgedCloudRevision: number;
   configurationRefreshOnly?: true;
+  streamReconciliation?: {
+    version: 1;
+    previousStreamId: string;
+    previousAcceptedSequence: number;
+  };
   runtime: { kind: 'dinodia_os'; version: string; capabilities: Record<string, unknown> };
   sentAt: string;
+};
+
+export type HubSyncStreamState = {
+  installationSyncMode: string;
+  syncStreamId: string | null;
+  syncAcceptedSequence: number;
+  syncGapDetected: boolean;
+  syncCriticalBacklog: boolean;
+  syncTelemetryPaused: boolean;
+  syncDroppedTelemetryCount: number;
 };
 
 const INSTALLATION_BOOTSTRAP_EVENT_TYPES = new Set(['sync.compacted', 'update.status', 'area.upsert']);
@@ -251,9 +266,16 @@ function validEvent(event: unknown): event is HubSyncEvent {
 export function validateHubSyncEnvelope(value: unknown, rawBody?: string): value is HubSyncEnvelope {
   if (rawBody !== undefined && Buffer.byteLength(rawBody, 'utf8') > HUB_SYNC_MAX_BODY_BYTES) return false;
   const baseKeys = ['schemaVersion', 'hubInstallationId', 'streamId', 'fromSequence', 'toSequence', 'events', 'queueDepth', 'acknowledgedCloudRevision', 'runtime', 'sentAt'];
+  const hasConfigurationRefreshOnly = object(value) && Object.hasOwn(value, 'configurationRefreshOnly');
   const configurationRefreshOnly = object(value) && value.configurationRefreshOnly === true;
-  if (!object(value) || (!exactKeys(value, baseKeys)
-    && !(configurationRefreshOnly && exactKeys(value, [...baseKeys, 'configurationRefreshOnly'])))
+  const hasStreamReconciliation = object(value) && Object.hasOwn(value, 'streamReconciliation');
+  const allowedKeys = [...baseKeys,
+    ...(configurationRefreshOnly ? ['configurationRefreshOnly'] : []),
+    ...(hasStreamReconciliation ? ['streamReconciliation'] : []),
+  ];
+  if (!object(value) || !exactKeys(value, allowedKeys)
+    || hasConfigurationRefreshOnly && !configurationRefreshOnly
+    || configurationRefreshOnly && hasStreamReconciliation
     || value.schemaVersion !== 1 || typeof value.hubInstallationId !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value.hubInstallationId)
     || typeof value.streamId !== 'string' || !/^[a-zA-Z0-9._:-]{16,80}$/.test(value.streamId)
     || !Number.isSafeInteger(value.fromSequence) || !Number.isSafeInteger(value.toSequence)
@@ -263,6 +285,13 @@ export function validateHubSyncEnvelope(value: unknown, rawBody?: string): value
     || !validUtc(value.sentAt) || !Array.isArray(value.events) || value.events.length > HUB_SYNC_MAX_EVENTS
     || !object(value.runtime) || !exactKeys(value.runtime, ['kind', 'version', 'capabilities']) || value.runtime.kind !== 'dinodia_os'
     || !boundedText(value.runtime.version, 120) || !object(value.runtime.capabilities)) return false;
+  if (hasStreamReconciliation) {
+    const reconciliation = value.streamReconciliation;
+    if (!object(reconciliation) || !exactKeys(reconciliation, ['version', 'previousStreamId', 'previousAcceptedSequence'])
+      || reconciliation.version !== 1 || !boundedText(reconciliation.previousStreamId, 80)
+      || !/^[a-zA-Z0-9._:-]{16,80}$/.test(reconciliation.previousStreamId)
+      || !Number.isSafeInteger(reconciliation.previousAcceptedSequence) || Number(reconciliation.previousAcceptedSequence) < 1) return false;
+  }
   const syncStatus = (value.runtime.capabilities as Record<string, unknown>).nativeSyncOutbox;
   if (syncStatus !== undefined && (!object(syncStatus) || !exactKeys(syncStatus, ['queueDepth', 'gapDetected', 'criticalBacklog', 'telemetryPaused', 'droppedTelemetryCount', 'lastErrorCode'])
     || !Number.isSafeInteger(syncStatus.queueDepth) || Number(syncStatus.queueDepth) < 0 || Number(syncStatus.queueDepth) > 100000
@@ -280,6 +309,21 @@ export function validateHubSyncEnvelope(value: unknown, rawBody?: string): value
     for (let index = 0; index < events.length; index += 1) if (Number(events[index].sequence) !== Number(value.fromSequence) + index) return false;
   }
   return Buffer.byteLength(JSON.stringify(events), 'utf8') <= HUB_SYNC_MAX_BATCH_BYTES;
+}
+
+export function canReconcileHubSyncStream(envelope: HubSyncEnvelope, state: HubSyncStreamState): boolean {
+  const reconciliation = envelope.streamReconciliation;
+  const localStatus = envelope.runtime.capabilities.nativeSyncOutbox;
+  if (!reconciliation || envelope.configurationRefreshOnly === true || state.installationSyncMode !== 'ACTIVE'
+    || !state.syncStreamId || state.syncStreamId === envelope.streamId
+    || reconciliation.previousStreamId !== state.syncStreamId
+    || !Number.isSafeInteger(state.syncAcceptedSequence) || state.syncAcceptedSequence < 1
+    || reconciliation.previousAcceptedSequence !== state.syncAcceptedSequence
+    || envelope.fromSequence !== 1 || envelope.events.length < 1 || envelope.events[0]?.sequence !== 1
+    || state.syncGapDetected || state.syncCriticalBacklog || state.syncTelemetryPaused || state.syncDroppedTelemetryCount !== 0
+    || !object(localStatus) || localStatus.gapDetected !== false || localStatus.criticalBacklog !== false
+    || localStatus.telemetryPaused !== false || localStatus.droppedTelemetryCount !== 0) return false;
+  return true;
 }
 
 export function hubSyncBodyHash(rawBody: string): string {

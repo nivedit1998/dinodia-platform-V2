@@ -10346,6 +10346,81 @@ async function hubSyncConfigurationRefreshChecks() {
   }
 }
 
+async function hubSyncStreamReconciliationChecks() {
+  if (!customerFixture) fail('The disposable enrolled hub fixture is unavailable for stream-reconciliation integration checks');
+  const hubInstallationId = customerFixture.hubOneId;
+  const original = await prisma.hubInstallation.findUniqueOrThrow({ where: { id: hubInstallationId }, select: {
+    syncStreamId: true, syncAcceptedSequence: true, acknowledgedCloudRevision: true, cloudConfigurationRevision: true,
+    cloudConfigurationChecksum: true, lastSuccessfulSyncAt: true, lastQueueDepth: true, lastSyncErrorCode: true,
+    syncGapDetected: true, syncCriticalBacklog: true, syncTelemetryPaused: true, syncDroppedTelemetryCount: true,
+    runtimeVersion: true, capabilitySummary: true,
+  } });
+  const previousStreamId = `stage-old-${crypto.randomUUID()}`;
+  const nextStreamId = `stage-new-${crypto.randomUUID()}`;
+  const rejectedStreamId = `stage-stale-${crypto.randomUUID()}`;
+  const areaId = `stage-sync-reconcile-${crypto.randomUUID()}`;
+  const rejectedAreaId = `stage-sync-reconcile-denied-${crypto.randomUUID()}`;
+  const auditBefore = new Set((await prisma.auditEvent.findMany({ where: {
+    actorId: hubInstallationId, action: 'hub_sync_stream_reconciled', targetId: hubInstallationId,
+  }, select: { id: true } })).map((row) => row.id));
+  try {
+    await prisma.hubInstallation.update({ where: { id: hubInstallationId }, data: {
+      syncStreamId: previousStreamId, syncAcceptedSequence: 18, acknowledgedCloudRevision: 5,
+      cloudConfigurationRevision: 5, syncGapDetected: false, syncCriticalBacklog: false,
+      syncTelemetryPaused: false, syncDroppedTelemetryCount: 0,
+    } });
+    const now = new Date().toISOString();
+    const syncStatus = { queueDepth: 1, gapDetected: false, criticalBacklog: false, telemetryPaused: false, droppedTelemetryCount: 0, lastErrorCode: null };
+    const event = { id: crypto.randomUUID(), sequence: 1, type: 'area.upsert', aggregateId: areaId,
+      occurredAt: now, critical: true, payload: { osAreaId: areaId, name: 'Disposable reconciliation room', icon: 'room' } };
+    const body = {
+      serial: customerFixture.identityOneSerial, identityGeneration: customerFixture.identityOneGeneration,
+      schemaVersion: 1, hubInstallationId, streamId: nextStreamId, fromSequence: 1, toSequence: 1,
+      queueDepth: 1, acknowledgedCloudRevision: 5,
+      streamReconciliation: { version: 1, previousStreamId, previousAcceptedSequence: 18 },
+      runtime: { kind: 'dinodia_os', version: 'stream-reconciliation-fixture', capabilities: { nativeSyncOutbox: syncStatus } },
+      sentAt: now, events: [event],
+    };
+    const first = await machineRequest({ base: `http://127.0.0.1:${appPort}`, path: '/api/hub-agent/v2/sync', machineSecret: customerFixture.machineSecret, body });
+    const afterFirst = await prisma.hubInstallation.findUniqueOrThrow({ where: { id: hubInstallationId }, select: { syncStreamId: true, syncAcceptedSequence: true } });
+    const areaAfterFirst = await prisma.area.findUnique({ where: { homeId_osAreaId: { homeId: customerFixture.homeOneId, osAreaId: areaId } }, select: { id: true } });
+    const receiptsAfterFirst = await prisma.hubSyncReceipt.count({ where: { hubInstallationId, streamId: nextStreamId } });
+    const auditsAfterFirst = await prisma.auditEvent.count({ where: { actorId: hubInstallationId, action: 'hub_sync_stream_reconciled', targetId: hubInstallationId } });
+    if (first.response.status !== 200 || first.body.streamReconciled !== true
+      || first.body.reconciledFromStreamId !== previousStreamId || Number(first.body.reconciledFromSequence) !== 18
+      || afterFirst.syncStreamId !== nextStreamId || Number(afterFirst.syncAcceptedSequence) !== 1
+      || !areaAfterFirst || receiptsAfterFirst !== 1 || auditsAfterFirst !== auditBefore.size + 1) {
+      fail(`The exact active-cursor stream transition was not atomically accepted (${first.response.status}/${first.body.errorCode || 'no-code'})`);
+    }
+    const exactRetry = await machineRequest({ base: `http://127.0.0.1:${appPort}`, path: '/api/hub-agent/v2/sync', machineSecret: customerFixture.machineSecret, body });
+    const retryReceiptCount = await prisma.hubSyncReceipt.count({ where: { hubInstallationId, streamId: nextStreamId } });
+    const retryAuditCount = await prisma.auditEvent.count({ where: { actorId: hubInstallationId, action: 'hub_sync_stream_reconciled', targetId: hubInstallationId } });
+    if (exactRetry.response.status !== 200 || exactRetry.body.duplicate !== true || exactRetry.body.streamReconciled !== true
+      || retryReceiptCount !== 1 || retryAuditCount !== auditsAfterFirst) {
+      fail('An exact lost-response retry did not return the original reconciliation receipt exactly once');
+    }
+    const staleBody = { ...body, streamId: rejectedStreamId,
+      streamReconciliation: { version: 1, previousStreamId, previousAcceptedSequence: 18 },
+      events: [{ ...event, id: crypto.randomUUID(), aggregateId: rejectedAreaId, payload: { ...event.payload, osAreaId: rejectedAreaId } }] };
+    const stale = await machineRequest({ base: `http://127.0.0.1:${appPort}`, path: '/api/hub-agent/v2/sync', machineSecret: customerFixture.machineSecret, body: staleBody });
+    const afterStale = await prisma.hubInstallation.findUniqueOrThrow({ where: { id: hubInstallationId }, select: { syncStreamId: true, syncAcceptedSequence: true } });
+    const rejectedArea = await prisma.area.findUnique({ where: { homeId_osAreaId: { homeId: customerFixture.homeOneId, osAreaId: rejectedAreaId } }, select: { id: true } });
+    if (stale.response.status !== 409 || stale.body.errorCode !== 'hub_sync_stream_reconciliation_required'
+      || afterStale.syncStreamId !== nextStreamId || Number(afterStale.syncAcceptedSequence) !== 1 || rejectedArea) {
+      fail('A stale prior cursor could rebind the accepted stream or create a domain effect');
+    }
+    console.log('[stage5:integration] PASS: a machine-authenticated exact first batch transitions only from the current active server cursor; event, cursor, audit and receipt commit atomically; exact retry reuses one receipt; stale transition is denied without effects');
+  } finally {
+    await prisma.hubSyncReceipt.deleteMany({ where: { hubInstallationId, streamId: { in: [nextStreamId, rejectedStreamId] } } }).catch(() => {});
+    const createdAuditIds = (await prisma.auditEvent.findMany({ where: {
+      actorId: hubInstallationId, action: 'hub_sync_stream_reconciled', targetId: hubInstallationId,
+    }, select: { id: true } })).map((row) => row.id).filter((id) => !auditBefore.has(id));
+    if (createdAuditIds.length) await prisma.auditEvent.deleteMany({ where: { id: { in: createdAuditIds } } }).catch(() => {});
+    await prisma.area.deleteMany({ where: { homeId: customerFixture.homeOneId, osAreaId: { in: [areaId, rejectedAreaId] } } }).catch(() => {});
+    await prisma.hubInstallation.update({ where: { id: hubInstallationId }, data: original }).catch(() => {});
+  }
+}
+
 async function verifyStage11PropertyDisableAcknowledgement() {
   if (!pendingStage11AutomationDisableAck || !customerFixture) fail('The property-automation disable acknowledgement scenario was not prepared');
   const expected = pendingStage11AutomationDisableAck.expectedRevision;
@@ -10548,6 +10623,7 @@ try {
     await installationBootstrapChecks();
     await osChecks();
     await hubSyncConfigurationRefreshChecks();
+    await hubSyncStreamReconciliationChecks();
   } else if (stage12AlexaOnly) {
     // Focused development mode still runs the real disposable auth fixture
     // and actual OAuth routes, while the normal maintained package command
@@ -10562,6 +10638,7 @@ try {
     await installationBootstrapChecks();
     await osChecks();
     await hubSyncConfigurationRefreshChecks();
+    await hubSyncStreamReconciliationChecks();
     await operatorMutationChecks();
     await verifyStage11PropertyDisableAcknowledgement();
     await tenantMembershipRemovalChecks();

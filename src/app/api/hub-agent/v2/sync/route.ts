@@ -5,7 +5,7 @@ import { authErrorResponse, Stage1AuthError } from '@/lib/stage1Auth';
 import { authenticateHub } from '@/lib/stage1HubAuth';
 import { buildHubCloudConfiguration, finalizeHubCloudConfiguration } from '@/lib/hubCloudConfiguration';
 import { applyHubSyncEvent } from '@/lib/hubSyncIngestion';
-import { HUB_SYNC_MAX_BODY_BYTES, hubSyncBodyHash, isInstallationBootstrapEvent, validateHubSyncEnvelope } from '@/lib/hubSyncEnvelope';
+import { canReconcileHubSyncStream, HUB_SYNC_MAX_BODY_BYTES, hubSyncBodyHash, isInstallationBootstrapEvent, validateHubSyncEnvelope } from '@/lib/hubSyncEnvelope';
 import { resolveNativeInstallationSyncMode } from '@/lib/nativeInstallationSyncMode';
 
 export const dynamic = 'force-dynamic';
@@ -77,6 +77,7 @@ export async function POST(request: Request) {
             cloudUrlVerifiedAt: true, remoteVerificationAt: true,
             syncStreamId: true, syncAcceptedSequence: true, acknowledgedCloudRevision: true, accessPolicyRevision: true,
             cloudConfigurationRevision: true, cloudConfigurationChecksum: true,
+            syncGapDetected: true, syncCriticalBacklog: true, syncTelemetryPaused: true, syncDroppedTelemetryCount: true,
           } });
           const home = current ? await tx.home.findUnique({ where: { id: current.homeId }, select: { id: true, lifecycle: true, installationStatus: true, activeHubInstallationId: true, managementRevision: true } }) : null;
           const activeIdentity = await tx.hubManufacturingIdentity.findFirst({ where: { id: hub.identity.id, serialNumber: hub.identity.serialNumber, identityGeneration: hub.identity.identityGeneration, status: 'ACTIVE' }, select: { id: true } });
@@ -171,12 +172,29 @@ export async function POST(request: Request) {
             };
           }
 
-          const cursor = Number(current.syncAcceptedSequence);
+          const streamReconciled = Boolean(current.syncStreamId && current.syncStreamId !== envelope.streamId
+            && canReconcileHubSyncStream(envelope, {
+              installationSyncMode: syncMode,
+              syncStreamId: current.syncStreamId,
+              syncAcceptedSequence: Number(current.syncAcceptedSequence),
+              syncGapDetected: current.syncGapDetected,
+              syncCriticalBacklog: current.syncCriticalBacklog,
+              syncTelemetryPaused: current.syncTelemetryPaused,
+              syncDroppedTelemetryCount: current.syncDroppedTelemetryCount,
+            }));
+          if (current.syncStreamId && current.syncStreamId !== envelope.streamId && !streamReconciled) {
+            throw new Stage1AuthError(409, 'hub_sync_stream_reconciliation_required', 'The durable local stream cannot be reconciled against the current signed server cursor');
+          }
+          if (envelope.streamReconciliation && current.syncStreamId === envelope.streamId
+            && Number(current.syncAcceptedSequence) < envelope.toSequence) {
+            throw new Stage1AuthError(409, 'hub_sync_stream_reconciliation_required', 'The server stream transition is not confirmed by its accepted cursor');
+          }
+          const cursor = streamReconciled ? 0 : Number(current.syncAcceptedSequence);
           if (Number(envelope.acknowledgedCloudRevision) < current.acknowledgedCloudRevision
             || Number(envelope.acknowledgedCloudRevision) > current.cloudConfigurationRevision) {
             throw new Stage1AuthError(409, 'hub_sync_configuration_ack_invalid', 'The hub configuration acknowledgement is stale or ahead of the current revision');
           }
-          if (current.syncStreamId && current.syncStreamId !== envelope.streamId) throw new Stage1AuthError(409, 'hub_sync_stream_conflict', 'A new sync stream requires explicit full reconciliation');
+          if (current.syncStreamId && current.syncStreamId !== envelope.streamId && !streamReconciled) throw new Stage1AuthError(409, 'hub_sync_stream_conflict', 'A new sync stream requires explicit full reconciliation');
           if (!current.syncStreamId && envelope.fromSequence !== 1) throw new Stage1AuthError(409, 'hub_sync_initial_cursor_invalid', 'The first sync batch must begin at sequence one');
           if (envelope.events.length === 0) {
             if (envelope.toSequence !== cursor || envelope.fromSequence !== cursor + 1) throw new Stage1AuthError(409, 'hub_sync_empty_range_invalid', 'An empty sync request must match the current cursor');
@@ -205,6 +223,11 @@ export async function POST(request: Request) {
           const response = {
             acceptedThroughSequence,
             streamId: envelope.streamId,
+            ...(streamReconciled ? {
+              streamReconciled: true,
+              reconciledFromStreamId: current.syncStreamId,
+              reconciledFromSequence: Number(current.syncAcceptedSequence),
+            } : {}),
             cloudRevision: configuration.revision,
             configurationAppliedRevision: Number(envelope.acknowledgedCloudRevision),
             configuration,
@@ -216,6 +239,23 @@ export async function POST(request: Request) {
           };
 
           if (envelope.events.length) {
+            if (streamReconciled) {
+              await tx.auditEvent.create({ data: {
+                homeId: current.homeId, actorType: 'HUB', actorId: current.id,
+                category: 'SECURITY', action: 'hub_sync_stream_reconciled', targetType: 'HubInstallation', targetId: current.id,
+                metadata: {
+                  version: 1,
+                  fromStreamId: current.syncStreamId,
+                  fromAcceptedSequence: Number(current.syncAcceptedSequence),
+                  toStreamId: envelope.streamId,
+                  fromSequence: envelope.fromSequence,
+                  toSequence: envelope.toSequence,
+                  eventCount: envelope.events.length,
+                  bodyHash,
+                },
+                purgeAt: new Date(now.getTime() + 365 * 24 * 60 * 60 * 1000),
+              } });
+            }
             const advanced = await tx.hubInstallation.updateMany({ where: { id: current.id, homeId: current.homeId, state: current.state, lifecycleStatus: current.lifecycleStatus, syncStreamId: current.syncStreamId, syncAcceptedSequence: current.syncAcceptedSequence }, data: {
               syncStreamId: envelope.streamId,
               syncAcceptedSequence: to,

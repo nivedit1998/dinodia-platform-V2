@@ -16,7 +16,7 @@ function loadTypeScript(relative) {
   return module.exports;
 }
 
-const { isInstallationBootstrapEvent, validateHubSyncEnvelope } = loadTypeScript('src/lib/hubSyncEnvelope.ts');
+const { canReconcileHubSyncStream, isInstallationBootstrapEvent, validateHubSyncEnvelope } = loadTypeScript('src/lib/hubSyncEnvelope.ts');
 const { parseHubSyncOutboxReport, parseCloudflareTunnelStatus, currentCloudflareTunnelStatus } = loadTypeScript('src/lib/hubSyncTelemetry.ts');
 const { resolveNativeInstallationSyncMode } = loadTypeScript('src/lib/nativeInstallationSyncMode.ts');
 
@@ -125,6 +125,35 @@ test('hub sync accepts a bounded contiguous signed-envelope shape and rejects ma
   assert.equal(validateHubSyncEnvelope(conflictingMetadata), false);
 
   assert.equal(validateHubSyncEnvelope(valid, 'x'.repeat(1024 * 1024 + 1)), false);
+});
+
+test('stream reconciliation is bound to the exact active remote cursor and a complete gap-free local first batch', () => {
+  const candidate = envelope();
+  candidate.streamId = 'local-stream-00000001';
+  candidate.streamReconciliation = { version: 1, previousStreamId: 'remote-stream-accepted-18', previousAcceptedSequence: 18 };
+  candidate.runtime.capabilities.nativeSyncOutbox = {
+    queueDepth: 1, gapDetected: false, criticalBacklog: false, telemetryPaused: false, droppedTelemetryCount: 0, lastErrorCode: null,
+  };
+  assert.equal(validateHubSyncEnvelope(candidate), true);
+  const active = {
+    installationSyncMode: 'ACTIVE', syncStreamId: 'remote-stream-accepted-18', syncAcceptedSequence: 18,
+    syncGapDetected: false, syncCriticalBacklog: false, syncTelemetryPaused: false, syncDroppedTelemetryCount: 0,
+  };
+  assert.equal(canReconcileHubSyncStream(candidate, active), true);
+  assert.equal(canReconcileHubSyncStream(candidate, { ...active, syncAcceptedSequence: 19 }), false, 'a stale cursor cannot replace newer server history');
+  assert.equal(canReconcileHubSyncStream(candidate, { ...active, installationSyncMode: 'INSTALLATION_BOOTSTRAP' }), false, 'restricted bootstrap cannot reconcile a full Home stream');
+  assert.equal(canReconcileHubSyncStream(candidate, { ...active, syncGapDetected: true }), false, 'a known server retention gap remains held');
+  assert.equal(canReconcileHubSyncStream({ ...candidate, runtime: { ...candidate.runtime, capabilities: { ...candidate.runtime.capabilities, nativeSyncOutbox: { ...candidate.runtime.capabilities.nativeSyncOutbox, droppedTelemetryCount: 1 } } } }, active), false, 'known local drops cannot be represented as a complete transition');
+
+  const malformed = structuredClone(candidate);
+  malformed.streamReconciliation.unreviewed = true;
+  assert.equal(validateHubSyncEnvelope(malformed), false, 'unknown reconciliation fields are rejected');
+  const wrongStart = structuredClone(candidate);
+  wrongStart.fromSequence = 2;
+  wrongStart.toSequence = 2;
+  wrongStart.events[0].sequence = 2;
+  assert.equal(validateHubSyncEnvelope(wrongStart), true);
+  assert.equal(canReconcileHubSyncStream(wrongStart, active), false, 'the local stream must be replayed from sequence one');
 });
 
 test('configuration refresh is a distinct empty signed envelope and can never carry events', () => {
@@ -303,4 +332,7 @@ test('the Stage 5 sync endpoint is inventoried as a machine-authenticated Native
   assert.match(source, /syncAcceptedSequence/);
   assert.match(source, /applyHubSyncEvent/);
   assert.match(source, /hubSyncReceipt\.create/);
+  assert.match(source, /hub_sync_stream_reconciliation_required/);
+  assert.match(source, /canReconcileHubSyncStream/);
+  assert.match(source, /hub_sync_stream_reconciled/);
 });
