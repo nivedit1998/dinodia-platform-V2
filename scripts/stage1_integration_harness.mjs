@@ -9876,7 +9876,7 @@ async function osChecks() {
   const adoptionReady = await machineRequest({ base: platformBase, path: '/api/hub-agent/v2/commissioning-sessions', machineSecret: customerFixture.machineSecret, body: {
     ...adoptionBase, action: 'transition', expectedRevision: 1, operationKind: 'REGISTER_EXISTING', status: 'READY', selectedAreaId: syncedArea.id,
     candidateRef: adoptionCandidateRef, osDeviceId: adoptionDeviceId, targetOsDeviceId: adoptionDeviceId, targetIdentityHash: adoptionIdentityHash,
-    requestedName: 'Existing radiator', customerLabel: 'Living room radiator', catalogueStatus: 'ready', catalogueRevision: 1, descriptorDigest: adoptionDescriptorDigest,
+    requestedName: 'Existing radiator', customerLabel: 'Living room radiator', analyticsCategory: 'RADIATOR', catalogueStatus: 'ready', catalogueRevision: 1, descriptorDigest: adoptionDescriptorDigest,
   } });
   if (adoptionReady.response.status !== 200 || adoptionReady.body.state !== 'READY') fail(`The Platform owner rejected the current assigned Area/descriptor review for an already-paired device (${adoptionReady.response.status}/${adoptionReady.body.error?.code || 'no-code'})`);
   const adoptionFinalizeBody = { ...adoptionBase, action: 'finalize', operationKind: 'REGISTER_EXISTING', expectedRevision: 2,
@@ -9884,13 +9884,13 @@ async function osChecks() {
       osDeviceId: adoptionDeviceId, originalName: 'Existing radiator', technicalLabel: 'property_device', deviceType: 'radiator', manufacturer: 'Fixture', model: 'TRV', protocol: 'ZIGBEE',
       protocolIdentityHash: adoptionIdentityHash, descriptorRevision: 1, descriptorDigest: adoptionDescriptorDigest,
       capabilitySummary: { controls: [{ controlId: 'target-temperature', kind: 'number', readable: true, writable: true, domain: 'target_temperature' }] },
-      areaId: syncedArea.id, name: 'Living room radiator', customerLabel: 'Living room radiator', catalogueStatus: 'ready', usefulReadings: true,
+      areaId: syncedArea.id, name: 'Living room radiator', customerLabel: 'Living room radiator', analyticsCategory: 'RADIATOR', catalogueStatus: 'ready', usefulReadings: true,
     } };
   const adoptionFinalize = await machineRequest({ base: platformBase, path: '/api/hub-agent/v2/commissioning-sessions', machineSecret: customerFixture.machineSecret, body: adoptionFinalizeBody });
   const adoptionFinalizeRetry = await machineRequest({ base: platformBase, path: '/api/hub-agent/v2/commissioning-sessions', machineSecret: customerFixture.machineSecret, body: adoptionFinalizeBody });
   const adoptedCanonical = adoptionFinalize.body.device?.id ? await prisma.nativeDevice.findUnique({ where: { id: adoptionFinalize.body.device.id }, select: {
     id: true, homeId: true, hubInstallationId: true, osDeviceId: true, managementClass: true, ownerMembershipId: true, lifecycle: true,
-    installationRequestId: true, assignments: { select: { areaId: true, source: true } }, sourceAliases: { select: { protocol: true, protocolIdentityHash: true } },
+    installationRequestId: true, analyticsCategory: true, inventoryRevision: true, assignments: { select: { areaId: true, source: true } }, sourceAliases: { select: { protocol: true, protocolIdentityHash: true } },
   } }) : null;
   const adoptionDomainEvent = await prisma.nativeDomainOutbox.findFirst({ where: { aggregateId: adoptionFinalize.body.device?.id, eventType: 'PROPERTY_DEVICE_ADOPTED' }, select: { id: true, payload: true } });
   if (adoptionFinalize.response.status !== 200 || adoptionFinalize.body.operationKind !== 'REGISTER_EXISTING'
@@ -9898,10 +9898,52 @@ async function osChecks() {
     || !adoptedCanonical || adoptedCanonical.homeId !== customerFixture.homeOneId || adoptedCanonical.hubInstallationId !== customerFixture.hubOneId
     || adoptedCanonical.osDeviceId !== adoptionDeviceId || adoptedCanonical.managementClass !== 'PROPERTY_DEVICE' || adoptedCanonical.ownerMembershipId !== null
     || adoptedCanonical.lifecycle !== 'INSTALLED' || adoptedCanonical.installationRequestId !== newInstallationRequest.body.request.id
+    || adoptedCanonical.analyticsCategory !== 'RADIATOR'
     || adoptedCanonical.assignments.length !== 1 || adoptedCanonical.assignments[0].areaId !== syncedArea.id
     || adoptedCanonical.assignments[0].source !== 'NATIVE_STAFF_EXISTING_DEVICE_ADOPTION'
     || adoptedCanonical.sourceAliases.length !== 1 || adoptedCanonical.sourceAliases[0].protocol !== 'zigbee'
     || adoptedCanonical.sourceAliases[0].protocolIdentityHash !== adoptionIdentityHash || !adoptionDomainEvent) fail(`Existing local device adoption did not create one canonical property record, identity alias and durable receipt (${adoptionFinalize.response.status}/${adoptionFinalize.body.error?.code || 'no-device'})`);
+  const categoryHomeBefore = await prisma.home.findUniqueOrThrow({ where: { id: customerFixture.homeOneId }, select: { managementRevision: true } });
+  const analyticsCategoryBody = { serial: customerFixture.identityOneSerial, identityGeneration: customerFixture.identityOneGeneration,
+    homeId: customerFixture.homeOneId, hubInstallationId: customerFixture.hubOneId, accessScope: 'os:permanent-installation',
+    employeeId: commissioningActor.employeeId, employeeSessionId: commissioningActor.employeeSessionId, operatorHandoffId: commissioningActor.operatorHandoffId,
+    operatorJti: commissioningActor.operatorJti, workItemId: commissioningActor.workItemId, workRevision: commissioningActor.workRevision,
+    requestId: commissioningActor.requestId, osDeviceId: adoptionDeviceId, expectedManagementRevision: categoryHomeBefore.managementRevision,
+    expectedInventoryRevision: adoptedCanonical.inventoryRevision, expectedAnalyticsCategory: 'RADIATOR', analyticsCategory: 'NONE', operationId: crypto.randomUUID() };
+  const analyticsCategoryPath = '/api/hub-agent/v2/permanent-device-analytics-category';
+  const analyticsCategoryUpdate = await machineRequest({ base: platformBase, path: analyticsCategoryPath, machineSecret: customerFixture.machineSecret, body: analyticsCategoryBody });
+  const analyticsCategoryRetry = await machineRequest({ base: platformBase, path: analyticsCategoryPath, machineSecret: customerFixture.machineSecret, body: analyticsCategoryBody });
+  const analyticsCategoryCanonical = await prisma.nativeDevice.findUniqueOrThrow({ where: { id: adoptedCanonical.id }, select: { analyticsCategory: true, inventoryRevision: true } });
+  const analyticsCategoryHomeAfter = await prisma.home.findUniqueOrThrow({ where: { id: customerFixture.homeOneId }, select: { managementRevision: true } });
+  if (analyticsCategoryUpdate.response.status !== 200 || analyticsCategoryUpdate.body.analyticsCategory !== 'NONE'
+    || analyticsCategoryRetry.response.status !== 200 || analyticsCategoryRetry.body.idempotentReplay !== true
+    || analyticsCategoryCanonical.analyticsCategory !== 'NONE' || analyticsCategoryCanonical.inventoryRevision !== adoptedCanonical.inventoryRevision + 1
+    || analyticsCategoryHomeAfter.managementRevision !== categoryHomeBefore.managementRevision + 1) fail(`The optional analytics-category owner did not exact-retry one authorized permanent-device metadata update (${analyticsCategoryUpdate.response.status}/${analyticsCategoryUpdate.body.error?.code || 'no-code'})`);
+  const staleAnalyticsCategory = await machineRequest({ base: platformBase, path: analyticsCategoryPath, machineSecret: customerFixture.machineSecret, body: {
+    ...analyticsCategoryBody, operationId: crypto.randomUUID(), expectedAnalyticsCategory: 'NONE', analyticsCategory: 'RADIATOR',
+  } });
+  if (staleAnalyticsCategory.response.status !== 409 || (await prisma.nativeDevice.findUniqueOrThrow({ where: { id: adoptedCanonical.id }, select: { analyticsCategory: true } })).analyticsCategory !== 'NONE') fail('A stale Home revision was allowed to overwrite device analytics metadata');
+  // Refresh the consumed handoff row: launch-time scope intentionally has no
+  // one-use operator JTI; consume binds it durably before this mutation test.
+  const fullHomeHandoff = await prisma.operatorHandoff.findUnique({ where: { id: areaAdminLaunch.body.handoffId }, select: { scope: true } });
+  const fullHomeScope = fullHomeHandoff?.scope && typeof fullHomeHandoff.scope === 'object' ? fullHomeHandoff.scope : {};
+  const fullHomeCategoryBefore = await prisma.home.findUniqueOrThrow({ where: { id: customerFixture.homeOneId }, select: { managementRevision: true } });
+  const fullHomeDeviceBefore = await prisma.nativeDevice.findUniqueOrThrow({ where: { id: adoptedCanonical.id }, select: { analyticsCategory: true, inventoryRevision: true } });
+  const fullHomeAnalyticsBody = { serial: customerFixture.identityOneSerial, identityGeneration: customerFixture.identityOneGeneration,
+    homeId: customerFixture.homeOneId, hubInstallationId: customerFixture.hubOneId, accessScope: 'os:admin', employeeId: customerFixture.operatorEmployeeId,
+    employeeSessionId: fullHomeScope.employeeSessionId, operatorHandoffId: areaAdminLaunch.body.handoffId, operatorJti: fullHomeScope.operatorJti,
+    workItemId: customerFixture.operatorWorkId, workRevision: Number(fullHomeScope.workRevision), osDeviceId: adoptionDeviceId,
+    expectedManagementRevision: fullHomeCategoryBefore.managementRevision, expectedInventoryRevision: fullHomeDeviceBefore.inventoryRevision,
+    expectedAnalyticsCategory: fullHomeDeviceBefore.analyticsCategory, analyticsCategory: 'RADIATOR', operationId: crypto.randomUUID() };
+  const fullHomeCategoryUpdate = await machineRequest({ base: platformBase, path: analyticsCategoryPath, machineSecret: customerFixture.machineSecret, body: fullHomeAnalyticsBody });
+  const fullHomeCategoryRetry = await machineRequest({ base: platformBase, path: analyticsCategoryPath, machineSecret: customerFixture.machineSecret, body: fullHomeAnalyticsBody });
+  const fullHomeCategoryCanonical = await prisma.nativeDevice.findUniqueOrThrow({ where: { id: adoptedCanonical.id }, select: { analyticsCategory: true, inventoryRevision: true } });
+  const fullHomeCategoryAfter = await prisma.home.findUniqueOrThrow({ where: { id: customerFixture.homeOneId }, select: { managementRevision: true } });
+  if (!fullHomeScope.employeeSessionId || !fullHomeScope.operatorJti || Number(fullHomeScope.workRevision) < 1
+    || fullHomeCategoryUpdate.response.status !== 200 || fullHomeCategoryUpdate.body.analyticsCategory !== 'RADIATOR'
+    || fullHomeCategoryRetry.response.status !== 200 || fullHomeCategoryRetry.body.idempotentReplay !== true
+    || fullHomeCategoryCanonical.analyticsCategory !== 'RADIATOR' || fullHomeCategoryCanonical.inventoryRevision !== fullHomeDeviceBefore.inventoryRevision + 1
+    || fullHomeCategoryAfter.managementRevision !== fullHomeCategoryBefore.managementRevision + 1) fail(`The assigned full-Home dashboard could not update and exact-retry the permanent-device category through its own authority scope (first=${fullHomeCategoryUpdate.response.status}/${fullHomeCategoryUpdate.body.error?.code || 'no-error-code'}, retry=${fullHomeCategoryRetry.response.status}/${fullHomeCategoryRetry.body.error?.code || 'no-error-code'}, employeeSession=${Boolean(fullHomeScope.employeeSessionId)}, jti=${Boolean(fullHomeScope.operatorJti)}, workRevision=${Number(fullHomeScope.workRevision) || 0}, category=${fullHomeCategoryCanonical.analyticsCategory}, inventoryAdvanced=${fullHomeCategoryCanonical.inventoryRevision === fullHomeDeviceBefore.inventoryRevision + 1}, homeRevisionAdvanced=${fullHomeCategoryAfter.managementRevision === fullHomeCategoryBefore.managementRevision + 1})`);
   const adoptionHomeowner = await fetchJson(`${platformBase}/api/v2/homes/${encodeURIComponent(customerFixture.homeOneId)}/homeowner-context`, { headers: { authorization: `Bearer ${homeownerLogin.body.accessToken}`, 'x-dinodia-home-id': customerFixture.homeOneId } });
   const homeownerAdopted = adoptionHomeowner.body?.devices?.find((device) => device.id === adoptionFinalize.body.device.id);
   if (adoptionHomeowner.response.status !== 200 || !homeownerAdopted || homeownerAdopted.lifecycle !== 'INSTALLED'

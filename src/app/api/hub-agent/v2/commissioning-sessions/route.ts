@@ -236,7 +236,7 @@ export async function POST(request: Request) {
           ...(registerExisting ? ['targetOsDeviceId','targetIdentityHash'] : []), ...actorKeys];
         const nextStatus = String(body.status || '');
         const state = ({ ADVERTISING: 'ADVERTISING', READY: 'READY', COMPLETED: 'COMPLETED', CANCELLED: 'CANCELLED', EXPIRED: 'EXPIRED', FAILED: 'FAILED' } as Record<string,string>)[nextStatus];
-        const optional = ['selectedAreaId','candidateRef','osDeviceId','requestedName','customerLabel','catalogueStatus','catalogueRevision','descriptorDigest','result'];
+        const optional = ['selectedAreaId','candidateRef','osDeviceId','requestedName','customerLabel','analyticsCategory','catalogueStatus','catalogueRevision','descriptorDigest','result'];
         const operationKeys = registerExisting ? ['targetOsDeviceId','targetIdentityHash'] : [];
         if (!exactKeys(body, allowed.filter((key) => !optional.includes(key) && !operationKeys.includes(key))
           .concat(optional.filter((key) => Object.hasOwn(body, key)), operationKeys)) || !state
@@ -247,6 +247,8 @@ export async function POST(request: Request) {
           && row.requestedAreaId === body.selectedAreaId && row.selectedCandidateRef === body.candidateRef && row.selectedOsDeviceId === body.osDeviceId
           && row.customerLabel === body.customerLabel && row.catalogueStatus === body.catalogueStatus && row.catalogueRevision === body.catalogueRevision
           && row.catalogueDigest === body.descriptorDigest) {
+          const category = String(body.analyticsCategory === undefined ? 'NONE' : body.analyticsCategory);
+          if (category !== String(owner.analyticsCategory || 'NONE')) fail(409, 'commissioning_idempotency_conflict', 'The reviewed analytics category changed; refresh the device review');
           return NextResponse.json({ ok: true, sessionId: row.id, revision: row.revision, state }, { headers: { 'Cache-Control': 'no-store' } });
         }
         if (state === 'COMPLETED' && row.state === 'COMPLETED' && row.finalDisposition === 'REMOVED' && body.result === 'REMOVED'
@@ -266,6 +268,8 @@ export async function POST(request: Request) {
             || typeof body.osDeviceId !== 'string' || !/^[A-Za-z0-9:_-]{1,160}$/.test(body.osDeviceId)
             || !(body.requestedName === null || typeof body.requestedName === 'string' && body.requestedName.length <= 80)
             || typeof body.customerLabel !== 'string' || !body.customerLabel.trim() || [...body.customerLabel].length > 40
+            || !['NONE','LIGHT','BOILER','RADIATOR'].includes(String(body.analyticsCategory === undefined ? 'NONE' : body.analyticsCategory))
+            || !isStaff && String(body.analyticsCategory || 'NONE') !== 'NONE'
             || !['ready','no_safe_controls','unsupported'].includes(catalogueStatus)
             || !Number.isSafeInteger(body.catalogueRevision) || Number(body.catalogueRevision) < 1 || !HASH.test(String(body.descriptorDigest || ''))) fail(403, 'commissioning_area_denied', 'The selected device or Area is not currently permitted');
           if (registerExisting && (body.candidateRef !== owner.candidateRef || body.osDeviceId !== owner.targetOsDeviceId
@@ -281,6 +285,12 @@ export async function POST(request: Request) {
           ...(state === 'READY' ? { requestedAreaId: String(body.selectedAreaId), selectedCandidateRef: String(body.candidateRef), selectedOsDeviceId: String(body.osDeviceId), requestedName: body.requestedName == null ? '' : String(body.requestedName), customerLabel: String(body.customerLabel), catalogueStatus: String(body.catalogueStatus), catalogueRevision: Number(body.catalogueRevision), catalogueDigest: String(body.descriptorDigest) } : {}),
           ...(state === 'COMPLETED' ? { finalDisposition: 'REMOVED' } : {}), revision: { increment: 1 }, ...(state === 'CANCELLED' || state === 'EXPIRED' || state === 'FAILED' || state === 'COMPLETED' ? { closedAt: transitionNow } : {}) } });
         if (changed.count !== 1) fail(409, 'commissioning_revision_conflict', 'The commissioning session changed; refresh it before continuing');
+        if (state === 'READY') {
+          const nextOwner = { ...owner, analyticsCategory: String(body.analyticsCategory === undefined ? 'NONE' : body.analyticsCategory) };
+          await tx.idempotencyRecord.update({ where: { namespace_keyHash: { namespace: SESSION_NAMESPACE, keyHash: row.idempotencyKeyHash } }, data: {
+            responseBody: nextOwner, responseDigest: sha256(JSON.stringify(nextOwner)),
+          } });
+        }
         return NextResponse.json({ ok: true, sessionId: row.id, revision: row.revision + 1, state }, { headers: { 'Cache-Control': 'no-store' } });
       }
 
@@ -292,8 +302,11 @@ export async function POST(request: Request) {
         || registerExisting && (body.targetOsDeviceId !== owner.targetOsDeviceId || body.targetIdentityHash !== owner.targetIdentityHash)
         || !body.device || typeof body.device !== 'object' || Array.isArray(body.device)) fail(409, 'commissioning_finalize_invalid', 'The device is not ready for ownership registration');
       const device = body.device as Record<string, unknown>;
-      const keys = ['osDeviceId','originalName','technicalLabel','deviceType','manufacturer','model','protocol',...(Object.hasOwn(device, 'protocolIdentityHash') ? ['protocolIdentityHash'] : []),'descriptorRevision','descriptorDigest','capabilitySummary','areaId','name','customerLabel','catalogueStatus','usefulReadings'];
+      const keys = ['osDeviceId','originalName','technicalLabel','deviceType','manufacturer','model','protocol',...(Object.hasOwn(device, 'protocolIdentityHash') ? ['protocolIdentityHash'] : []),'descriptorRevision','descriptorDigest','capabilitySummary','areaId','name','customerLabel',...(Object.hasOwn(device, 'analyticsCategory') ? ['analyticsCategory'] : []),'catalogueStatus','usefulReadings'];
+      const analyticsCategory = String(device.analyticsCategory === undefined ? owner.analyticsCategory || 'NONE' : device.analyticsCategory);
       if (!exactKeys(device, keys) || typeof body.candidateRef !== 'string' || body.candidateRef.length > 80 || !['install','view_only'].includes(String(body.disposition))
+        || !['NONE','LIGHT','BOILER','RADIATOR'].includes(analyticsCategory) || !isStaff && analyticsCategory !== 'NONE'
+        || analyticsCategory !== String(owner.analyticsCategory || 'NONE')
         || typeof device.osDeviceId !== 'string' || !/^[A-Za-z0-9:_-]{1,160}$/.test(device.osDeviceId)
         || ![device.originalName,device.technicalLabel,device.deviceType].every((v) => typeof v === 'string' && v.trim().length > 0)
         || (device.name !== null && (typeof device.name !== 'string' || String(device.name).length > 80))
@@ -345,6 +358,7 @@ export async function POST(request: Request) {
       const created = await tx.nativeDevice.create({ data: {
         homeId: authority.home.id, hubInstallationId: hub.installation.id, osDeviceId: String(device.osDeviceId), originalName: String(device.originalName),
         overrideName: device.name == null || !String(device.name).trim() ? null : String(device.name), technicalLabel: String(device.technicalLabel), customerLabel: String(device.customerLabel),
+        analyticsCategory: analyticsCategory as never,
         managementClass: authority.managementClass, ownerMembershipId: authority.ownerMembershipId, deviceType: String(device.deviceType),
         manufacturer: device.manufacturer == null ? null : String(device.manufacturer), model: device.model == null ? null : String(device.model), protocol,
         capabilitySummary: { ...safeSummary, commissioning: { status: String(device.catalogueStatus), usefulReadings: device.usefulReadings === true, catalogueVersion: 'DINODIA-NATIVE-COMMISSIONING-V1', descriptorDigest: String(device.descriptorDigest) } } as never,
@@ -352,7 +366,7 @@ export async function POST(request: Request) {
         lifecycle: body.disposition === 'view_only' ? 'VIEW_ONLY' : 'INSTALLED', onlineState: 'UNKNOWN', installedAt: now,
         ...(isStaff ? { installationRequestId: authority.request!.id } : {}),
         assignments: { create: { areaId, homeId: authority.home.id, source: isStaff ? (registerExisting ? 'NATIVE_STAFF_EXISTING_DEVICE_ADOPTION' : 'NATIVE_STAFF_COMMISSIONING') : 'NATIVE_TENANT_COMMISSIONING' } },
-      }, select: { id: true, homeId: true, osDeviceId: true, ownerMembershipId: true, managementClass: true, lifecycle: true, customerLabel: true, descriptorRevision: true } });
+      }, select: { id: true, homeId: true, osDeviceId: true, ownerMembershipId: true, managementClass: true, lifecycle: true, customerLabel: true, descriptorRevision: true, analyticsCategory: true, inventoryRevision: true } });
       await observeDeviceSourceAlias(tx, { homeId: authority.home.id, deviceId: created.id, hubInstallationId: hub.installation.id,
         protocol: sourceProtocol, sourceDeviceId: String(device.osDeviceId),
         ...(typeof device.protocolIdentityHash === 'string' ? { protocolIdentityHash: device.protocolIdentityHash } : {}), now });
@@ -365,7 +379,7 @@ export async function POST(request: Request) {
         action: isStaff ? (registerExisting ? 'property_device_adopted_by_assigned_staff' : 'property_device_commissioned_by_assigned_staff') : 'tenant_device_commissioned',
         targetType: 'NativeDevice', targetId: created.id, metadata: { protocol, areaId, outcome: 'installed', operationKind: ownerOperationKind, requestId: authority.request?.id || null, workItemId: authority.work?.id || null }, purgeAt: new Date(now.getTime() + 365 * 24 * 60 * 60 * 1000) } });
       const response = { ok: true, sessionId: row.id, revision: row.revision + 1, state: 'COMPLETED', operationKind: ownerOperationKind,
-        device: { id: created.id, osDeviceId: created.osDeviceId, managementClass: created.managementClass, ownerMembershipId: created.ownerMembershipId, lifecycle: created.lifecycle, customerLabel: created.customerLabel, descriptorRevision: created.descriptorRevision } };
+        device: { id: created.id, osDeviceId: created.osDeviceId, managementClass: created.managementClass, ownerMembershipId: created.ownerMembershipId, lifecycle: created.lifecycle, customerLabel: created.customerLabel, descriptorRevision: created.descriptorRevision, analyticsCategory: created.analyticsCategory, inventoryRevision: created.inventoryRevision } };
       await tx.idempotencyRecord.create({ data: { namespace: COMPLETE_NAMESPACE, keyHash: finalHash, actorId: authority.actorId, homeId: authority.home.id, hubInstallationId: hub.installation.id, requestHash: finalRequest, responseStatus: 200, responseBody: response, responseDigest: sha256(JSON.stringify(response)), expiresAt: new Date(now.getTime() + 24 * 60 * 60 * 1000) } });
       return NextResponse.json(response, { headers: { 'Cache-Control': 'no-store' } });
     }, { isolationLevel: 'Serializable', maxWait: 5000, timeout: 12000 });

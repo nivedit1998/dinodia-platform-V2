@@ -16,7 +16,7 @@ export async function buildHubCloudConfiguration(db: Prisma.TransactionClient, i
       select: { id: true, role: true, accessRevision: true, tenantAreaGrants: { where: { revokedAt: null, area: { status: 'ACTIVE' } }, orderBy: { areaId: 'asc' }, select: { areaId: true, policyRevision: true } } },
     }),
     db.nativeDevice.findMany({ where: { homeId: input.homeId, hubInstallationId: input.hubInstallationId }, orderBy: { id: 'asc' }, take: 2000,
-      select: { osDeviceId: true, managementClass: true, ownerMembershipId: true, analyticsCategory: true, lifecycle: true, customerLabel: true, overrideName: true, descriptorRevision: true, descriptorDigest: true, assignments: { where: { validUntil: null, area: { status: 'ACTIVE' } }, orderBy: { areaId: 'asc' }, take: 8, select: { areaId: true, area: { select: { osAreaId: true } } } } } }),
+      select: { osDeviceId: true, managementClass: true, ownerMembershipId: true, analyticsCategory: true, inventoryRevision: true, lifecycle: true, customerLabel: true, overrideName: true, descriptorRevision: true, descriptorDigest: true, assignments: { where: { validUntil: null, area: { status: 'ACTIVE' } }, orderBy: { areaId: 'asc' }, take: 8, select: { areaId: true, area: { select: { osAreaId: true } } } } } }),
     automationActivationEnabled ? db.nativeAutomation.findMany({ where: { homeId: input.homeId, status: { not: 'RETIRED' } }, orderBy: { id: 'asc' }, take: 100,
       select: { id: true, name: true, status: true, revision: true, definitionChecksum: true, timezone: true, triggers: { orderBy: { id: 'asc' }, select: { id: true, kind: true, configuration: true, revision: true } }, actions: { orderBy: [{ sortOrder: 'asc' }, { id: 'asc' }], select: { id: true, device: { select: { osDeviceId: true } }, area: { select: { osAreaId: true } }, controlId: true, sortOrder: true, descriptorRevision: true, actionValue: true, needsAttention: true } } } })
       : Promise.resolve([]),
@@ -31,6 +31,7 @@ export async function buildHubCloudConfiguration(db: Prisma.TransactionClient, i
       osDeviceId: device.osDeviceId, managementClass: device.managementClass, ownerMembershipId: device.ownerMembershipId,
       lifecycle: device.lifecycle, customerLabel: device.customerLabel, overrideName: device.overrideName,
       analyticsCategory: device.analyticsCategory,
+      inventoryRevision: device.inventoryRevision,
       descriptorRevision: device.descriptorRevision, descriptorDigest: device.descriptorDigest,
       osAreaIds: device.assignments.map((assignment) => assignment.area.osAreaId),
     })),
