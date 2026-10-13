@@ -9904,6 +9904,7 @@ async function osChecks() {
     || adoptedCanonical.sourceAliases.length !== 1 || adoptedCanonical.sourceAliases[0].protocol !== 'zigbee'
     || adoptedCanonical.sourceAliases[0].protocolIdentityHash !== adoptionIdentityHash || !adoptionDomainEvent) fail(`Existing local device adoption did not create one canonical property record, identity alias and durable receipt (${adoptionFinalize.response.status}/${adoptionFinalize.body.error?.code || 'no-device'})`);
   const categoryHomeBefore = await prisma.home.findUniqueOrThrow({ where: { id: customerFixture.homeOneId }, select: { managementRevision: true } });
+  const categoryHubBefore = await prisma.hubInstallation.findUniqueOrThrow({ where: { id: customerFixture.hubOneId }, select: { cloudConfigurationRevision: true } });
   // A harmless concurrent Home-level change must not block a device-scoped
   // category update when the device's own category and inventory revision
   // are still exactly the ones staff reviewed. The endpoint increments the
@@ -9913,7 +9914,7 @@ async function osChecks() {
     homeId: customerFixture.homeOneId, hubInstallationId: customerFixture.hubOneId, accessScope: 'os:permanent-installation',
     employeeId: commissioningActor.employeeId, employeeSessionId: commissioningActor.employeeSessionId, operatorHandoffId: commissioningActor.operatorHandoffId,
     operatorJti: commissioningActor.operatorJti, workItemId: commissioningActor.workItemId, workRevision: commissioningActor.workRevision,
-    requestId: commissioningActor.requestId, osDeviceId: adoptionDeviceId, expectedManagementRevision: categoryHomeBefore.managementRevision,
+    requestId: commissioningActor.requestId, osDeviceId: adoptionDeviceId, expectedManagementRevision: categoryHubBefore.cloudConfigurationRevision,
     expectedInventoryRevision: adoptedCanonical.inventoryRevision, expectedAnalyticsCategory: 'RADIATOR', analyticsCategory: 'NONE', operationId: crypto.randomUUID() };
   const analyticsCategoryPath = '/api/hub-agent/v2/permanent-device-analytics-category';
   const analyticsCategoryUpdate = await machineRequest({ base: platformBase, path: analyticsCategoryPath, machineSecret: customerFixture.machineSecret, body: analyticsCategoryBody });
@@ -9925,20 +9926,22 @@ async function osChecks() {
     || analyticsCategoryCanonical.analyticsCategory !== 'NONE' || analyticsCategoryCanonical.inventoryRevision !== adoptedCanonical.inventoryRevision + 1
     || analyticsCategoryHomeAfter.managementRevision !== categoryHomeBefore.managementRevision + 2) fail(`The optional analytics-category owner rejected a device-scoped update after an unrelated Home revision change or failed exact retry (${analyticsCategoryUpdate.response.status}/${analyticsCategoryUpdate.body.error?.code || 'no-code'})`);
   const staleAnalyticsCategory = await machineRequest({ base: platformBase, path: analyticsCategoryPath, machineSecret: customerFixture.machineSecret, body: {
-    ...analyticsCategoryBody, operationId: crypto.randomUUID(), expectedAnalyticsCategory: 'NONE', analyticsCategory: 'RADIATOR',
+    ...analyticsCategoryBody, operationId: crypto.randomUUID(), expectedManagementRevision: Number(categoryHubBefore.cloudConfigurationRevision) + 1,
+    expectedAnalyticsCategory: 'NONE', analyticsCategory: 'RADIATOR',
   } });
-  if (staleAnalyticsCategory.response.status !== 409 || (await prisma.nativeDevice.findUniqueOrThrow({ where: { id: adoptedCanonical.id }, select: { analyticsCategory: true } })).analyticsCategory !== 'NONE') fail('A stale Home revision was allowed to overwrite device analytics metadata');
+  if (staleAnalyticsCategory.response.status !== 409 || (await prisma.nativeDevice.findUniqueOrThrow({ where: { id: adoptedCanonical.id }, select: { analyticsCategory: true } })).analyticsCategory !== 'NONE') fail('A stale signed cloud-configuration revision was allowed to overwrite device analytics metadata');
   // Refresh the consumed handoff row: launch-time scope intentionally has no
   // one-use operator JTI; consume binds it durably before this mutation test.
   const fullHomeHandoff = await prisma.operatorHandoff.findUnique({ where: { id: areaAdminLaunch.body.handoffId }, select: { scope: true } });
   const fullHomeScope = fullHomeHandoff?.scope && typeof fullHomeHandoff.scope === 'object' ? fullHomeHandoff.scope : {};
   const fullHomeCategoryBefore = await prisma.home.findUniqueOrThrow({ where: { id: customerFixture.homeOneId }, select: { managementRevision: true } });
+  const fullHomeHubBefore = await prisma.hubInstallation.findUniqueOrThrow({ where: { id: customerFixture.hubOneId }, select: { cloudConfigurationRevision: true } });
   const fullHomeDeviceBefore = await prisma.nativeDevice.findUniqueOrThrow({ where: { id: adoptedCanonical.id }, select: { analyticsCategory: true, inventoryRevision: true } });
   const fullHomeAnalyticsBody = { serial: customerFixture.identityOneSerial, identityGeneration: customerFixture.identityOneGeneration,
     homeId: customerFixture.homeOneId, hubInstallationId: customerFixture.hubOneId, accessScope: 'os:admin', employeeId: customerFixture.operatorEmployeeId,
     employeeSessionId: fullHomeScope.employeeSessionId, operatorHandoffId: areaAdminLaunch.body.handoffId, operatorJti: fullHomeScope.operatorJti,
     workItemId: customerFixture.operatorWorkId, workRevision: Number(fullHomeScope.workRevision), osDeviceId: adoptionDeviceId,
-    expectedManagementRevision: fullHomeCategoryBefore.managementRevision, expectedInventoryRevision: fullHomeDeviceBefore.inventoryRevision,
+    expectedManagementRevision: fullHomeHubBefore.cloudConfigurationRevision, expectedInventoryRevision: fullHomeDeviceBefore.inventoryRevision,
     expectedAnalyticsCategory: fullHomeDeviceBefore.analyticsCategory, analyticsCategory: 'RADIATOR', operationId: crypto.randomUUID() };
   const fullHomeCategoryUpdate = await machineRequest({ base: platformBase, path: analyticsCategoryPath, machineSecret: customerFixture.machineSecret, body: fullHomeAnalyticsBody });
   const fullHomeCategoryRetry = await machineRequest({ base: platformBase, path: analyticsCategoryPath, machineSecret: customerFixture.machineSecret, body: fullHomeAnalyticsBody });
