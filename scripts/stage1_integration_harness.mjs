@@ -3324,8 +3324,30 @@ async function customerAuthorizationChecks(deliveryEnv) {
   const deniedArea = await prisma.area.findUnique({ where: { homeId_osAreaId: { homeId: homeOne.id, osAreaId: syncAreaId } }, select: { id: true } });
   const cursorAfterDenial = await prisma.hubInstallation.findUniqueOrThrow({ where: { id: hubOne.id }, select: { syncAcceptedSequence: true } });
   if (deniedSync.response.status !== 401 || deniedArea || cursorAfterDenial.syncAcceptedSequence !== syncCursorBeforeDenial.syncAcceptedSequence) fail('An unauthenticated sync request disclosed or mutated the test inventory/cursor');
-  const acceptedSync = await machineRequest({ base: platformBase, path: '/api/hub-agent/v2/sync', machineSecret, body: signedSyncBody(syncBatch) });
-  if (acceptedSync.response.status !== 200 || Number(acceptedSync.body.acceptedThroughSequence) !== syncBatch.toSequence) fail(`The valid machine-authenticated sync batch failed (${acceptedSync.response.status}/${acceptedSync.body.errorCode || 'no-code'})`);
+  // Hold the disposable hub row past Prisma's default five-second
+  // interactive-transaction timeout while the real signed sync route is
+  // committing its receipt/cursor. The route must keep the transaction alive
+  // for this bounded database delay and then accept the unchanged batch.
+  let markHubLockAcquired;
+  let releaseHubLock;
+  const hubLockAcquired = new Promise((resolve) => { markHubLockAcquired = resolve; });
+  const hubLockRelease = new Promise((resolve) => { releaseHubLock = resolve; });
+  const hubRowLock = prisma.$transaction(async (tx) => {
+    const lockedRows = await tx.$queryRaw`SELECT "id" FROM "HubInstallation" WHERE "id" = ${hubOne.id}::uuid FOR UPDATE`;
+    if (!Array.isArray(lockedRows) || lockedRows.length !== 1) fail('The delayed sync regression could not lock its disposable hub row');
+    markHubLockAcquired();
+    await hubLockRelease;
+  }, { maxWait: 5000, timeout: 15000 });
+  await hubLockAcquired;
+  const delayedSignedSync = machineRequest({ base: platformBase, path: '/api/hub-agent/v2/sync', machineSecret, body: signedSyncBody(syncBatch) });
+  await sleep(6500);
+  releaseHubLock();
+  await hubRowLock;
+  const acceptedSync = await delayedSignedSync;
+  if (acceptedSync.response.status !== 200 || Number(acceptedSync.body.acceptedThroughSequence) !== syncBatch.toSequence) {
+    fail(`A valid signed sync failed after a bounded six-second database lock (${acceptedSync.response.status}/${acceptedSync.body.errorCode || 'no-code'}); the route must outlive Prisma's default five-second transaction limit`);
+  }
+  console.log('[stage5:integration] PASS: actual machine-signed sync route commits after a six-second disposable hub-row lock without transaction expiry');
   const acceptedArea = await prisma.area.findUnique({ where: { homeId_osAreaId: { homeId: homeOne.id, osAreaId: syncAreaId } }, select: { id: true, originalName: true, status: true, updatedAt: true } });
   const receiptCountAfterAccept = await prisma.hubSyncReceipt.count({ where: { hubInstallationId: hubOne.id, streamId: syncBatch.streamId, fromSequence: syncBatch.fromSequence, toSequence: syncBatch.toSequence } });
   if (!acceptedArea || acceptedArea.originalName !== 'Stage 5 loopback reconciliation' || acceptedArea.status !== 'ACTIVE' || receiptCountAfterAccept !== 1) fail('The accepted sync did not create exactly one canonical area projection and durable range receipt');

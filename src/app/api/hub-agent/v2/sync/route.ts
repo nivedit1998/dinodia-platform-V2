@@ -281,7 +281,16 @@ export async function POST(request: Request) {
             } });
           }
           return response;
-        }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
+        }, {
+          isolationLevel: Prisma.TransactionIsolationLevel.Serializable,
+          // Sync applies a bounded (<=200 event) durable batch plus its
+          // configuration projection and receipt in one transaction. Keep
+          // this atomic route independent of Prisma's five-second default,
+          // while bounding both pool acquisition and transaction lifetime
+          // below the platform function's request deadline.
+          maxWait: 10_000,
+          timeout: 60_000,
+        });
         if ('__hubSyncConflict' in result) {
           const conflictHomeId = String(result.homeId);
           const conflictHubInstallationId = String(result.hubInstallationId);
