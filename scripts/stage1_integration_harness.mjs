@@ -9904,6 +9904,11 @@ async function osChecks() {
     || adoptedCanonical.sourceAliases.length !== 1 || adoptedCanonical.sourceAliases[0].protocol !== 'zigbee'
     || adoptedCanonical.sourceAliases[0].protocolIdentityHash !== adoptionIdentityHash || !adoptionDomainEvent) fail(`Existing local device adoption did not create one canonical property record, identity alias and durable receipt (${adoptionFinalize.response.status}/${adoptionFinalize.body.error?.code || 'no-device'})`);
   const categoryHomeBefore = await prisma.home.findUniqueOrThrow({ where: { id: customerFixture.homeOneId }, select: { managementRevision: true } });
+  // A harmless concurrent Home-level change must not block a device-scoped
+  // category update when the device's own category and inventory revision
+  // are still exactly the ones staff reviewed. The endpoint increments the
+  // current Home revision atomically when it commits the category change.
+  await prisma.home.update({ where: { id: customerFixture.homeOneId }, data: { managementRevision: { increment: 1 } } });
   const analyticsCategoryBody = { serial: customerFixture.identityOneSerial, identityGeneration: customerFixture.identityOneGeneration,
     homeId: customerFixture.homeOneId, hubInstallationId: customerFixture.hubOneId, accessScope: 'os:permanent-installation',
     employeeId: commissioningActor.employeeId, employeeSessionId: commissioningActor.employeeSessionId, operatorHandoffId: commissioningActor.operatorHandoffId,
@@ -9918,7 +9923,7 @@ async function osChecks() {
   if (analyticsCategoryUpdate.response.status !== 200 || analyticsCategoryUpdate.body.analyticsCategory !== 'NONE'
     || analyticsCategoryRetry.response.status !== 200 || analyticsCategoryRetry.body.idempotentReplay !== true
     || analyticsCategoryCanonical.analyticsCategory !== 'NONE' || analyticsCategoryCanonical.inventoryRevision !== adoptedCanonical.inventoryRevision + 1
-    || analyticsCategoryHomeAfter.managementRevision !== categoryHomeBefore.managementRevision + 1) fail(`The optional analytics-category owner did not exact-retry one authorized permanent-device metadata update (${analyticsCategoryUpdate.response.status}/${analyticsCategoryUpdate.body.error?.code || 'no-code'})`);
+    || analyticsCategoryHomeAfter.managementRevision !== categoryHomeBefore.managementRevision + 2) fail(`The optional analytics-category owner rejected a device-scoped update after an unrelated Home revision change or failed exact retry (${analyticsCategoryUpdate.response.status}/${analyticsCategoryUpdate.body.error?.code || 'no-code'})`);
   const staleAnalyticsCategory = await machineRequest({ base: platformBase, path: analyticsCategoryPath, machineSecret: customerFixture.machineSecret, body: {
     ...analyticsCategoryBody, operationId: crypto.randomUUID(), expectedAnalyticsCategory: 'NONE', analyticsCategory: 'RADIATOR',
   } });
