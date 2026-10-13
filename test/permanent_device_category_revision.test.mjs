@@ -17,7 +17,7 @@ function loadTypeScript(relative, overrides = {}) {
   return module.exports;
 }
 
-function categoryRouteHarness({ homeRevision = 8, inventoryRevision = 4, analyticsCategory = 'NONE' } = {}) {
+function categoryRouteHarness({ homeRevision = 8, cloudConfigurationRevision = 11, inventoryRevision = 4, analyticsCategory = 'NONE' } = {}) {
   const ids = {
     home: '11111111-1111-4111-8111-111111111111', hub: '22222222-2222-4222-8222-222222222222',
     employee: '33333333-3333-4333-8333-333333333333', employeeSession: '44444444-4444-4444-8444-444444444444',
@@ -44,6 +44,9 @@ function categoryRouteHarness({ homeRevision = 8, inventoryRevision = 4, analyti
     home: {
       findFirst: async () => ({ id: ids.home, managementRevision: homeRevision }),
       updateMany: async (input) => { writes.home = input; return { count: 1 }; },
+    },
+    hubInstallation: {
+      findFirst: async () => ({ cloudConfigurationRevision }),
     },
     nativeDevice: {
       findFirst: async () => device,
@@ -72,7 +75,7 @@ function categoryRouteHarness({ homeRevision = 8, inventoryRevision = 4, analyti
   const body = { serial: 'DIN-HUB-TEST-1', identityGeneration: 3, homeId: ids.home, hubInstallationId: ids.hub,
     accessScope: 'os:admin', employeeId: ids.employee, employeeSessionId: ids.employeeSession, operatorHandoffId: ids.handoff,
     operatorJti: 'operator-jti-12345678', workItemId: ids.work, workRevision: 5, osDeviceId: device.osDeviceId,
-    expectedManagementRevision: 7, expectedInventoryRevision: 4, expectedAnalyticsCategory: 'NONE', analyticsCategory: 'RADIATOR', operationId: ids.operation };
+    expectedCloudConfigurationRevision: cloudConfigurationRevision, expectedInventoryRevision: 4, expectedAnalyticsCategory: 'NONE', analyticsCategory: 'RADIATOR', operationId: ids.operation };
   const request = new Request('https://platform.test/api/hub-agent/v2/permanent-device-analytics-category', {
     method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
   });
@@ -111,4 +114,42 @@ test('a concurrent category change still rejects a stale category selection', as
   assert.equal(body.error.code, 'analytics_category_revision_conflict');
   assert.equal(writes.home, undefined, 'a stale category must not advance the Home revision');
   assert.equal(writes.device, undefined, 'a concurrent category change must remain protected');
+});
+
+test('a category update accepts the signed cloud-configuration revision when it is ahead of Home managementRevision', async () => {
+  const { route, request, writes } = categoryRouteHarness({ homeRevision: 2, cloudConfigurationRevision: 11, inventoryRevision: 4 });
+  const response = await route.POST(request);
+  const result = await response.json();
+  assert.equal(response.status, 200, JSON.stringify(result));
+  assert.equal(result.analyticsCategory, 'RADIATOR');
+  assert.equal(result.managementRevision, 3, 'the write advances the actual Home management revision, not the cloud config revision');
+  assert.equal(writes.home.where.managementRevision, 2);
+});
+
+test('a category update rejects a stale cloud configuration revision without changing the category or Home', async () => {
+  const { route, request, writes } = categoryRouteHarness({ homeRevision: 8, cloudConfigurationRevision: 11 });
+  const body = await request.clone().json();
+  body.expectedCloudConfigurationRevision = 10;
+  const staleRequest = new Request(request.url, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+  });
+  const response = await route.POST(staleRequest);
+  const result = await response.json();
+  assert.equal(response.status, 409);
+  assert.equal(result.error.code, 'analytics_category_revision_conflict');
+  assert.equal(writes.home, undefined);
+  assert.equal(writes.device, undefined);
+});
+
+test('an installed legacy hub may submit its management-named signed configuration revision during rollout', async () => {
+  const { route, request } = categoryRouteHarness({ homeRevision: 2, cloudConfigurationRevision: 11 });
+  const body = await request.clone().json();
+  body.expectedManagementRevision = body.expectedCloudConfigurationRevision;
+  delete body.expectedCloudConfigurationRevision;
+  const legacyRequest = new Request(request.url, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+  });
+  const response = await route.POST(legacyRequest);
+  assert.equal(response.status, 200);
+  assert.equal((await response.json()).managementRevision, 3);
 });

@@ -32,7 +32,7 @@ async function currentAssignedStaff(tx: Prisma.TransactionClient, input: Body, h
     fail(403, 'analytics_category_authority_denied', 'Current assigned staff authority is required');
   }
   const now = new Date();
-  const [employee, employeeSession, handoff, work, home] = await Promise.all([
+  const [employee, employeeSession, handoff, work, home, hubConfiguration] = await Promise.all([
     tx.companyEmployeeAccount.findFirst({ where: { id: employeeId, status: 'ACTIVE', role: { in: ['INSTALLER', 'SENIOR_OPERATIONS_MANAGER', 'CXO'] } }, select: { id: true, role: true } }),
     tx.employeeSession.findFirst({ where: { id: employeeSessionId, employeeId, status: 'ACTIVE', revokedAt: null }, select: { id: true, employeeId: true, status: true, createdAt: true, expiresAt: true } }),
     tx.operatorHandoff.findFirst({ where: { id: handoffId, employeeId, workflowId: workItemId, homeId: hub.installation.homeId, hubInstallationId: hub.installation.id, consumedAt: { not: null }, revokedAt: null }, select: { id: true, createdAt: true, scope: true } }),
@@ -40,12 +40,13 @@ async function currentAssignedStaff(tx: Prisma.TransactionClient, input: Body, h
       state: accessScope === 'os:permanent-installation' ? 'IN_PROGRESS' : { in: ['ASSIGNED', 'IN_PROGRESS', 'REOPENED'] }, workRevision, certifiedSerialNumber: hub.identity.serialNumber },
     select: { id: true, homeId: true, hubInstallationId: true, assignedEmployeeId: true, state: true, workRevision: true, permanentInstallationRequestId: true } }),
     tx.home.findFirst({ where: { id: hub.installation.homeId, lifecycle: 'ACTIVE', installationStatus: 'COMPLETE', activeHubInstallationId: hub.installation.id }, select: { id: true, managementRevision: true } }),
+    tx.hubInstallation.findFirst({ where: { id: hub.installation.id, homeId: hub.installation.homeId }, select: { cloudConfigurationRevision: true } }),
   ]);
   const scope = handoff?.scope && typeof handoff.scope === 'object' && !Array.isArray(handoff.scope) ? handoff.scope as Record<string, unknown> : {};
   const scopes = Array.isArray(scope.scopes) ? scope.scopes.map(String) : [];
   const issuedAt = Number(scope.operatorIssuedAt);
   const expiresAt = Number(scope.operatorExpiresAt);
-  if (!employee || !employeeSession || !handoff || !work || !home
+  if (!employee || !employeeSession || !handoff || !work || !home || !hubConfiguration
     || employeeSession.expiresAt.getTime() - employeeSession.createdAt.getTime() > EMPLOYEE_SESSION_SECONDS * 1000
     || handoff.createdAt >= employeeSession.expiresAt || !Number.isSafeInteger(issuedAt) || !Number.isSafeInteger(expiresAt)
     || issuedAt < handoff.createdAt.getTime() - 1000 || expiresAt <= now.getTime() || expiresAt - issuedAt !== OPERATOR_SESSION_SECONDS * 1000
@@ -61,7 +62,7 @@ async function currentAssignedStaff(tx: Prisma.TransactionClient, input: Body, h
   } else if (Object.hasOwn(input, 'requestId')) {
     fail(400, 'analytics_category_request_invalid', 'A full-Home update must not claim installation-only request authority');
   }
-  return { employee, employeeSession, handoff, work, home, actorId: employee.id, accessScope };
+  return { employee, employeeSession, handoff, work, home, hubConfiguration, actorId: employee.id, accessScope };
 }
 
 export async function POST(request: Request) {
@@ -72,13 +73,18 @@ export async function POST(request: Request) {
     delete body.serial;
     const accessScope = String(body.accessScope || '');
     const required = ['accessScope', 'homeId', 'hubInstallationId', 'identityGeneration', 'employeeId', 'employeeSessionId', 'operatorHandoffId',
-      'operatorJti', 'workItemId', 'workRevision', 'osDeviceId', 'expectedManagementRevision', 'expectedAnalyticsCategory', 'analyticsCategory', 'operationId'];
+      'operatorJti', 'workItemId', 'workRevision', 'osDeviceId', 'expectedAnalyticsCategory', 'analyticsCategory', 'operationId'];
     if (accessScope === 'os:permanent-installation') required.push('requestId');
-    const allowed = [...required, ...(Object.hasOwn(body, 'expectedInventoryRevision') ? ['expectedInventoryRevision'] : [])];
+    // Older installed Native OS builds call this signed cloud-policy revision
+    // `expectedManagementRevision`. Accept precisely one spelling while those
+    // builds remain deployed; new builds use the accurately named field.
+    const revisionFields = ['expectedCloudConfigurationRevision', 'expectedManagementRevision'].filter((key) => Object.hasOwn(body, key));
+    const allowed = [...required, ...revisionFields, ...(Object.hasOwn(body, 'expectedInventoryRevision') ? ['expectedInventoryRevision'] : [])];
+    const expectedCloudConfigurationRevision = Number(body.expectedCloudConfigurationRevision ?? body.expectedManagementRevision);
     if (!exactKeys(body, allowed) || body.homeId !== hub.installation.homeId || body.hubInstallationId !== hub.installation.id
       || !UUID.test(String(body.operationId || '')) || !/^[A-Za-z0-9:_-]{1,160}$/.test(String(body.osDeviceId || ''))
       || !CATEGORIES.has(String(body.expectedAnalyticsCategory)) || !CATEGORIES.has(String(body.analyticsCategory))
-      || !Number.isSafeInteger(body.expectedManagementRevision) || Number(body.expectedManagementRevision) < 1
+      || revisionFields.length !== 1 || !Number.isSafeInteger(expectedCloudConfigurationRevision) || expectedCloudConfigurationRevision < 1
       || Object.hasOwn(body, 'expectedInventoryRevision') && (!Number.isSafeInteger(body.expectedInventoryRevision) || Number(body.expectedInventoryRevision) < 1)) {
       fail(400, 'analytics_category_request_invalid', 'The permanent-device analytics category request is invalid');
     }
@@ -91,7 +97,7 @@ export async function POST(request: Request) {
       if (!device || device.assignments.length === 0) fail(404, 'analytics_category_device_unavailable', 'Only an active permanent property device in a current Home Area can be updated');
       const requestHash = sha256(JSON.stringify({ homeId: authority.home.id, hubInstallationId: hub.installation.id, employeeId: authority.employee.id,
         workItemId: authority.work.id, workRevision: authority.work.workRevision, osDeviceId: device.osDeviceId,
-        expectedManagementRevision: Number(body.expectedManagementRevision), expectedInventoryRevision: body.expectedInventoryRevision ?? null,
+        expectedCloudConfigurationRevision, expectedInventoryRevision: body.expectedInventoryRevision ?? null,
         expectedAnalyticsCategory: body.expectedAnalyticsCategory, analyticsCategory: body.analyticsCategory }));
       const keyHash = sha256(String(body.operationId));
       const prior = await tx.idempotencyRecord.findUnique({ where: { namespace_keyHash: { namespace: NAMESPACE, keyHash } }, select: { actorId: true, homeId: true, hubInstallationId: true, requestHash: true, responseBody: true } });
@@ -106,12 +112,13 @@ export async function POST(request: Request) {
       // inventoryRevision without changing this category. The expected category
       // below is the compare-and-swap guard for this operation; applying the
       // stale inventory revision here made unrelated device updates block it.
-      // Category edits are device-scoped. A different, unrelated Home update
-      // may advance the global management revision after the staff dashboard
-      // loaded; the category compare-and-swap above and below remains the
-      // concurrency guard. Reject only a revision from the future (which
-      // cannot have come from the current signed view).
-      if (Number(body.expectedManagementRevision) > authority.home.managementRevision) fail(409, 'analytics_category_revision_conflict', 'The signed Home configuration is newer than the current Home; refresh before changing this category');
+      // The signed cloud-configuration revision and Home.managementRevision
+      // are independent counters. Compare the submitted snapshot against the
+      // hub's current signed-policy revision, never against the Home counter.
+      // The device-category compare-and-swap remains the mutation guard.
+      if (expectedCloudConfigurationRevision !== Number(authority.hubConfiguration.cloudConfigurationRevision)) {
+        fail(409, 'analytics_category_revision_conflict', 'The signed cloud configuration changed; refresh the Home dashboard before changing this category');
+      }
 
       const changedHome = await tx.home.updateMany({ where: { id: authority.home.id, lifecycle: 'ACTIVE', installationStatus: 'COMPLETE', activeHubInstallationId: hub.installation.id,
         managementRevision: authority.home.managementRevision }, data: { managementRevision: { increment: body.analyticsCategory === body.expectedAnalyticsCategory ? 0 : 1 } } });
