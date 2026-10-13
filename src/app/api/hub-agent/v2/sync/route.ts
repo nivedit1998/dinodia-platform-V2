@@ -9,6 +9,11 @@ import { canReconcileHubSyncStream, HUB_SYNC_MAX_BODY_BYTES, hubSyncBodyHash, is
 import { resolveNativeInstallationSyncMode } from '@/lib/nativeInstallationSyncMode';
 
 export const dynamic = 'force-dynamic';
+// The durable sync transaction can legitimately wait behind a concurrent
+// heartbeat/policy update. Keep this route alive longer than the hub's normal
+// request window so an exact retry can receive its immutable receipt instead
+// of repeatedly timing out at the platform's default function duration.
+export const maxDuration = 60;
 
 function isSyncReceiptUniqueConflict(error: unknown): boolean {
   if (!error || typeof error !== 'object' || !('meta' in error)) return false;
@@ -286,10 +291,10 @@ export async function POST(request: Request) {
           // Sync applies a bounded (<=200 event) durable batch plus its
           // configuration projection and receipt in one transaction. Keep
           // this atomic route independent of Prisma's five-second default,
-          // while bounding both pool acquisition and transaction lifetime
-          // below the platform function's request deadline.
-          maxWait: 10_000,
-          timeout: 60_000,
+          // while leaving headroom inside maxDuration for authentication and
+          // response serialization.
+          maxWait: 8_000,
+          timeout: 45_000,
         });
         if ('__hubSyncConflict' in result) {
           const conflictHomeId = String(result.homeId);
