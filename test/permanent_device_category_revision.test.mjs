@@ -17,7 +17,7 @@ function loadTypeScript(relative, overrides = {}) {
   return module.exports;
 }
 
-function categoryRouteHarness({ homeRevision = 8, inventoryRevision = 4 } = {}) {
+function categoryRouteHarness({ homeRevision = 8, inventoryRevision = 4, analyticsCategory = 'NONE' } = {}) {
   const ids = {
     home: '11111111-1111-4111-8111-111111111111', hub: '22222222-2222-4222-8222-222222222222',
     employee: '33333333-3333-4333-8333-333333333333', employeeSession: '44444444-4444-4444-8444-444444444444',
@@ -30,7 +30,7 @@ function categoryRouteHarness({ homeRevision = 8, inventoryRevision = 4 } = {}) 
     employeeSessionId: ids.employeeSession, operatorJti: 'operator-jti-12345678', workRevision: 5,
     identityGeneration: 3, serialNumber: 'DIN-HUB-TEST-1',
   } };
-  const device = { id: 'permanent-device-db-id', osDeviceId: 'zigbee:permanent-radiator', analyticsCategory: 'NONE', inventoryRevision,
+  const device = { id: 'permanent-device-db-id', osDeviceId: 'zigbee:permanent-radiator', analyticsCategory, inventoryRevision,
     assignments: [{ areaId: 'active-area-id' }] };
   const writes = {};
   const tx = {
@@ -89,15 +89,26 @@ test('a current device category update tolerates unrelated Home revision changes
   assert.equal(body.inventoryRevision, 5);
   assert.equal(writes.home.where.managementRevision, 8, 'the atomic Home update uses its current revision, not the stale dashboard revision');
   assert.equal(writes.home.data.managementRevision.increment, 1);
-  assert.equal(writes.device.where.inventoryRevision, 4, 'the reviewed device revision remains a strict compare-and-swap');
+  assert.equal(Object.hasOwn(writes.device.where, 'inventoryRevision'), false, 'category mutation is guarded by its own category revision');
 });
 
-test('a device category update still rejects a stale device inventory revision', async () => {
+test('a device category update tolerates unrelated inventory revision changes', async () => {
   const { route, request, writes } = categoryRouteHarness({ homeRevision: 8, inventoryRevision: 5 });
+  const response = await route.POST(request);
+  const body = await response.json();
+  assert.equal(response.status, 200);
+  assert.equal(body.analyticsCategory, 'RADIATOR');
+  assert.equal(body.inventoryRevision, 6);
+  assert.equal(writes.device.where.analyticsCategory, 'NONE', 'the category itself remains the compare-and-swap guard');
+  assert.equal(Object.hasOwn(writes.device.where, 'inventoryRevision'), false, 'unrelated device revisions do not block classification');
+});
+
+test('a concurrent category change still rejects a stale category selection', async () => {
+  const { route, request, writes } = categoryRouteHarness({ homeRevision: 8, inventoryRevision: 5, analyticsCategory: 'LIGHT' });
   const response = await route.POST(request);
   const body = await response.json();
   assert.equal(response.status, 409);
   assert.equal(body.error.code, 'analytics_category_revision_conflict');
-  assert.equal(writes.home, undefined, 'a stale device must not advance the Home revision');
-  assert.equal(writes.device, undefined, 'a stale device must not be changed');
+  assert.equal(writes.home, undefined, 'a stale category must not advance the Home revision');
+  assert.equal(writes.device, undefined, 'a concurrent category change must remain protected');
 });

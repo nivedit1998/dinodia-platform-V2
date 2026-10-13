@@ -101,12 +101,16 @@ export async function POST(request: Request) {
         return NextResponse.json({ ...(prior.responseBody as Record<string, unknown>), idempotentReplay: true }, { headers: { 'Cache-Control': 'no-store' } });
       }
       if (device.analyticsCategory !== body.expectedAnalyticsCategory) fail(409, 'analytics_category_revision_conflict', 'The device category changed; refresh the signed device policy before retrying');
-      if (Object.hasOwn(body, 'expectedInventoryRevision') && device.inventoryRevision !== body.expectedInventoryRevision) fail(409, 'analytics_category_revision_conflict', 'The permanent device changed; refresh the signed device policy before retrying');
+      // Analytics category is an independent, device-scoped classification.
+      // Names, assignments, observations, and other inventory edits can advance
+      // inventoryRevision without changing this category. The expected category
+      // below is the compare-and-swap guard for this operation; applying the
+      // stale inventory revision here made unrelated device updates block it.
       // Category edits are device-scoped. A different, unrelated Home update
       // may advance the global management revision after the staff dashboard
-      // loaded; the exact category and device inventory revision above remain
-      // the compare-and-swap guards for this mutation. Reject only a revision
-      // from the future (which cannot have come from the current signed view).
+      // loaded; the category compare-and-swap above and below remains the
+      // concurrency guard. Reject only a revision from the future (which
+      // cannot have come from the current signed view).
       if (Number(body.expectedManagementRevision) > authority.home.managementRevision) fail(409, 'analytics_category_revision_conflict', 'The signed Home configuration is newer than the current Home; refresh before changing this category');
 
       const changedHome = await tx.home.updateMany({ where: { id: authority.home.id, lifecycle: 'ACTIVE', installationStatus: 'COMPLETE', activeHubInstallationId: hub.installation.id,
@@ -115,7 +119,6 @@ export async function POST(request: Request) {
       const changedDevice = body.analyticsCategory === body.expectedAnalyticsCategory ? { count: 1 } : await tx.nativeDevice.updateMany({ where: {
         id: device.id, homeId: authority.home.id, hubInstallationId: hub.installation.id, managementClass: 'PROPERTY_DEVICE', ownerMembershipId: null,
         lifecycle: { in: ['INSTALLED', 'VIEW_ONLY'] }, analyticsCategory: body.expectedAnalyticsCategory as AnalyticsCategory,
-        ...(Object.hasOwn(body, 'expectedInventoryRevision') ? { inventoryRevision: body.expectedInventoryRevision as number } : {}),
       }, data: { analyticsCategory: body.analyticsCategory as AnalyticsCategory, inventoryRevision: { increment: 1 } } });
       if (changedDevice.count !== 1) fail(409, 'analytics_category_revision_conflict', 'The permanent device changed; refresh the dashboard before retrying');
       const managementRevision = authority.home.managementRevision + (body.analyticsCategory === body.expectedAnalyticsCategory ? 0 : 1);
