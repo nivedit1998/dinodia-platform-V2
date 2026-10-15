@@ -20,3 +20,22 @@ test('native sync route deadline contains its bounded Prisma wait and transactio
   assert.match(harness, /delayed sync regression[\s\S]{0,1500}sleep\(16000\)/,
     'the actual signed-route regression must cross the current 15-second hub request deadline');
 });
+
+test('oversized signed sync batches are explicitly rejected before opening the Prisma transaction', () => {
+  const route = fs.readFileSync(routePath, 'utf8');
+  const authentication = route.indexOf('authenticateHub(request, raw');
+  const rejection = route.indexOf('hub_sync_batch_too_large');
+  const transaction = route.indexOf('prisma.$transaction');
+  const validation = route.indexOf('validateHubSyncEnvelope(envelope, raw)');
+
+  assert.ok(authentication >= 0 && validation > authentication && rejection > validation,
+    'batch-size negotiation must follow authentication and full envelope validation');
+  assert.ok(transaction > rejection,
+    'the server must reject the legacy oversized range before starting any database transaction');
+  const envelope = fs.readFileSync(new URL('../src/lib/hubSyncEnvelope.ts', import.meta.url), 'utf8');
+  const processingLimit = Number(envelope.match(/HUB_SYNC_PROCESSING_MAX_EVENTS\s*=\s*(\d+)/)?.[1] || 0);
+  assert.equal(processingLimit, 40);
+  const osOutbox = fs.readFileSync(new URL('../../Dinodia%20OS/src/sync/syncOutbox.js', import.meta.url), 'utf8');
+  const osLimit = Number(osOutbox.match(/SYNC_BATCH_MAX_EVENTS\s*=\s*(\d+)/)?.[1] || 0);
+  assert.equal(osLimit, processingLimit, 'the Producer and authenticated receiver must enforce the same event cap');
+});

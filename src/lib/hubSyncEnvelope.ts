@@ -3,6 +3,9 @@ import { createHash } from 'node:crypto';
 export const HUB_SYNC_MAX_BODY_BYTES = 1024 * 1024;
 export const HUB_SYNC_MAX_BATCH_BYTES = 512 * 1024;
 export const HUB_SYNC_MAX_EVENTS = 200;
+// Applying each event is intentionally atomic within the receipt transaction.
+// Keep each transaction bounded even when a hub returns from a long outage.
+export const HUB_SYNC_PROCESSING_MAX_EVENTS = 40;
 
 export type HubSyncEvent = {
   id: string;

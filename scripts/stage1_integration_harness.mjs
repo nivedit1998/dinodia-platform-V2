@@ -428,6 +428,47 @@ function machineRequest({ base, path: requestPath, body, machineSecret, machineV
   const machineSignature = crypto.createHmac('sha256', sha256(machineSecret)).update(canonicalHubRequest({ method: 'POST', path: requestPath, timestamp, nonce, bodyHash }), 'utf8').digest('base64url');
   return fetchJson(`${base}${requestPath}`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-machine-version': String(machineVersion), 'x-dinodia-machine-signature': machineSignature, 'x-dinodia-hub-timestamp': timestamp, 'x-dinodia-hub-nonce': nonce, 'x-dinodia-body-sha256': bodyHash }, body: raw });
 }
+
+async function boundedSyncBatchAcceptanceCheck() {
+  const fixture = customerFixture;
+  if (!fixture) fail('The bounded signed-batch check requires the disposable customer/hub fixture');
+  const routeBase = `http://127.0.0.1:${appPort}`;
+  const before = await prisma.hubInstallation.findUniqueOrThrow({ where: { id: fixture.hubOneId }, select: {
+    syncStreamId: true, syncAcceptedSequence: true, acknowledgedCloudRevision: true,
+  } });
+  const fromSequence = Number(before.syncAcceptedSequence) + 1;
+  const events = Array.from({ length: 40 }, (_, index) => {
+    const sequence = fromSequence + index;
+    return { id: crypto.randomUUID(), sequence, type: 'sync.compacted', aggregateId: '',
+      occurredAt: new Date(Date.now() + index).toISOString(), critical: false, payload: { supersededBy: sequence + 1 } };
+  });
+  const envelope = {
+    schemaVersion: 1, hubInstallationId: fixture.hubOneId, streamId: String(before.syncStreamId),
+    fromSequence, toSequence: fromSequence + events.length - 1, events, queueDepth: events.length,
+    acknowledgedCloudRevision: Number(before.acknowledgedCloudRevision),
+    runtime: { kind: 'dinodia_os', version: 'bounded-sync-integration', capabilities: {} },
+    sentAt: new Date().toISOString(),
+  };
+  const startedAt = Date.now();
+  const response = await machineRequest({ base: routeBase, path: '/api/hub-agent/v2/sync', machineSecret: fixture.machineSecret,
+    body: { serial: fixture.identityOneSerial, identityGeneration: fixture.identityOneGeneration, ...envelope } });
+  const after = await prisma.hubInstallation.findUniqueOrThrow({ where: { id: fixture.hubOneId }, select: {
+    syncStreamId: true, syncAcceptedSequence: true,
+  } });
+  const receiptCount = await prisma.hubSyncReceipt.count({ where: {
+    hubInstallationId: fixture.hubOneId, streamId: envelope.streamId,
+    fromSequence: envelope.fromSequence, toSequence: envelope.toSequence,
+  } });
+  if (response.response.status !== 200 || after.syncStreamId !== envelope.streamId
+    || Number(after.syncAcceptedSequence) !== envelope.toSequence || receiptCount !== 1) {
+    fail(`A bounded signed sync batch did not commit one contiguous receipt/cursor (${JSON.stringify({
+      status: response.response.status, body: response.body, expectedAcceptedSequence: envelope.toSequence,
+      actualAcceptedSequence: String(after.syncAcceptedSequence), receiptCount,
+    })})`);
+  }
+  console.log(`[stage5:integration] PASS: actual machine-signed 40-event batch committed one contiguous receipt/cursor in ${Date.now() - startedAt}ms`);
+}
+
 function signedManufacturingIdentityRequest({ base, path: requestPath, body, signingPrivateKeyPem }) {
   const raw = JSON.stringify(body);
   const timestamp = String(Date.now());
@@ -3393,6 +3434,41 @@ async function customerAuthorizationChecks(deliveryEnv) {
   if (hub.store.getSyncOutbox().acknowledgedSequence < tombstoneSequence || retiredSyncArea.status !== 'RETIRED' || !retiredSyncArea.retiredAt) {
     fail(`The durable area tombstone did not retire the cloud projection (${JSON.stringify({ status: retiredSyncArea.status, acknowledged: hub.store.getSyncOutbox().acknowledgedSequence, tombstoneSequence, syncError: hub.store.getSyncOutbox().lastErrorCode })})`);
   }
+  const cursorBeforeOversizedBatch = await prisma.hubInstallation.findUniqueOrThrow({ where: { id: hubOne.id }, select: {
+    syncStreamId: true, syncAcceptedSequence: true, acknowledgedCloudRevision: true,
+  } });
+  const oversizedFrom = Number(cursorBeforeOversizedBatch.syncAcceptedSequence) + 1;
+  const oversizedEvents = Array.from({ length: 41 }, (_, index) => {
+    const sequence = oversizedFrom + index;
+    return { id: crypto.randomUUID(), sequence, type: 'sync.compacted', aggregateId: '',
+      occurredAt: new Date(Date.now() + index).toISOString(), critical: false, payload: { supersededBy: sequence + 1 } };
+  });
+  const oversizedEnvelope = {
+    schemaVersion: 1, hubInstallationId: hubOne.id, streamId: String(cursorBeforeOversizedBatch.syncStreamId),
+    fromSequence: oversizedFrom, toSequence: oversizedFrom + oversizedEvents.length - 1, events: oversizedEvents,
+    queueDepth: oversizedEvents.length, acknowledgedCloudRevision: Number(cursorBeforeOversizedBatch.acknowledgedCloudRevision),
+    runtime: hub.store.getSyncRuntime(hub.pairing.runtime), sentAt: new Date().toISOString(),
+  };
+  const oversizedReceiptCountBefore = await prisma.hubSyncReceipt.count({ where: {
+    hubInstallationId: hubOne.id, streamId: oversizedEnvelope.streamId,
+    fromSequence: oversizedEnvelope.fromSequence, toSequence: oversizedEnvelope.toSequence,
+  } });
+  const oversizedResponse = await machineRequest({ base: platformBase, path: '/api/hub-agent/v2/sync', machineSecret,
+    body: signedSyncBody(oversizedEnvelope) });
+  const cursorAfterOversizedBatch = await prisma.hubInstallation.findUniqueOrThrow({ where: { id: hubOne.id }, select: {
+    syncStreamId: true, syncAcceptedSequence: true,
+  } });
+  const oversizedReceiptCountAfter = await prisma.hubSyncReceipt.count({ where: {
+    hubInstallationId: hubOne.id, streamId: oversizedEnvelope.streamId,
+    fromSequence: oversizedEnvelope.fromSequence, toSequence: oversizedEnvelope.toSequence,
+  } });
+  if (oversizedResponse.response.status !== 413 || oversizedResponse.body.errorCode !== 'hub_sync_batch_too_large'
+    || cursorAfterOversizedBatch.syncStreamId !== cursorBeforeOversizedBatch.syncStreamId
+    || cursorAfterOversizedBatch.syncAcceptedSequence !== cursorBeforeOversizedBatch.syncAcceptedSequence
+    || oversizedReceiptCountBefore !== 0 || oversizedReceiptCountAfter !== 0) {
+    fail('A valid signed oversized batch was not rejected before creating a receipt or advancing its accepted cursor');
+  }
+  console.log('[stage5:integration] PASS: actual machine-signed oversized batch is rejected before durable effects for safe hub-side splitting');
   const cursorBeforePrivateProjection = await prisma.hubInstallation.findUniqueOrThrow({ where: { id: hubOne.id }, select: { syncStreamId: true, syncAcceptedSequence: true, acknowledgedCloudRevision: true } });
   const privateProjectionEvent = {
     id: crypto.randomUUID(), sequence: Number(cursorBeforePrivateProjection.syncAcceptedSequence) + 1,
@@ -10697,6 +10773,7 @@ try {
     await osChecks();
     await hubSyncConfigurationRefreshChecks();
     await hubSyncStreamReconciliationChecks();
+    await boundedSyncBatchAcceptanceCheck();
   } else if (stage12AlexaOnly) {
     // Focused development mode still runs the real disposable auth fixture
     // and actual OAuth routes, while the normal maintained package command

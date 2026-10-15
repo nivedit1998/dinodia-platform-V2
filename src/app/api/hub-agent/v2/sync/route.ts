@@ -5,7 +5,7 @@ import { authErrorResponse, Stage1AuthError } from '@/lib/stage1Auth';
 import { authenticateHub } from '@/lib/stage1HubAuth';
 import { buildHubCloudConfiguration, finalizeHubCloudConfiguration } from '@/lib/hubCloudConfiguration';
 import { applyHubSyncEvent } from '@/lib/hubSyncIngestion';
-import { canReconcileHubSyncStream, HUB_SYNC_MAX_BODY_BYTES, hubSyncBodyHash, isInstallationBootstrapEvent, validateHubSyncEnvelope } from '@/lib/hubSyncEnvelope';
+import { canReconcileHubSyncStream, HUB_SYNC_MAX_BODY_BYTES, HUB_SYNC_PROCESSING_MAX_EVENTS, hubSyncBodyHash, isInstallationBootstrapEvent, validateHubSyncEnvelope } from '@/lib/hubSyncEnvelope';
 import { resolveNativeInstallationSyncMode } from '@/lib/nativeInstallationSyncMode';
 
 export const dynamic = 'force-dynamic';
@@ -55,6 +55,12 @@ export async function POST(request: Request) {
     if (serial !== hub.identity.serialNumber || Number(identityGeneration) !== hub.identity.identityGeneration
       || !validateHubSyncEnvelope(envelope, raw) || envelope.hubInstallationId !== hub.installation.id) {
       throw new Stage1AuthError(400, 'hub_sync_envelope_invalid', 'The native sync envelope is invalid');
+    }
+    if (envelope.events.length > HUB_SYNC_PROCESSING_MAX_EVENTS) {
+      // Explicitly reject legacy larger durable ranges before opening a DB
+      // transaction. The hub verifies the unchanged signed cursor on its next
+      // token-state read before splitting the same queued event range.
+      throw new Stage1AuthError(413, 'hub_sync_batch_too_large', 'The durable sync batch must be retried in smaller contiguous ranges');
     }
     // sentAt is durable batch metadata and remains stable across process restart,
     // response loss and retry. Freshness is enforced by authenticateHub's
