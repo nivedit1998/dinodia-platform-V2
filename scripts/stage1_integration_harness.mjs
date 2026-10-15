@@ -3381,13 +3381,13 @@ async function customerAuthorizationChecks(deliveryEnv) {
     await hubLockRelease;
   }, { maxWait: 5000, timeout: 25000 });
   await hubLockAcquired;
-  const delayedSignedSync = machineRequest({ base: platformBase, path: '/api/hub-agent/v2/sync', machineSecret, body: signedSyncBody(syncBatch) });
+  const delayedSignedSync = hub.pairing.requestWithHubIdentity('/api/hub-agent/v2/sync', syncBatch);
   await sleep(16000);
   releaseHubLock();
   await hubRowLock;
   const acceptedSync = await delayedSignedSync;
-  if (acceptedSync.response.status !== 200 || Number(acceptedSync.body.acceptedThroughSequence) !== syncBatch.toSequence) {
-    fail(`A valid signed sync failed after a bounded sixteen-second database lock (${acceptedSync.response.status}/${acceptedSync.body.errorCode || 'no-code'}); the route must outlive the hub's current fifteen-second HTTP deadline and Prisma's default transaction limit`);
+  if (Number(acceptedSync.acceptedThroughSequence) !== syncBatch.toSequence) {
+    fail(`The actual OS signed-sync client did not receive the accepted sequence after a bounded sixteen-second database lock (${acceptedSync.errorCode || acceptedSync.code || 'no-code'}); the route must outlive the hub's former fifteen-second HTTP deadline and Prisma's default transaction limit`);
   }
   console.log('[stage5:integration] PASS: actual machine-signed sync route commits after a sixteen-second disposable hub-row lock beyond the current hub HTTP deadline');
   const acceptedArea = await prisma.area.findUnique({ where: { homeId_osAreaId: { homeId: homeOne.id, osAreaId: syncAreaId } }, select: { id: true, originalName: true, status: true, updatedAt: true } });
@@ -5977,14 +5977,13 @@ async function pendingInvitationRouteChecks(deliveryEnv) {
     || Number(telemetryBatch.toSequence) < telemetryRequiredSequence) {
     fail(`The prepared durable OS batch did not contain the exact Stage 10 producer events (${JSON.stringify({ eventTypes: telemetryBatch?.events?.map((event) => event.type) ?? [], targetEventTypes: telemetryBatchDeviceEvents.map((event) => event.type), through: telemetryBatch?.toSequence ?? null, requiredThrough: telemetryRequiredSequence })})`);
   }
-  const telemetryAccepted = await machineRequest({ base, path: '/api/hub-agent/v2/sync', machineSecret: customerFixture.machineSecret,
-    body: { serial: customerFixture.identityOneSerial, identityGeneration: customerFixture.identityOneGeneration, ...telemetryBatch } });
-  if (telemetryAccepted.response.status !== 200 || Number(telemetryAccepted.body?.acceptedThroughSequence) < telemetryRequiredSequence
-    || telemetryAccepted.body?.duplicate === true) {
-    fail(`The actual signed sync route did not accept the OS-generated analytics batch (${telemetryAccepted.response.status}/${telemetryAccepted.body?.errorCode || 'no-code'})`);
+  const telemetryAccepted = await hub.pairing.requestWithHubIdentity('/api/hub-agent/v2/sync', telemetryBatch);
+  if (Number(telemetryAccepted?.acceptedThroughSequence) < telemetryRequiredSequence
+    || telemetryAccepted?.duplicate === true) {
+    fail(`The actual OS signed-sync client and Platform route did not accept the OS-generated analytics batch (${telemetryAccepted?.errorCode || telemetryAccepted?.code || 'no-code'})`);
   }
-  await hub.store.acknowledgeSyncBatch({ streamId: telemetryAccepted.body.streamId, acceptedThroughSequence: Number(telemetryAccepted.body.acceptedThroughSequence),
-    cloudRevision: Number(telemetryAccepted.body.cloudRevision), configurationAppliedRevision: Number(telemetryAccepted.body.configurationAppliedRevision) });
+  await hub.store.acknowledgeSyncBatch({ streamId: telemetryAccepted.streamId, acceptedThroughSequence: Number(telemetryAccepted.acceptedThroughSequence),
+    cloudRevision: Number(telemetryAccepted.cloudRevision), configurationAppliedRevision: Number(telemetryAccepted.configurationAppliedRevision) });
   const telemetryOutboxAfter = hub.store.getSyncOutbox();
   const telemetryExpectedBucketCount = Math.floor((telemetryNow.getTime() - 1) / 3_600_000) - Math.floor(telemetryObservedAt.getTime() / 3_600_000) + 1;
   const telemetryExpectedActivitySeconds = Math.ceil(telemetryNow.getTime() / 1000) - Math.ceil(telemetryObservedAt.getTime() / 1000);
@@ -6580,12 +6579,16 @@ async function pendingInvitationRouteChecks(deliveryEnv) {
   // validity expired before this signed route delivery. It must be retained
   // as historical evidence, must not become current, and must not replace the
   // newer fresh reading from the first telemetry device. The preceding
-  // assignment-boundary cases are complete; extend only this disposable
-  // assignment backward to cover the historical temperature's source time.
+  // assignment-boundary cases are complete; keep the earliest existing
+  // assignment boundary while extending it far enough backward to cover the
+  // historical temperature's source time. Moving validFrom forward here
+  // would invalidate the still-open usage bucket already produced by this
+  // same disposable device, correctly causing the Platform to reject it.
   const delayedDeliveredAt = new Date();
   const delayedObservedAt = new Date(delayedDeliveredAt.getTime() - 31 * 60_000);
   const delayedTemperature = 20.8;
-  await prisma.deviceAreaAssignment.update({ where: { id: partialAssignment.id }, data: { validFrom: new Date(delayedObservedAt.getTime() - 1) } });
+  const delayedAssignmentStart = new Date(Math.min(partialObservedAt.getTime(), delayedObservedAt.getTime() - 1));
+  await prisma.deviceAreaAssignment.update({ where: { id: partialAssignment.id }, data: { validFrom: delayedAssignmentStart } });
   await hub.store.upsertDevice({
     id: partialOsDeviceId, name: 'Disposable partial-hour radiator', protocol: 'zigbee', deviceType: 'radiator',
     technicalLabel: 'radiator', areaId: telemetryOsAreaId,
@@ -9227,7 +9230,10 @@ async function osChecks() {
         })) : undefined;
       const rejectedAreaEvidence = response.status === 409 && errorCode === 'hub_sync_area_assignment_invalid'
         ? (Array.isArray(requestBody.events) ? requestBody.events : []).filter((event) => ['device.state','temperature.sample','usage.bucket'].includes(String(event.type)))
-          .map((event) => ({ sequence: Number(event.sequence) || null, type: String(event.type), aggregateHash: sha256(String(event.aggregateId || '')).slice(0, 12), areaHash: sha256(String(event.payload?.areaId || '')).slice(0, 12), observedAt: String(event.payload?.observedAt || event.payload?.bucketStart || event.payload?.sourceObservedAt || '').slice(0, 32) })) : undefined;
+          .map((event) => ({ sequence: Number(event.sequence) || null, type: String(event.type), deviceHash: sha256(String(event.payload?.osDeviceId || '')).slice(0, 12),
+            areaHash: sha256(String(event.payload?.osAreaId || '')).slice(0, 12), bucketStart: String(event.payload?.bucketStart || '').slice(0, 32),
+            coverageStartAt: String(event.payload?.coverageStartAt || event.payload?.sourceObservedAt || event.payload?.observedAt || '').slice(0, 32),
+            coverageEndAt: String(event.payload?.coverageEndAt || event.payload?.validUntil || '').slice(0, 32) })) : undefined;
       stageHomeSyncReceipts.push({ status: response.status, requestAck: Number(requestBody.acknowledgedCloudRevision), from: Number(requestBody.fromSequence), to: Number(requestBody.toSequence), errorCode, cloudRevision: Number(responseBody.cloudRevision) || null, appliedRevision: Number(responseBody.configurationAppliedRevision) || null, acceptedThrough: Number(responseBody.acceptedThroughSequence) || null, duplicate: responseBody.duplicate === true, ...(response.status === 400 ? inspectRejectedSyncEnvelope(requestBody) : {}), ...(uncommissionedDevices ? { uncommissionedDevices } : {}), ...(rejectedAreaEvidence ? { rejectedAreaEvidence } : {}) });
       if (stageHomeSyncReceipts.length > 12) stageHomeSyncReceipts.shift();
     }

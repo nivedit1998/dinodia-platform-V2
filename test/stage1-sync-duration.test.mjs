@@ -17,8 +17,12 @@ test('native sync route deadline contains its bounded Prisma wait and transactio
     'database acquisition plus transaction must leave time for authentication and response serialization');
 
   const harness = fs.readFileSync(harnessPath, 'utf8');
+  assert.ok(/delayedSignedSync\s*=\s*hub\.pairing\.requestWithHubIdentity\(['"]\/api\/hub-agent\/v2\/sync['"]/.test(harness),
+    'the delayed route test must exercise Native OS signing, timeout and response parsing rather than a direct test-only fetch');
   assert.match(harness, /delayed sync regression[\s\S]{0,1500}sleep\(16000\)/,
     'the actual signed-route regression must cross the current 15-second hub request deadline');
+  assert.ok(/telemetryAccepted\s*=\s*await\s+hub\.pairing\.requestWithHubIdentity\(['"]\/api\/hub-agent\/v2\/sync['"]/.test(harness),
+    'the mixed device/catalogue/usage/temperature batch must travel through the actual Native OS request owner');
 });
 
 test('oversized signed sync batches are explicitly rejected before opening the Prisma transaction', () => {
