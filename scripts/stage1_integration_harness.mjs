@@ -6831,16 +6831,49 @@ async function pendingInvitationRouteChecks(deliveryEnv) {
   const issuedInvitation = await fetchJson(`${base}/api/v2/homes/${inviter.homeId}/tenants/invitations`, { method: 'POST', headers: { ...inviterHeaders, 'idempotency-key': invitationIdempotencyKey }, body: JSON.stringify(invitationPayload) });
   const invitation = issuedInvitation.body?.invitationId ? await prisma.membershipInvitation.findUniqueOrThrow({ where: { id: issuedInvitation.body.invitationId }, select: { id: true, updatedAt: true, targetAccountId: true, targetEmailNormalized: true, role: true, expiresAt: true, temporaryCredentialHash: true, areas: { select: { areaId: true } } } }) : null;
   const invitationRetry = await fetchJson(`${base}/api/v2/homes/${inviter.homeId}/tenants/invitations`, { method: 'POST', headers: { ...inviterHeaders, 'idempotency-key': invitationIdempotencyKey }, body: JSON.stringify(invitationPayload) });
+  const pageFixtureIds = Array.from({ length: 50 }, () => crypto.randomUUID());
+  const pageFixtureRows = pageFixtureIds.map((id, index) => {
+    const targetEmail = `stage9-page-${index}-${crypto.randomUUID()}@invalid.test`;
+    return { id, homeId: inviter.homeId, inviterMembershipId: customerFixture.ownerMembershipId,
+      targetEmail, targetEmailNormalized: targetEmail, role: 'TENANT',
+      tokenHash: crypto.randomBytes(32).toString('hex'), expiresAt: new Date(Date.now() + 6 * 24 * 60 * 60 * 1000),
+      areas: { create: [{ homeId: inviter.homeId, areaId }] } };
+  });
+  await prisma.$transaction(pageFixtureRows.map((data) => prisma.membershipInvitation.create({ data })));
+  const expiredPageFixtureId = crypto.randomUUID();
+  const expiredPageEmail = `expired-${crypto.randomUUID()}@invalid.test`;
+  const soonExpiredAt = new Date(Date.now() + 1_000);
+  await prisma.membershipInvitation.create({ data: { id: expiredPageFixtureId, homeId: inviter.homeId,
+    inviterMembershipId: customerFixture.ownerMembershipId, targetEmail: expiredPageEmail,
+    targetEmailNormalized: expiredPageEmail, role: 'TENANT', tokenHash: crypto.randomBytes(32).toString('hex'),
+    expiresAt: soonExpiredAt, areas: { create: [{ homeId: inviter.homeId, areaId }] } } });
+  await new Promise((resolve) => setTimeout(resolve, Math.max(0, soonExpiredAt.getTime() - Date.now() + 100)));
+  const pendingInvitationPage1 = await fetchJson(`${base}/api/v2/homes/${inviter.homeId}/invitations`, { headers: inviterHeaders });
+  const pendingInvitationPage2 = pendingInvitationPage1.body?.nextCursor
+    ? await fetchJson(`${base}/api/v2/homes/${inviter.homeId}/invitations?cursor=${encodeURIComponent(pendingInvitationPage1.body.nextCursor)}`, { headers: inviterHeaders }) : null;
+  const pendingInvitationAnonymous = await fetchJson(`${base}/api/v2/homes/${inviter.homeId}/invitations`);
+  const pendingInvitationMalformedCursor = await fetchJson(`${base}/api/v2/homes/${inviter.homeId}/invitations?cursor=not-a-cursor`, { headers: inviterHeaders });
+  const invitationPageRows = [...(pendingInvitationPage1.body?.invitations ?? []), ...(pendingInvitationPage2?.body?.invitations ?? [])];
+  const invitationPageIds = invitationPageRows.map((row) => row.invitationId);
+  const invitationRowsAreSafe = invitationPageRows.every((row) => Object.keys(row).sort().join(',') === 'areas,createdAt,deliveryStatus,expiresAt,invitationId,role,state,targetEmail'
+    && row.state === 'PENDING' && !('tokenHash' in row) && !('temporaryCredentialHash' in row)
+    && row.areas.every((area) => Object.keys(area).sort().join(',') === 'areaId,name'));
+  await prisma.membershipInvitation.deleteMany({ where: { id: { in: [...pageFixtureIds, expiredPageFixtureId] } } });
   const unauthorizedTenantInvite = await fetchJson(`${base}/api/v2/homes/${customerFixture.homeOneId}/tenant/invitations`, { method: 'POST', headers: { 'content-type': 'application/json', cookie: `dinodia_customer_session=${encodeURIComponent(customerFixture.customerSessionSecret)}`, 'idempotency-key': `stage6-tenant-invite-${crypto.randomUUID()}` }, body: JSON.stringify({ email: `unauthorized-${crypto.randomUUID()}@invalid.test`, areaIds: [customerFixture.areaOneId], expectedManagementRevision: (await prisma.home.findUniqueOrThrow({ where: { id: customerFixture.homeOneId }, select: { managementRevision: true } })).managementRevision }) });
   const unauthorizedInvitationCount = await prisma.membershipInvitation.count({ where: { targetEmailNormalized: { startsWith: 'unauthorized-' } } });
-  if (issuedInvitation.response.status !== 201 || !nativeV1Contract.validateCustomerMembershipInvitationReceipt(issuedInvitation.body, inviter.homeId, 'TENANT')
+  if (pendingInvitationPage1.response.status !== 200 || pendingInvitationPage1.body?.invitations?.length !== 50
+    || !pendingInvitationPage1.body?.nextCursor || pendingInvitationPage2?.response.status !== 200
+    || pendingInvitationPage2.body?.nextCursor !== null || invitationPageIds.length !== 51 || new Set(invitationPageIds).size !== 51
+    || !invitationPageIds.includes(invitation?.id) || invitationPageIds.includes(expiredPageFixtureId) || !invitationRowsAreSafe
+    || pendingInvitationAnonymous.response.status !== 401 || pendingInvitationMalformedCursor.response.status !== 400
+    || issuedInvitation.response.status !== 201 || !nativeV1Contract.validateCustomerMembershipInvitationReceipt(issuedInvitation.body, inviter.homeId, 'TENANT')
     || invitation?.targetAccountId !== account.id || invitation?.targetEmailNormalized !== email.toLowerCase() || invitation?.role !== 'TENANT'
     || invitation.temporaryCredentialHash !== null || invitation.areas.map((area) => area.areaId).join(',') !== areaId
     || Math.abs(invitation.expiresAt.getTime() - Date.now() - 7 * 24 * 60 * 60 * 1000) > 5000
     || capturedCustomerInvitation !== invitation.id || capturedCustomerInvitationTempPassword !== null
     || JSON.stringify(issuedInvitation.body).includes(email) || invitationRetry.response.status !== 201 || !invitationRetry.body.idempotentReplay
     || customerInvitationEmailCount !== emailCountBefore + 1
-    || unauthorizedTenantInvite.response.status !== 403 || unauthorizedInvitationCount !== 0) fail('Owner-issued tenant invitation did not preserve exact Areas, seven-day expiry, existing credentials, idempotent mail submission or role denial');
+    || unauthorizedTenantInvite.response.status !== 403 || unauthorizedInvitationCount !== 0) fail(`Owner-issued tenant invitation or pending invitation projection violated exact Area, seven-day expiry, idempotency, pagination, expiry, privacy, or authorization rules (${JSON.stringify({ listStatuses: [pendingInvitationPage1.response.status, pendingInvitationPage2?.response.status, pendingInvitationAnonymous.response.status, pendingInvitationMalformedCursor.response.status], pageSizes: [pendingInvitationPage1.body?.invitations?.length, pendingInvitationPage2?.body?.invitations?.length], uniquePageIds: new Set(invitationPageIds).size, expiredOmitted: !invitationPageIds.includes(expiredPageFixtureId), rowsSafe: invitationRowsAreSafe })})`);
   const managerInviteEmail = `stage6-manager-invite-${crypto.randomUUID()}@invalid.test`;
   const managerInvitePayload = { email: managerInviteEmail, areaIds: [], expectedManagementRevision: invitationHomeAfterStage9.managementRevision };
   const managerInvite = await fetchJson(`${base}/api/v2/homes/${inviter.homeId}/property-managers/invitations`, { method: 'POST', headers: { ...inviterHeaders, 'idempotency-key': `stage6-manager-${crypto.randomUUID()}` }, body: JSON.stringify(managerInvitePayload) });
@@ -6873,6 +6906,15 @@ async function pendingInvitationRouteChecks(deliveryEnv) {
     await tx.home.update({ where: { id: inviter.homeId }, data: { managementRevision: { increment: 1 } } });
     return recipientMembership.id;
   });
+  const formerOwnerManagerInvitationList = await fetchJson(`${base}/api/v2/homes/${inviter.homeId}/invitations`, { headers: inviterHeaders });
+  const newOwnerInvitationList = await fetchJson(`${base}/api/v2/homes/${inviter.homeId}/invitations`, { headers: managerRecipientHeaders });
+  if (formerOwnerManagerInvitationList.response.status !== 200
+    || (formerOwnerManagerInvitationList.body?.invitations ?? []).some((row) => row.role !== 'TENANT')
+    || (formerOwnerManagerInvitationList.body?.invitations ?? []).some((row) => row.invitationId === managerInviteReplacement?.body?.invitationId)
+    || newOwnerInvitationList.response.status !== 200
+    || !(newOwnerInvitationList.body?.invitations ?? []).some((row) => row.invitationId === managerInviteReplacement?.body?.invitationId && row.role === 'PROPERTY_MANAGER')) {
+    fail(`Pending invitation visibility did not enforce owner versus manager role boundaries (${JSON.stringify({ managerStatus: formerOwnerManagerInvitationList.response.status, managerRoles: (formerOwnerManagerInvitationList.body?.invitations ?? []).map((row) => row.role), ownerStatus: newOwnerInvitationList.response.status, ownerHasManagerInvite: (newOwnerInvitationList.body?.invitations ?? []).some((row) => row.invitationId === managerInviteReplacement?.body?.invitationId) })})`);
+  }
   const homeAtFormerOwnerDemotion = await prisma.home.findUniqueOrThrow({ where: { id: inviter.homeId }, select: { managementRevision: true } });
   const formerOwnerInvitationDecision = managerInvitationCurrent && managerRecipientLogin.response.status === 200
     ? await fetchJson(`${base}/api/v2/invitations/${managerInvitationCurrent.id}/decision`, { method: 'POST', headers: { cookie: cookieHeader(managerRecipientJar), 'content-type': 'application/json' }, body: JSON.stringify({ decision: 'ACCEPT', expectedUpdatedAt: managerInvitationCurrent.updatedAt.toISOString() }) })
@@ -6931,6 +6973,7 @@ async function pendingInvitationRouteChecks(deliveryEnv) {
   const currentInviteForAcceptance = newTenantInvitation ? await prisma.membershipInvitation.findUniqueOrThrow({ where: { id: newTenantInvitation.id }, select: { updatedAt: true } }) : null;
   const newTenantMembershipBeforeAccept = newTenantAccount ? await prisma.homeMembership.findUnique({ where: { customerAccountId_homeId: { customerAccountId: newTenantAccount.id, homeId: inviter.homeId } }, select: { id: true } }) : null;
   const acceptedNewTenantInvitation = tenantPending?.response.status === 200 && currentInviteForAcceptance ? await fetchJson(`${base}/api/v2/invitations/${newTenantInvitation.id}/decision`, { method: 'POST', headers: { ...newTenantAuthHeaders(), 'content-type': 'application/json', 'idempotency-key': `stage6-new-tenant-accept-${crypto.randomUUID()}` }, body: JSON.stringify({ decision: 'ACCEPT', expectedUpdatedAt: currentInviteForAcceptance.updatedAt.toISOString() }) }) : null;
+  const tenantCannotListInviterInvitations = await fetchJson(`${base}/api/v2/homes/${inviter.homeId}/invitations`, { headers: newTenantAuthHeaders() });
   const newTenantMembershipAfterAccept = newTenantAccount ? await prisma.homeMembership.findUnique({ where: { customerAccountId_homeId: { customerAccountId: newTenantAccount.id, homeId: inviter.homeId } }, select: { id: true, status: true, role: true, tenantAreaGrants: { where: { revokedAt: null }, select: { areaId: true } } } }) : null;
   if (newTenantIssue.response.status !== 201 || !newTenantInvitation?.temporaryCredentialHash || newTenantInvitation.targetAccountId
     || !temporaryPassword || !/^[A-Za-z0-9_-]{24,160}$/.test(temporaryPassword) || capturedCustomerInvitation !== newTenantInvitation.id
@@ -6944,7 +6987,7 @@ async function pendingInvitationRouteChecks(deliveryEnv) {
     || mandatoryReplacement?.response.status !== 200 || usernameRequirements?.body?.nextAction !== 'CHOOSE_USERNAME' || pendingBeforeUsername?.response.status !== 403
     || usernameSelection?.response.status !== 200 || selectedTenantAccount?.usernameNormalized !== newTenantUsername.toLowerCase() || selectedTenantAccount.usernameSelectionRequired
     || tenantPolicyAcceptance?.response.status !== 200 || tenantPending?.body?.pendingRelationships?.[0]?.allowedActions?.includes('ACCEPT') !== true
-    || acceptedNewTenantInvitation?.response.status !== 200 || newTenantMembershipBeforeAccept || newTenantMembershipAfterAccept?.status !== 'ACTIVE'
+    || acceptedNewTenantInvitation?.response.status !== 200 || tenantCannotListInviterInvitations.response.status !== 404 || newTenantMembershipBeforeAccept || newTenantMembershipAfterAccept?.status !== 'ACTIVE'
     || newTenantMembershipAfterAccept?.role !== 'TENANT' || newTenantMembershipAfterAccept.tenantAreaGrants.length !== 1 || newTenantMembershipAfterAccept.tenantAreaGrants[0].areaId !== areaId) fail(`New tenant invitation did not complete the mobile temporary-password, password-replacement, username-selection and explicit-accept journey (${JSON.stringify({ issue: newTenantIssue.response.status, invitation: Boolean(newTenantInvitation), wrongGenericRegistration: wrongTempRegister.response.status, wrongLinkedRedeem: wrongLinkedRedeem?.response.status, login: newTenantLogin?.response.status, loginError: newTenantLogin?.body?.error?.code ?? null, accessShape: /^dno-customer-access-[A-Za-z0-9_-]{32,}$/.test(newTenantLogin?.body?.accessToken ?? ''), refreshShape: /^dno-customer-session-[A-Za-z0-9_-]{32,}$/.test(newTenantLogin?.body?.refreshToken ?? ''), accountPlaceholder: newTenantAccount?.usernameNormalized?.startsWith('setup-'), accountVerified: Boolean(newTenantAccount?.emailVerifiedAt), accountMustChangePassword: newTenantAccount?.mustChangePassword, accountUsernameRequired: newTenantAccount?.usernameSelectionRequired, invitationBound: boundInvitation?.targetAccountId === newTenantAccount?.id, invitationSecretCleared: boundInvitation?.temporaryCredentialHash === null, initialAction: newTenantRequirements?.body?.nextAction, replacement: mandatoryReplacement?.response.status, replacementError: mandatoryReplacement?.body?.error?.code ?? null, replacementAccessShape: /^dno-customer-access-[A-Za-z0-9_-]{32,}$/.test(mandatoryReplacement?.body?.accessToken ?? ''), usernameAction: usernameRequirements?.body?.nextAction, pendingBeforeUsername: pendingBeforeUsername?.response.status, usernameSelection: usernameSelection?.response.status, usernameMatches: selectedTenantAccount?.usernameNormalized === newTenantUsername.toLowerCase(), usernameStillRequired: selectedTenantAccount?.usernameSelectionRequired, policy: tenantPolicyAcceptance?.response.status, pendingAction: tenantPending?.body?.pendingRelationships?.[0]?.allowedActions, invitationAccept: acceptedNewTenantInvitation?.response.status, membershipBeforeAccept: Boolean(newTenantMembershipBeforeAccept), membershipAfterAccept: newTenantMembershipAfterAccept?.status, grantCount: newTenantMembershipAfterAccept?.tenantAreaGrants.length, grantedAreaMatches: newTenantMembershipAfterAccept?.tenantAreaGrants?.[0]?.areaId === areaId })})`);
   // Stage 9: owner-only, revisioned tenant grant replacement uses an exact
   // trusted-phone proof and the selected-home route; denials preserve grants.

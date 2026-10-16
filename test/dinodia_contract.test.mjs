@@ -36,6 +36,38 @@ const compiled = ts.transpileModule(source, { compilerOptions: { module: ts.Modu
 const module = { exports: {} };
 new Function('module','exports','require',compiled)(module,module.exports,require);
 const native = module.exports;
+test('home invitation management projection is bounded, role-safe, expiring and secret-free', () => {
+  const schema = ajv.getSchema(`${contract.$id}#/$defs/homePendingInvitationsReceipt`);
+  assert.ok(schema);
+  const homeId = '11111111-1111-4111-8111-111111111111';
+  const generatedAt = '2026-10-16T12:00:00.000Z';
+  const tenant = {
+    invitationId: '22222222-2222-4222-8222-222222222222', targetEmail: 'tenant@example.test', role: 'TENANT', state: 'PENDING',
+    createdAt: '2026-10-15T12:00:00.000Z', expiresAt: '2026-10-22T12:00:00.000Z', deliveryStatus: 'UNKNOWN',
+    areas: [{ areaId: '33333333-3333-4333-8333-333333333333', name: 'Room 1' }],
+  };
+  const valid = { schemaVersion: 'dinodia.v1', ok: true, homeId, managementRevision: 8, generatedAt, invitations: [tenant], nextCursor: null };
+  assert.equal(schema(valid), true, JSON.stringify(schema.errors));
+  assert.equal(native.validateHomePendingInvitationsReceipt(valid, homeId, 'OWNER'), true);
+  assert.equal(native.validateHomePendingInvitationsReceipt(valid, homeId, 'PROPERTY_MANAGER'), true);
+  for (const invalid of [
+    { ...valid, invitations: [{ ...tenant, role: 'PROPERTY_MANAGER' }] },
+    { ...valid, invitations: [{ ...tenant, tokenHash: 'must-not-leak' }] },
+    { ...valid, invitations: [{ ...tenant, areas: [] }] },
+    { ...valid, invitations: Array.from({ length: 51 }, (_, index) => ({ ...tenant, invitationId: `22222222-2222-4222-8222-${String(index).padStart(12, '0')}` })) },
+  ]) {
+    assert.equal(schema(invalid), false, `JSON Schema rejects invalid invitation projection: ${JSON.stringify(invalid).slice(0, 260)}`);
+    assert.equal(native.validateHomePendingInvitationsReceipt(invalid, homeId, 'PROPERTY_MANAGER'), false);
+  }
+  const expired = { ...valid, invitations: [{ ...tenant, expiresAt: generatedAt }] };
+  assert.equal(schema(expired), true, 'the schema validates timestamp shape while the request-time validator enforces expiry');
+  assert.equal(native.validateHomePendingInvitationsReceipt(expired, homeId, 'OWNER'), false);
+  const ownerInvite = { ...tenant, invitationId: '44444444-4444-4444-8444-444444444444', role: 'PROPERTY_MANAGER', areas: [] };
+  const ownerProjection = { ...valid, invitations: [ownerInvite] };
+  assert.equal(schema(ownerProjection), true, JSON.stringify(schema.errors));
+  assert.equal(native.validateHomePendingInvitationsReceipt(ownerProjection, homeId, 'OWNER'), true);
+  assert.equal(native.validateHomePendingInvitationsReceipt(ownerProjection, homeId, 'PROPERTY_MANAGER'), false);
+});
 test('customer requirements and policy acceptance bind the exact server-owned text hash', () => {
   const text = 'A sufficiently long disposable policy text used only by this contract unit test.';
   const contentSha256 = crypto.createHash('sha256').update(text).digest('hex');

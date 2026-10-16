@@ -83,6 +83,7 @@ export const stage1RouteInventory = [
   ['POST', '/api/v2/invitations/:invitationId/decision', 'customer'],
   ['GET', '/api/v2/homes/:homeId/property-managers', 'customer'],
   ['POST', '/api/v2/homes/:homeId/property-managers', 'customer'],
+  ['GET', '/api/v2/homes/:homeId/invitations', 'customer'],
   ['POST', '/api/v2/homes/:homeId/tenant/invitations', 'customer'],
   ['POST', '/api/public/areas/scan', 'public-login'],
   ['POST', '/api/public/areas/request-access', 'customer'],

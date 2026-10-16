@@ -86,6 +86,15 @@ export interface HomeInvitationAreasReceipt {
   schemaVersion: typeof DINODIA_V1; ok: true; homeId: OpaqueId; managementRevision: number;
   areas: Array<{ id: OpaqueId; name: string }>;
 }
+export interface HomePendingInvitation {
+  invitationId: OpaqueId; targetEmail: string; role: 'PROPERTY_MANAGER'|'TENANT'; state: 'PENDING';
+  createdAt: string; expiresAt: string; deliveryStatus: 'PENDING'|'ACCEPTED'|'NOT_SENT'|'FAILED'|'UNKNOWN';
+  areas: Array<{ areaId: OpaqueId; name: string }>;
+}
+export interface HomePendingInvitationsReceipt {
+  schemaVersion: typeof DINODIA_V1; ok: true; homeId: OpaqueId; managementRevision: number;
+  generatedAt: string; invitations: HomePendingInvitation[]; nextCursor: string|null;
+}
 export interface HomeownerTenantAreaGrantsRequest { areaIds: OpaqueId[]; expectedAccessRevision: number; expectedManagementRevision: number; proof: string }
 export interface HomeownerTenantAreaGrantsReceipt {
   schemaVersion: typeof DINODIA_V1; ok: true; homeId: OpaqueId; tenantMembershipId: OpaqueId; areaIds: OpaqueId[];
@@ -520,6 +529,36 @@ export function validateHomeInvitationAreasReceipt(value: unknown, expectedHomeI
     && Array.isArray(value.areas) && value.areas.length <= 64
     && value.areas.every((area) => object(area) && hasOnlyKeys(area, ['id','name']) && id(area.id) && nonEmptyText(area.name, 120))
     && new Set(value.areas.map((area) => (area as Record<string, unknown>).id)).size === value.areas.length;
+}
+export function validateHomePendingInvitationsReceipt(value: unknown, expectedHomeId: string, viewerRole?: 'OWNER'|'PROPERTY_MANAGER'): value is HomePendingInvitationsReceipt {
+  if (!object(value) || !hasOnlyKeys(value, ['schemaVersion','ok','homeId','managementRevision','generatedAt','invitations','nextCursor'])
+    || value.schemaVersion !== DINODIA_V1 || value.ok !== true || value.homeId !== expectedHomeId
+    || !Number.isSafeInteger(value.managementRevision) || Number(value.managementRevision) < 0
+    || !utcTimestamp(value.generatedAt) || !Array.isArray(value.invitations) || value.invitations.length > 50
+    || !(value.nextCursor === null || typeof value.nextCursor === 'string' && value.nextCursor.length > 0 && value.nextCursor.length <= 256)) return false;
+  const ids = new Set<string>();
+  for (const invitation of value.invitations) {
+    if (!object(invitation) || !hasOnlyKeys(invitation, ['invitationId','targetEmail','role','state','createdAt','expiresAt','deliveryStatus','areas'])
+      || !id(invitation.invitationId) || ids.has(invitation.invitationId)
+      || typeof invitation.targetEmail !== 'string' || invitation.targetEmail.length > 320
+      || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(invitation.targetEmail)
+      || !['PROPERTY_MANAGER','TENANT'].includes(String(invitation.role))
+      || viewerRole === 'PROPERTY_MANAGER' && invitation.role !== 'TENANT'
+      || invitation.state !== 'PENDING' || !utcTimestamp(invitation.createdAt) || !utcTimestamp(invitation.expiresAt)
+      || Date.parse(invitation.expiresAt) <= Date.parse(value.generatedAt)
+      || !['PENDING','ACCEPTED','NOT_SENT','FAILED','UNKNOWN'].includes(String(invitation.deliveryStatus))
+      || !Array.isArray(invitation.areas) || invitation.areas.length > 64) return false;
+    const areaIds = new Set<string>();
+    for (const area of invitation.areas) {
+      if (!object(area) || !hasOnlyKeys(area, ['areaId','name']) || !id(area.areaId) || areaIds.has(area.areaId)
+        || !nonEmptyText(area.name, 160)) return false;
+      areaIds.add(area.areaId);
+    }
+    if (invitation.role === 'TENANT' && invitation.areas.length === 0
+      || invitation.role === 'PROPERTY_MANAGER' && invitation.areas.length !== 0) return false;
+    ids.add(invitation.invitationId);
+  }
+  return true;
 }
 export function validateHomeownerTenantAreaGrantsRequest(value: unknown): value is HomeownerTenantAreaGrantsRequest {
   return object(value) && hasOnlyKeys(value, ['areaIds','expectedAccessRevision','expectedManagementRevision','proof'])
