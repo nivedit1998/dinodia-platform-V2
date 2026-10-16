@@ -15,11 +15,15 @@ import { retireNativeAutomations } from '@/lib/nativeAutomations/lifecycle';
 import { refreshNativeAutomationCloudRevision } from '@/lib/nativeAutomations/delivery';
 
 export const dynamic = 'force-dynamic';
+// Bounded per-route headroom for two rollback-safe serializable attempts.
+export const maxDuration = 40;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const NAMESPACE = 'homeowner-tenant-membership-remove:v1';
 const noStore = { 'Cache-Control': 'no-store', Pragma: 'no-cache' };
 
 export async function DELETE(request: Request, context: { params: Promise<{ homeId: string; tenantId: string }> }) {
+  const startedAt = Date.now();
+  let phase = 'authenticate';
   try {
     const selected = await requireCustomerSelectedHome(request);
     const { homeId, tenantId } = await context.params;
@@ -33,7 +37,9 @@ export async function DELETE(request: Request, context: { params: Promise<{ home
     const keyHash = sha256(`${selected.id}:${body.idempotencyKey}`);
     const requestHash = sha256(JSON.stringify({ homeId, tenantId,
       expectedAccessRevision: body.expectedAccessRevision, expectedManagementRevision: body.expectedManagementRevision }));
+    phase = 'transaction';
     const result = await serializableTransaction(async (tx) => {
+      phase = 'lock_and_validate_authority';
       await tx.$queryRaw`SELECT "id" FROM "Home" WHERE "id" = ${homeId}::uuid FOR UPDATE`;
       await tx.$queryRaw`SELECT "id" FROM "CustomerAccount" WHERE "id" = ${selected.id}::uuid FOR UPDATE`;
       await tx.$queryRaw`SELECT "id" FROM "CustomerSession" WHERE "id" = ${selected.sessionId}::uuid FOR UPDATE`;
@@ -63,6 +69,7 @@ export async function DELETE(request: Request, context: { params: Promise<{ home
         throw new Stage1AuthError(409, 'REVISION_CONFLICT', 'Home, session or management authority changed. Refresh before removing access.');
       }
       const namespace = NAMESPACE;
+      phase = 'lookup_exact_replay';
       await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`${namespace}:${keyHash}`}, 0)) IS NULL AS acquired`;
       const prior = await tx.idempotencyRecord.findUnique({ where: { namespace_keyHash: { namespace, keyHash } }, select: { actorId: true, homeId: true, requestHash: true, responseBody: true, expiresAt: true } });
       if (prior) {
@@ -99,6 +106,7 @@ export async function DELETE(request: Request, context: { params: Promise<{ home
       }, data: { consumedAt: now } });
       if (proofUse.count !== 1) throw new Stage1AuthError(403, 'step_up_invalid', 'Fresh trusted-phone confirmation for this exact tenant removal is required');
 
+      phase = 'revoke_membership_and_private_scope';
       const nextAccessRevision = target.accessRevision + 1;
       const nextManagementRevision = home.managementRevision + 1;
       const homeChanged = await tx.home.updateMany({ where: { id: homeId, managementRevision: home.managementRevision }, data: { managementRevision: { increment: 1 } } });
@@ -147,11 +155,14 @@ export async function DELETE(request: Request, context: { params: Promise<{ home
         areaId: null, deviceId: null, safeDiagnostics: Prisma.DbNull, customerResolution: null, revision: { increment: 1 },
       } });
       await retireNativeAutomations(tx, { homeId, createdByMembershipId: tenantId, now, actorId: selected.id, reason: 'tenant_membership_removed' });
+      phase = 'rebuild_home_configuration';
       await refreshNativeAutomationCloudRevision(tx, { homeId, hubInstallationId: hub.id });
       await tx.memberPreferenceDocument.deleteMany({ where: { membershipId: tenantId } });
       await tx.alexaNativeEndpointProjection.deleteMany({ where: { homeId, membershipId: tenantId } });
       await tx.alexaNativeHomeScope.deleteMany({ where: { homeId, membershipId: tenantId } });
+      phase = 'orphan_account_cleanup';
       await cleanupCustomerAccountIfOrphaned(tx, target.customerAccountId, now, 'owner_removed_tenant', 'HOME_TENANT_REMOVAL_ACCOUNT_CLEANUP');
+      phase = 'write_audit_and_receipt';
       await tx.auditEvent.create({ data: { homeId, actorType: 'CUSTOMER', actorId: selected.id, category: 'ACCESS', action: 'home_tenant_membership_removed',
         targetType: 'HomeMembership', targetId: tenantId, metadata: { outcome: 'removed', nextAccessRevision, pendingHubCleanup: true,
           privateDeviceTombstoneCount: privateDevices.filter((item) => !['RETIRED', 'REMOVED'].includes(item.lifecycle)).length },
@@ -163,7 +174,7 @@ export async function DELETE(request: Request, context: { params: Promise<{ home
         responseStatus: 200, responseDigest: sha256(JSON.stringify(receipt)), responseBody: receipt as unknown as Prisma.InputJsonValue,
         expiresAt: new Date(now.getTime() + 24 * 60 * 60 * 1000) } });
       return receipt;
-    });
+    }, 2, { maxWaitMs: 1_500, timeoutMs: 14_000 });
     return NextResponse.json(result, { headers: noStore });
-  } catch (error) { return nativeV1ErrorResponse(error); }
+  } catch (error) { return nativeV1ErrorResponse(error, { operation: 'home_tenant_remove', phase, startedAt }); }
 }

@@ -27,7 +27,10 @@ export async function replaceTenantAreaGrants(db: Prisma.TransactionClient, inpu
   if (home.managementRevision !== input.expectedManagementRevision || tenant.accessRevision !== input.expectedAccessRevision) throw new NativeAreaAccessError('REVISION_CONFLICT');
   const current = await db.tenantAreaGrant.findMany({ where: { membershipId: tenant.id, homeId: input.homeId, revokedAt: null }, select: { areaId: true } });
   const currentIds = current.map((grant) => grant.areaId).sort();
-  if (currentIds.length === areaIds.length && currentIds.every((id, index) => id === areaIds[index])) return { changed: false, managementRevision: home.managementRevision, accessRevision: tenant.accessRevision };
+  if (currentIds.length === areaIds.length && currentIds.every((id, index) => id === areaIds[index])) {
+    return { changed: false, managementRevision: home.managementRevision,
+      accessRevision: tenant.accessRevision, decommissionTombstoneCount: 0 };
+  }
   const removedAreaIds = currentIds.filter((id) => !areaIds.includes(id));
   // Any rule which loses one granted Area is retired as a whole. Its action
   // bodies are removed immediately; only a minimal bounded tombstone remains

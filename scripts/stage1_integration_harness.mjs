@@ -7028,6 +7028,47 @@ async function pendingInvitationRouteChecks(deliveryEnv) {
   const grantRequest = (areaIds, proof, key, headers = selectedHomeHeaders, expectedAccessRevision = grantTargetBefore.accessRevision, expectedManagementRevision = grantHomeBefore.managementRevision) => fetchJson(grantPath, { method: 'PUT',
     headers: { ...headers, 'idempotency-key': key }, body: JSON.stringify({ areaIds, proof,
       expectedAccessRevision, expectedManagementRevision }) });
+  const grantReceiptPath = `${base}/api/v2/homes/${inviter.homeId}/tenants/${newTenantMembershipAfterAccept.id}/management-operation-receipt`;
+  const grantReceiptRequest = (areaIds, key, expectedAccessRevision, expectedManagementRevision, headers = selectedHomeHeaders) => fetchJson(grantReceiptPath, {
+    method: 'POST', headers, body: JSON.stringify({ operationKind: 'tenant_area_grants_replace', idempotencyKey: key,
+      areaIds: [...areaIds].sort(), expectedAccessRevision, expectedManagementRevision }),
+  });
+  const removeHomeDelay = async () => {
+    await prisma.$executeRawUnsafe('DROP TRIGGER IF EXISTS stage9_home_revision_delay ON "Home"');
+    await prisma.$executeRawUnsafe('DROP FUNCTION IF EXISTS stage9_test_home_revision_delay()');
+  };
+  const addHomeDelay = async (seconds) => {
+    await removeHomeDelay();
+    await prisma.$executeRawUnsafe(`CREATE FUNCTION stage9_test_home_revision_delay() RETURNS trigger LANGUAGE plpgsql AS $$
+      BEGIN IF NEW.id::text = TG_ARGV[0] THEN PERFORM pg_sleep(TG_ARGV[1]::double precision); END IF; RETURN NEW; END $$`);
+    await prisma.$executeRawUnsafe(`CREATE TRIGGER stage9_home_revision_delay BEFORE UPDATE OF "managementRevision" ON "Home"
+      FOR EACH ROW EXECUTE FUNCTION stage9_test_home_revision_delay('${inviter.homeId}', '${Number(seconds)}')`);
+  };
+  const removeTenantRemovalAuditFailure = async () => {
+    await prisma.$executeRawUnsafe('DROP TRIGGER IF EXISTS stage9_tenant_removal_audit_failure ON "AuditEvent"');
+    await prisma.$executeRawUnsafe('DROP FUNCTION IF EXISTS stage9_test_tenant_removal_audit_failure()');
+  };
+  const addTenantRemovalAuditFailure = async (homeId, membershipId) => {
+    await removeTenantRemovalAuditFailure();
+    await prisma.$executeRawUnsafe(`CREATE FUNCTION stage9_test_tenant_removal_audit_failure() RETURNS trigger LANGUAGE plpgsql AS $$
+      BEGIN
+        IF NEW."homeId"::text = TG_ARGV[0] AND NEW."action" = 'home_tenant_membership_removed'
+          AND NEW."targetId"::text = TG_ARGV[1] THEN
+          RAISE EXCEPTION 'stage9 disposable late tenant-removal audit failure';
+        END IF;
+        RETURN NEW;
+      END $$`);
+    await prisma.$executeRawUnsafe(`CREATE TRIGGER stage9_tenant_removal_audit_failure BEFORE INSERT ON "AuditEvent"
+      FOR EACH ROW EXECUTE FUNCTION stage9_test_tenant_removal_audit_failure('${homeId}', '${membershipId}')`);
+  };
+  const noopGrantProof = await issueGrantProof([areaId]);
+  const noopGrantKey = `stage9-grant-noop-${crypto.randomUUID()}`;
+  const noopGrant = await grantRequest([areaId], noopGrantProof, noopGrantKey);
+  const noopGrantReplay = await grantRequest([areaId], noopGrantProof, noopGrantKey);
+  const noopGrantConflict = await grantRequest(desiredGrantAreaIds, noopGrantProof, noopGrantKey);
+  const noopGrantCurrent = await prisma.homeMembership.findUniqueOrThrow({ where: { id: newTenantMembershipAfterAccept.id },
+    select: { accessRevision: true, tenantAreaGrants: { where: { revokedAt: null }, select: { areaId: true } } } });
+  const noopGrantHome = await prisma.home.findUniqueOrThrow({ where: { id: inviter.homeId }, select: { managementRevision: true } });
   const grantMismatch = await grantRequest(desiredGrantAreaIds, badGrantProof, `stage9-grant-mismatch-${crypto.randomUUID()}`);
   const proofAfterMismatch = await prisma.stepUpAuthorization.findFirst({ where: { nonceHash: sha256(badGrantProof) }, select: { consumedAt: true } });
   const targetAfterMismatch = await prisma.homeMembership.findUniqueOrThrow({ where: { id: newTenantMembershipAfterAccept.id }, select: { accessRevision: true, tenantAreaGrants: { where: { revokedAt: null }, select: { areaId: true } } } });
@@ -7036,9 +7077,23 @@ async function pendingInvitationRouteChecks(deliveryEnv) {
   const goodGrantProof = await issueGrantProof(desiredGrantAreaIds);
   const tenantAttempt = await grantRequest(desiredGrantAreaIds, goodGrantProof, `stage9-grant-tenant-${crypto.randomUUID()}`, { ...newTenantAuthHeaders(), 'x-dinodia-home-id': inviter.homeId });
   const grantsKey = `stage9-grant-valid-${crypto.randomUUID()}`;
-  const grantSaved = await grantRequest(desiredGrantAreaIds, goodGrantProof, grantsKey);
+  await addHomeDelay(7);
+  const slowGrantStartedAt = Date.now();
+  let grantSaved, concurrentGrantReplay;
+  try {
+    [grantSaved, concurrentGrantReplay] = await Promise.all([
+      grantRequest(desiredGrantAreaIds, goodGrantProof, grantsKey),
+      grantRequest(desiredGrantAreaIds, goodGrantProof, grantsKey),
+    ]);
+  }
+  finally { await removeHomeDelay(); }
+  const slowGrantElapsedMs = Date.now() - slowGrantStartedAt;
   const grantReplay = await grantRequest(desiredGrantAreaIds, goodGrantProof, grantsKey);
   const grantConflict = await grantRequest([areaId], goodGrantProof, grantsKey);
+  const grantReceiptRecovered = await grantReceiptRequest(desiredGrantAreaIds, grantsKey,
+    grantTargetBefore.accessRevision, grantHomeBefore.managementRevision);
+  const grantReceiptWrongActor = await grantReceiptRequest(desiredGrantAreaIds, grantsKey,
+    grantTargetBefore.accessRevision, grantHomeBefore.managementRevision, { ...newTenantAuthHeaders(), 'x-dinodia-home-id': inviter.homeId });
   const targetAfterGrant = await prisma.homeMembership.findUniqueOrThrow({ where: { id: newTenantMembershipAfterAccept.id }, select: { accessRevision: true, tenantAreaGrants: { where: { revokedAt: null }, select: { areaId: true } } } });
   const homeAfterGrant = await prisma.home.findUniqueOrThrow({ where: { id: inviter.homeId }, select: { managementRevision: true } });
   const restoreProof = await issueGrantProof([areaId], targetAfterGrant.accessRevision, homeAfterGrant.managementRevision);
@@ -7051,15 +7106,28 @@ async function pendingInvitationRouteChecks(deliveryEnv) {
   const grantDeviceAfterRestore = await prisma.nativeDevice.findUnique({ where: { id: grantTestDevice.id }, select: { id: true } });
   const grantCleanupOutbox = await prisma.nativeDomainOutbox.findFirst({ where: { aggregateType: 'NativeDevice', aggregateId: grantTestDevice.id,
     eventType: 'TENANT_DEVICE_DECOMMISSION' }, select: { id: true, payload: true } });
-  if (grantMismatch.response.status !== 403 || proofAfterMismatch?.consumedAt !== null
+  if (noopGrant.response.status !== 200 || noopGrant.body?.changed !== false
+    || noopGrant.body?.decommissionTombstoneCount !== 0 || noopGrant.body?.managementRevision !== grantHomeBefore.managementRevision
+    || noopGrant.body?.accessRevision !== grantTargetBefore.accessRevision
+    || noopGrantReplay.response.status !== 200 || noopGrantReplay.body?.decommissionTombstoneCount !== 0
+    || noopGrantConflict.response.status !== 409 || noopGrantCurrent.accessRevision !== grantTargetBefore.accessRevision
+    || noopGrantHome.managementRevision !== grantHomeBefore.managementRevision
+    || grantMismatch.response.status !== 403 || proofAfterMismatch?.consumedAt !== null
     || targetAfterMismatch.accessRevision !== grantTargetBefore.accessRevision
     || targetAfterMismatch.tenantAreaGrants.map((row) => row.areaId).sort().join(',') !== grantTargetBefore.tenantAreaGrants.map((row) => row.areaId).sort().join(',')
     || automationAfterMismatch.length !== 2 || !deviceAfterMismatch
     || tenantAttempt.response.status !== 404 || grantSaved.response.status !== 200 || grantSaved.body?.changed !== true
+    || concurrentGrantReplay.response.status !== 200
+    || concurrentGrantReplay.body?.managementRevision !== grantSaved.body?.managementRevision
+    || slowGrantElapsedMs < 7_000 || slowGrantElapsedMs >= 14_000
     || grantSaved.body?.accessRevision !== grantTargetBefore.accessRevision + 1
     || grantSaved.body?.managementRevision !== grantHomeBefore.managementRevision + 1
     || grantReplay.response.status !== 200 || grantReplay.body?.managementRevision !== grantSaved.body?.managementRevision
     || grantConflict.response.status !== 409 || targetAfterGrant.tenantAreaGrants.map((row) => row.areaId).sort().join(',') !== desiredGrantAreaIds.join(',')
+    || grantReceiptRecovered.response.status !== 200 || grantReceiptRecovered.body?.status !== 'COMMITTED'
+    || grantReceiptRecovered.body?.operationKind !== 'tenant_area_grants_replace'
+    || grantReceiptRecovered.body?.receipt?.managementRevision !== grantSaved.body?.managementRevision
+    || grantReceiptWrongActor.response.status !== 404
     || grantsRestored.response.status !== 200 || targetAfterRestore.tenantAreaGrants.map((row) => row.areaId).join(',') !== areaId
     || automationAfterRestore.find((row) => row.id === grantAffectedAutomation.id)?.status !== 'RETIRED'
     || automationAfterRestore.find((row) => row.id === grantAffectedAutomation.id)?.actions.length !== 0
@@ -7072,7 +7140,56 @@ async function pendingInvitationRouteChecks(deliveryEnv) {
       save: grantSaved.response.status, saveCode: grantSaved.body?.error?.code, replay: grantReplay.response.status,
       conflict: grantConflict.response.status, activeGrantCount: targetAfterGrant.tenantAreaGrants.length })})`);
   }
-  console.log('[stage9:integration] PASS: owner Area-grant edit requires exact fresh phone proof; denials have zero effects, revisioned replay is single, and removing an Area removes only the affected tenant automation/private device with a durable decommission tombstone');
+  console.log('[stage9:integration] PASS: unchanged Area grant returns a complete zero-count receipt without advancing revisions; concurrent same-key retry, exact retry, changed-body conflict, authenticated receipt recovery and >5s bounded transaction commit pass; tenant denials have zero effects and Area removal queues only scoped cleanup');
+
+  // Cross the explicit 14-second route deadline on a disposable DB-side
+  // trigger. The transaction must roll back, including proof consumption and
+  // the idempotency receipt; after removing the trigger, a fresh exact proof
+  // may commit the same frozen request under the same key exactly once.
+  const timeoutBaseline = await prisma.homeMembership.findUniqueOrThrow({ where: { id: newTenantMembershipAfterAccept.id },
+    select: { accessRevision: true, tenantAreaGrants: { where: { revokedAt: null }, select: { areaId: true } } } });
+  const timeoutHomeBaseline = await prisma.home.findUniqueOrThrow({ where: { id: inviter.homeId }, select: { managementRevision: true } });
+  const timeoutAreaIds = [grantTestArea.id];
+  const timeoutKey = `stage9-grant-timeout-${crypto.randomUUID()}`;
+  const timeoutProof = await issueGrantProof(timeoutAreaIds, timeoutBaseline.accessRevision, timeoutHomeBaseline.managementRevision);
+  await addHomeDelay(16);
+  const delayedGrantStartedAt = Date.now();
+  let delayedGrant;
+  try { delayedGrant = await grantRequest(timeoutAreaIds, timeoutProof, timeoutKey,
+    selectedHomeHeaders, timeoutBaseline.accessRevision, timeoutHomeBaseline.managementRevision); }
+  finally { await removeHomeDelay(); }
+  const delayedGrantElapsedMs = Date.now() - delayedGrantStartedAt;
+  const timeoutTargetAfter = await prisma.homeMembership.findUniqueOrThrow({ where: { id: newTenantMembershipAfterAccept.id },
+    select: { accessRevision: true, tenantAreaGrants: { where: { revokedAt: null }, select: { areaId: true } } } });
+  const timeoutHomeAfter = await prisma.home.findUniqueOrThrow({ where: { id: inviter.homeId }, select: { managementRevision: true } });
+  const timeoutProofAfter = await prisma.stepUpAuthorization.findFirst({ where: { nonceHash: sha256(timeoutProof) }, select: { consumedAt: true } });
+  const timeoutReceipt = await grantReceiptRequest(timeoutAreaIds, timeoutKey,
+    timeoutBaseline.accessRevision, timeoutHomeBaseline.managementRevision);
+  if (![500, 503].includes(delayedGrant.response.status) || delayedGrantElapsedMs < 13_000
+    || delayedGrantElapsedMs > 30_000 || timeoutTargetAfter.accessRevision !== timeoutBaseline.accessRevision
+    || timeoutTargetAfter.tenantAreaGrants.map((row) => row.areaId).sort().join(',') !== timeoutBaseline.tenantAreaGrants.map((row) => row.areaId).sort().join(',')
+    || timeoutHomeAfter.managementRevision !== timeoutHomeBaseline.managementRevision || timeoutProofAfter?.consumedAt !== null
+    || timeoutReceipt.response.status !== 200 || timeoutReceipt.body?.status !== 'NOT_FOUND') {
+    fail(`Delayed Area grant did not roll back atomically at the bounded route deadline (${JSON.stringify({ status: delayedGrant.response.status,
+      elapsedMs: delayedGrantElapsedMs, accessRevisionUnchanged: timeoutTargetAfter.accessRevision === timeoutBaseline.accessRevision,
+      managementRevisionUnchanged: timeoutHomeAfter.managementRevision === timeoutHomeBaseline.managementRevision,
+      proofConsumed: Boolean(timeoutProofAfter?.consumedAt), receiptStatus: timeoutReceipt.body?.status })})`);
+  }
+  const retryTimeoutProof = await issueGrantProof(timeoutAreaIds, timeoutBaseline.accessRevision, timeoutHomeBaseline.managementRevision);
+  const retriedDelayedGrant = await grantRequest(timeoutAreaIds, retryTimeoutProof, timeoutKey,
+    selectedHomeHeaders, timeoutBaseline.accessRevision, timeoutHomeBaseline.managementRevision);
+  const retryTimeoutReceipt = await grantReceiptRequest(timeoutAreaIds, timeoutKey,
+    timeoutBaseline.accessRevision, timeoutHomeBaseline.managementRevision);
+  const timeoutTargetCommitted = await prisma.homeMembership.findUniqueOrThrow({ where: { id: newTenantMembershipAfterAccept.id },
+    select: { accessRevision: true, tenantAreaGrants: { where: { revokedAt: null }, select: { areaId: true } } } });
+  if (retriedDelayedGrant.response.status !== 200 || retryTimeoutReceipt.response.status !== 200
+    || retryTimeoutReceipt.body?.status !== 'COMMITTED'
+    || timeoutTargetCommitted.accessRevision !== timeoutBaseline.accessRevision + 1
+    || timeoutTargetCommitted.tenantAreaGrants.map((row) => row.areaId).join(',') !== grantTestArea.id) {
+    fail(`Exact delayed grant retry did not commit once after a fully rolled-back timeout (${JSON.stringify({ retry: retriedDelayedGrant.response.status,
+      receipt: retryTimeoutReceipt.body?.status, accessRevision: timeoutTargetCommitted.accessRevision })})`);
+  }
+  console.log('[stage9:integration] PASS: a >14s disposable DB trigger causes a bounded failure with full rollback, unconsumed proof and no receipt; exact same-key/body retry with fresh phone proof commits once and receipt recovery confirms it');
 
   // Stage 7: exercise the real tenant projection and preference write through
   // loopback using the newly invited, policy-current disposable mobile account.
@@ -8078,9 +8195,18 @@ async function pendingInvitationRouteChecks(deliveryEnv) {
   const validTenantProof = await issueOwnerProof('home_tenant_remove', [removalTenantMembershipA.id], tenantValue);
   const tenantRemovalKey = `stage9-tenant-remove-${crypto.randomUUID()}`;
   const tenantRemovalPayload = tenantRemovalBody(validTenantProof, tenantRemovalKey);
-  const tenantRemoval = await fetchJson(tenantRemovalPath(removalTenantMembershipA.id), { method: 'DELETE', headers: selectedHomeHeaders, body: JSON.stringify(tenantRemovalPayload) });
+  await addHomeDelay(7);
+  const tenantRemovalStartedAt = Date.now();
+  let tenantRemoval;
+  try { tenantRemoval = await fetchJson(tenantRemovalPath(removalTenantMembershipA.id), { method: 'DELETE', headers: selectedHomeHeaders, body: JSON.stringify(tenantRemovalPayload) }); }
+  finally { await removeHomeDelay(); }
+  const tenantRemovalElapsedMs = Date.now() - tenantRemovalStartedAt;
   const tenantRemovalReplay = await fetchJson(tenantRemovalPath(removalTenantMembershipA.id), { method: 'DELETE', headers: selectedHomeHeaders, body: JSON.stringify(tenantRemovalPayload) });
   const tenantRemovalConflict = await fetchJson(tenantRemovalPath(removalTenantMembershipB.id), { method: 'DELETE', headers: selectedHomeHeaders, body: JSON.stringify(tenantRemovalPayload) });
+  const tenantRemovalReceipt = await fetchJson(`${base}/api/v2/homes/${inviter.homeId}/tenants/${removalTenantMembershipA.id}/management-operation-receipt`, {
+    method: 'POST', headers: selectedHomeHeaders, body: JSON.stringify({ operationKind: 'home_tenant_remove', idempotencyKey: tenantRemovalKey,
+      expectedAccessRevision: tenantTargetBefore.accessRevision, expectedManagementRevision: tenantHomeBefore.managementRevision }),
+  });
   const removedTenantMembership = await prisma.homeMembership.findUniqueOrThrow({ where: { id: removalTenantMembershipA.id }, select: { status: true, accessRevision: true } });
   const preservedTenantLink = await prisma.homeMembership.findUnique({ where: { id: preservedTenantMembership.id }, select: { status: true } });
   const preservedTenantAccount = await prisma.customerAccount.findUnique({ where: { id: removalTenantA.id }, select: { id: true } });
@@ -8107,11 +8233,15 @@ async function pendingInvitationRouteChecks(deliveryEnv) {
   if (![403, 404].includes(wrongRoleTenantRemoval.response.status) || wrongHomeTenantRemoval.response.status !== 404
     || mismatchedTenantRemoval.response.status !== 403 || mismatchedTenantProofState?.consumedAt !== null
     || tenantRowsAfterDenials.some((row) => row.status !== 'ACTIVE') || !privateDeviceAfterDenials
-    || tenantRemoval.response.status !== 200 || tenantRemoval.body?.state !== 'REMOVED' || tenantRemoval.body?.hubEnforcement !== 'PENDING'
+    || tenantRemoval.response.status !== 200 || tenantRemovalElapsedMs < 7_000 || tenantRemovalElapsedMs >= 14_000
+    || tenantRemoval.body?.state !== 'REMOVED' || tenantRemoval.body?.hubEnforcement !== 'PENDING'
     || tenantRemoval.body?.accessRevision !== tenantTargetBefore.accessRevision + 1
     || tenantRemoval.body?.managementRevision !== tenantHomeBefore.managementRevision + 1
     || tenantRemovalReplay.response.status !== 200 || tenantRemovalReplay.body?.idempotentReplay !== true
     || tenantRemovalConflict.response.status !== 409 || tenantHomeAfter.managementRevision !== tenantHomeBefore.managementRevision + 1
+    || tenantRemovalReceipt.response.status !== 200 || tenantRemovalReceipt.body?.status !== 'COMMITTED'
+    || tenantRemovalReceipt.body?.receipt?.idempotentReplay !== true
+    || tenantRemovalReceipt.body?.receipt?.managementRevision !== tenantRemoval.body?.managementRevision
     || removedTenantMembership.status !== 'REMOVED' || removedTenantMembership.accessRevision !== tenantTargetBefore.accessRevision + 1
     || !preservedTenantLink || !preservedTenantAccount || preservedTenantDevice?.revokedAt || preservedTenantSession?.revokedAt
     || removedPrivateDevice || removedAutomation?.status !== 'RETIRED' || removedAutomation.name !== 'Removed automation'
@@ -8124,14 +8254,91 @@ async function pendingInvitationRouteChecks(deliveryEnv) {
       accountPreserved: Boolean(preservedTenantAccount), otherHome: preservedTenantLink?.status, privateDeviceRemoved: !removedPrivateDevice,
       tombstone: Boolean(tenantDeviceTombstone), automation: removedAutomation?.status, automationChildren: retiredAutomationChildren, hub: tenantRemoval.body?.hubEnforcement })})`);
   }
+  console.log('[stage9:integration] PASS: owner tenant removal with a 7s disposable Home-row delay commits within its explicit transaction budget; exact receipt remains recoverable after target removal without persisting or resubmitting phone proof');
   const tenantBHomeBefore = await prisma.home.findUniqueOrThrow({ where: { id: inviter.homeId }, select: { managementRevision: true } });
   const tenantBTargetBefore = await prisma.homeMembership.findUniqueOrThrow({ where: { id: removalTenantMembershipB.id }, select: { accessRevision: true } });
+  const lateFailureKey = `stage9-tenant-removal-late-failure-${crypto.randomUUID()}`;
+  const lateFailureProof = await issueOwnerProof('home_tenant_remove', [removalTenantMembershipB.id], {
+    expectedAccessRevision: tenantBTargetBefore.accessRevision, expectedManagementRevision: tenantBHomeBefore.managementRevision,
+  });
+  const lateFailurePayload = { expectedAccessRevision: tenantBTargetBefore.accessRevision,
+    expectedManagementRevision: tenantBHomeBefore.managementRevision, proof: lateFailureProof, idempotencyKey: lateFailureKey };
+  const lateFailureNoticePrefix = `homeowner-removal:${removalTenantMembershipB.id}:${tenantBTargetBefore.accessRevision + 1}:`;
+  await addTenantRemovalAuditFailure(inviter.homeId, removalTenantMembershipB.id);
+  let lateRemovalFailure;
+  try {
+    lateRemovalFailure = await fetchJson(tenantRemovalPath(removalTenantMembershipB.id), {
+      method: 'DELETE', headers: selectedHomeHeaders, body: JSON.stringify(lateFailurePayload),
+    });
+  } finally { await removeTenantRemovalAuditFailure(); }
+  const lateFailureMember = await prisma.homeMembership.findUniqueOrThrow({ where: { id: removalTenantMembershipB.id },
+    select: { status: true, accessRevision: true, tenantAreaGrants: { where: { revokedAt: null }, select: { areaId: true } } } });
+  const lateFailureHome = await prisma.home.findUniqueOrThrow({ where: { id: inviter.homeId }, select: { managementRevision: true } });
+  const lateFailureAccount = await prisma.customerAccount.findUnique({ where: { id: removalTenantB.id }, select: { id: true } });
+  const lateFailureProofState = await prisma.stepUpAuthorization.findFirst({ where: { nonceHash: sha256(lateFailureProof) }, select: { consumedAt: true } });
+  const lateFailureReceipt = await fetchJson(`${base}/api/v2/homes/${inviter.homeId}/tenants/${removalTenantMembershipB.id}/management-operation-receipt`, {
+    method: 'POST', headers: selectedHomeHeaders, body: JSON.stringify({ operationKind: 'home_tenant_remove',
+      idempotencyKey: lateFailureKey, expectedAccessRevision: tenantBTargetBefore.accessRevision,
+      expectedManagementRevision: tenantBHomeBefore.managementRevision }),
+  });
+  const lateFailureNotices = await prisma.nativeDomainOutbox.count({ where: {
+    aggregateType: 'HomeownerAccessRemovalNotice', idempotencyKey: { startsWith: lateFailureNoticePrefix },
+  } });
+  if (![500, 503].includes(lateRemovalFailure.response.status)
+    || lateFailureMember.status !== 'ACTIVE' || lateFailureMember.accessRevision !== tenantBTargetBefore.accessRevision
+    || lateFailureMember.tenantAreaGrants.length !== 1 || lateFailureHome.managementRevision !== tenantBHomeBefore.managementRevision
+    || !lateFailureAccount || lateFailureProofState?.consumedAt !== null || lateFailureReceipt.response.status !== 200
+    || lateFailureReceipt.body?.status !== 'NOT_FOUND' || lateFailureNotices !== 0) {
+    fail(`Late audit-stage failure did not roll back tenant cleanup, account deletion, proof, notices and idempotency receipt (${JSON.stringify({
+      status: lateRemovalFailure.response.status, member: lateFailureMember.status, accessRevision: lateFailureMember.accessRevision,
+      homeRevisionUnchanged: lateFailureHome.managementRevision === tenantBHomeBefore.managementRevision,
+      accountPreserved: Boolean(lateFailureAccount), proofConsumed: Boolean(lateFailureProofState?.consumedAt),
+      receipt: lateFailureReceipt.body?.status, notices: lateFailureNotices,
+    })})`);
+  }
+  console.log('[stage9:integration] PASS: injected failure after account/private-scope cleanup but before audit/receipt commit rolls the whole tenant-removal transaction back, including Home/member/grants/account/proof/notices and exact receipt');
   const tenantBProof = await issueOwnerProof('home_tenant_remove', [removalTenantMembershipB.id], {
     expectedAccessRevision: tenantBTargetBefore.accessRevision, expectedManagementRevision: tenantBHomeBefore.managementRevision,
   });
+  const tenantBRemovalKey = `stage9-tenant-final-remove-${crypto.randomUUID()}`;
+  const tenantBRemovalPayload = { expectedAccessRevision: tenantBTargetBefore.accessRevision,
+    expectedManagementRevision: tenantBHomeBefore.managementRevision, proof: tenantBProof, idempotencyKey: tenantBRemovalKey };
+  await addHomeDelay(16);
+  const tenantBTimeoutStartedAt = Date.now();
+  let tenantBTimeout;
+  try { tenantBTimeout = await fetchJson(tenantRemovalPath(removalTenantMembershipB.id), {
+    method: 'DELETE', headers: selectedHomeHeaders, body: JSON.stringify(tenantBRemovalPayload) }); }
+  finally { await removeHomeDelay(); }
+  const tenantBTimeoutElapsedMs = Date.now() - tenantBTimeoutStartedAt;
+  const tenantBAfterTimeout = await prisma.homeMembership.findUniqueOrThrow({ where: { id: removalTenantMembershipB.id },
+    select: { status: true, accessRevision: true, tenantAreaGrants: { where: { revokedAt: null }, select: { areaId: true } } } });
+  const tenantBProofAfterTimeout = await prisma.stepUpAuthorization.findFirst({ where: { nonceHash: sha256(tenantBProof) }, select: { consumedAt: true } });
+  const tenantBHomeAfterTimeout = await prisma.home.findUniqueOrThrow({ where: { id: inviter.homeId }, select: { managementRevision: true } });
+  const tenantBReceiptAfterTimeout = await fetchJson(`${base}/api/v2/homes/${inviter.homeId}/tenants/${removalTenantMembershipB.id}/management-operation-receipt`, {
+    method: 'POST', headers: selectedHomeHeaders, body: JSON.stringify({ operationKind: 'home_tenant_remove',
+      idempotencyKey: tenantBRemovalKey, expectedAccessRevision: tenantBTargetBefore.accessRevision,
+      expectedManagementRevision: tenantBHomeBefore.managementRevision }),
+  });
+  if (![500, 503].includes(tenantBTimeout.response.status) || tenantBTimeoutElapsedMs < 13_000 || tenantBTimeoutElapsedMs > 30_000
+    || tenantBAfterTimeout.status !== 'ACTIVE' || tenantBAfterTimeout.accessRevision !== tenantBTargetBefore.accessRevision
+    || tenantBAfterTimeout.tenantAreaGrants.length !== 1 || tenantBProofAfterTimeout?.consumedAt !== null
+    || tenantBHomeAfterTimeout.managementRevision !== tenantBHomeBefore.managementRevision
+    || tenantBReceiptAfterTimeout.response.status !== 200 || tenantBReceiptAfterTimeout.body?.status !== 'NOT_FOUND') {
+    fail(`Delayed final-relationship removal did not roll back proof, Home revision, tenant and grant atomically (${JSON.stringify({ status: tenantBTimeout.response.status,
+      elapsedMs: tenantBTimeoutElapsedMs, membership: tenantBAfterTimeout.status, accessRevision: tenantBAfterTimeout.accessRevision,
+      proofConsumed: Boolean(tenantBProofAfterTimeout?.consumedAt), homeRevisionUnchanged: tenantBHomeAfterTimeout.managementRevision === tenantBHomeBefore.managementRevision,
+      receipt: tenantBReceiptAfterTimeout.body?.status })})`);
+  }
+  const tenantBRetryProof = await issueOwnerProof('home_tenant_remove', [removalTenantMembershipB.id], {
+    expectedAccessRevision: tenantBTargetBefore.accessRevision, expectedManagementRevision: tenantBHomeBefore.managementRevision,
+  });
   const tenantBRemoval = await fetchJson(tenantRemovalPath(removalTenantMembershipB.id), { method: 'DELETE', headers: selectedHomeHeaders,
-    body: JSON.stringify({ expectedAccessRevision: tenantBTargetBefore.accessRevision,
-      expectedManagementRevision: tenantBHomeBefore.managementRevision, proof: tenantBProof, idempotencyKey: `stage9-tenant-final-remove-${crypto.randomUUID()}` }) });
+    body: JSON.stringify({ ...tenantBRemovalPayload, proof: tenantBRetryProof }) });
+  const tenantBRemovalReceipt = await fetchJson(`${base}/api/v2/homes/${inviter.homeId}/tenants/${removalTenantMembershipB.id}/management-operation-receipt`, {
+    method: 'POST', headers: selectedHomeHeaders, body: JSON.stringify({ operationKind: 'home_tenant_remove',
+      idempotencyKey: tenantBRemovalKey, expectedAccessRevision: tenantBTargetBefore.accessRevision,
+      expectedManagementRevision: tenantBHomeBefore.managementRevision }),
+  });
   const finalTenantAccount = await prisma.customerAccount.findUnique({ where: { id: removalTenantB.id }, select: { id: true } });
   const finalTenantNoticeKey = `homeowner-removal:${removalTenantMembershipB.id}:${tenantBTargetBefore.accessRevision + 1}:email`;
   const finalTenantNotice = await prisma.nativeDomainOutbox.findUnique({ where: { idempotencyKey: finalTenantNoticeKey }, select: { state: true, payload: true } });
@@ -8140,12 +8347,15 @@ async function pendingInvitationRouteChecks(deliveryEnv) {
     prisma.nativeDeviceUsageBucket.count({ where: { deviceId: tenantBPrivateDevice.id } }),
     prisma.nativeDeviceOutageIncident.count({ where: { deviceId: tenantBPrivateDevice.id } }),
   ]);
-  if (tenantBRemoval.response.status !== 200 || finalTenantAccount !== null || !finalTenantNotice || finalTenantNotice.state !== 'PENDING'
+  if (tenantBRemoval.response.status !== 200 || tenantBRemovalReceipt.response.status !== 200
+    || tenantBRemovalReceipt.body?.status !== 'COMMITTED' || tenantBRemovalReceipt.body?.receipt?.idempotentReplay !== true
+    || finalTenantAccount !== null || !finalTenantNotice || finalTenantNotice.state !== 'PENDING'
     || JSON.stringify(finalTenantNotice.payload).includes(removalTenantB.email) || finalTenantPrivateData[0]
     || finalTenantPrivateData[1] !== 0 || finalTenantPrivateData[2] !== 0) {
     fail(`Final-relationship removal did not delete the disposable account while preserving only encrypted notice delivery (${JSON.stringify({ status: tenantBRemoval.response.status,
       accountDeleted: finalTenantAccount === null, noticeQueued: Boolean(finalTenantNotice), noticeState: finalTenantNotice?.state })})`);
   }
+  console.log('[stage9:integration] PASS: final-relationship tenant removal rolls back completely beyond the transaction deadline; exact same-key/body retry with fresh proof commits once, preserves a recoverable receipt and applies orphan-account policy');
   const removalNoticeKeys = [
     `homeowner-removal:${managerAMembership.id}:${managerAMembership.accessRevision + 1}:email`,
     `homeowner-removal:${removalTenantMembershipA.id}:${tenantTargetBefore.accessRevision + 1}:email`,

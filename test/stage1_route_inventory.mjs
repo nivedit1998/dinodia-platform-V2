@@ -189,6 +189,7 @@ export const stage1RouteInventory = [
   ['POST', '/api/v2/homes/:homeId/tenants/invitations/:invitationId/resend', 'customer'],
   ['DELETE', '/api/v2/homes/:homeId/tenants/:tenantId', 'customer'],
   ['PUT', '/api/v2/homes/:homeId/tenants/:tenantId/area-grants', 'customer'],
+  ['POST', '/api/v2/homes/:homeId/tenants/:tenantId/management-operation-receipt', 'customer'],
 ];
 
 export const protectedStage1Routes = stage1RouteInventory.filter(([, , auth]) => !['public', 'public-login', 'public-disabled-feature', 'capability', 'signed-manufacturing-bootstrap'].includes(auth));

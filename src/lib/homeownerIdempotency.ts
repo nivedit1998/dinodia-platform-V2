@@ -25,6 +25,7 @@ export function homeownerRequestHash(value: unknown): string { return sha256(can
 export async function runIdempotentHomeMutation<T extends Record<string, unknown>>(db: Prisma.TransactionClient, input: {
   namespace: string; keyHash: string; actorId: string; homeId: string; requestHash: string; now?: Date;
   beforeLookup?: () => Promise<void>;
+  validateResponse?: (value: unknown) => value is T;
   operation: () => Promise<T>;
 }): Promise<T> {
   // Project PostgreSQL's `void` lock result to a supported Prisma scalar.
@@ -39,9 +40,17 @@ export async function runIdempotentHomeMutation<T extends Record<string, unknown
       || prior.expiresAt <= now || !prior.responseBody || typeof prior.responseBody !== 'object' || Array.isArray(prior.responseBody)) {
       throw new Stage1AuthError(409, 'IDEMPOTENCY_CONFLICT', 'This request key was already used');
     }
+    if (input.validateResponse && !input.validateResponse(prior.responseBody)) {
+      throw new Stage1AuthError(500, 'INTERNAL_ERROR', 'The saved operation receipt is invalid');
+    }
     return prior.responseBody as T;
   }
   const response = await input.operation();
+  // Validate before the durable success record is created. Otherwise a broken
+  // producer contract could commit a receipt which every client must reject.
+  if (input.validateResponse && !input.validateResponse(response)) {
+    throw new Stage1AuthError(500, 'INTERNAL_ERROR', 'The operation receipt is invalid');
+  }
   await db.idempotencyRecord.create({ data: {
     namespace: input.namespace, keyHash: input.keyHash, actorId: input.actorId, homeId: input.homeId,
     requestHash: input.requestHash, responseStatus: 200, responseBody: response as Prisma.InputJsonValue,

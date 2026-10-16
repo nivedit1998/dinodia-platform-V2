@@ -7,12 +7,16 @@ import { consumeStepUpInTransaction } from '@/lib/sensitiveOperationStepUp';
 import { validateHomeownerTenantAreaGrantsReceipt, validateHomeownerTenantAreaGrantsRequest } from '@/lib/contracts/dinodiaV1';
 import { homeownerIdempotencyIdentity, homeownerRequestHash, runIdempotentHomeMutation } from '@/lib/homeownerIdempotency';
 import { NativeAreaAccessError, replaceTenantAreaGrants } from '@/lib/nativeAreaAccess';
-import { prisma } from '@/lib/prisma';
 
 export const dynamic = 'force-dynamic';
+// Covers two bounded serializable attempts, connection acquisition and the
+// exact-receipt/retry path without relying on the platform default duration.
+export const maxDuration = 40;
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 export async function PUT(request: Request, context: { params: Promise<{ homeId: string; tenantId: string }> }) {
+  const startedAt = Date.now();
+  let phase = 'authenticate';
   try {
     const selected = await requireCustomerSelectedHome(request);
     const { homeId, tenantId } = await context.params;
@@ -30,16 +34,34 @@ export async function PUT(request: Request, context: { params: Promise<{ homeId:
     const identity = homeownerIdempotencyIdentity(selected.id, key, 'homeowner-tenant-area-grants:v1');
     const requestHash = homeownerRequestHash({ homeId, membershipId: selected.membershipId, tenantId, areaIds,
       expectedAccessRevision: body.expectedAccessRevision, expectedManagementRevision: body.expectedManagementRevision });
-    // A retry may return its saved receipt only while the actor and target still
-    // exist under current authority; an idempotency record is never authority.
-    const targetIsCurrent = await prisma.homeMembership.findFirst({ where: {
-      id: tenantId, homeId, role: 'TENANT', status: 'ACTIVE', customerAccount: { status: 'ACTIVE' },
-    }, select: { id: true } });
-    if (!targetIsCurrent) throw new Stage1AuthError(404, 'RESOURCE_NOT_FOUND', 'This tenant is no longer linked to the selected Home');
-
+    phase = 'transaction';
     const receipt = await serializableTransaction((tx) => runIdempotentHomeMutation(tx, {
       ...identity, actorId: selected.id, homeId, requestHash,
+      validateResponse: (value): value is Record<string, unknown> =>
+        validateHomeownerTenantAreaGrantsReceipt(value, homeId, tenantId),
+      // A submitted exact operation may be reconciled after the target was
+      // removed elsewhere. Revalidate current actor/Home authority before
+      // looking up its receipt, but do not require the historical target to
+      // remain active for a read of this actor's own committed result.
+      beforeLookup: async () => {
+        phase = 'authority_revalidation';
+        await tx.$queryRaw`SELECT "id" FROM "Home" WHERE "id" = ${homeId}::uuid FOR UPDATE`;
+        await tx.$queryRaw`SELECT "id" FROM "HomeMembership" WHERE "id" = ${selected.membershipId}::uuid FOR UPDATE`;
+        const [actor, home, hub] = await Promise.all([
+          tx.homeMembership.findFirst({ where: { id: selected.membershipId, customerAccountId: selected.id, homeId,
+            role: { in: ['OWNER', 'PROPERTY_MANAGER'] }, status: 'ACTIVE' }, select: { id: true, accessRevision: true } }),
+          tx.home.findFirst({ where: { id: homeId, lifecycle: 'ACTIVE', installationStatus: 'COMPLETE' },
+            select: { id: true, activeHubInstallationId: true } }),
+          tx.hubInstallation.findFirst({ where: { id: selected.hubInstallationId, homeId, lifecycleStatus: 'ACTIVE' },
+            select: { id: true, accessPolicyRevision: true } }),
+        ]);
+        if (!actor || !home || !hub || home.activeHubInstallationId !== hub.id
+          || Math.max(actor.accessRevision, hub.accessPolicyRevision) !== selected.policyRevision) {
+          throw new Stage1AuthError(404, 'RESOURCE_NOT_FOUND', 'Tenant Area access is unavailable for this Home');
+        }
+      },
       operation: async () => {
+        phase = 'lock_and_validate_target';
         await tx.$queryRaw`SELECT "id" FROM "Home" WHERE "id" = ${homeId}::uuid FOR UPDATE`;
         await tx.$queryRaw`SELECT "id" FROM "HomeMembership" WHERE "id" = ${selected.membershipId}::uuid FOR UPDATE`;
         await tx.$queryRaw`SELECT "id" FROM "HomeMembership" WHERE "id" = ${tenantId}::uuid FOR UPDATE`;
@@ -60,6 +82,7 @@ export async function PUT(request: Request, context: { params: Promise<{ homeId:
           policyRevision: currentPolicyRevision,
         });
         try {
+          phase = 'replace_grants_and_cleanup';
           const changed = await replaceTenantAreaGrants(tx, { actorAccountId: selected.id, actorMembershipId: actor.id,
             tenantMembershipId: tenantId, homeId, areaIds,
             expectedManagementRevision: Number(body.expectedManagementRevision), expectedAccessRevision: Number(body.expectedAccessRevision) });
@@ -74,8 +97,7 @@ export async function PUT(request: Request, context: { params: Promise<{ homeId:
           throw error;
         }
       },
-    }));
-    if (!validateHomeownerTenantAreaGrantsReceipt(receipt, homeId, tenantId)) throw new Stage1AuthError(500, 'INTERNAL_ERROR', 'The tenant Area-access receipt failed contract validation');
+    }), 2, { maxWaitMs: 1_500, timeoutMs: 14_000 });
     return NextResponse.json(receipt, { headers: { 'Cache-Control': 'no-store', Pragma: 'no-cache' } });
-  } catch (error) { return nativeV1ErrorResponse(error); }
+  } catch (error) { return nativeV1ErrorResponse(error, { operation: 'tenant_area_grants_replace', phase, startedAt }); }
 }

@@ -74,7 +74,9 @@ function canonicalCode(failure: BoundedFailure, status: number): string {
 
 /** The sole Native V1 Platform error envelope. Stage 1's legacy responder is
  * intentionally unchanged; only routes under /api/v2 use this boundary. */
-export function nativeV1ErrorResponse(error: unknown): NextResponse {
+export function nativeV1ErrorResponse(error: unknown, diagnostic?: {
+  operation: string; phase: string; startedAt: number;
+}): NextResponse {
   const failure = error && typeof error === 'object' ? error as BoundedFailure : {};
   const status = normalizedStatus(failure.status);
   const code = canonicalCode(failure, status);
@@ -82,6 +84,20 @@ export function nativeV1ErrorResponse(error: unknown): NextResponse {
     ? 'The request could not be completed'
     : String(failure.message ?? 'The request could not be completed').trim().slice(0, 240);
   const requestId = crypto.randomUUID();
+  if (status >= 500 && diagnostic) {
+    const record = error && typeof error === 'object'
+      ? error as { name?: unknown; code?: unknown; meta?: { code?: unknown; sqlState?: unknown; sqlstate?: unknown } }
+      : {};
+    const errorName = String(record.name ?? 'Error').slice(0, 48).replace(/[^A-Za-z0-9_.-]/g, '');
+    const prismaCode = String(record.code ?? '').match(/^P\d{4}$/)?.[0] ?? null;
+    const sqlStateValue = record.meta?.code ?? record.meta?.sqlState ?? record.meta?.sqlstate;
+    const sqlState = typeof sqlStateValue === 'string' && /^[0-9A-Z]{5}$/.test(sqlStateValue) ? sqlStateValue : null;
+    console.error('[native-v1-management-failure]', JSON.stringify({
+      requestId, operation: diagnostic.operation, phase: diagnostic.phase,
+      elapsedMs: Math.max(0, Math.min(600_000, Date.now() - diagnostic.startedAt)),
+      errorName, prismaCode, sqlState,
+    }));
+  }
   const retryable = code === 'HUB_UNAVAILABLE' || code === 'RATE_LIMITED' || code === 'INTERNAL_ERROR';
   const headers: Record<string, string> = { 'Cache-Control': 'no-store', Pragma: 'no-cache' };
   return NextResponse.json({ error: { code, message, requestId, retryable } }, {
