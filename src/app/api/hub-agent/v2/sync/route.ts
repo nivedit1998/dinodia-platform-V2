@@ -5,6 +5,7 @@ import { authErrorResponse, Stage1AuthError } from '@/lib/stage1Auth';
 import { authenticateHub } from '@/lib/stage1HubAuth';
 import { buildHubCloudConfiguration, finalizeHubCloudConfiguration } from '@/lib/hubCloudConfiguration';
 import { applyHubSyncEvent, assertUsageClosureRecoveryCurrent } from '@/lib/hubSyncIngestion';
+import { acknowledgeAppliedTenantPolicy } from '@/lib/hubTenantPolicyAcknowledgement';
 import { canReconcileHubSyncStream, HUB_SYNC_MAX_BODY_BYTES, HUB_SYNC_PROCESSING_MAX_EVENTS, hubSyncBodyHash, isInstallationBootstrapEvent, validateHubSyncEnvelope, type HubSyncEnvelope, type HubSyncEvent } from '@/lib/hubSyncEnvelope';
 import { resolveNativeInstallationSyncMode } from '@/lib/nativeInstallationSyncMode';
 import { canonicalDigest, eventDigests, HUB_USAGE_CLOSURE_RECOVERY_ACTION, HUB_USAGE_CLOSURE_AUTH_ACTION, HUB_USAGE_CLOSURE_REJECTION_ACTION, recoveryNormalizedFingerprint, signedEnvelopeFingerprint } from '@/lib/hubUsageClosureRecovery';
@@ -376,6 +377,14 @@ export async function POST(request: Request) {
               runtimeVersion: String(envelope.runtime.version).slice(0, 120), capabilitySummary: envelope.runtime.capabilities as Prisma.InputJsonValue,
             } });
           }
+          await acknowledgeAppliedTenantPolicy(tx, {
+            homeId: current.homeId, hubInstallationId: current.id,
+            homeManagementRevision: home.managementRevision,
+            acknowledgedCloudRevision: Number(envelope.acknowledgedCloudRevision),
+            configuration, streamId: envelope.streamId,
+            fromSequence: envelope.fromSequence, toSequence: envelope.toSequence,
+            bodyHash, now,
+          });
           return response;
         }, {
           isolationLevel: Prisma.TransactionIsolationLevel.Serializable,

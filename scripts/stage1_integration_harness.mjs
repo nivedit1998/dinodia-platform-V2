@@ -5084,6 +5084,253 @@ async function tenantMembershipRemovalChecks() {
     fail(`Actual scoped tenant removal did not revoke only the selected Home and reconcile retry (${JSON.stringify({ status: removed.response.status, error: removed.body?.error?.code, accountDeleted: removed.body?.accountDeleted, removed: removedMembership.status, other: preservedMembership.status, grantRevoked: Boolean(revokedGrant.revokedAt), outbox: Boolean(removalOutbox), retry: retry.response.status })})`);
   }
 
+  // A cloud cursor or a heartbeat is not evidence that the Hub applied the
+  // revocation. First send a real machine-signed sync carrying its old config
+  // acknowledgement; the outbox must remain pending. Then let the actual OS
+  // client apply the returned configuration and report that exact revision
+  // on its next signed sync.
+  const removalHubBeforeSync = await prisma.hubInstallation.findUniqueOrThrow({ where: { id: fixture.hubOneId }, select: {
+    syncStreamId: true, syncAcceptedSequence: true, acknowledgedCloudRevision: true,
+    cloudConfigurationRevision: true, cleanupState: true,
+  } });
+  if (!removalHubBeforeSync.syncStreamId
+    || Number(removalHubBeforeSync.acknowledgedCloudRevision) >= Number(removalHubBeforeSync.cloudConfigurationRevision)) {
+    fail('Disposable tenant removal did not create a newer unacknowledged signed Home configuration');
+  }
+  const currentCursor = Number(removalHubBeforeSync.syncAcceptedSequence);
+  const staleAckEnvelope = {
+    schemaVersion: 1, hubInstallationId: fixture.hubOneId,
+    streamId: String(removalHubBeforeSync.syncStreamId), fromSequence: currentCursor + 1,
+    toSequence: currentCursor, events: [], queueDepth: 0,
+    acknowledgedCloudRevision: Number(removalHubBeforeSync.acknowledgedCloudRevision),
+    runtime: hub.store.getSyncRuntime(hub.pairing.runtime), sentAt: new Date().toISOString(),
+  };
+  const staleAck = await machineRequest({ base, path: '/api/hub-agent/v2/sync', machineSecret: fixture.machineSecret,
+    body: { serial: fixture.identityOneSerial, identityGeneration: fixture.identityOneGeneration, ...staleAckEnvelope } });
+  const pendingAfterStaleAck = await prisma.nativeDomainOutbox.findUniqueOrThrow({ where: { id: removalOutbox.id }, select: { state: true, attempts: true } });
+  if (staleAck.response.status !== 200 || Number(staleAck.body?.cloudRevision) <= Number(staleAckEnvelope.acknowledgedCloudRevision)
+    || Number(staleAck.body?.configurationAppliedRevision) !== staleAckEnvelope.acknowledgedCloudRevision
+    || pendingAfterStaleAck.state !== 'PENDING' || pendingAfterStaleAck.attempts !== 0) {
+    fail(`An old signed configuration acknowledgement completed tenant revocation or failed to deliver the current policy (${JSON.stringify({ status: staleAck.response.status, cloudRevision: staleAck.body?.cloudRevision, applied: staleAck.body?.configurationAppliedRevision, outbox: pendingAfterStaleAck.state, attempts: pendingAfterStaleAck.attempts })})`);
+  }
+
+  const enforcementDeadline = Date.now() + 25_000;
+  let enforcedHub = null;
+  let enforcedOutbox = null;
+  while (Date.now() < enforcementDeadline) {
+    while (hub.pairing.syncing && Date.now() < enforcementDeadline) await sleep(10);
+    enforcedHub = await prisma.hubInstallation.findUniqueOrThrow({ where: { id: fixture.hubOneId }, select: {
+      acknowledgedCloudRevision: true, cloudConfigurationRevision: true, cleanupState: true,
+    } });
+    enforcedOutbox = await prisma.nativeDomainOutbox.findUniqueOrThrow({ where: { id: removalOutbox.id }, select: { state: true, attempts: true } });
+    const applied = Number(hub.store.getSyncOutbox()?.configurationAppliedRevision || 0);
+    if (enforcedOutbox.state === 'DELIVERED'
+      && Number(enforcedHub.acknowledgedCloudRevision) >= Number(staleAck.body.cloudRevision)
+      && applied >= Number(staleAck.body.cloudRevision)) break;
+    hub.pairing.nextRetryAt = 0;
+    await hub.pairing.syncNow();
+  }
+  const localConfiguration = hub.store.getPlatform()?.cloudConfiguration;
+  const locallyRevoked = !Array.isArray(localConfiguration?.memberships)
+    || !localConfiguration.memberships.some((row) => row.id === otherHome.memberships[0].id);
+  const noLongerAuthorized = await fetchJson(`${base}/api/v2/homes/${fixture.homeOneId}/tenant/access`, { headers });
+  const remainingTenantCleanup = await prisma.nativeDomainOutbox.count({ where: {
+    homeId: fixture.homeOneId, hubInstallationId: fixture.hubOneId,
+    eventType: { in: ['TENANT_MEMBERSHIP_REVOKED', 'TENANT_DEVICE_DECOMMISSION'] },
+    state: { notIn: ['DELIVERED', 'CANCELLED', 'EXPIRED'] },
+  } });
+  const pendingSupportRevocations = await prisma.supportSession.count({ where: {
+    homeId: fixture.homeOneId, hubInstallationId: fixture.hubOneId, status: 'PENDING_HUB_REVOKE',
+  } });
+  const expectedCleanupState = remainingTenantCleanup === 0 && pendingSupportRevocations === 0 ? 'ACKNOWLEDGED' : 'WAITING_FOR_TENANT_DEVICE_CLEANUP';
+  const enforcementAudit = await prisma.auditEvent.findFirst({ where: {
+    homeId: fixture.homeOneId, actorType: 'HUB', actorId: fixture.hubOneId,
+    action: 'hub_tenant_policy_enforced', targetId: otherHome.memberships[0].id,
+  }, select: { metadata: true } });
+  if (enforcedOutbox?.state !== 'DELIVERED' || enforcedOutbox.attempts !== 1
+    || Number(enforcedHub?.acknowledgedCloudRevision) < Number(staleAck.body.cloudRevision)
+    || Number(hub.store.getSyncOutbox()?.configurationAppliedRevision || 0) < Number(staleAck.body.cloudRevision)
+    || !locallyRevoked || noLongerAuthorized.response.status !== 404
+    || enforcedHub?.cleanupState !== expectedCleanupState
+    || !enforcementAudit || enforcementAudit.metadata?.configurationRevision !== Number(staleAck.body.cloudRevision)
+    || enforcementAudit.metadata?.streamId !== String(removalHubBeforeSync.syncStreamId)) {
+    fail(`Actual signed Hub policy application did not complete and audit only the removed Home membership (${JSON.stringify({ outbox: enforcedOutbox?.state, attempts: enforcedOutbox?.attempts, acknowledged: enforcedHub?.acknowledgedCloudRevision, cloud: enforcedHub?.cloudConfigurationRevision, locallyRevoked, cloudAccessStatus: noLongerAuthorized.response.status, cleanup: enforcedHub?.cleanupState, expectedCleanupState, audit: Boolean(enforcementAudit), localError: String(hub.pairing.lastError || '').slice(0, 80) })})`);
+  }
+  console.log('[stage6:integration] PASS: a stale signed configuration ACK leaves tenant revocation PENDING; the actual OS applies the revocation, acknowledges the exact current revision in a later signed sync, completes the scoped outbox once, records an audit and denies the removed Home membership');
+
+  // Exercise the homeowner DELETE route as well: this is the customer-facing
+  // flow that originally left the Hub cleanup row pending. Seed the disposable
+  // tenant/device into the actual OS policy first so the Hub must remove its
+  // local private device before its next signed configuration acknowledgement.
+  const ownerRemovalTenant = await createTenant('owner-removal-ack', [fixture.homeOneId]);
+  const ownerRemovalMembership = ownerRemovalTenant.memberships[0];
+  const ownerRemovalDevice = await prisma.nativeDevice.create({ data: {
+    homeId: fixture.homeOneId, hubInstallationId: fixture.hubOneId,
+    osDeviceId: `stage6-owner-removal-${crypto.randomUUID()}`,
+    originalName: 'Disposable owner-removal lamp', customerLabel: 'Disposable private lamp',
+    technicalLabel: 'tenant_device', managementClass: 'TENANT_DEVICE', ownerMembershipId: ownerRemovalMembership.id,
+    deviceType: 'light', protocol: 'virtual', lifecycle: 'DISCOVERED', descriptorRevision: 1,
+  } });
+  await prisma.deviceAreaAssignment.create({ data: {
+    homeId: fixture.homeOneId, deviceId: ownerRemovalDevice.id, areaId: fixture.areaOneId,
+    source: 'STAGE6_DISPOSABLE_OWNER_REMOVAL', actorType: 'SYSTEM',
+  } });
+  await prisma.nativeDevice.update({ where: { id: ownerRemovalDevice.id }, data: { lifecycle: 'INSTALLED' } });
+  await hub.store.upsertDevice({ id: ownerRemovalDevice.osDeviceId, name: 'Disposable owner-removal lamp',
+    protocol: 'virtual', areaId: fixture.areaOneOsId, setup: { status: 'installed' },
+    managementClass: 'tenant_device', tenantOwnerMembershipId: ownerRemovalMembership.id,
+    metadata: { managementClass: 'tenant_device', tenantOwnerMembershipId: ownerRemovalMembership.id } });
+  while (hub.pairing.syncing) await sleep(10);
+  hub.pairing.nextRetryAt = 0;
+  await hub.pairing.syncNow();
+  const preRemovalConfiguration = hub.store.getPlatform()?.cloudConfiguration;
+  if (!preRemovalConfiguration?.memberships?.some((item) => item.id === ownerRemovalMembership.id)
+    || !preRemovalConfiguration?.devicePolicies?.some((item) => item.osDeviceId === ownerRemovalDevice.osDeviceId
+      && item.managementClass === 'TENANT_DEVICE' && item.ownerMembershipId === ownerRemovalMembership.id)
+    || !hub.store.getDevice(ownerRemovalDevice.osDeviceId)) {
+    fail('Owner-removal fixture did not first establish the tenant/device in the actual OS configuration and local Store');
+  }
+  const ownerSessionCookie = `dinodia_customer_session=${encodeURIComponent(fixture.propertySessionSecret)}`;
+  const ownerRequirements = await fetchJson(`${base}/api/v2/auth/requirements`, { headers: { cookie: ownerSessionCookie } });
+  const ownerCurrentPolicy = ownerRequirements.body?.policy;
+  if (ownerRequirements.response.status !== 200 || !ownerCurrentPolicy?.version
+    || !/^[a-f0-9]{64}$/.test(ownerCurrentPolicy.contentSha256 || '')) {
+    fail('Disposable homeowner could not resolve the server-owned current customer policy');
+  }
+  if (ownerRequirements.body.accepted === false) {
+    const ownerPolicyAccepted = await fetchJson(`${base}/api/v2/auth/policy/acceptance`, { method: 'POST',
+      headers: { cookie: ownerSessionCookie, 'content-type': 'application/json' },
+      body: JSON.stringify({ version: ownerCurrentPolicy.version, contentSha256: ownerCurrentPolicy.contentSha256, accepted: true }) });
+    if (ownerPolicyAccepted.response.status !== 200 || ownerPolicyAccepted.body.policyVersion !== ownerCurrentPolicy.version) {
+      fail('Disposable homeowner could not accept the server-current customer policy');
+    }
+  } else if (ownerRequirements.body.accepted !== true) {
+    fail('Disposable homeowner policy requirements returned an unexpected accepted state');
+  }
+  const ownerLogin = await fetchJson(`${base}/api/v2/mobile/session`, { method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ email: fixture.propertyEmail, password: fixture.propertyPassword,
+      deviceInstallationId: fixture.propertyInstallationId, publicKey: fixture.propertyPublicKey,
+      deviceName: 'Disposable owner-removal test phone', model: 'integration-test', osFamily: 'test', osVersion: 'test' }) });
+  if (ownerLogin.response.status !== 200 || !/^dno-customer-access-[A-Za-z0-9_-]{32,}$/.test(ownerLogin.body?.accessToken ?? '')) {
+    fail(`Disposable homeowner could not establish a real account-access session (${ownerLogin.response.status}/${ownerLogin.body?.error?.code ?? 'none'})`);
+  }
+  const ownerHeaders = { authorization: `Bearer ${ownerLogin.body.accessToken}`,
+    'x-dinodia-home-id': fixture.homeOneId, 'content-type': 'application/json' };
+  const ownerHomeBefore = await prisma.home.findUniqueOrThrow({ where: { id: fixture.homeOneId }, select: { managementRevision: true } });
+  const ownerTargetBefore = await prisma.homeMembership.findUniqueOrThrow({ where: { id: ownerRemovalMembership.id }, select: { accessRevision: true } });
+  const ownerStepValue = { expectedAccessRevision: ownerTargetBefore.accessRevision,
+    expectedManagementRevision: ownerHomeBefore.managementRevision };
+  const ownerChallenge = await fetchJson(`${base}/api/v2/security/step-up/challenge`, { method: 'POST', headers: ownerHeaders,
+    body: JSON.stringify({ operationKind: 'home_tenant_remove', targetIds: [ownerRemovalMembership.id], value: ownerStepValue }) });
+  if (ownerChallenge.response.status !== 200) fail(`Disposable owner-removal challenge failed (${ownerChallenge.response.status}/${ownerChallenge.body?.error?.code ?? 'none'})`);
+  const ownerSignature = crypto.sign(null, stepUpChallengeMessage({ challengeId: ownerChallenge.body.challengeId,
+    nonce: ownerChallenge.body.nonce, operationDigest: ownerChallenge.body.operationDigest }),
+  crypto.createPrivateKey(fixture.propertyTrustedPhonePrivateKey)).toString('base64url');
+  const ownerProof = await fetchJson(`${base}/api/v2/security/step-up/issue`, { method: 'POST', headers: ownerHeaders,
+    body: JSON.stringify({ challengeId: ownerChallenge.body.challengeId, nonce: ownerChallenge.body.nonce, deviceSignature: ownerSignature }) });
+  if (ownerProof.response.status !== 200 || typeof ownerProof.body?.proof !== 'string') fail('Disposable homeowner removal did not issue its exact signed proof');
+  const ownerRemoval = await fetchJson(`${base}/api/v2/homes/${fixture.homeOneId}/tenants/${ownerRemovalMembership.id}`, {
+    method: 'DELETE', headers: ownerHeaders,
+    body: JSON.stringify({ ...ownerStepValue, proof: ownerProof.body.proof, idempotencyKey: `stage6-owner-removal-${crypto.randomUUID()}` }),
+  });
+  const ownerMembershipTombstone = await prisma.nativeDomainOutbox.findFirst({ where: {
+    homeId: fixture.homeOneId, hubInstallationId: fixture.hubOneId, aggregateType: 'HomeMembership',
+    aggregateId: ownerRemovalMembership.id, eventType: 'TENANT_MEMBERSHIP_REVOKED',
+  }, select: { id: true, state: true, attempts: true, payload: true } });
+  const ownerDeviceTombstone = await prisma.nativeDomainOutbox.findFirst({ where: {
+    homeId: fixture.homeOneId, hubInstallationId: fixture.hubOneId, aggregateType: 'NativeDevice',
+    aggregateId: ownerRemovalDevice.id, eventType: 'TENANT_DEVICE_DECOMMISSION',
+  }, select: { id: true, state: true, attempts: true, payload: true } });
+  const ownerRemovedDeviceCloud = await prisma.nativeDevice.findUnique({ where: { id: ownerRemovalDevice.id }, select: { id: true } });
+  if (ownerRemoval.response.status !== 200 || !ownerMembershipTombstone || !ownerDeviceTombstone) {
+    fail(`Actual homeowner removal did not create the expected pending tombstones (${JSON.stringify({ status: ownerRemoval.response.status,
+      errorCode: ownerRemoval.body?.error?.code, membershipState: ownerRemoval.body?.state,
+      membershipTombstone: Boolean(ownerMembershipTombstone), deviceTombstone: Boolean(ownerDeviceTombstone),
+      deviceStillPresent: Boolean(ownerRemovedDeviceCloud) })})`);
+  }
+  const ownerHubBeforeAck = await prisma.hubInstallation.findUniqueOrThrow({ where: { id: fixture.hubOneId }, select: {
+    syncStreamId: true, syncAcceptedSequence: true, acknowledgedCloudRevision: true, cloudConfigurationRevision: true,
+  } });
+  if (ownerRemoval.response.status !== 200 || ownerRemoval.body?.state !== 'REMOVED' || ownerRemoval.body?.hubEnforcement !== 'PENDING'
+    || ownerMembershipTombstone.state !== 'PENDING' || ownerMembershipTombstone.attempts !== 0
+    || ownerDeviceTombstone.state !== 'PENDING' || ownerDeviceTombstone.attempts !== 0
+    || ownerDeviceTombstone.payload?.osDeviceId !== ownerRemovalDevice.osDeviceId
+    || ownerDeviceTombstone.payload?.membershipId !== ownerRemovalMembership.id
+    || ownerDeviceTombstone.payload?.managementRevision !== ownerRemoval.body?.managementRevision
+    || ownerRemovedDeviceCloud || !ownerHubBeforeAck.syncStreamId
+    || Number(ownerHubBeforeAck.acknowledgedCloudRevision) >= Number(ownerHubBeforeAck.cloudConfigurationRevision)) {
+    fail(`Actual homeowner removal did not create exact pending Hub policy/device evidence (${JSON.stringify({ status: ownerRemoval.response.status,
+      hubEnforcement: ownerRemoval.body?.hubEnforcement, membershipOutbox: ownerMembershipTombstone.state,
+      deviceOutbox: ownerDeviceTombstone.state, devicePresent: Boolean(ownerRemovedDeviceCloud), oldAck: ownerHubBeforeAck.acknowledgedCloudRevision,
+      desired: ownerHubBeforeAck.cloudConfigurationRevision })})`);
+  }
+
+  const ownerCursor = Number(ownerHubBeforeAck.syncAcceptedSequence);
+  const staleOwnerAck = await machineRequest({ base, path: '/api/hub-agent/v2/sync', machineSecret: fixture.machineSecret,
+    body: { serial: fixture.identityOneSerial, identityGeneration: fixture.identityOneGeneration,
+      schemaVersion: 1, hubInstallationId: fixture.hubOneId, streamId: String(ownerHubBeforeAck.syncStreamId),
+      fromSequence: ownerCursor + 1, toSequence: ownerCursor, events: [], queueDepth: 0,
+      acknowledgedCloudRevision: Number(ownerHubBeforeAck.acknowledgedCloudRevision),
+      runtime: hub.store.getSyncRuntime(hub.pairing.runtime), sentAt: new Date().toISOString() },
+  });
+  const membershipAfterStaleOwnerAck = await prisma.nativeDomainOutbox.findUniqueOrThrow({ where: { id: ownerMembershipTombstone.id }, select: { state: true, attempts: true } });
+  const deviceAfterStaleOwnerAck = await prisma.nativeDomainOutbox.findUniqueOrThrow({ where: { id: ownerDeviceTombstone.id }, select: { state: true, attempts: true } });
+  if (staleOwnerAck.response.status !== 200 || Number(staleOwnerAck.body?.configurationAppliedRevision) !== Number(ownerHubBeforeAck.acknowledgedCloudRevision)
+    || membershipAfterStaleOwnerAck.state !== 'PENDING' || membershipAfterStaleOwnerAck.attempts !== 0
+    || deviceAfterStaleOwnerAck.state !== 'PENDING' || deviceAfterStaleOwnerAck.attempts !== 0) {
+    fail('A stale signed homeowner-removal configuration acknowledgement completed membership or private-device cleanup');
+  }
+
+  const ownerEnforcementDeadline = Date.now() + 25_000;
+  let ownerMembershipAfterSync = null;
+  let ownerDeviceAfterSync = null;
+  let ownerHubAfterSync = null;
+  while (Date.now() < ownerEnforcementDeadline) {
+    while (hub.pairing.syncing && Date.now() < ownerEnforcementDeadline) await sleep(10);
+    hub.pairing.nextRetryAt = 0;
+    await hub.pairing.syncNow();
+    [ownerMembershipAfterSync, ownerDeviceAfterSync, ownerHubAfterSync] = await Promise.all([
+      prisma.nativeDomainOutbox.findUniqueOrThrow({ where: { id: ownerMembershipTombstone.id }, select: { state: true, attempts: true } }),
+      prisma.nativeDomainOutbox.findUniqueOrThrow({ where: { id: ownerDeviceTombstone.id }, select: { state: true, attempts: true } }),
+      prisma.hubInstallation.findUniqueOrThrow({ where: { id: fixture.hubOneId }, select: { acknowledgedCloudRevision: true, cloudConfigurationRevision: true, cleanupState: true } }),
+    ]);
+    const localConfig = hub.store.getPlatform()?.cloudConfiguration;
+    if (ownerMembershipAfterSync.state === 'DELIVERED' && ownerDeviceAfterSync.state === 'DELIVERED'
+      && Number(ownerHubAfterSync.acknowledgedCloudRevision) >= Number(staleOwnerAck.body.cloudRevision)
+      && Number(hub.store.getSyncOutbox()?.configurationAppliedRevision || 0) >= Number(staleOwnerAck.body.cloudRevision)
+      && !hub.store.getDevice(ownerRemovalDevice.osDeviceId)
+      && !localConfig?.memberships?.some((item) => item.id === ownerRemovalMembership.id)) break;
+  }
+  const ownerCloudAccessDenied = await fetchJson(`${base}/api/v2/homes/${fixture.homeOneId}/tenant/access`, { headers: {
+    cookie: `dinodia_customer_session=${encodeURIComponent(ownerRemovalTenant.rawSession)}`, 'x-dinodia-home-id': fixture.homeOneId,
+  } });
+  const ownerAuditRows = await prisma.auditEvent.findMany({ where: { homeId: fixture.homeOneId,
+    actorType: 'HUB', actorId: fixture.hubOneId, action: 'hub_tenant_policy_enforced',
+    targetId: { in: [ownerRemovalMembership.id, ownerRemovalDevice.id] },
+  }, select: { targetId: true, metadata: true } });
+  const ownerPolicyAuditIsBound = ownerAuditRows.length === 2 && ownerAuditRows.every((row) =>
+    row.metadata?.configurationRevision === Number(staleOwnerAck.body.cloudRevision)
+    && row.metadata?.streamId === String(ownerHubBeforeAck.syncStreamId));
+  if (ownerMembershipAfterSync?.state !== 'DELIVERED' || ownerMembershipAfterSync.attempts !== 1
+    || ownerDeviceAfterSync?.state !== 'DELIVERED' || ownerDeviceAfterSync.attempts !== 1
+    || Number(ownerHubAfterSync?.acknowledgedCloudRevision) < Number(staleOwnerAck.body.cloudRevision)
+    || Number(hub.store.getSyncOutbox()?.configurationAppliedRevision || 0) < Number(staleOwnerAck.body.cloudRevision)
+    || hub.store.getDevice(ownerRemovalDevice.osDeviceId)
+    || hub.store.getPlatform()?.cloudConfiguration?.memberships?.some((item) => item.id === ownerRemovalMembership.id)
+    // Final homeowner removal deletes the disposable account and revokes its
+    // access-token session, so this exact route correctly returns 401. The
+    // non-final membership-removal case above separately asserts 404 after
+    // the surviving account loses that Home relationship.
+    || ownerCloudAccessDenied.response.status !== 401 || !ownerPolicyAuditIsBound
+    || ownerHubAfterSync?.cleanupState !== 'ACKNOWLEDGED') {
+    fail(`Actual homeowner removal did not complete only after durable local device/policy application and signed acknowledgement (${JSON.stringify({ membership: ownerMembershipAfterSync,
+      device: ownerDeviceAfterSync, acknowledged: ownerHubAfterSync?.acknowledgedCloudRevision, desired: ownerHubAfterSync?.cloudConfigurationRevision,
+      localDeviceRemoved: !hub.store.getDevice(ownerRemovalDevice.osDeviceId), localMembershipRemoved: !hub.store.getPlatform()?.cloudConfiguration?.memberships?.some((item) => item.id === ownerRemovalMembership.id),
+      cloudAccess: ownerCloudAccessDenied.response.status, audits: ownerAuditRows.length, auditBound: ownerPolicyAuditIsBound,
+      cleanup: ownerHubAfterSync?.cleanupState })})`);
+  }
+  console.log('[stage6:integration] PASS: actual homeowner tenant DELETE keeps membership and private-device tombstones PENDING for a stale acknowledgement; the actual OS removes the seeded private device, durably applies the exact policy, then a later signed sync completes each tombstone once with correlated audits and denies cloud access');
+
   const finalTenant = await createTenant('final', [fixture.homeOneId]);
   await acceptConfiguredPolicy(finalTenant);
   const finalHeaders = { cookie: `dinodia_customer_session=${encodeURIComponent(finalTenant.rawSession)}`, 'x-dinodia-home-id': fixture.homeOneId, 'content-type': 'application/json' };

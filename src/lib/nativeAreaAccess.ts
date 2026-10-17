@@ -43,7 +43,7 @@ export async function replaceTenantAreaGrants(db: Prisma.TransactionClient, inpu
       assignments: { some: { validUntil: null, areaId: { in: removedAreaIds } } },
       NOT: { assignments: { some: { validUntil: null, areaId: { in: areaIds }, area: { status: 'ACTIVE' } } } },
     },
-    select: { id: true, hubInstallationId: true },
+    select: { id: true, hubInstallationId: true, osDeviceId: true, assignments: { where: { validUntil: null }, select: { areaId: true } } },
   }) : [];
   const nextRevision = home.managementRevision + 1;
   const changedHome = await db.home.updateMany({ where: { id: home.id, managementRevision: home.managementRevision }, data: { managementRevision: { increment: 1 } } });
@@ -62,7 +62,9 @@ export async function replaceTenantAreaGrants(db: Prisma.TransactionClient, inpu
         create: {
           homeId: input.homeId, hubInstallationId: device.hubInstallationId, aggregateType: 'NativeDevice', aggregateId: device.id,
           eventType: 'TENANT_DEVICE_DECOMMISSION', idempotencyKey: `tenant-area-revocation:${nextRevision}:${device.id}`,
-          payload: { operation: 'REMOVE_TENANT_DEVICE', deviceId: device.id, membershipId: tenant.id, policyRevision: nextRevision }, expiresAt,
+          payload: { operation: 'REMOVE_TENANT_DEVICE', deviceId: device.id, osDeviceId: device.osDeviceId,
+            areaIds: device.assignments.map((assignment) => assignment.areaId), membershipId: tenant.id,
+            policyRevision: nextRevision, managementRevision: nextRevision, accessRevision: tenant.accessRevision + 1 }, expiresAt,
         },
         update: {},
       });

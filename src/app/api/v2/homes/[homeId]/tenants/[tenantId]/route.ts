@@ -124,13 +124,16 @@ export async function DELETE(request: Request, context: { params: Promise<{ home
       await tx.membershipInvitation.updateMany({ where: { homeId, state: 'PENDING', OR: [{ targetAccountId: target.customerAccountId }, { targetEmailNormalized: target.customerAccount.emailNormalized }] }, data: { state: 'REVOKED', revokedAt: now } });
       await tx.areaAccessRequest.updateMany({ where: { homeId, requesterAccountId: target.customerAccountId, status: 'PENDING' }, data: { status: 'CANCELLED', cancelledAt: now } });
       const privateDevices = await tx.nativeDevice.findMany({ where: { homeId, ownerMembershipId: tenantId, managementClass: 'TENANT_DEVICE' },
-        select: { id: true, hubInstallationId: true, lifecycle: true } });
+        select: { id: true, hubInstallationId: true, lifecycle: true, osDeviceId: true,
+          assignments: { where: { validUntil: null }, select: { areaId: true } } } });
       for (const device of privateDevices) {
         if (device.lifecycle === 'RETIRED' || device.lifecycle === 'REMOVED') continue;
         await tx.nativeDomainOutbox.upsert({ where: { idempotencyKey: `homeowner-tenant-removal:${tenantId}:${nextAccessRevision}:device:${device.id}` }, create: {
           homeId, hubInstallationId: device.hubInstallationId, aggregateType: 'NativeDevice', aggregateId: device.id,
           eventType: 'TENANT_DEVICE_DECOMMISSION', idempotencyKey: `homeowner-tenant-removal:${tenantId}:${nextAccessRevision}:device:${device.id}`,
-          payload: { operation: 'REMOVE_TENANT_DEVICE', deviceId: device.id, membershipId: tenantId, policyRevision: nextAccessRevision },
+          payload: { operation: 'REMOVE_TENANT_DEVICE', deviceId: device.id, osDeviceId: device.osDeviceId,
+            areaIds: device.assignments.map((assignment) => assignment.areaId), membershipId: tenantId,
+            policyRevision: nextAccessRevision, managementRevision: nextManagementRevision },
           expiresAt: new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000),
         }, update: {} });
       }

@@ -174,7 +174,8 @@ export async function DELETE(request: Request, context: { params: Promise<{ home
         data: { revokedAt: now, revokeReason: 'tenant_self_removal', policyRevision: nextAccessRevision } });
 
       const privateDevices = await tx.nativeDevice.findMany({ where: { homeId, ownerMembershipId: membership.id,
-        managementClass: 'TENANT_DEVICE' }, select: { id: true, hubInstallationId: true, lifecycle: true } });
+        managementClass: 'TENANT_DEVICE' }, select: { id: true, hubInstallationId: true, lifecycle: true, osDeviceId: true,
+          assignments: { where: { validUntil: null }, select: { areaId: true } } } });
       const affectedHubIds = new Set<string>([selected.hubInstallationId]);
       for (const deviceRow of privateDevices) {
         affectedHubIds.add(deviceRow.hubInstallationId);
@@ -182,7 +183,9 @@ export async function DELETE(request: Request, context: { params: Promise<{ home
         await tx.nativeDomainOutbox.upsert({ where: { idempotencyKey: `tenant-membership-removal:${membership.id}:${nextAccessRevision}:device:${deviceRow.id}` }, create: {
           homeId, hubInstallationId: deviceRow.hubInstallationId, aggregateType: 'NativeDevice', aggregateId: deviceRow.id,
           eventType: 'TENANT_DEVICE_DECOMMISSION', idempotencyKey: `tenant-membership-removal:${membership.id}:${nextAccessRevision}:device:${deviceRow.id}`,
-          payload: { operation: 'REMOVE_TENANT_DEVICE', deviceId: deviceRow.id, membershipId: membership.id, policyRevision: nextAccessRevision },
+          payload: { operation: 'REMOVE_TENANT_DEVICE', deviceId: deviceRow.id, osDeviceId: deviceRow.osDeviceId,
+            areaIds: deviceRow.assignments.map((assignment) => assignment.areaId), membershipId: membership.id,
+            policyRevision: nextAccessRevision, managementRevision: nextManagementRevision },
           expiresAt: new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000),
         }, update: {} });
       }
