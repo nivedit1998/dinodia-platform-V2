@@ -4,9 +4,10 @@ import { prisma } from '@/lib/prisma';
 import { authErrorResponse, Stage1AuthError } from '@/lib/stage1Auth';
 import { authenticateHub } from '@/lib/stage1HubAuth';
 import { buildHubCloudConfiguration, finalizeHubCloudConfiguration } from '@/lib/hubCloudConfiguration';
-import { applyHubSyncEvent } from '@/lib/hubSyncIngestion';
-import { canReconcileHubSyncStream, HUB_SYNC_MAX_BODY_BYTES, HUB_SYNC_PROCESSING_MAX_EVENTS, hubSyncBodyHash, isInstallationBootstrapEvent, validateHubSyncEnvelope } from '@/lib/hubSyncEnvelope';
+import { applyHubSyncEvent, assertUsageClosureRecoveryCurrent } from '@/lib/hubSyncIngestion';
+import { canReconcileHubSyncStream, HUB_SYNC_MAX_BODY_BYTES, HUB_SYNC_PROCESSING_MAX_EVENTS, hubSyncBodyHash, isInstallationBootstrapEvent, validateHubSyncEnvelope, type HubSyncEnvelope, type HubSyncEvent } from '@/lib/hubSyncEnvelope';
 import { resolveNativeInstallationSyncMode } from '@/lib/nativeInstallationSyncMode';
+import { canonicalDigest, eventDigests, HUB_USAGE_CLOSURE_RECOVERY_ACTION, HUB_USAGE_CLOSURE_AUTH_ACTION, HUB_USAGE_CLOSURE_REJECTION_ACTION, recoveryNormalizedFingerprint, signedEnvelopeFingerprint } from '@/lib/hubUsageClosureRecovery';
 
 export const dynamic = 'force-dynamic';
 // The durable sync transaction can legitimately wait behind a concurrent
@@ -47,6 +48,10 @@ async function readBoundedBody(request: Request): Promise<string> {
 }
 
 export async function POST(request: Request) {
+  let rejectedUsageContext: {
+    homeId: string; hubInstallationId: string; serial: string; identityGeneration: number;
+    bodyHash: string; envelope: HubSyncEnvelope; target: HubSyncEvent;
+  } | null = null;
   try {
     const raw = await readBoundedBody(request);
     const hub = await authenticateHub(request, raw, { maxBodyBytes: HUB_SYNC_MAX_BODY_BYTES });
@@ -66,6 +71,7 @@ export async function POST(request: Request) {
     // response loss and retry. Freshness is enforced by authenticateHub's
     // signed request timestamp/nonce, not by expiring this persisted body.
     const bodyHash = hubSyncBodyHash(raw);
+    const targetIdentity = hub.identity;
     const rawSyncStatus = envelope.runtime.capabilities.nativeSyncOutbox;
     const syncStatus = rawSyncStatus && typeof rawSyncStatus === 'object' && !Array.isArray(rawSyncStatus)
       ? rawSyncStatus as { gapDetected: boolean; criticalBacklog: boolean; telemetryPaused: boolean; droppedTelemetryCount: number }
@@ -183,6 +189,45 @@ export async function POST(request: Request) {
             };
           }
 
+          let usageRecoveryGrant: { id: string; metadata: Record<string, unknown>; oldPayloadHash: string } | null = null;
+          if (envelope.usageClosureRecovery) {
+            const marker = envelope.usageClosureRecovery;
+            const grant = await tx.auditEvent.findFirst({ where: {
+              id: marker.authorizationId, homeId: current.homeId, actorType: 'HUB', actorId: current.id,
+              category: 'SECURITY', action: HUB_USAGE_CLOSURE_AUTH_ACTION,
+              targetType: 'HubInstallation', targetId: current.id,
+            }, select: { id: true, metadata: true } });
+            const metadata = grant?.metadata && typeof grant.metadata === 'object' && !Array.isArray(grant.metadata)
+              ? grant.metadata as Record<string, unknown> : null;
+            const normalized = structuredClone(envelope) as HubSyncEnvelope;
+            delete normalized.usageClosureRecovery;
+            const repairedTarget = normalized.events.find((event) => event.id === marker.targetEventId && event.sequence === marker.targetSequence);
+            if (repairedTarget?.type === 'usage.bucket') repairedTarget.payload.closedAt = null;
+            const fingerprint = signedEnvelopeFingerprint({ serial, identityGeneration: Number(identityGeneration), envelope: normalized });
+            const target = envelope.events.find((event) => event.id === marker.targetEventId && event.sequence === marker.targetSequence);
+            const grantTarget = metadata?.target && typeof metadata.target === 'object' && !Array.isArray(metadata.target)
+              ? metadata.target as Record<string, unknown> : null;
+            if (!grant || !metadata || metadata.version !== 1 || metadata.consumedAt !== null
+              || Date.parse(String(metadata.expiresAt || '')) <= now.getTime()
+              || metadata.bodyHash !== marker.rejectedBodyHash || metadata.streamId !== envelope.streamId
+              || Number(metadata.fromSequence) !== envelope.fromSequence || Number(metadata.toSequence) !== envelope.toSequence
+              || metadata.hubInstallationId !== current.id || Number(metadata.identityGeneration) !== Number(identityGeneration)
+              || fingerprint !== metadata.normalizedFingerprint
+              || !Array.isArray(metadata.eventDigests) || canonicalDigest(eventDigests(normalized)) !== canonicalDigest(metadata.eventDigests)
+              || !target || target.type !== 'usage.bucket' || target.payload.closedAt !== metadata.closedAt
+              || !grantTarget || grantTarget.eventId !== target.id || Number(grantTarget.sequence) !== target.sequence
+              || grantTarget.correctedPayloadHash !== canonicalDigest(target.payload)
+              || current.syncStreamId !== envelope.streamId || Number(current.syncAcceptedSequence) !== envelope.fromSequence - 1) {
+              throw new Stage1AuthError(409, 'hub_sync_usage_recovery_grant_invalid', 'The exact signed recovery grant is expired, consumed, or no longer matches the authoritative range');
+            }
+            if (target?.type !== 'usage.bucket') throw new Stage1AuthError(409, 'hub_sync_usage_recovery_grant_invalid', 'The authorized recovery target is unavailable');
+            await assertUsageClosureRecoveryCurrent(tx, {
+              homeId: current.homeId, hubInstallationId: current.id,
+              identityGeneration: Number(identityGeneration), payload: target.payload,
+            });
+            usageRecoveryGrant = { id: grant.id, metadata, oldPayloadHash: String(grantTarget.payloadHash) };
+          }
+
           const streamReconciled = Boolean(current.syncStreamId && current.syncStreamId !== envelope.streamId
             && canReconcileHubSyncStream(envelope, {
               installationSyncMode: syncMode,
@@ -220,10 +265,49 @@ export async function POST(request: Request) {
           }
 
           if (envelope.events.length) {
-            for (const event of envelope.events) await applyHubSyncEvent(tx, {
-              event, homeId: current.homeId, hubInstallationId: current.id,
-              identityGeneration: hub.identity.identityGeneration, now,
-            });
+            for (const event of envelope.events) {
+              try {
+                await applyHubSyncEvent(tx, {
+                  event, homeId: current.homeId, hubInstallationId: current.id,
+                  identityGeneration: hub.identity.identityGeneration, now,
+                });
+              } catch (error) {
+                const code = typeof error === 'object' && error && 'code' in error ? String((error as { code?: unknown }).code) : '';
+                if (code === 'hub_sync_usage_bucket_closure_invalid' && event.type === 'usage.bucket') {
+                  rejectedUsageContext = {
+                    homeId: current.homeId, hubInstallationId: current.id, serial: targetIdentity.serialNumber,
+                    identityGeneration: targetIdentity.identityGeneration, bodyHash, envelope, target: event,
+                  };
+                }
+                throw error;
+              }
+            }
+          }
+          if (usageRecoveryGrant && envelope.usageClosureRecovery) {
+            const marker = envelope.usageClosureRecovery;
+            const targetEvent = envelope.events.find((event) => event.id === marker.targetEventId && event.sequence === marker.targetSequence);
+            const targetPayload = targetEvent?.payload;
+            const targetDevice = targetPayload ? await tx.nativeDevice.findUnique({ where: { hubInstallationId_osDeviceId: {
+              hubInstallationId: current.id, osDeviceId: String(targetPayload.osDeviceId),
+            } }, select: { id: true } }) : null;
+            const metadata = {
+              ...usageRecoveryGrant.metadata,
+              consumedAt: now.toISOString(), acceptedBodyHash: bodyHash,
+              acceptedStreamId: envelope.streamId, acceptedFromSequence: envelope.fromSequence,
+              acceptedToSequence: envelope.toSequence,
+            };
+            await tx.auditEvent.update({ where: { id: usageRecoveryGrant.id }, data: { metadata } });
+            await tx.auditEvent.create({ data: {
+              homeId: current.homeId, actorType: 'HUB', actorId: current.id, category: 'SECURITY',
+              action: HUB_USAGE_CLOSURE_RECOVERY_ACTION, targetType: 'NativeDevice', targetId: targetDevice?.id || null,
+              metadata: {
+                version: 1, authorizationId: usageRecoveryGrant.id, rejectedBodyHash: marker.rejectedBodyHash,
+                acceptedBodyHash: bodyHash, streamId: envelope.streamId, fromSequence: envelope.fromSequence,
+                toSequence: envelope.toSequence, eventId: marker.targetEventId, eventSequence: marker.targetSequence,
+                oldPayloadHash: usageRecoveryGrant.oldPayloadHash, newPayloadHash: targetPayload ? canonicalDigest(targetPayload) : null,
+                changedFields: ['closedAt'], closedAt: targetPayload?.closedAt ?? null,
+              }, purgeAt: new Date(now.getTime() + 365 * 24 * 60 * 60 * 1000),
+            } });
           }
           const configCandidate = await buildHubCloudConfiguration(tx, { homeId: current.homeId, hubInstallationId: current.id });
           const currentConfig = finalizeHubCloudConfiguration(configCandidate, current.cloudConfigurationRevision);
@@ -247,6 +331,7 @@ export async function POST(request: Request) {
             // retain the explicit recovery-required state until reconciliation.
             resnapshotRequired: Boolean(syncStatus?.gapDetected || syncStatus?.criticalBacklog),
             nextPollAfterSeconds: 30,
+            ...(envelope.usageClosureRecovery ? { usageClosureRecoveryAccepted: true, acceptedBodyHash: bodyHash } : {}),
           };
 
           if (envelope.events.length) {
@@ -324,5 +409,45 @@ export async function POST(request: Request) {
       }
     }
     throw new Stage1AuthError(409, 'hub_sync_cursor_race', 'Concurrent sync requests could not be reconciled; retry the same durable batch');
-  } catch (error) { return authErrorResponse(error); }
+  } catch (error) {
+    const code = typeof error === 'object' && error && 'code' in error ? String((error as { code?: unknown }).code) : '';
+    const status = typeof error === 'object' && error && 'status' in error ? Number((error as { status?: unknown }).status) : 0;
+    if (code === 'hub_sync_usage_bucket_closure_invalid' && status === 409 && rejectedUsageContext) {
+      const context = rejectedUsageContext;
+      const fingerprint = signedEnvelopeFingerprint({ serial: context.serial, identityGeneration: context.identityGeneration, envelope: context.envelope });
+      const metadata = {
+        version: 1, status: 409, code, bodyHash: context.bodyHash,
+        envelopeFingerprint: fingerprint,
+        normalizedFingerprint: recoveryNormalizedFingerprint({ serial: context.serial, identityGeneration: context.identityGeneration, envelope: context.envelope }, context.target.id),
+        streamId: context.envelope.streamId, fromSequence: context.envelope.fromSequence, toSequence: context.envelope.toSequence,
+        hubInstallationId: context.hubInstallationId, identityGeneration: context.identityGeneration,
+        eventDigests: eventDigests(context.envelope),
+        target: { eventId: context.target.id, sequence: context.target.sequence, payloadHash: canonicalDigest(context.target.payload) },
+      };
+      try {
+        const prior = await prisma.auditEvent.findFirst({ where: {
+          homeId: context.homeId, actorType: 'HUB', actorId: context.hubInstallationId, category: 'SECURITY',
+          action: HUB_USAGE_CLOSURE_REJECTION_ACTION, targetType: 'HubInstallation', targetId: context.hubInstallationId,
+          metadata: { path: ['bodyHash'], equals: context.bodyHash },
+        }, select: { metadata: true } });
+        if (prior) {
+          const priorMetadata = prior.metadata && typeof prior.metadata === 'object' && !Array.isArray(prior.metadata)
+            ? prior.metadata as Record<string, unknown> : null;
+          if (!priorMetadata || canonicalDigest(priorMetadata) !== canonicalDigest(metadata)) throw new Error('Stored rejection witness does not match the current rejected body');
+        } else await prisma.auditEvent.create({ data: {
+          homeId: context.homeId, actorType: 'HUB', actorId: context.hubInstallationId, category: 'SECURITY',
+          action: HUB_USAGE_CLOSURE_REJECTION_ACTION, targetType: 'HubInstallation', targetId: context.hubInstallationId,
+          metadata, purgeAt: new Date(Date.now() + 365 * 24 * 60 * 60 * 1000),
+        } });
+        const rejected = (error as { message?: unknown }).message;
+        return NextResponse.json({ ok: false, error: typeof rejected === 'string' ? rejected : 'The sync range was rejected', errorCode: code,
+          rejectedEvent: { eventId: context.target.id, sequence: context.target.sequence, payloadHash: canonicalDigest(context.target.payload) } },
+        { status: 409, headers: { 'Cache-Control': 'no-store', Pragma: 'no-cache' } });
+      } catch {
+        // Without a durable exact-body rejection witness the hub must retain
+        // and retry its original request; do not authorize local repair.
+      }
+    }
+    return authErrorResponse(error);
+  }
 }

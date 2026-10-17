@@ -43,6 +43,53 @@ async function requireAreaAssignmentForCoverage(tx: Prisma.TransactionClient, in
   if (!assignment) invalid('hub_sync_area_assignment_invalid', 'The device was not assigned to this area for the complete covered interval');
 }
 
+export async function assertUsageClosureRecoveryCurrent(tx: Prisma.TransactionClient, input: {
+  homeId: string; hubInstallationId: string; identityGeneration: number; payload: Record<string, unknown>;
+}): Promise<void> {
+  const payload = input.payload;
+  const device = await tx.nativeDevice.findUnique({ where: { hubInstallationId_osDeviceId: {
+    hubInstallationId: input.hubInstallationId, osDeviceId: String(payload.osDeviceId),
+  } }, select: { id: true, homeId: true, managementClass: true, analyticsCategory: true, lifecycle: true,
+    descriptorRevision: true, capabilitySummary: true } });
+  const category = String(payload.analyticsCategory);
+  if (!device || device.homeId !== input.homeId || device.managementClass !== 'PROPERTY_DEVICE'
+    || device.analyticsCategory !== category || !['LIGHT', 'BOILER', 'RADIATOR'].includes(category)
+    || ['RETIRED', 'REMOVED', 'REMOVAL_PENDING'].includes(device.lifecycle)
+    || Number(payload.sourceGeneration) !== input.identityGeneration) {
+    invalid('hub_sync_usage_recovery_policy_changed', 'Current permanent-device analytics authority no longer permits this bucket');
+  }
+  const summary = device.capabilitySummary && typeof device.capabilitySummary === 'object' && !Array.isArray(device.capabilitySummary)
+    ? device.capabilitySummary as Record<string, unknown> : {};
+  const catalog = summary.controlCatalog && typeof summary.controlCatalog === 'object' && !Array.isArray(summary.controlCatalog)
+    ? summary.controlCatalog as Record<string, unknown> : {};
+  const controls = Array.isArray(catalog.controls) ? catalog.controls as Array<Record<string, unknown>> : [];
+  const roles = category === 'LIGHT' ? ['power', 'brightness'] : category === 'RADIATOR' ? ['active_heat_demand'] : ['active_heat_production'];
+  if (Number(catalog.revision) !== Number(device.descriptorRevision)
+    || !controls.some((control) => control.controlId === payload.controlId
+      && roles.includes(String(control.semanticRole)) && control.observable === true)) {
+    invalid('hub_sync_usage_recovery_policy_changed', 'The current descriptor does not authorize this Radiator observation');
+  }
+  const area = await tx.area.findUnique({ where: { homeId_osAreaId: {
+    homeId: input.homeId, osAreaId: String(payload.osAreaId),
+  } }, select: { id: true, status: true } });
+  const coverageStart = new Date(String(payload.coverageStartAt));
+  const coverageEnd = new Date(String(payload.coverageEndAt));
+  if (!area || area.status !== 'ACTIVE') invalid('hub_sync_usage_recovery_policy_changed', 'The source Area is no longer active');
+  await requireAreaAssignmentForCoverage(tx, { homeId: input.homeId, deviceId: device.id, areaId: area.id,
+    start: coverageStart, end: coverageEnd });
+  const bucket = await tx.nativeDeviceUsageBucket.findUnique({ where: {
+    deviceId_areaId_analyticsCategory_controlId_bucketStart_sourceGeneration: {
+      deviceId: device.id, areaId: area.id, analyticsCategory: category as 'LIGHT' | 'BOILER' | 'RADIATOR', controlId: String(payload.controlId),
+      bucketStart: new Date(String(payload.bucketStart)), sourceGeneration: Number(payload.sourceGeneration),
+    },
+  }, select: { revision: true, onSeconds: true, offSeconds: true, unknownSeconds: true, closedAt: true } });
+  if (bucket && (bucket.closedAt || bucket.revision >= Number(payload.revision)
+    || bucket.onSeconds > Number(payload.onSeconds) || bucket.offSeconds > Number(payload.offSeconds)
+    || bucket.unknownSeconds > Number(payload.unknownSeconds))) {
+    invalid('hub_sync_usage_recovery_state_changed', 'The cloud already contains this or a newer usage revision');
+  }
+}
+
 function oneCalendarYearAfter(source: Date): Date {
   const result = new Date(source);
   const day = result.getUTCDate();

@@ -6979,6 +6979,131 @@ async function pendingInvitationRouteChecks(deliveryEnv) {
   }
   console.log('[stage10:integration] PASS: actual OS Store observations -> durable outbox -> machine-authenticated loopback sync receipt/cursor -> retained usage/temperature rows -> owner analytics APIs; tenant-private device produced zero rows and stayed out of selectors/results; wrong-home denied; higher-revision rewrite of a closed hour denied with unchanged history, cursor and receipt count');
 
+  // An exact, full-hour/open event is rejected atomically, then the actual OS
+  // durable Store receives an authenticated, cloud-authorized closedAt-only
+  // recovery. This is disposable integration data; no Production queue or
+  // real Home state is involved.
+  const recoveryStart = new Date(closedBucketStart.getTime() - 3_600_000);
+  const recoveryEnd = new Date(recoveryStart.getTime() + 3_600_000);
+  const recoveryPurge = new Date(recoveryStart); const recoveryDay = recoveryPurge.getUTCDate();
+  recoveryPurge.setUTCDate(1); recoveryPurge.setUTCFullYear(recoveryPurge.getUTCFullYear() + 1);
+  recoveryPurge.setUTCDate(Math.min(recoveryDay, new Date(Date.UTC(recoveryPurge.getUTCFullYear(), recoveryPurge.getUTCMonth() + 1, 0)).getUTCDate()));
+  const recoveryPayload = {
+    osDeviceId: telemetryOsDeviceId, osAreaId: telemetryOsAreaId, analyticsCategory: 'RADIATOR', controlId: telemetryControlId,
+    sourceGeneration: customerFixture.identityOneGeneration, bucketStart: recoveryStart.toISOString(), revision: 1,
+    onSeconds: 1200, offSeconds: 600, unknownSeconds: 1800,
+    coverageStartAt: recoveryStart.toISOString(), coverageEndAt: recoveryEnd.toISOString(), closedAt: null,
+    purgeAt: recoveryPurge.toISOString(),
+  };
+  const recoveryAggregate = sha256([recoveryPayload.osDeviceId, recoveryPayload.osAreaId, recoveryPayload.analyticsCategory,
+    recoveryPayload.controlId, String(recoveryPayload.sourceGeneration), String(recoveryStart.getTime())].join('|'));
+  const recoveryEvent = await hub.store.queueSyncEvent('usage.bucket', recoveryAggregate, recoveryPayload, { critical: false, now: Date.now() });
+  const recoveryOriginalBatch = await hub.store.prepareSyncBatch(telemetryHubId, hub.pairing.runtime, Date.now());
+  if (!recoveryEvent || !recoveryOriginalBatch || recoveryOriginalBatch.events.length !== 1
+    || recoveryOriginalBatch.events[0].id !== recoveryEvent.id) fail('The disposable rejected-usage recovery did not prepare one exact in-flight event');
+  const recoveryCursorBefore = await prisma.hubInstallation.findUniqueOrThrow({ where: { id: telemetryHubId }, select: { syncStreamId: true, syncAcceptedSequence: true } });
+  const recoveryReceiptCountBefore = await prisma.hubSyncReceipt.count({ where: { hubInstallationId: telemetryHubId } });
+  let originalRejection;
+  try {
+    await hub.pairing.requestWithHubIdentity('/api/hub-agent/v2/sync', recoveryOriginalBatch);
+    fail('The deliberately full-hour/open disposable usage event was unexpectedly accepted');
+  } catch (error) { originalRejection = error; }
+  if (originalRejection?.code !== 'hub_sync_usage_bucket_closure_invalid' || originalRejection?.statusCode !== 409
+    || !originalRejection.requestBodyHash || originalRejection.rejectedEvent?.id !== recoveryEvent.id) {
+    fail(`The exact malformed usage event did not produce a durable diagnostic rejection (${JSON.stringify({ code: originalRejection?.code, status: originalRejection?.statusCode, targetMatched: originalRejection?.rejectedEvent?.id === recoveryEvent.id })})`);
+  }
+  await hub.store.markSyncFailure(originalRejection.code, {
+    statusCode: originalRejection.statusCode, requestBodyHash: originalRejection.requestBodyHash,
+    envelopeHash: sha256(JSON.stringify(recoveryOriginalBatch)), rejectedEvent: originalRejection.rejectedEvent,
+  });
+  const localRejection = hub.store.getSyncOutbox().usageClosureRejection;
+  const wrongGrantRequest = await hub.pairing.requestWithHubIdentity('/api/hub-agent/v2/sync/usage-closure-recovery', {
+    rejectedBodyHash: localRejection.requestBodyHash, targetEventId: recoveryEvent.id,
+    targetSequence: recoveryEvent.sequence, targetPayloadHash: '0'.repeat(64), rejectedEnvelope: recoveryOriginalBatch,
+  }).then(() => ({ status: 200, code: null }), (error) => ({ status: error.statusCode, code: error.code }));
+  if (wrongGrantRequest.status !== 409 || wrongGrantRequest.code !== 'hub_sync_usage_recovery_request_invalid') fail('The signed recovery authorization endpoint accepted a substituted rejected-event digest');
+  const recoveryAuthorization = await hub.pairing.requestWithHubIdentity('/api/hub-agent/v2/sync/usage-closure-recovery', {
+    rejectedBodyHash: localRejection.requestBodyHash, targetEventId: localRejection.targetEventId,
+    targetSequence: localRejection.targetSequence, targetPayloadHash: localRejection.targetPayloadHash,
+    rejectedEnvelope: recoveryOriginalBatch,
+  });
+  const recoveredBatch = await hub.store.prepareUsageClosureRecovery({
+    authorization: recoveryAuthorization, streamId: recoveryCursorBefore.syncStreamId,
+    acceptedSequence: Number(recoveryCursorBefore.syncAcceptedSequence), now: Date.now(),
+  });
+  if (!recoveredBatch?.usageClosureRecovery || recoveredBatch.events[0].payload.closedAt !== recoveryEnd.toISOString()
+    || recoveredBatch.events[0].payload.onSeconds !== recoveryPayload.onSeconds
+    || recoveredBatch.events[0].payload.offSeconds !== recoveryPayload.offSeconds
+    || recoveredBatch.events[0].payload.unknownSeconds !== recoveryPayload.unknownSeconds) {
+    fail('The local exact recovery did not change only the authorized full-hour closedAt field');
+  }
+  const beforeTamperedRecovery = await Promise.all([
+    prisma.hubInstallation.findUniqueOrThrow({ where: { id: telemetryHubId }, select: { syncAcceptedSequence: true } }),
+    prisma.nativeDeviceUsageBucket.count({ where: { homeId: telemetryHomeId, deviceId: telemetryDevice.id, bucketStart: recoveryStart } }),
+    prisma.hubSyncReceipt.count({ where: { hubInstallationId: telemetryHubId } }),
+  ]);
+  const tamperedBatch = structuredClone(recoveredBatch);
+  tamperedBatch.usageClosureRecovery.targetSequence += 1;
+  const tamperedResponse = await hub.pairing.requestWithHubIdentity('/api/hub-agent/v2/sync', tamperedBatch)
+    .then(() => ({ status: 200, code: null }), (error) => ({ status: error.statusCode, code: error.code }));
+  const afterTamperedRecovery = await Promise.all([
+    prisma.hubInstallation.findUniqueOrThrow({ where: { id: telemetryHubId }, select: { syncAcceptedSequence: true } }),
+    prisma.nativeDeviceUsageBucket.count({ where: { homeId: telemetryHomeId, deviceId: telemetryDevice.id, bucketStart: recoveryStart } }),
+    prisma.hubSyncReceipt.count({ where: { hubInstallationId: telemetryHubId } }),
+  ]);
+  if (tamperedResponse.status !== 400 || tamperedResponse.code !== 'hub_sync_envelope_invalid'
+    || Number(beforeTamperedRecovery[0].syncAcceptedSequence) !== Number(afterTamperedRecovery[0].syncAcceptedSequence)
+    || beforeTamperedRecovery[1] !== afterTamperedRecovery[1] || beforeTamperedRecovery[2] !== afterTamperedRecovery[2]) {
+    fail('A tampered recovery authorization changed the cloud cursor, usage table or receipt ledger');
+  }
+  const recoveryAccepted = await hub.pairing.requestWithHubIdentity('/api/hub-agent/v2/sync', recoveredBatch);
+  if (recoveryAccepted?.usageClosureRecoveryAccepted !== true
+    || Number(recoveryAccepted.acceptedThroughSequence) !== Number(recoveredBatch.toSequence)) fail('Platform did not acknowledge the exact authorized usage recovery');
+  const acceptedSignedBodyHash = sha256(JSON.stringify({ serial: customerFixture.identityOneSerial,
+    identityGeneration: customerFixture.identityOneGeneration, ...recoveredBatch }));
+  await hub.store.acknowledgeSyncBatch({ streamId: recoveryAccepted.streamId,
+    acceptedThroughSequence: Number(recoveryAccepted.acceptedThroughSequence), cloudRevision: Number(recoveryAccepted.cloudRevision),
+    configurationAppliedRevision: Number(recoveryAccepted.configurationAppliedRevision), bodyHash: recoveryAccepted.acceptedBodyHash });
+  const [recoveredBucket, recoveryCursorAfter, recoveryReceipts, recoveryAudit, recoveryReceiptCountAfter] = await Promise.all([
+    prisma.nativeDeviceUsageBucket.findUniqueOrThrow({ where: { deviceId_areaId_analyticsCategory_controlId_bucketStart_sourceGeneration: {
+      deviceId: telemetryDevice.id, areaId: telemetryAreaId, analyticsCategory: 'RADIATOR', controlId: telemetryControlId,
+      bucketStart: recoveryStart, sourceGeneration: customerFixture.identityOneGeneration,
+    } } }),
+    prisma.hubInstallation.findUniqueOrThrow({ where: { id: telemetryHubId }, select: { syncStreamId: true, syncAcceptedSequence: true } }),
+    prisma.hubSyncReceipt.findMany({ where: { hubInstallationId: telemetryHubId, streamId: recoveredBatch.streamId,
+      fromSequence: BigInt(recoveredBatch.fromSequence), toSequence: BigInt(recoveredBatch.toSequence) }, select: { bodyHash: true } }),
+    prisma.auditEvent.findMany({ where: { homeId: telemetryHomeId, actorType: 'HUB', actorId: telemetryHubId,
+      action: 'hub_sync_usage_closure_recovered' }, orderBy: { occurredAt: 'desc' }, take: 5, select: { metadata: true } }),
+    prisma.hubSyncReceipt.count({ where: { hubInstallationId: telemetryHubId } }),
+  ]);
+  if (!recoveredBucket.closedAt || recoveredBucket.closedAt.toISOString() !== recoveryEnd.toISOString()
+    || recoveredBucket.revision !== recoveryPayload.revision
+    || recoveredBucket.onSeconds !== recoveryPayload.onSeconds || recoveredBucket.offSeconds !== recoveryPayload.offSeconds
+    || recoveredBucket.unknownSeconds !== recoveryPayload.unknownSeconds
+    || recoveryCursorAfter.syncStreamId !== recoveredBatch.streamId
+    || Number(recoveryCursorAfter.syncAcceptedSequence) !== Number(recoveredBatch.toSequence)
+    || recoveryReceipts.length !== 1 || recoveryReceipts[0].bodyHash !== acceptedSignedBodyHash
+    || recoveryReceiptCountAfter !== recoveryReceiptCountBefore + 1
+    || !recoveryAudit.some((row) => row.metadata?.authorizationId === recoveryAuthorization.authorizationId
+      && row.metadata?.rejectedBodyHash === localRejection.requestBodyHash
+      && row.metadata?.acceptedBodyHash === acceptedSignedBodyHash
+      && JSON.stringify(row.metadata?.changedFields) === JSON.stringify(['closedAt']))) {
+    fail(`Authorized recovery did not atomically produce the expected usage row, receipt, cursor and redacted audit (${JSON.stringify({ bucketClosed: Boolean(recoveredBucket.closedAt), revision: recoveredBucket.revision, receiptCount: recoveryReceipts.length, cursor: Number(recoveryCursorAfter.syncAcceptedSequence), audited: recoveryAudit.length })})`);
+  }
+  const duplicateRecovery = await hub.pairing.requestWithHubIdentity('/api/hub-agent/v2/sync', recoveredBatch);
+  const duplicateReceiptCount = await prisma.hubSyncReceipt.count({ where: { hubInstallationId: telemetryHubId,
+    streamId: recoveredBatch.streamId, fromSequence: BigInt(recoveredBatch.fromSequence), toSequence: BigInt(recoveredBatch.toSequence) } });
+  const duplicateTotalReceiptCount = await prisma.hubSyncReceipt.count({ where: { hubInstallationId: telemetryHubId } });
+  if (duplicateRecovery?.duplicate !== true || duplicateRecovery?.usageClosureRecoveryAccepted !== true
+    || duplicateReceiptCount !== 1 || duplicateTotalReceiptCount !== recoveryReceiptCountAfter) {
+    fail('An exact retry after simulated response loss did not reuse the immutable recovery receipt');
+  }
+  const localRecoveryAudit = hub.store.getSyncOutbox().usageClosureRecoveryHistory.at(-1);
+  if (hub.store.getSyncOutbox().usageClosureRecovery !== null || localRecoveryAudit?.originalPayloadHash !== localRejection.targetPayloadHash
+    || localRecoveryAudit?.acceptedBodyHash !== acceptedSignedBodyHash
+    || localRecoveryAudit?.changedFields?.join(',') !== 'closedAt') fail('The Store did not retain the completed local recovery audit');
+  console.log('[stage10:integration] PASS: malformed signed full-hour/open usage was rejected and audited; signed authorization bound the exact rejected body, cursor, Home/device/Area policy and cloud revision; only closedAt was repaired; tampering had no effect; real receipt/cursor/usage row/audit committed once; exact duplicate reused the receipt');
+
   const homeownerContext = await fetchJson(`${base}/api/v2/homes/${inviter.homeId}/homeowner-context`, { headers: selectedHomeHeaders });
   const homeLifecycleBeforeDeferredActions = await prisma.home.findUniqueOrThrow({ where: { id: inviter.homeId }, select: { lifecycle: true, managementRevision: true, activeHubInstallationId: true, areas: { select: { id: true } } } });
   const deferredDeregPreview = await fetchJson(`${base}/api/v2/homes/${inviter.homeId}/deregister-full-home/preview`, { method: 'POST', headers: selectedHomeHeaders, body: JSON.stringify({}) });

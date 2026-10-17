@@ -32,6 +32,13 @@ export type HubSyncEnvelope = {
     previousStreamId: string;
     previousAcceptedSequence: number;
   };
+  usageClosureRecovery?: {
+    version: 1;
+    authorizationId: string;
+    rejectedBodyHash: string;
+    targetEventId: string;
+    targetSequence: number;
+  };
   runtime: { kind: 'dinodia_os'; version: string; capabilities: Record<string, unknown> };
   sentAt: string;
 };
@@ -272,13 +279,16 @@ export function validateHubSyncEnvelope(value: unknown, rawBody?: string): value
   const hasConfigurationRefreshOnly = object(value) && Object.hasOwn(value, 'configurationRefreshOnly');
   const configurationRefreshOnly = object(value) && value.configurationRefreshOnly === true;
   const hasStreamReconciliation = object(value) && Object.hasOwn(value, 'streamReconciliation');
+  const hasUsageClosureRecovery = object(value) && Object.hasOwn(value, 'usageClosureRecovery');
   const allowedKeys = [...baseKeys,
     ...(configurationRefreshOnly ? ['configurationRefreshOnly'] : []),
     ...(hasStreamReconciliation ? ['streamReconciliation'] : []),
+    ...(hasUsageClosureRecovery ? ['usageClosureRecovery'] : []),
   ];
   if (!object(value) || !exactKeys(value, allowedKeys)
     || hasConfigurationRefreshOnly && !configurationRefreshOnly
     || configurationRefreshOnly && hasStreamReconciliation
+    || hasUsageClosureRecovery && (configurationRefreshOnly || hasStreamReconciliation)
     || value.schemaVersion !== 1 || typeof value.hubInstallationId !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value.hubInstallationId)
     || typeof value.streamId !== 'string' || !/^[a-zA-Z0-9._:-]{16,80}$/.test(value.streamId)
     || !Number.isSafeInteger(value.fromSequence) || !Number.isSafeInteger(value.toSequence)
@@ -295,6 +305,15 @@ export function validateHubSyncEnvelope(value: unknown, rawBody?: string): value
       || !/^[a-zA-Z0-9._:-]{16,80}$/.test(reconciliation.previousStreamId)
       || !Number.isSafeInteger(reconciliation.previousAcceptedSequence) || Number(reconciliation.previousAcceptedSequence) < 1) return false;
   }
+  if (hasUsageClosureRecovery) {
+    const recovery = value.usageClosureRecovery;
+    if (!object(recovery) || !exactKeys(recovery, ['version', 'authorizationId', 'rejectedBodyHash', 'targetEventId', 'targetSequence'])
+      || recovery.version !== 1
+      || typeof recovery.authorizationId !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(recovery.authorizationId)
+      || typeof recovery.rejectedBodyHash !== 'string' || !/^[a-f0-9]{64}$/i.test(recovery.rejectedBodyHash)
+      || typeof recovery.targetEventId !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(recovery.targetEventId)
+      || !Number.isSafeInteger(recovery.targetSequence) || Number(recovery.targetSequence) < 1) return false;
+  }
   const syncStatus = (value.runtime.capabilities as Record<string, unknown>).nativeSyncOutbox;
   if (syncStatus !== undefined && (!object(syncStatus) || !exactKeys(syncStatus, ['queueDepth', 'gapDetected', 'criticalBacklog', 'telemetryPaused', 'droppedTelemetryCount', 'lastErrorCode'])
     || !Number.isSafeInteger(syncStatus.queueDepth) || Number(syncStatus.queueDepth) < 0 || Number(syncStatus.queueDepth) > 100000
@@ -310,6 +329,11 @@ export function validateHubSyncEnvelope(value: unknown, rawBody?: string): value
   } else {
     if (Number(value.fromSequence) !== Number(events[0].sequence) || Number(value.toSequence) !== Number(events.at(-1)?.sequence)) return false;
     for (let index = 0; index < events.length; index += 1) if (Number(events[index].sequence) !== Number(value.fromSequence) + index) return false;
+  }
+  if (hasUsageClosureRecovery) {
+    const recovery = value.usageClosureRecovery as HubSyncEnvelope['usageClosureRecovery'];
+    const target = events.find((event) => event.id === recovery?.targetEventId && event.sequence === recovery.targetSequence);
+    if (!target || target.type !== 'usage.bucket' || target.payload.closedAt === null) return false;
   }
   return Buffer.byteLength(JSON.stringify(events), 'utf8') <= HUB_SYNC_MAX_BATCH_BYTES;
 }

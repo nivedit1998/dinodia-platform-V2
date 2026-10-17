@@ -46,6 +46,7 @@ export const stage1RouteInventory = [
   ['POST', '/api/hub-agent/v2/heartbeat', 'machine'],
   ['POST', '/api/hub-agent/v2/lan-endpoint', 'manufacturing-identity-recovery'],
   ['POST', '/api/hub-agent/v2/sync', 'machine'],
+  ['POST', '/api/hub-agent/v2/sync/usage-closure-recovery', 'machine'],
   ['POST', '/api/hub-agent/v2/pairing/acknowledge', 'manufacturing-or-machine'],
   ['POST', '/api/hub-agent/v2/pairing/challenge', 'manufacturing-or-machine'],
   ['POST', '/api/hub-agent/v2/pairing/cloud-url', 'machine'],
