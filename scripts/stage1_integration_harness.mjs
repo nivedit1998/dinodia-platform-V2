@@ -7529,6 +7529,8 @@ async function pendingInvitationRouteChecks(deliveryEnv) {
     || JSON.stringify(issuedInvitation.body).includes(email) || invitationRetry.response.status !== 201 || !invitationRetry.body.idempotentReplay
     || customerInvitationEmailCount !== emailCountBefore + 1
     || unauthorizedTenantInvite.response.status !== 403 || unauthorizedInvitationCount !== 0) fail(`Owner-issued tenant invitation or pending invitation projection violated exact Area, seven-day expiry, idempotency, pagination, expiry, privacy, or authorization rules (${JSON.stringify({ listStatuses: [pendingInvitationPage1.response.status, pendingInvitationPage2?.response.status, pendingInvitationAnonymous.response.status, pendingInvitationMalformedCursor.response.status], pageSizes: [pendingInvitationPage1.body?.invitations?.length, pendingInvitationPage2?.body?.invitations?.length], uniquePageIds: new Set(invitationPageIds).size, expiredOmitted: !invitationPageIds.includes(expiredPageFixtureId), rowsSafe: invitationRowsAreSafe })})`);
+  await tenantInvitationLockContentionCheck({ base, homeId: inviter.homeId, areaId, actorId: customerFixture.accountId, inviterHeaders });
+  if (process.env.STAGE6_INVITATION_LOCK_ONLY === '1') return;
   const managerInviteEmail = `stage6-manager-invite-${crypto.randomUUID()}@invalid.test`;
   const managerInvitePayload = { email: managerInviteEmail, areaIds: [], expectedManagementRevision: invitationHomeAfterStage9.managementRevision };
   const managerInvite = await fetchJson(`${base}/api/v2/homes/${inviter.homeId}/property-managers/invitations`, { method: 'POST', headers: { ...inviterHeaders, 'idempotency-key': `stage6-manager-${crypto.randomUUID()}` }, body: JSON.stringify(managerInvitePayload) });
@@ -9115,6 +9117,73 @@ async function pendingInvitationRouteChecks(deliveryEnv) {
   }
   console.log('[stage9:integration] PASS: tenant and manager removal are owner-scoped, step-up-bound, idempotent and measured; unrelated Home relationships survive, private-device deletion queues hub cleanup, mandatory generic notices are encrypted and provider-accepted by the existing dispatcher, and activity is allowlisted, retained and CSV-paginated');
 
+}
+
+async function tenantInvitationLockContentionCheck({ base, homeId, areaId, actorId, inviterHeaders }) {
+  // A transient Home lock must roll back invitation, receipt, audit and email;
+  // the exact original key must then issue once and replay the same receipt.
+  const email = `stage6-lock-retry-${crypto.randomUUID()}@invalid.test`;
+  const idempotencyKey = `stage6-lock-${crypto.randomUUID()}`;
+  const home = await prisma.home.findUniqueOrThrow({ where: { id: homeId }, select: { managementRevision: true } });
+  const payload = { email, areaIds: [areaId], expectedManagementRevision: home.managementRevision };
+  const keyHash = sha256(`${actorId}\n${idempotencyKey}`);
+  const countEffects = async () => Promise.all([
+    prisma.membershipInvitation.count({ where: { homeId, targetEmailNormalized: email.toLowerCase() } }),
+    prisma.idempotencyRecord.count({ where: { namespace: 'customer-membership-invitation:v1', keyHash } }),
+    prisma.auditEvent.count({ where: { homeId, actorType: 'CUSTOMER', actorId, category: 'ACCESS', action: 'membership_invitation_issued', targetType: 'MembershipInvitation' } }),
+  ]);
+  const effectsBefore = await countEffects();
+  const emailCountBefore = customerInvitationEmailCount;
+  let releaseLock;
+  let signalLock;
+  const lockAcquired = new Promise((resolve) => { signalLock = resolve; });
+  const heldLock = prisma.$transaction(async (tx) => {
+    await tx.$queryRaw`SELECT "id" FROM "Home" WHERE "id" = ${homeId}::uuid FOR UPDATE`;
+    signalLock();
+    await new Promise((resolve) => { releaseLock = resolve; });
+  }, { timeout: 15000 });
+  await lockAcquired;
+  const startedAt = Date.now();
+  let blocked;
+  try {
+    blocked = await fetchJson(`${base}/api/v2/homes/${homeId}/tenant/invitations`, {
+      method: 'POST', headers: { ...inviterHeaders, 'idempotency-key': idempotencyKey }, body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(7000),
+    });
+  } finally {
+    releaseLock?.();
+    await heldLock;
+  }
+  const elapsedMs = Date.now() - startedAt;
+  const effectsAfterBlock = await countEffects();
+  if (blocked.response.status !== 503 || blocked.body?.error?.code !== 'INTERNAL_ERROR'
+    || blocked.body?.error?.retryable !== true || elapsedMs > 6000
+    || effectsAfterBlock.some((count, index) => count !== effectsBefore[index])
+    || customerInvitationEmailCount !== emailCountBefore) {
+    fail(`Contended tenant invitation was not bounded and rollback-safe (${JSON.stringify({ status: blocked.response.status,
+      code: blocked.body?.error?.code, retryable: blocked.body?.error?.retryable, elapsedMs,
+      effectsBefore, effectsAfterBlock, emailDelta: customerInvitationEmailCount - emailCountBefore })})`);
+  }
+  const retry = await fetchJson(`${base}/api/v2/homes/${homeId}/tenant/invitations`, {
+    method: 'POST', headers: { ...inviterHeaders, 'idempotency-key': idempotencyKey }, body: JSON.stringify(payload),
+  });
+  const replay = await fetchJson(`${base}/api/v2/homes/${homeId}/tenant/invitations`, {
+    method: 'POST', headers: { ...inviterHeaders, 'idempotency-key': idempotencyKey }, body: JSON.stringify(payload),
+  });
+  const [effectsAfterRetry, invitation] = await Promise.all([
+    countEffects(),
+    prisma.membershipInvitation.findFirst({ where: { homeId, targetEmailNormalized: email.toLowerCase() }, select: { id: true, state: true, role: true } }),
+  ]);
+  if (retry.response.status !== 201 || replay.response.status !== 201
+    || retry.body?.invitationId !== replay.body?.invitationId || replay.body?.idempotentReplay !== true
+    || !invitation || invitation.id !== retry.body?.invitationId || invitation.state !== 'PENDING' || invitation.role !== 'TENANT'
+    || effectsAfterRetry.some((count, index) => count !== effectsBefore[index] + 1)
+    || customerInvitationEmailCount !== emailCountBefore + 1) {
+    fail(`Exact-key tenant invitation retry did not commit one invitation, receipt, audit and email (${JSON.stringify({
+      retryStatus: retry.response.status, retryCode: retry.body?.error?.code, replayStatus: replay.response.status,
+      replay: replay.body?.idempotentReplay, effectsBefore, effectsAfterRetry, emailDelta: customerInvitationEmailCount - emailCountBefore })})`);
+  }
+  console.log(`[stage6:integration] PASS: Home lock contention rolled back in ${elapsedMs}ms; exact-key retry committed one invitation, receipt, audit, and email, then replayed safely`);
 }
 
 async function browserSessionRefreshChecks({ base, loginPayload, accountId }) {
@@ -11755,7 +11824,8 @@ try {
   const stage12AlexaOnly = process.env.STAGE12_ALEXA_ONLY === '1';
   const stage5SyncRecoveryOnly = process.env.STAGE5_SYNC_RECOVERY_ONLY === '1';
   const stage9RemovalEncryptionOnly = process.env.STAGE9_HOMEOWNER_TENANT_REMOVAL_ONLY === '1';
-  if (!stage5SyncRecoveryOnly && !stage9RemovalEncryptionOnly
+  const stage6InvitationLockOnly = process.env.STAGE6_INVITATION_LOCK_ONLY === '1';
+  if (!stage5SyncRecoveryOnly && !stage9RemovalEncryptionOnly && !stage6InvitationLockOnly
     && (stage12AlexaOnly || (process.env.STAGE6_TRANSFER_ONLY !== '1' && process.env.STAGE6_TENANT_REMOVAL_ONLY !== '1'))) {
     await nativeAlexaOAuthChecks(deliveryEnv);
   }
@@ -11773,6 +11843,8 @@ try {
     // continues to execute the complete integration suite.
   } else if (stage9RemovalEncryptionOnly) {
     await homeownerRemovalEncryptionConfigurationChecks(deliveryEnv);
+  } else if (stage6InvitationLockOnly) {
+    await pendingInvitationRouteChecks(deliveryEnv);
   } else if (process.env.STAGE6_TRANSFER_ONLY === '1') {
     await ownershipTransferChecks(deliveryEnv);
   } else if (process.env.STAGE6_TENANT_REMOVAL_ONLY === '1') {

@@ -4,6 +4,7 @@ import { nativeV1ErrorResponse } from '@/lib/contracts/nativeV1Error';
 import { Stage1AuthError } from '@/lib/stage1Auth';
 
 export const dynamic = 'force-dynamic';
+export const maxDuration = 40;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 export async function POST(request: Request, context: { params: Promise<{ homeId: string; invitationId: string }> }) {

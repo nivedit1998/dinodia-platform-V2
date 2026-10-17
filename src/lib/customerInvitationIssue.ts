@@ -5,6 +5,7 @@ import { Stage1AuthError, type CustomerAccountSessionPrincipal } from './stage1A
 import { randomSecret, sha256 } from './stage1Crypto';
 import { hashPassword } from './passwords';
 import { sendCustomerInvitationEmail } from './customerInvitationEmail';
+import { serializableTransaction } from './serializableTransaction';
 
 const INVITATION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const IDEMPOTENCY_TTL_MS = 30 * 24 * 60 * 60 * 1000;
@@ -12,6 +13,15 @@ type Role = 'PROPERTY_MANAGER' | 'TENANT';
 type Input = { homeId: string; email: string; role: Role; areaIds: string[]; expectedManagementRevision: number; resendInvitationId: string | null; idempotencyKey: string };
 type SafeReceipt = { schemaVersion: 'dinodia.v1'; ok: true; invitationId: string; homeId: string; role: Role; state: 'PENDING'|'REVOKED'; expiresAt: string; emailSubmission: 'PENDING'|'ACCEPTED'|'NOT_SENT'|'FAILED'; idempotentReplay: boolean };
 type IssueResult = { status: number; body: SafeReceipt; delivery?: { email: string; postcode: string; expiresAt: Date; temporaryPassword: string | null } };
+
+function isPostgresLockTimeout(error: unknown): boolean {
+  const record = typeof error === 'object' && error !== null
+    ? error as { code?: unknown; meta?: { code?: unknown; sqlState?: unknown; sqlstate?: unknown } }
+    : {};
+  const prismaCode = String(record.code ?? '');
+  const sqlState = String(record.meta?.code ?? record.meta?.sqlState ?? record.meta?.sqlstate ?? '');
+  return prismaCode === '55P03' || prismaCode === 'P2010' && sqlState === '55P03';
+}
 
 function bodyHash(input: Input): string {
   return sha256(JSON.stringify({ homeId: input.homeId, email: input.email, role: input.role, areaIds: input.areaIds, expectedManagementRevision: input.expectedManagementRevision, resendInvitationId: input.resendInvitationId }));
@@ -21,7 +31,11 @@ function safeReceipt(invitationId: string, homeId: string, role: Role, expiresAt
   return { schemaVersion: 'dinodia.v1', ok: true, invitationId, homeId, role, state, expiresAt: expiresAt.toISOString(), emailSubmission, idempotentReplay };
 }
 
-export async function issueCustomerMembershipInvitation(input: Input, customer: CustomerAccountSessionPrincipal): Promise<IssueResult> {
+export async function issueCustomerMembershipInvitation(
+  input: Input,
+  customer: CustomerAccountSessionPrincipal,
+  onPhase?: (phase: string) => void,
+): Promise<IssueResult> {
   const normalizedEmail = input.email.trim().toLowerCase();
   const areaIds = [...new Set(input.areaIds)].sort();
   const normalizedInput = { ...input, email: normalizedEmail, areaIds };
@@ -45,13 +59,28 @@ export async function issueCustomerMembershipInvitation(input: Input, customer: 
   const generatedTemporaryPassword = input.role === 'TENANT' ? randomSecret(24) : null;
   const generatedTemporaryPasswordHash = generatedTemporaryPassword ? hashPassword(generatedTemporaryPassword) : null;
   const invitationSecretHash = sha256(randomSecret(32));
+  let currentPhase = 'preflight';
+  const setPhase = (phase: string) => { currentPhase = phase; onPhase?.(phase); };
 
-  const result = await prisma.$transaction(async (tx): Promise<IssueResult> => {
+  let result: IssueResult;
+  try {
+    result = await serializableTransaction(async (tx): Promise<IssueResult> => {
+    setPhase('transaction_setup');
+    // A short database lock budget prevents an unrelated long Home or account
+    // mutation from holding an interactive transaction past Prisma's expiry.
+    // The app retains and retries the same idempotency key after this rollback.
+    await tx.$executeRaw`SET LOCAL lock_timeout = '1500ms'`;
+    await tx.$executeRaw`SET LOCAL statement_timeout = '6500ms'`;
+    setPhase('lock_customer_account');
     await tx.$queryRaw`SELECT "id" FROM "CustomerAccount" WHERE "id" = ${customer.id}::uuid FOR UPDATE`;
+    setPhase('lock_customer_session');
     await tx.$queryRaw`SELECT "id" FROM "CustomerSession" WHERE "id" = ${customer.sessionId}::uuid FOR UPDATE`;
+    setPhase('lock_trusted_device');
     await tx.$queryRaw`SELECT "id" FROM "TrustedDevice" WHERE "id" = ${customer.trustedDeviceId}::uuid FOR UPDATE`;
+    setPhase('lock_home');
     await tx.$queryRaw`SELECT "id" FROM "Home" WHERE "id" = ${input.homeId}::uuid FOR UPDATE`;
     const now = new Date();
+    setPhase('idempotency_lookup');
     const priorKey = await tx.idempotencyRecord.findUnique({ where: { namespace_keyHash: { namespace: 'customer-membership-invitation:v1', keyHash } }, select: { actorId: true, homeId: true, requestHash: true, responseStatus: true, responseBody: true, expiresAt: true } });
     if (priorKey) {
       if (priorKey.actorId !== customer.id || priorKey.homeId !== input.homeId || priorKey.requestHash !== requestHash || priorKey.expiresAt <= now || !priorKey.responseBody || typeof priorKey.responseBody !== 'object' || Array.isArray(priorKey.responseBody)) {
@@ -60,6 +89,7 @@ export async function issueCustomerMembershipInvitation(input: Input, customer: 
       return { status: priorKey.responseStatus, body: { ...(priorKey.responseBody as SafeReceipt), idempotentReplay: true } };
     }
 
+    setPhase('authority_revalidation');
     const [account, session, device, home, membership, acceptance] = await Promise.all([
       tx.customerAccount.findUnique({ where: { id: customer.id }, select: { id: true, emailNormalized: true, emailVerifiedAt: true, status: true, mustChangePassword: true, securityVersion: true } }),
       tx.customerSession.findUnique({ where: { id: customer.sessionId }, select: { id: true, customerAccountId: true, trustedDeviceId: true, refreshTokenHash: true, accessTokenHash: true, accessTokenExpiresAt: true, securityVersion: true, trustedDeviceSessionVersion: true, revokedAt: true, expiresAt: true, absoluteExpiresAt: true } }),
@@ -82,9 +112,11 @@ export async function issueCustomerMembershipInvitation(input: Input, customer: 
       throw new Stage1AuthError(403, 'SCOPE_DENIED', 'The current account cannot issue this invitation');
     }
     if (input.role === 'TENANT') {
+      setPhase('area_validation');
       const areas = await tx.area.findMany({ where: { id: { in: areaIds }, homeId: input.homeId, status: 'ACTIVE' }, select: { id: true } });
       if (areas.length !== areaIds.length) throw new Stage1AuthError(409, 'REVISION_CONFLICT', 'One or more selected Areas are no longer available');
     }
+    setPhase('target_validation');
     const target = await tx.customerAccount.findUnique({ where: { emailNormalized: normalizedEmail }, select: { id: true, status: true } });
     if (target && target.status !== 'ACTIVE') throw new Stage1AuthError(409, 'REVISION_CONFLICT', 'This invitation cannot be issued for the current account state');
     if (target) {
@@ -93,6 +125,7 @@ export async function issueCustomerMembershipInvitation(input: Input, customer: 
     }
 
     let replacement: { id: string } | null = null;
+    setPhase('pending_invitation_check');
     if (input.resendInvitationId) {
       await tx.$queryRaw`SELECT "id" FROM "MembershipInvitation" WHERE "id" = ${input.resendInvitationId}::uuid FOR UPDATE`;
       replacement = await tx.membershipInvitation.findFirst({ where: { id: input.resendInvitationId, homeId: input.homeId, state: 'PENDING', expiresAt: { gt: now }, targetEmailNormalized: normalizedEmail }, select: { id: true } });
@@ -109,6 +142,7 @@ export async function issueCustomerMembershipInvitation(input: Input, customer: 
       }
     }
 
+    setPhase('invitation_create');
     const expiresAt = new Date(now.getTime() + INVITATION_TTL_MS);
     const invitation = await tx.membershipInvitation.create({ data: {
       homeId: input.homeId, inviterMembershipId: membership.id, targetAccountId: target?.id ?? null,
@@ -118,18 +152,29 @@ export async function issueCustomerMembershipInvitation(input: Input, customer: 
       areas: { create: areaIds.map((areaId) => ({ areaId, homeId: input.homeId })) },
     }, select: { id: true, expiresAt: true } });
     const body = safeReceipt(invitation.id, input.homeId, input.role, expiresAt, 'PENDING', false);
+    setPhase('receipt_and_audit');
     await tx.idempotencyRecord.create({ data: { namespace: 'customer-membership-invitation:v1', keyHash, actorId: customer.id, homeId: input.homeId, requestHash, responseStatus: 202, responseBody: body as Prisma.InputJsonValue, responseDigest: sha256(JSON.stringify(body)), expiresAt: new Date(now.getTime() + IDEMPOTENCY_TTL_MS) } });
     await tx.auditEvent.create({ data: { homeId: input.homeId, actorType: 'CUSTOMER', actorId: customer.id, category: 'ACCESS', action: 'membership_invitation_issued', targetType: 'MembershipInvitation', targetId: invitation.id, metadata: { role: input.role, areaCount: areaIds.length, replacement: Boolean(replacement) }, occurredAt: now, purgeAt: new Date(now.getTime() + 365 * 24 * 60 * 60 * 1000) } });
     return { status: 202, body, delivery: { email: normalizedEmail, postcode: home.postcode ?? '', expiresAt, temporaryPassword: !target && input.role === 'TENANT' ? generatedTemporaryPassword : null } };
-  }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
+    }, 2, { maxWaitMs: 2000, timeoutMs: 8000 });
+  } catch (error) {
+    if (isPostgresLockTimeout(error)) {
+      setPhase(`lock_timeout_after_${currentPhase}`);
+      throw new Stage1AuthError(503, 'internal_error', 'The invitation service is temporarily busy');
+    }
+    throw error;
+  }
 
   if (!result.delivery) return result;
   try {
+    setPhase('email_submission');
     await sendCustomerInvitationEmail({ email: result.delivery.email, invitationId: result.body.invitationId, role: result.body.role, postcode: result.delivery.postcode, expiresAt: result.delivery.expiresAt, temporaryPassword: result.delivery.temporaryPassword });
     const body = { ...result.body, emailSubmission: 'ACCEPTED' as const };
+    setPhase('email_receipt_finalize');
     await prisma.idempotencyRecord.update({ where: { namespace_keyHash: { namespace: 'customer-membership-invitation:v1', keyHash } }, data: { responseStatus: 201, responseBody: body as Prisma.InputJsonValue, responseDigest: sha256(JSON.stringify(body)) } });
     return { status: 201, body };
   } catch {
+    setPhase('email_failure_compensation');
     const now = new Date();
     await prisma.$transaction(async (tx) => {
       await tx.membershipInvitation.updateMany({ where: { id: result.body.invitationId, state: 'PENDING' }, data: { state: 'REVOKED', revokedAt: now } });
