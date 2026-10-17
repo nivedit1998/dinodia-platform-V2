@@ -311,6 +311,37 @@ test('claim and invitation decision adapters reject impossible UTC calendar time
   candidate.at = '2026-02-31T10:00:00Z';
   assert.equal(resolvePrototypeActionDecision('invitation', 'accept', invitation, [candidate.id]), null);
 });
+
+test('invitation status contract is recipient-minimal and binds active membership only to ACCEPTED', () => {
+  const schema = ajv.getSchema(`${contract.$id}#/$defs/customerInvitationStatusReceipt`);
+  assert.ok(schema);
+  const receipt = {
+    schemaVersion: 'dinodia.v1', ok: true,
+    invitationId: '44444444-4444-4444-8444-444444444444',
+    state: 'PENDING', homeId: '11111111-1111-4111-8111-111111111111',
+    role: 'TENANT', homeMembershipId: null,
+  };
+  assert.equal(schema(receipt), true, JSON.stringify(schema.errors));
+  assert.equal(native.validateCustomerInvitationStatusReceipt(receipt, receipt.invitationId), true);
+  for (const [state, membership] of [
+    ['ACCEPTED', '22222222-2222-4222-8222-222222222222'],
+    ['DECLINED', null], ['EXPIRED', null], ['REPLACED', null], ['REVOKED', null],
+  ]) {
+    const exact = { ...receipt, state, homeMembershipId: membership };
+    assert.equal(schema(exact), true, `${state} must have its exact membership shape`);
+    assert.equal(native.validateCustomerInvitationStatusReceipt(exact, receipt.invitationId), true);
+  }
+  for (const invalid of [
+    { ...receipt, homeMembershipId: '22222222-2222-4222-8222-222222222222' },
+    { ...receipt, state: 'DECLINED', homeMembershipId: '22222222-2222-4222-8222-222222222222' },
+    { ...receipt, recipientEmail: 'must-not-leak@example.test' },
+  ]) {
+    assert.equal(schema(invalid), false);
+    assert.equal(native.validateCustomerInvitationStatusReceipt(invalid, receipt.invitationId), false);
+  }
+  assert.equal(native.validateCustomerInvitationStatusReceipt(receipt, '55555555-5555-4555-8555-555555555555'), false,
+    'A status receipt must bind the exact invitation ID requested by this recipient');
+});
 test('decision fixture runner rejects structurally valid privacy, delivery, offline and claim contradictions', () => {
   const read = (name) => JSON.parse(fs.readFileSync(path.join(root, 'fixtures', name), 'utf8'));
   const baseline = {

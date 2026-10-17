@@ -1,5 +1,5 @@
-import { prisma } from './prisma';
 import { Stage1AuthError } from './stage1Auth';
+import { serializableTransaction } from './serializableTransaction';
 
 type DecisionInput = {
   invitationId: string; decision: 'ACCEPT'|'DECLINE'; expectedUpdatedAt: string;
@@ -13,17 +13,42 @@ type DecisionInput = {
  * home and membership are revalidated after their locks; an exact retry returns
  * the already committed result and a different decision cannot reverse it.
  */
-export async function decideCustomerInvitation(input: DecisionInput) {
-  return prisma.$transaction(async (tx) => {
-    await tx.$queryRaw`SELECT "id" FROM "CustomerAccount" WHERE "id" = ${input.accountId}::uuid FOR UPDATE`;
-    await tx.$queryRaw`SELECT "id" FROM "CustomerSession" WHERE "id" = ${input.sessionId}::uuid FOR UPDATE`;
-    await tx.$queryRaw`SELECT "id" FROM "TrustedDevice" WHERE "id" = ${input.trustedDeviceId}::uuid FOR UPDATE`;
-    await tx.$queryRaw`SELECT "id" FROM "MembershipInvitation" WHERE "id" = ${input.invitationId}::uuid FOR UPDATE`;
+function isPostgresLockTimeout(error: unknown): boolean {
+  const record = typeof error === 'object' && error !== null
+    ? error as { code?: unknown; meta?: { code?: unknown; sqlState?: unknown; sqlstate?: unknown } }
+    : {};
+  const prismaCode = String(record.code ?? '');
+  const sqlState = String(record.meta?.code ?? record.meta?.sqlState ?? record.meta?.sqlstate ?? '');
+  return prismaCode === '55P03' || prismaCode === 'P2010' && sqlState === '55P03';
+}
 
+export async function decideCustomerInvitation(input: DecisionInput, onPhase?: (phase: string) => void) {
+  let currentPhase = 'transaction_setup';
+  const setPhase = (phase: string) => { currentPhase = phase; onPhase?.(phase); };
+  try {
+  return await serializableTransaction(async (tx) => {
+    setPhase('transaction_setup');
+    await tx.$executeRaw`SET LOCAL lock_timeout = '1500ms'`;
+    await tx.$executeRaw`SET LOCAL statement_timeout = '6500ms'`;
+    setPhase('lock_customer_account');
+    await tx.$queryRaw`SELECT "id" FROM "CustomerAccount" WHERE "id" = ${input.accountId}::uuid FOR UPDATE`;
+    setPhase('lock_customer_session');
+    await tx.$queryRaw`SELECT "id" FROM "CustomerSession" WHERE "id" = ${input.sessionId}::uuid FOR UPDATE`;
+    setPhase('lock_trusted_device');
+    await tx.$queryRaw`SELECT "id" FROM "TrustedDevice" WHERE "id" = ${input.trustedDeviceId}::uuid FOR UPDATE`;
+
+    // Invitation issue/replacement locks the Home before the old invitation.
+    // Read the immutable foreign key first, then take those locks in the same
+    // order. Re-read the invitation after both locks and verify the Home ID.
+    setPhase('invitation_home_lookup');
     const initial = await tx.membershipInvitation.findUnique({ where: { id: input.invitationId }, select: { homeId: true } });
     if (!initial) throw new Stage1AuthError(404, 'RESOURCE_NOT_FOUND', 'This invitation is no longer available');
+    setPhase('lock_home');
     await tx.$queryRaw`SELECT "id" FROM "Home" WHERE "id" = ${initial.homeId}::uuid FOR UPDATE`;
+    setPhase('lock_invitation');
+    await tx.$queryRaw`SELECT "id" FROM "MembershipInvitation" WHERE "id" = ${input.invitationId}::uuid FOR UPDATE`;
 
+    setPhase('authority_revalidation');
     const now = new Date();
     const [account, session, device, invitation] = await Promise.all([
       tx.customerAccount.findUnique({ where: { id: input.accountId }, select: { id: true, emailNormalized: true, emailVerifiedAt: true, status: true, mustChangePassword: true, securityVersion: true } }),
@@ -53,6 +78,7 @@ export async function decideCustomerInvitation(input: DecisionInput) {
 
     const stateForDecision = input.decision === 'ACCEPT' ? 'ACCEPTED' : 'DECLINED';
     if (invitation.state === stateForDecision) {
+      setPhase('idempotent_receipt');
       const membership = input.decision === 'ACCEPT'
         ? await tx.homeMembership.findUnique({ where: { customerAccountId_homeId: { customerAccountId: account.id, homeId: invitation.homeId } }, select: { id: true, status: true } })
         : null;
@@ -61,11 +87,15 @@ export async function decideCustomerInvitation(input: DecisionInput) {
       return { schemaVersion: 'dinodia.v1' as const, ok: true as const, invitationId: invitation.id,
         decision: input.decision, state: stateForDecision, homeMembershipId: membership?.id ?? null, idempotentReplay: true };
     }
+    if (invitation.state === 'ACCEPTED' || invitation.state === 'DECLINED') {
+      throw new Stage1AuthError(409, 'REVISION_CONFLICT', 'This invitation already has a different terminal decision');
+    }
     if (invitation.state !== 'PENDING' || invitation.expiresAt <= now) {
       throw new Stage1AuthError(410, 'TOKEN_EXPIRED', 'This invitation has expired or is no longer available');
     }
     if (invitation.updatedAt.toISOString() !== input.expectedUpdatedAt) throw new Stage1AuthError(409, 'REVISION_CONFLICT', 'This invitation changed; refresh Pending access and setup');
     if (input.decision === 'DECLINE') {
+      setPhase('decline_commit');
       await tx.membershipInvitation.update({ where: { id: invitation.id }, data: { state: 'DECLINED', declinedAt: now, targetAccountId: account.id } });
       await tx.auditEvent.create({ data: { homeId: invitation.homeId, actorType: 'CUSTOMER', actorId: account.id, category: 'ACCESS', action: 'membership_invitation_declined', targetType: 'MembershipInvitation', targetId: invitation.id, metadata: { role: invitation.role }, occurredAt: now, purgeAt: new Date(now.getTime() + 365 * 24 * 60 * 60 * 1000) } });
       return { schemaVersion: 'dinodia.v1' as const, ok: true as const, invitationId: invitation.id,
@@ -88,6 +118,7 @@ export async function decideCustomerInvitation(input: DecisionInput) {
 
     const existing = await tx.homeMembership.findUnique({ where: { customerAccountId_homeId: { customerAccountId: account.id, homeId: invitation.homeId } }, select: { id: true, role: true, status: true, accessRevision: true } });
     if (existing && existing.status !== 'REMOVED') throw new Stage1AuthError(409, 'REVISION_CONFLICT', 'This account already has an active or pending relationship with the Home');
+    setPhase('accept_commit');
     const changedHome = await tx.home.updateMany({ where: { id: invitation.homeId, lifecycle: 'ACTIVE', installationStatus: 'COMPLETE', managementRevision: invitation.home.managementRevision }, data: { managementRevision: { increment: 1 } } });
     if (changedHome.count !== 1) throw new Stage1AuthError(409, 'REVISION_CONFLICT', 'The Home access policy changed; refresh and retry');
     const nextPolicyRevision = invitation.home.managementRevision + 1;
@@ -104,5 +135,12 @@ export async function decideCustomerInvitation(input: DecisionInput) {
     await tx.auditEvent.create({ data: { homeId: invitation.homeId, actorType: 'CUSTOMER', actorId: account.id, category: 'ACCESS', action: 'membership_invitation_accepted', targetType: 'MembershipInvitation', targetId: invitation.id, metadata: { role: invitation.role, areaGrantCount: invitedAreaIds.length, managementRevision: nextPolicyRevision }, occurredAt: now, purgeAt: new Date(now.getTime() + 365 * 24 * 60 * 60 * 1000) } });
     return { schemaVersion: 'dinodia.v1' as const, ok: true as const, invitationId: invitation.id,
       decision: input.decision, state: stateForDecision, homeMembershipId: membership.id, idempotentReplay: false };
-  }, { isolationLevel: 'Serializable' });
+  }, 2, { maxWaitMs: 2000, timeoutMs: 8000 });
+  } catch (error) {
+    if (isPostgresLockTimeout(error)) {
+      setPhase(`lock_timeout_after_${currentPhase}`);
+      throw new Stage1AuthError(503, 'internal_error', 'The invitation service is temporarily busy');
+    }
+    throw error;
+  }
 }

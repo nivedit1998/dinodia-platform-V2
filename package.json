@@ -25,6 +25,7 @@
     "test:foundation:invariants": "node scripts/foundation_invariants.mjs",
     "test:stage1:db": "node scripts/stage1_db_checks.mjs",
     "test:stage1:integration": "prisma generate && node scripts/stage1_integration_harness.mjs",
+    "test:stage6:invitation-decision": "prisma generate && STAGE6_TENANT_INVITATION_DECISION_ONLY=1 node scripts/stage1_integration_harness.mjs",
     "test:stage9:tenant-removal-encryption": "prisma generate && STAGE9_HOMEOWNER_TENANT_REMOVAL_ONLY=1 node scripts/stage1_integration_harness.mjs",
     "test:stage1": "node --test test/stage1_security.test.mjs test/operator_rate_limit_policy.test.mjs && npm run test:stage1:integration",
     "check:native-schema": "node scripts/verify_native_schema.mjs",

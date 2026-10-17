@@ -76,6 +76,11 @@ export interface CustomerInvitationDecisionReceipt {
   schemaVersion: typeof DINODIA_V1; ok: true; invitationId: OpaqueId; decision: 'ACCEPT'|'DECLINE';
   state: 'ACCEPTED'|'DECLINED'; homeMembershipId: OpaqueId|null; idempotentReplay: boolean;
 }
+export interface CustomerInvitationStatusReceipt {
+  schemaVersion: typeof DINODIA_V1; ok: true; invitationId: OpaqueId;
+  state: 'PENDING'|'ACCEPTED'|'DECLINED'|'EXPIRED'|'REPLACED'|'REVOKED';
+  homeId: OpaqueId; role: MembershipRole; homeMembershipId: OpaqueId|null;
+}
 export interface CustomerMembershipInvitationRequest { email: string; areaIds: OpaqueId[]; expectedManagementRevision: number; resendInvitationId?: OpaqueId }
 export interface CustomerMembershipInvitationReceipt {
   schemaVersion: typeof DINODIA_V1; ok: true; invitationId: OpaqueId; homeId: OpaqueId;
@@ -507,6 +512,14 @@ export function validateCustomerInvitationDecisionReceipt(value: unknown, expect
     && ['ACCEPT','DECLINE'].includes(String(value.decision)) && (value.state === 'ACCEPTED' || value.state === 'DECLINED')
     && (value.homeMembershipId === null || id(value.homeMembershipId)) && typeof value.idempotentReplay === 'boolean'
     && (value.decision === 'ACCEPT' ? value.state === 'ACCEPTED' && id(value.homeMembershipId) : value.state === 'DECLINED' && value.homeMembershipId === null);
+}
+export function validateCustomerInvitationStatusReceipt(value: unknown, expectedInvitationId: string): value is CustomerInvitationStatusReceipt {
+  return object(value) && hasOnlyKeys(value, ['schemaVersion','ok','invitationId','state','homeId','role','homeMembershipId'])
+    && value.schemaVersion === DINODIA_V1 && value.ok === true && value.invitationId === expectedInvitationId
+    && ['PENDING','ACCEPTED','DECLINED','EXPIRED','REPLACED','REVOKED'].includes(String(value.state))
+    && id(value.homeId) && ['OWNER','PROPERTY_MANAGER','TENANT'].includes(String(value.role))
+    && (value.homeMembershipId === null || id(value.homeMembershipId))
+    && (value.state === 'ACCEPTED' || value.homeMembershipId === null);
 }
 export function validateCustomerMembershipInvitationRequest(value: unknown, role: 'PROPERTY_MANAGER'|'TENANT'): value is CustomerMembershipInvitationRequest {
   if (!object(value) || !hasOnlyKeys(value, ['email','areaIds','expectedManagementRevision','resendInvitationId'])

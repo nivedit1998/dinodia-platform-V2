@@ -7599,6 +7599,7 @@ async function pendingInvitationRouteChecks(deliveryEnv) {
   capturedCustomerInvitationTempPassword = null;
   capturedCustomerVerification = null;
   const newTenantIssue = await fetchJson(`${base}/api/v2/homes/${inviter.homeId}/tenant/invitations`, { method: 'POST', headers: { ...inviterHeaders, 'idempotency-key': `stage6-new-tenant-${crypto.randomUUID()}` }, body: JSON.stringify({ email: newTenantEmail, areaIds: [areaId], expectedManagementRevision: invitationHome.managementRevision }) });
+  const capturedNewTenantInvitationIdAtIssue = capturedCustomerInvitation;
   const newTenantInvitation = newTenantIssue.body?.invitationId ? await prisma.membershipInvitation.findUniqueOrThrow({ where: { id: newTenantIssue.body.invitationId }, select: { id: true, targetAccountId: true, temporaryCredentialHash: true } }) : null;
   const temporaryPassword = capturedCustomerInvitationTempPassword;
   const wrongTempRegister = await fetchJson(`${base}/api/v2/auth/register`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ displayName: 'Disposable new tenant', username: `wrong-${crypto.randomUUID().slice(0, 10)}`, email: newTenantEmail, password: `wrong-stage6-${crypto.randomUUID()}` }) });
@@ -7629,11 +7630,103 @@ async function pendingInvitationRouteChecks(deliveryEnv) {
   const tenantPending = tenantPolicyAcceptance?.response.status === 200 ? await fetchJson(`${base}/api/v2/me/pending-relationships`, { headers: newTenantAuthHeaders() }) : null;
   const currentInviteForAcceptance = newTenantInvitation ? await prisma.membershipInvitation.findUniqueOrThrow({ where: { id: newTenantInvitation.id }, select: { updatedAt: true } }) : null;
   const newTenantMembershipBeforeAccept = newTenantAccount ? await prisma.homeMembership.findUnique({ where: { customerAccountId_homeId: { customerAccountId: newTenantAccount.id, homeId: inviter.homeId } }, select: { id: true } }) : null;
-  const acceptedNewTenantInvitation = tenantPending?.response.status === 200 && currentInviteForAcceptance ? await fetchJson(`${base}/api/v2/invitations/${newTenantInvitation.id}/decision`, { method: 'POST', headers: { ...newTenantAuthHeaders(), 'content-type': 'application/json', 'idempotency-key': `stage6-new-tenant-accept-${crypto.randomUUID()}` }, body: JSON.stringify({ decision: 'ACCEPT', expectedUpdatedAt: currentInviteForAcceptance.updatedAt.toISOString() }) }) : null;
+  const pendingStatusBeforeDecision = tenantPending?.response.status === 200 && newTenantInvitation
+    ? await fetchJson(`${base}/api/v2/invitations/${newTenantInvitation.id}/status`, { headers: newTenantAuthHeaders() }) : null;
+  const anonymousInvitationStatus = newTenantInvitation
+    ? await fetchJson(`${base}/api/v2/invitations/${newTenantInvitation.id}/status`) : null;
+  const wrongRecipientInvitationStatus = newTenantInvitation
+    ? await fetchJson(`${base}/api/v2/invitations/${newTenantInvitation.id}/status`, { headers: inviterHeaders }) : null;
+  const originalInvitationDecisionRace = tenantPending?.response.status === 200 && currentInviteForAcceptance && newTenantInvitation
+    ? await Promise.all(['ACCEPT', 'DECLINE'].map((decision) => fetchJson(`${base}/api/v2/invitations/${newTenantInvitation.id}/decision`, {
+      method: 'POST', headers: { ...newTenantAuthHeaders(), 'content-type': 'application/json' },
+      body: JSON.stringify({ decision, expectedUpdatedAt: currentInviteForAcceptance.updatedAt.toISOString() }),
+    }))) : [];
+  let finalDecisionInvitationId = newTenantInvitation?.id ?? '';
+  let originalInvitationAfterRace = newTenantInvitation
+    ? await prisma.membershipInvitation.findUniqueOrThrow({ where: { id: newTenantInvitation.id }, select: { state: true } }) : null;
+  let acceptedNewTenantInvitation = null;
+  let originalDeclineAuditCount = newTenantInvitation
+    ? await prisma.auditEvent.count({ where: { targetId: newTenantInvitation.id, action: 'membership_invitation_declined' } }) : 0;
+  let originalAcceptAuditCount = newTenantInvitation
+    ? await prisma.auditEvent.count({ where: { targetId: newTenantInvitation.id, action: 'membership_invitation_accepted' } }) : 0;
+  if (originalInvitationAfterRace?.state === 'ACCEPTED') {
+    acceptedNewTenantInvitation = originalInvitationDecisionRace.find((result) => result.response.status === 200) ?? null;
+  } else if (originalInvitationAfterRace?.state === 'DECLINED') {
+    // A real race is allowed to choose either terminal winner. To keep later
+    // onboarding checks on the accepted branch, issue one new invitation to
+    // this same disposable existing account and accept that new generation.
+    const latestInvitationHome = await prisma.home.findUniqueOrThrow({ where: { id: inviter.homeId }, select: { managementRevision: true } });
+    const replacementIssue = await fetchJson(`${base}/api/v2/homes/${inviter.homeId}/tenant/invitations`, {
+      method: 'POST', headers: { ...inviterHeaders, 'idempotency-key': `stage6-race-recovery-${crypto.randomUUID()}` },
+      body: JSON.stringify({ email: newTenantEmail, areaIds: [areaId], expectedManagementRevision: latestInvitationHome.managementRevision }),
+    });
+    const replacementInvitation = replacementIssue.body?.invitationId
+      ? await prisma.membershipInvitation.findUniqueOrThrow({ where: { id: replacementIssue.body.invitationId }, select: { id: true, updatedAt: true, targetAccountId: true, temporaryCredentialHash: true, state: true } })
+      : null;
+    finalDecisionInvitationId = replacementInvitation?.id ?? '';
+    acceptedNewTenantInvitation = replacementInvitation
+      ? await fetchJson(`${base}/api/v2/invitations/${replacementInvitation.id}/decision`, {
+        method: 'POST', headers: { ...newTenantAuthHeaders(), 'content-type': 'application/json' },
+        body: JSON.stringify({ decision: 'ACCEPT', expectedUpdatedAt: replacementInvitation.updatedAt.toISOString() }),
+      }) : null;
+    if (replacementIssue.response.status !== 201 || replacementInvitation?.state !== 'PENDING'
+      || replacementInvitation.targetAccountId !== newTenantAccount?.id || replacementInvitation.temporaryCredentialHash !== null) {
+      fail(`A new invitation to the existing disposable account could not recover from a committed DECLINED race result (${JSON.stringify({ issue: replacementIssue.response.status, state: replacementInvitation?.state, targetBound: replacementInvitation?.targetAccountId === newTenantAccount?.id, temporaryCredentialHashAbsent: replacementInvitation?.temporaryCredentialHash === null })})`);
+    }
+  }
+  const invitationStatusAfterDecision = finalDecisionInvitationId
+    ? await fetchJson(`${base}/api/v2/invitations/${finalDecisionInvitationId}/status`, { headers: newTenantAuthHeaders() }) : null;
+  const originalInvitationStatusAfterDecision = newTenantInvitation
+    ? await fetchJson(`${base}/api/v2/invitations/${newTenantInvitation.id}/status`, { headers: newTenantAuthHeaders() }) : null;
   const tenantCannotListInviterInvitations = await fetchJson(`${base}/api/v2/homes/${inviter.homeId}/invitations`, { headers: newTenantAuthHeaders() });
   const newTenantMembershipAfterAccept = newTenantAccount ? await prisma.homeMembership.findUnique({ where: { customerAccountId_homeId: { customerAccountId: newTenantAccount.id, homeId: inviter.homeId } }, select: { id: true, status: true, role: true, tenantAreaGrants: { where: { revokedAt: null }, select: { areaId: true } } } }) : null;
+  const decisionRaceStatuses = originalInvitationDecisionRace.map((result) => result.response.status).sort((left, right) => left - right);
+  const originalRaceStateIsTerminal = ['ACCEPTED', 'DECLINED'].includes(originalInvitationAfterRace?.state ?? '');
+  const originalRaceAuditIsExact = originalInvitationAfterRace?.state === 'ACCEPTED'
+    ? originalAcceptAuditCount === 1 && originalDeclineAuditCount === 0
+    : originalInvitationAfterRace?.state === 'DECLINED' && originalDeclineAuditCount === 1 && originalAcceptAuditCount === 0;
+  const exactFinalStatus = invitationStatusAfterDecision?.response.status === 200
+    && invitationStatusAfterDecision.body?.ok === true
+    && invitationStatusAfterDecision.body?.invitationId === finalDecisionInvitationId
+    && invitationStatusAfterDecision.body?.state === 'ACCEPTED'
+    && invitationStatusAfterDecision.body?.homeId === inviter.homeId
+    && invitationStatusAfterDecision.body?.role === 'TENANT'
+    && invitationStatusAfterDecision.body?.homeMembershipId === newTenantMembershipAfterAccept?.id;
+  const exactOriginalStatus = originalInvitationStatusAfterDecision?.response.status === 200
+    && originalInvitationStatusAfterDecision.body?.state === originalInvitationAfterRace?.state
+    && originalInvitationStatusAfterDecision.body?.homeMembershipId === (originalInvitationAfterRace?.state === 'ACCEPTED' ? newTenantMembershipAfterAccept?.id : null);
+  console.log(`[stage6:integration] invitationDecisionRace=${JSON.stringify({ statuses: decisionRaceStatuses,
+    originalState: originalInvitationAfterRace?.state, originalAudits: { accepted: originalAcceptAuditCount, declined: originalDeclineAuditCount },
+    pendingStatus: pendingStatusBeforeDecision?.response.status, anonymousStatus: anonymousInvitationStatus?.response.status,
+    wrongRecipientStatus: wrongRecipientInvitationStatus?.response.status, originalStatus: originalInvitationStatusAfterDecision?.body?.state,
+    exactOriginalStatus, originalRaceStateIsTerminal, originalRaceAuditIsExact,
+    finalInvitationIdIsReplacement: finalDecisionInvitationId !== newTenantInvitation?.id,
+    finalDecision: acceptedNewTenantInvitation?.body?.decision, finalDecisionState: acceptedNewTenantInvitation?.body?.state,
+    finalStatus: invitationStatusAfterDecision?.body?.state, finalMembershipMatches: exactFinalStatus,
+    tenantListStatus: tenantCannotListInviterInvitations.response.status,
+    membershipBeforeAccept: Boolean(newTenantMembershipBeforeAccept), membershipStatus: newTenantMembershipAfterAccept?.status,
+    membershipRole: newTenantMembershipAfterAccept?.role, grantCount: newTenantMembershipAfterAccept?.tenantAreaGrants.length ?? null,
+    grantedAreaMatches: newTenantMembershipAfterAccept?.tenantAreaGrants?.[0]?.areaId === areaId,
+    pendingStatusProjection: pendingStatusBeforeDecision?.body,
+    originalStatusProjection: originalInvitationStatusAfterDecision?.body,
+    finalStatusProjection: invitationStatusAfterDecision?.body,
+    finalDecisionReceipt: acceptedNewTenantInvitation?.body,
+    finalMembershipId: newTenantMembershipAfterAccept?.id,
+    finalInvitationId: finalDecisionInvitationId,
+    exactChecks: {
+      issue: newTenantIssue.response.status === 201,
+      pendingRecipient: pendingStatusBeforeDecision?.response.status === 200 && pendingStatusBeforeDecision.body?.homeMembershipId === null,
+      privacy: anonymousInvitationStatus?.response.status === 401 && wrongRecipientInvitationStatus?.response.status === 404,
+      race: originalInvitationDecisionRace.length === 2 && decisionRaceStatuses[0] === 200 && decisionRaceStatuses[1] === 409,
+      terminalAudit: originalRaceStateIsTerminal && originalRaceAuditIsExact,
+      originalStatus: exactOriginalStatus,
+      finalStatus: exactFinalStatus,
+      finalReceipt: acceptedNewTenantInvitation?.response.status === 200 && acceptedNewTenantInvitation.body?.decision === 'ACCEPT' && acceptedNewTenantInvitation.body?.state === 'ACCEPTED' && acceptedNewTenantInvitation.body?.homeMembershipId === newTenantMembershipAfterAccept?.id,
+      tenantListDenied: tenantCannotListInviterInvitations.response.status === 404,
+      membershipAndArea: !newTenantMembershipBeforeAccept && newTenantMembershipAfterAccept?.status === 'ACTIVE' && newTenantMembershipAfterAccept?.role === 'TENANT' && newTenantMembershipAfterAccept?.tenantAreaGrants.length === 1 && newTenantMembershipAfterAccept.tenantAreaGrants[0].areaId === areaId
+    } })}`);
   if (newTenantIssue.response.status !== 201 || !newTenantInvitation?.temporaryCredentialHash || newTenantInvitation.targetAccountId
-    || !temporaryPassword || !/^[A-Za-z0-9_-]{24,160}$/.test(temporaryPassword) || capturedCustomerInvitation !== newTenantInvitation.id
+    || !temporaryPassword || !/^[A-Za-z0-9_-]{24,160}$/.test(temporaryPassword) || capturedNewTenantInvitationIdAtIssue !== newTenantInvitation.id
     || JSON.stringify(newTenantIssue.body).includes(temporaryPassword) || JSON.stringify(newTenantIssue.body).includes(newTenantEmail)
     || wrongTempRegister.response.status !== 400 || accountAfterWrongTemp || wrongTempCreatedVerification
     || wrongTempLogin?.response.status !== 401 || afterWrongTempLogin || wrongLinkedRedeem?.response.status !== 400
@@ -7644,8 +7737,118 @@ async function pendingInvitationRouteChecks(deliveryEnv) {
     || mandatoryReplacement?.response.status !== 200 || usernameRequirements?.body?.nextAction !== 'CHOOSE_USERNAME' || pendingBeforeUsername?.response.status !== 403
     || usernameSelection?.response.status !== 200 || selectedTenantAccount?.usernameNormalized !== newTenantUsername.toLowerCase() || selectedTenantAccount.usernameSelectionRequired
     || tenantPolicyAcceptance?.response.status !== 200 || tenantPending?.body?.pendingRelationships?.[0]?.allowedActions?.includes('ACCEPT') !== true
-    || acceptedNewTenantInvitation?.response.status !== 200 || tenantCannotListInviterInvitations.response.status !== 404 || newTenantMembershipBeforeAccept || newTenantMembershipAfterAccept?.status !== 'ACTIVE'
-    || newTenantMembershipAfterAccept?.role !== 'TENANT' || newTenantMembershipAfterAccept.tenantAreaGrants.length !== 1 || newTenantMembershipAfterAccept.tenantAreaGrants[0].areaId !== areaId) fail(`New tenant invitation did not complete the mobile temporary-password, password-replacement, username-selection and explicit-accept journey (${JSON.stringify({ issue: newTenantIssue.response.status, invitation: Boolean(newTenantInvitation), wrongGenericRegistration: wrongTempRegister.response.status, wrongLinkedRedeem: wrongLinkedRedeem?.response.status, login: newTenantLogin?.response.status, loginError: newTenantLogin?.body?.error?.code ?? null, accessShape: /^dno-customer-access-[A-Za-z0-9_-]{32,}$/.test(newTenantLogin?.body?.accessToken ?? ''), refreshShape: /^dno-customer-session-[A-Za-z0-9_-]{32,}$/.test(newTenantLogin?.body?.refreshToken ?? ''), accountPlaceholder: newTenantAccount?.usernameNormalized?.startsWith('setup-'), accountVerified: Boolean(newTenantAccount?.emailVerifiedAt), accountMustChangePassword: newTenantAccount?.mustChangePassword, accountUsernameRequired: newTenantAccount?.usernameSelectionRequired, invitationBound: boundInvitation?.targetAccountId === newTenantAccount?.id, invitationSecretCleared: boundInvitation?.temporaryCredentialHash === null, initialAction: newTenantRequirements?.body?.nextAction, replacement: mandatoryReplacement?.response.status, replacementError: mandatoryReplacement?.body?.error?.code ?? null, replacementAccessShape: /^dno-customer-access-[A-Za-z0-9_-]{32,}$/.test(mandatoryReplacement?.body?.accessToken ?? ''), usernameAction: usernameRequirements?.body?.nextAction, pendingBeforeUsername: pendingBeforeUsername?.response.status, usernameSelection: usernameSelection?.response.status, usernameMatches: selectedTenantAccount?.usernameNormalized === newTenantUsername.toLowerCase(), usernameStillRequired: selectedTenantAccount?.usernameSelectionRequired, policy: tenantPolicyAcceptance?.response.status, pendingAction: tenantPending?.body?.pendingRelationships?.[0]?.allowedActions, invitationAccept: acceptedNewTenantInvitation?.response.status, membershipBeforeAccept: Boolean(newTenantMembershipBeforeAccept), membershipAfterAccept: newTenantMembershipAfterAccept?.status, grantCount: newTenantMembershipAfterAccept?.tenantAreaGrants.length, grantedAreaMatches: newTenantMembershipAfterAccept?.tenantAreaGrants?.[0]?.areaId === areaId })})`);
+    || pendingStatusBeforeDecision?.response.status !== 200 || pendingStatusBeforeDecision.body?.state !== 'PENDING'
+    || pendingStatusBeforeDecision.body?.homeId !== inviter.homeId || pendingStatusBeforeDecision.body?.role !== 'TENANT'
+    || pendingStatusBeforeDecision.body?.homeMembershipId !== null
+    || anonymousInvitationStatus?.response.status !== 401 || wrongRecipientInvitationStatus?.response.status !== 404
+    || originalInvitationDecisionRace.length !== 2 || decisionRaceStatuses[0] !== 200 || decisionRaceStatuses[1] !== 409
+    || !originalRaceStateIsTerminal || !originalRaceAuditIsExact || !exactOriginalStatus || !exactFinalStatus
+    || originalInvitationAfterRace?.state === 'ACCEPTED' && finalDecisionInvitationId !== newTenantInvitation.id
+    || originalInvitationAfterRace?.state === 'DECLINED' && finalDecisionInvitationId === newTenantInvitation.id
+    || acceptedNewTenantInvitation?.response.status !== 200
+    || acceptedNewTenantInvitation.body?.decision !== 'ACCEPT' || acceptedNewTenantInvitation.body?.state !== 'ACCEPTED'
+    || acceptedNewTenantInvitation.body?.homeMembershipId !== newTenantMembershipAfterAccept?.id
+    || tenantCannotListInviterInvitations.response.status !== 404 || newTenantMembershipBeforeAccept || newTenantMembershipAfterAccept?.status !== 'ACTIVE'
+    || newTenantMembershipAfterAccept?.role !== 'TENANT' || newTenantMembershipAfterAccept.tenantAreaGrants.length !== 1 || newTenantMembershipAfterAccept.tenantAreaGrants[0].areaId !== areaId) fail(`New tenant invitation did not complete the mobile temporary-password, password-replacement, username-selection and explicit-accept journey (${JSON.stringify({ issue: newTenantIssue.response.status, invitation: Boolean(newTenantInvitation), wrongGenericRegistration: wrongTempRegister.response.status, wrongLinkedRedeem: wrongLinkedRedeem?.response.status, login: newTenantLogin?.response.status, loginError: newTenantLogin?.body?.error?.code ?? null, accessShape: /^dno-customer-access-[A-Za-z0-9_-]{32,}$/.test(newTenantLogin?.body?.accessToken ?? ''), refreshShape: /^dno-customer-session-[A-Za-z0-9_-]{32,}$/.test(newTenantLogin?.body?.refreshToken ?? ''), accountPlaceholder: newTenantAccount?.usernameNormalized?.startsWith('setup-'), accountVerified: Boolean(newTenantAccount?.emailVerifiedAt), accountMustChangePassword: newTenantAccount?.mustChangePassword, accountUsernameRequired: newTenantAccount?.usernameSelectionRequired, invitationBound: boundInvitation?.targetAccountId === newTenantAccount?.id, invitationSecretCleared: boundInvitation?.temporaryCredentialHash === null, initialAction: newTenantRequirements?.body?.nextAction, replacement: mandatoryReplacement?.response.status, replacementError: mandatoryReplacement?.body?.error?.code ?? null, replacementAccessShape: /^dno-customer-access-[A-Za-z0-9_-]{32,}$/.test(mandatoryReplacement?.body?.accessToken ?? ''), usernameAction: usernameRequirements?.body?.nextAction, pendingBeforeUsername: pendingBeforeUsername?.response.status, usernameSelection: usernameSelection?.response.status, usernameMatches: selectedTenantAccount?.usernameNormalized === newTenantUsername.toLowerCase(), usernameStillRequired: selectedTenantAccount?.usernameSelectionRequired, policy: tenantPolicyAcceptance?.response.status, pendingAction: tenantPending?.body?.pendingRelationships?.[0]?.allowedActions, invitationAccept: acceptedNewTenantInvitation?.response.status, membershipBeforeAccept: Boolean(newTenantMembershipBeforeAccept), membershipAfterAccept: newTenantMembershipAfterAccept?.status, grantCount: newTenantMembershipAfterAccept?.tenantAreaGrants.length, grantedAreaMatches: newTenantMembershipAfterAccept?.tenantAreaGrants?.[0]?.areaId === areaId,
+      hiddenChecks: { initialSecretExists: Boolean(newTenantInvitation?.temporaryCredentialHash), initiallyUnbound: newTenantInvitation?.targetAccountId === null,
+        temporaryPasswordPresent: Boolean(temporaryPassword), capturedIdMatches: capturedNewTenantInvitationIdAtIssue === newTenantInvitation?.id,
+        issueDoesNotLeakSecretOrEmail: !JSON.stringify(newTenantIssue.body).includes(temporaryPassword) && !JSON.stringify(newTenantIssue.body).includes(newTenantEmail),
+        wrongTempCreatedNoAccount: !accountAfterWrongTemp && !wrongTempCreatedVerification,
+        wrongTempLoginDenied: wrongTempLogin?.response.status === 401 && !afterWrongTempLogin,
+        initialGate: newTenantRequirements?.response.status === 200 && newTenantRequirements.body?.nextAction === 'CHANGE_PASSWORD',
+        usernameGate: usernameRequirements?.body?.nextAction === 'CHOOSE_USERNAME' && pendingBeforeUsername?.response.status === 403,
+        pendingState: pendingStatusBeforeDecision?.response.status === 200 && pendingStatusBeforeDecision.body?.state === 'PENDING'
+          && pendingStatusBeforeDecision.body?.homeId === inviter.homeId && pendingStatusBeforeDecision.body?.role === 'TENANT'
+          && pendingStatusBeforeDecision.body?.homeMembershipId === null,
+        wrongRecipientPrivacy: anonymousInvitationStatus?.response.status === 401 && wrongRecipientInvitationStatus?.response.status === 404,
+        terminalRace: originalInvitationDecisionRace.length === 2 && decisionRaceStatuses[0] === 200 && decisionRaceStatuses[1] === 409
+          && originalRaceStateIsTerminal && originalRaceAuditIsExact && exactOriginalStatus,
+        replacementChoice: originalInvitationAfterRace?.state !== 'DECLINED' || finalDecisionInvitationId !== newTenantInvitation?.id,
+        acceptedReceipt: acceptedNewTenantInvitation?.body?.decision === 'ACCEPT' && acceptedNewTenantInvitation?.body?.state === 'ACCEPTED'
+          && acceptedNewTenantInvitation?.body?.homeMembershipId === newTenantMembershipAfterAccept?.id,
+        tenantCannotListInviterInvitations: tenantCannotListInviterInvitations.response.status === 404 } })})`);
+  // Exercise the actual route's same-choice race before unrelated Stage 9
+  // dashboard assertions. This uses a separate disposable Home so the
+  // already-accepted/replacement-tested tenant can prove one original receipt
+  // plus one exact replay without changing the opposing-choice fixture above.
+  const identicalDecisionHomeId = customerFixture.homeOneId;
+  const identicalDecisionAreaId = customerFixture.areaOneId;
+  const identicalDecisionOwnerHeaders = { cookie: `dinodia_customer_session=${encodeURIComponent(customerFixture.propertySessionSecret)}`,
+    'x-dinodia-home-id': identicalDecisionHomeId, 'content-type': 'application/json' };
+  const identicalDecisionRecipientHeaders = { cookie: `dinodia_customer_session=${encodeURIComponent(rawSession)}`, 'content-type': 'application/json' };
+  const policyForExistingRecipient = await fetchJson(`${base}/api/v2/auth/policy/acceptance`, { method: 'POST',
+    headers: identicalDecisionRecipientHeaders,
+    body: JSON.stringify({ version: deliveryEnv.DINODIA_NATIVE_POLICY_VERSION, contentSha256: sha256(deliveryEnv.DINODIA_NATIVE_POLICY_TEXT), accepted: true }) });
+  const identicalDecisionHomeBefore = await prisma.home.findUniqueOrThrow({ where: { id: identicalDecisionHomeId }, select: { managementRevision: true } });
+  const identicalDecisionPriorMembership = await prisma.homeMembership.findUnique({ where: { customerAccountId_homeId: {
+    customerAccountId: account.id, homeId: identicalDecisionHomeId,
+  } }, select: { id: true } });
+  const identicalDecisionIssue = await fetchJson(`${base}/api/v2/homes/${identicalDecisionHomeId}/tenants/invitations`, {
+    method: 'POST', headers: { ...identicalDecisionOwnerHeaders, 'idempotency-key': `stage6-identical-decision-${crypto.randomUUID()}` },
+    body: JSON.stringify({ email, areaIds: [identicalDecisionAreaId], expectedManagementRevision: identicalDecisionHomeBefore.managementRevision }),
+  });
+  const identicalDecisionInvitation = identicalDecisionIssue.body?.invitationId
+    ? await prisma.membershipInvitation.findUniqueOrThrow({ where: { id: identicalDecisionIssue.body.invitationId }, select: { id: true, updatedAt: true, state: true, targetAccountId: true, temporaryCredentialHash: true } })
+    : null;
+  const identicalDecisionHomeAfterIssue = await prisma.home.findUniqueOrThrow({ where: { id: identicalDecisionHomeId }, select: { managementRevision: true } });
+  const identicalDecisionBody = JSON.stringify({ decision: 'ACCEPT', expectedUpdatedAt: identicalDecisionInvitation?.updatedAt.toISOString() });
+  const identicalDecisionRequests = identicalDecisionInvitation ? await Promise.all([0, 1].map(() => fetchJson(
+    `${base}/api/v2/invitations/${identicalDecisionInvitation.id}/decision`, { method: 'POST',
+      headers: identicalDecisionRecipientHeaders, body: identicalDecisionBody }))) : [];
+  const identicalDecisionAccepted = identicalDecisionInvitation
+    ? await prisma.membershipInvitation.findUnique({ where: { id: identicalDecisionInvitation.id }, select: { state: true } })
+    : null;
+  const identicalDecisionMembership = await prisma.homeMembership.findUnique({ where: { customerAccountId_homeId: {
+    customerAccountId: account.id, homeId: identicalDecisionHomeId,
+  } }, select: { id: true, status: true, role: true, tenantAreaGrants: { where: { revokedAt: null }, select: { areaId: true } } } });
+  const identicalDecisionHomeAfter = await prisma.home.findUniqueOrThrow({ where: { id: identicalDecisionHomeId }, select: { managementRevision: true } });
+  const identicalDecisionAuditCount = identicalDecisionInvitation ? await prisma.auditEvent.count({ where: {
+    targetId: identicalDecisionInvitation.id, action: 'membership_invitation_accepted',
+  } }) : 0;
+  const identicalDecisionReceiptFlags = identicalDecisionRequests.map((result) => result.body?.idempotentReplay).sort();
+  const identicalDecisionStatus = identicalDecisionInvitation ? await fetchJson(
+    `${base}/api/v2/invitations/${identicalDecisionInvitation.id}/status`, { headers: identicalDecisionRecipientHeaders }) : null;
+  const identicalDecisionRetry = identicalDecisionInvitation ? await fetchJson(
+    `${base}/api/v2/invitations/${identicalDecisionInvitation.id}/decision`, { method: 'POST', headers: identicalDecisionRecipientHeaders,
+      body: identicalDecisionBody }) : null;
+  const identicalDecisionConflict = identicalDecisionInvitation ? await fetchJson(
+    `${base}/api/v2/invitations/${identicalDecisionInvitation.id}/decision`, { method: 'POST', headers: identicalDecisionRecipientHeaders,
+      body: JSON.stringify({ decision: 'DECLINE', expectedUpdatedAt: identicalDecisionInvitation.updatedAt.toISOString() }) }) : null;
+  if (policyForExistingRecipient.response.status !== 200 || identicalDecisionPriorMembership
+    || identicalDecisionIssue.response.status !== 201 || !identicalDecisionInvitation
+    || identicalDecisionInvitation.state !== 'PENDING' || identicalDecisionInvitation.targetAccountId !== account.id
+    || identicalDecisionInvitation.temporaryCredentialHash !== null
+    || identicalDecisionRequests.length !== 2 || identicalDecisionRequests.some((result) => result.response.status !== 200
+      || !nativeV1Contract.validateCustomerInvitationDecisionReceipt(result.body, identicalDecisionInvitation.id))
+    || identicalDecisionReceiptFlags.filter((flag) => flag === false).length !== 1
+    || identicalDecisionReceiptFlags.filter((flag) => flag === true).length !== 1
+    || identicalDecisionRequests[0].body?.homeMembershipId !== identicalDecisionRequests[1].body?.homeMembershipId
+    || identicalDecisionAccepted?.state !== 'ACCEPTED' || identicalDecisionMembership?.status !== 'ACTIVE'
+    || identicalDecisionMembership?.role !== 'TENANT' || identicalDecisionMembership?.tenantAreaGrants.length !== 1
+    || identicalDecisionMembership.tenantAreaGrants[0].areaId !== identicalDecisionAreaId
+    || identicalDecisionHomeAfter.managementRevision !== identicalDecisionHomeAfterIssue.managementRevision + 1
+    || identicalDecisionAuditCount !== 1 || identicalDecisionStatus?.response.status !== 200
+    || identicalDecisionStatus.body?.state !== 'ACCEPTED'
+    || identicalDecisionStatus.body?.homeMembershipId !== identicalDecisionMembership?.id
+    || identicalDecisionRetry?.response.status !== 200 || identicalDecisionRetry.body?.idempotentReplay !== true
+    || identicalDecisionConflict?.response.status !== 409 || identicalDecisionConflict.body?.error?.code !== 'REVISION_CONFLICT') {
+    fail(`Concurrent identical recipient ACCEPTs were not one atomic decision plus one exact replay (${JSON.stringify({
+      policy: policyForExistingRecipient.response.status, issue: identicalDecisionIssue.response.status,
+      invitationBoundToExistingAccount: identicalDecisionInvitation?.targetAccountId === account.id,
+      credentialHashAbsent: identicalDecisionInvitation?.temporaryCredentialHash === null,
+      requestStatuses: identicalDecisionRequests.map((result) => result.response.status), receiptFlags: identicalDecisionReceiptFlags,
+      responseMembershipIds: identicalDecisionRequests.map((result) => result.body?.homeMembershipId),
+      state: identicalDecisionAccepted?.state, membershipStatus: identicalDecisionMembership?.status,
+      membershipRole: identicalDecisionMembership?.role, grants: identicalDecisionMembership?.tenantAreaGrants,
+      homeRevisionDelta: identicalDecisionHomeAfter.managementRevision - identicalDecisionHomeBefore.managementRevision,
+      auditCount: identicalDecisionAuditCount, statusRoute: identicalDecisionStatus?.response.status,
+      exactMembershipReference: identicalDecisionStatus?.body?.homeMembershipId === identicalDecisionMembership?.id,
+      exactRetry: [identicalDecisionRetry?.response.status, identicalDecisionRetry?.body?.idempotentReplay],
+      oppositeDecision: [identicalDecisionConflict?.response.status, identicalDecisionConflict?.body?.error?.code],
+    })})`);
+  }
+  console.log('[stage6:integration] PASS: actual-route concurrent identical ACCEPTs for an existing account produce one original and one exact replay, one membership/Area grant/audit/Home revision, authoritative status, and a clear opposing-decision conflict');
+  if (process.env.STAGE6_TENANT_INVITATION_DECISION_ONLY === '1') return;
   // Stage 9: owner-only, revisioned tenant grant replacement uses an exact
   // trusted-phone proof and the selected-home route; denials preserve grants.
   const grantTestArea = await prisma.area.create({ data: { homeId: inviter.homeId, osAreaId: `stage9-grant-${crypto.randomUUID()}`, originalName: 'Grant test Area', status: 'ACTIVE' }, select: { id: true } });
@@ -8121,7 +8324,12 @@ async function pendingInvitationRouteChecks(deliveryEnv) {
   ]);
   if (wrongRevision.response.status !== 409 || afterWrongRevision[0].state !== 'PENDING' || afterWrongRevision[1]
     || afterWrongRevision[2].managementRevision !== initialHome.managementRevision || afterWrongRevision[3] !== 0) fail('Stale invitation decision changed membership, grant authority, Home revision or audit state');
-  const accept = await fetchJson(`${base}/api/v2/invitations/${invitation.id}/decision`, { method: 'POST', headers: { ...headers, 'content-type': 'application/json' }, body: JSON.stringify({ decision: 'ACCEPT', expectedUpdatedAt: invitation.updatedAt.toISOString() }) });
+  const identicalAccepts = await Promise.all([0, 1].map(() => fetchJson(`${base}/api/v2/invitations/${invitation.id}/decision`, {
+    method: 'POST', headers: { ...headers, 'content-type': 'application/json' },
+    body: JSON.stringify({ decision: 'ACCEPT', expectedUpdatedAt: invitation.updatedAt.toISOString() }),
+  })));
+  const accept = identicalAccepts.find((result) => result.body?.idempotentReplay === false) ?? identicalAccepts[0];
+  const identicalReplay = identicalAccepts.find((result) => result.body?.idempotentReplay === true) ?? identicalAccepts[1];
   const afterAccept = await Promise.all([
     prisma.membershipInvitation.findUniqueOrThrow({ where: { id: invitation.id }, select: { state: true } }),
     prisma.homeMembership.findUniqueOrThrow({ where: { customerAccountId_homeId: { customerAccountId: account.id, homeId: inviter.homeId } }, select: { id: true, role: true, status: true, tenantAreaGrants: { where: { revokedAt: null }, select: { areaId: true } } } }),
@@ -8135,13 +8343,19 @@ async function pendingInvitationRouteChecks(deliveryEnv) {
     prisma.home.findUniqueOrThrow({ where: { id: inviter.homeId }, select: { managementRevision: true } }),
     prisma.auditEvent.count({ where: { targetId: invitation.id, action: 'membership_invitation_accepted' } }),
   ]);
-  if (accept.response.status !== 200 || !nativeV1Contract.validateCustomerInvitationDecisionReceipt(accept.body, invitation.id)
+  if (identicalAccepts.length !== 2 || identicalAccepts.some((result) => result.response.status !== 200
+      || !nativeV1Contract.validateCustomerInvitationDecisionReceipt(result.body, invitation.id))
+    || accept.body?.idempotentReplay !== false || identicalReplay.body?.idempotentReplay !== true
+    || identicalAccepts[0].body?.homeMembershipId !== identicalAccepts[1].body?.homeMembershipId
+    || !nativeV1Contract.validateCustomerInvitationDecisionReceipt(accept.body, invitation.id)
     || accept.body.idempotentReplay || afterAccept[0].state !== 'ACCEPTED' || afterAccept[1].role !== 'TENANT' || afterAccept[1].status !== 'ACTIVE'
     || afterAccept[1].tenantAreaGrants.map((grant) => grant.areaId).join(',') !== areaId || afterAccept[2].managementRevision !== initialHome.managementRevision + 1 || afterAccept[3] !== 1
-    || retry.response.status !== 200 || !retry.body.idempotentReplay || conflictingDecision.response.status !== 410
+    || retry.response.status !== 200 || !retry.body.idempotentReplay || conflictingDecision.response.status !== 409
+    || conflictingDecision.body?.error?.code !== 'REVISION_CONFLICT'
     || afterReplay[0].tenantAreaGrants.length !== 1 || afterReplay[1].managementRevision !== initialHome.managementRevision + 1 || afterReplay[2] !== 1) {
-    fail(`Invitation acceptance did not commit one exact tenant grant or safely reconcile retries (${accept.response.status}/${retry.response.status}/${conflictingDecision.response.status})`);
+    fail(`Concurrent identical invitation accepts did not return one original and one exact replay, or did not commit one exact tenant grant (${identicalAccepts.map((result) => `${result.response.status}/${result.body?.idempotentReplay}`).join(',')}; retry=${retry.response.status}; conflict=${conflictingDecision.response.status})`);
   }
+  console.log('[stage6:integration] PASS: concurrent identical invitation ACCEPTs return one committed receipt and one exact idempotent replay with the same membership, one Area grant, one Home revision increment and one audit');
   const recipientOnly = await fetchJson(`${base}/api/v2/invitations/${invitation.id}/decision`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ decision: 'ACCEPT', expectedUpdatedAt: invitation.updatedAt.toISOString() }) });
   if (recipientOnly.response.status !== 401) fail('Invitation decision route admitted an anonymous caller');
 
@@ -11825,11 +12039,14 @@ try {
   const stage5SyncRecoveryOnly = process.env.STAGE5_SYNC_RECOVERY_ONLY === '1';
   const stage9RemovalEncryptionOnly = process.env.STAGE9_HOMEOWNER_TENANT_REMOVAL_ONLY === '1';
   const stage6InvitationLockOnly = process.env.STAGE6_INVITATION_LOCK_ONLY === '1';
-  if (!stage5SyncRecoveryOnly && !stage9RemovalEncryptionOnly && !stage6InvitationLockOnly
+  const stage6TenantInvitationDecisionOnly = process.env.STAGE6_TENANT_INVITATION_DECISION_ONLY === '1';
+  if (!stage5SyncRecoveryOnly && !stage9RemovalEncryptionOnly && !stage6InvitationLockOnly && !stage6TenantInvitationDecisionOnly
     && (stage12AlexaOnly || (process.env.STAGE6_TRANSFER_ONLY !== '1' && process.env.STAGE6_TENANT_REMOVAL_ONLY !== '1'))) {
     await nativeAlexaOAuthChecks(deliveryEnv);
   }
-  if (stage5SyncRecoveryOnly) {
+  if (stage6TenantInvitationDecisionOnly) {
+    await pendingInvitationRouteChecks(deliveryEnv);
+  } else if (stage5SyncRecoveryOnly) {
     await pendingInvitationRouteChecks(deliveryEnv);
     await mobileSessionContractChecks();
     await installationBootstrapChecks();
