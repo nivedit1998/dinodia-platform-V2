@@ -86,16 +86,19 @@ export function nativeV1ErrorResponse(error: unknown, diagnostic?: {
   const requestId = crypto.randomUUID();
   if (status >= 500 && diagnostic) {
     const record = error && typeof error === 'object'
-      ? error as { name?: unknown; code?: unknown; meta?: { code?: unknown; sqlState?: unknown; sqlstate?: unknown } }
+      ? error as { name?: unknown; code?: unknown; failureCode?: unknown; meta?: { code?: unknown; sqlState?: unknown; sqlstate?: unknown } }
       : {};
     const errorName = String(record.name ?? 'Error').slice(0, 48).replace(/[^A-Za-z0-9_.-]/g, '');
     const prismaCode = String(record.code ?? '').match(/^P\d{4}$/)?.[0] ?? null;
     const sqlStateValue = record.meta?.code ?? record.meta?.sqlState ?? record.meta?.sqlstate;
     const sqlState = typeof sqlStateValue === 'string' && /^[0-9A-Z]{5}$/.test(sqlStateValue) ? sqlStateValue : null;
+    const failureCode = typeof record.failureCode === 'string' && [
+      'PLATFORM_ENCRYPTION_KEY_MISSING', 'PLATFORM_ENCRYPTION_KEY_INVALID_ENCODING', 'PLATFORM_ENCRYPTION_KEY_INVALID_SIZE',
+    ].includes(record.failureCode) ? record.failureCode : null;
     console.error('[native-v1-management-failure]', JSON.stringify({
       requestId, operation: diagnostic.operation, phase: diagnostic.phase,
       elapsedMs: Math.max(0, Math.min(600_000, Date.now() - diagnostic.startedAt)),
-      errorName, prismaCode, sqlState,
+      errorName, failureCode, prismaCode, sqlState,
     }));
   }
   const retryable = code === 'HUB_UNAVAILABLE' || code === 'RATE_LIMITED' || code === 'INTERNAL_ERROR';

@@ -1,7 +1,7 @@
-import crypto from 'node:crypto';
 import { NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
 import { encryptPlatformEnvelope } from '@/lib/hubOperatorCredentials';
+import { platformDataEncryptionTokenDigest } from '@/lib/platformDataEncryptionKey';
 import { nativeV1ErrorResponse } from '@/lib/contracts/nativeV1Error';
 import { validateApnsRegistrationReceipt, validateApnsRegistrationRequest } from '@/lib/contracts/dinodiaV1';
 import { requireCustomerAccountSession, Stage1AuthError } from '@/lib/stage1Auth';
@@ -9,10 +9,11 @@ import { requireCustomerAccountSession, Stage1AuthError } from '@/lib/stage1Auth
 export const dynamic = 'force-dynamic';
 
 function tokenDigest(token: string): string {
-  const configured = String(process.env.PLATFORM_DATA_ENCRYPTION_KEY ?? '');
-  const key = Buffer.from(configured, 'base64');
-  if (key.length !== 32) throw new Stage1AuthError(503, 'PUSH_REGISTRATION_UNAVAILABLE', 'Secure notification registration is unavailable');
-  return crypto.createHmac('sha256', key).update('dinodia-v2-apns-token-v1\0').update(token).digest('hex');
+  try {
+    return platformDataEncryptionTokenDigest(token);
+  } catch {
+    throw new Stage1AuthError(503, 'PUSH_REGISTRATION_UNAVAILABLE', 'Secure notification registration is unavailable');
+  }
 }
 
 export async function PUT(request: Request) {

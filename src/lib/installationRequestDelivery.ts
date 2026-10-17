@@ -1,6 +1,7 @@
 import { SESv2Client, SendEmailCommand } from '@aws-sdk/client-sesv2';
 import { prisma } from './prisma';
 import { decryptPlatformEnvelope } from './hubOperatorCredentials';
+import { getPlatformDataEncryptionKey, PlatformDataEncryptionKeyError } from './platformDataEncryptionKey';
 import { readApnsConfig, sendHomeAccessChangedPush, sendInstallationCompletePush, sendTenantAutomationFailurePush, sendTenantAutomationManagementPush, type ApnsConfig, type ApnsEnvironment, type ApnsResult } from './apnsDelivery';
 import { nextAllowedAutomationNotificationAt } from './nativeAutomations/notificationPolicy';
 import { isAutomationFailureDeviceToken } from './nativeAutomations/failureNotifications';
@@ -121,6 +122,9 @@ export async function dispatchInstallationPushReceipts(
       counts.deferred += 1;
       continue;
     }
+    // Fail before claiming/advancing the receipt if the shared encryption
+    // dependency is malformed; a configuration error is not a bad token.
+    getPlatformDataEncryptionKey();
     const claimed = await prisma.nativeNotificationDeliveryReceipt.updateMany({
       where: { id: receipt.id, status: 'PENDING', attemptCount: receipt.attemptCount, deliverAfter: { lte: now }, expiresAt: { gt: now } },
       data: { attemptCount: { increment: 1 } },
@@ -128,7 +132,8 @@ export async function dispatchInstallationPushReceipts(
     if (claimed.count !== 1) continue;
     let deviceToken: string;
     try { deviceToken = decryptPlatformEnvelope(device.apnsTokenCiphertext); }
-    catch {
+    catch (error) {
+      if (error instanceof PlatformDataEncryptionKeyError) throw error;
       await prisma.nativeNotificationDeliveryReceipt.updateMany({ where: { id: receipt.id, status: 'PENDING', attemptCount: receipt.attemptCount + 1 }, data: { status: 'FAILED', lastErrorCode: 'PUSH_TOKEN_DECRYPTION_FAILED' } });
       counts.failed += 1;
       continue;
@@ -198,6 +203,7 @@ export async function dispatchHomeownerAccessRemovalNotices(now = new Date(), de
     nextAttemptAt: { lte: now }, expiresAt: { gt: now }, attempts: { lt: 8 } },
     orderBy: [{ nextAttemptAt: 'asc' }, { createdAt: 'asc' }, { id: 'asc' }], take: RECEIPT_LIMIT,
     select: { id: true, eventType: true, expiresAt: true, attempts: true, payload: true } });
+  if (rows.length) getPlatformDataEncryptionKey();
   const configured = dependencies.sendEmail && dependencies.sendPush ? null : configuration();
   const apns = dependencies.sendPush ? null : readApnsConfig();
   for (const row of rows) {
@@ -210,7 +216,10 @@ export async function dispatchHomeownerAccessRemovalNotices(now = new Date(), de
       if (!sealed || typeof sealed !== 'object' || Array.isArray(sealed)) throw new Error('sealed payload invalid');
       decoded = JSON.parse(decryptPlatformEnvelope(JSON.stringify(sealed))) as Record<string, unknown>;
       noticeId = String(payload?.noticeId ?? '');
-    } catch { /* invalid encrypted payload is suppressed below */ }
+    } catch (error) {
+      if (error instanceof PlatformDataEncryptionKeyError) throw error;
+      /* Invalid stored envelopes are suppressed; configuration failures are not. */
+    }
     if (!decoded || decoded.version !== 1 || !/^[0-9a-f-]{36}$/i.test(noticeId)) {
       await prisma.nativeDomainOutbox.updateMany({ where: { id: row.id, state: 'PENDING', attempts: row.attempts }, data: { state: 'FAILED' } });
       counts.suppressed += 1;
@@ -475,7 +484,12 @@ export async function dispatchTenantAutomationFailureNotifications(now = new Dat
     }, select: { id: true, apnsTokenCiphertext: true, apnsTokenDigest: true, apnsEnvironment: true, apnsTokenRevision: true } });
     let token = '';
     if (device?.apnsTokenCiphertext) {
-      try { token = decryptPlatformEnvelope(device.apnsTokenCiphertext); } catch { token = ''; }
+      getPlatformDataEncryptionKey();
+      try { token = decryptPlatformEnvelope(device.apnsTokenCiphertext); }
+      catch (error) {
+        if (error instanceof PlatformDataEncryptionKeyError) throw error;
+        token = '';
+      }
     }
     if (!device || !device.apnsEnvironment || !device.apnsTokenCiphertext || !device.apnsTokenDigest || !isAutomationFailureDeviceToken(token)) {
       await prisma.nativeNotificationDeliveryReceipt.updateMany({ where: { id: receipt.id, status: 'PENDING', attemptCount: receipt.attemptCount }, data: { status: 'SUPPRESSED', lastErrorCode: 'NO_CURRENT_PUSH_AUTHORITY' } });

@@ -2,6 +2,7 @@ import crypto from 'node:crypto';
 import { Prisma } from '@prisma/client';
 import { prisma } from './prisma';
 import { randomSecret, sha256 } from './stage1Crypto';
+import { getPlatformDataEncryptionKey } from './platformDataEncryptionKey';
 
 export const OPERATOR_ROTATION_MS = 60 * 60 * 1000;
 export const OPERATOR_GRACE_MS = 20 * 60 * 1000;
@@ -27,10 +28,7 @@ export function encryptToHubKey(value: string, encryptionPublicKeyPem: string, p
 }
 
 export function encryptPlatformEnvelope(value: string): Record<string, string> {
-  const configured = String(process.env.PLATFORM_DATA_ENCRYPTION_KEY ?? '');
-  if (!configured) throw new Error('PLATFORM_DATA_ENCRYPTION_KEY is required');
-  const key = Buffer.from(configured, 'base64');
-  if (key.length !== 32) throw new Error('PLATFORM_DATA_ENCRYPTION_KEY must decode to 32 bytes');
+  const key = getPlatformDataEncryptionKey();
   const iv = crypto.randomBytes(12);
   const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
   const ciphertext = Buffer.concat([cipher.update(value, 'utf8'), cipher.final()]);
@@ -46,8 +44,7 @@ export function decryptPlatformEnvelope(serialized: string): string {
     || typeof value.iv !== 'string' || typeof value.tag !== 'string' || typeof value.ciphertext !== 'string') {
     throw new Error('encrypted envelope invalid');
   }
-  const configured = String(process.env.PLATFORM_DATA_ENCRYPTION_KEY ?? '');
-  const key = Buffer.from(configured, 'base64');
+  const key = getPlatformDataEncryptionKey();
   const iv = Buffer.from(value.iv, 'base64');
   const tag = Buffer.from(value.tag, 'base64');
   const ciphertext = Buffer.from(value.ciphertext, 'base64');

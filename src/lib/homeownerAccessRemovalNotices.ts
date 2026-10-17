@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 import type { Prisma } from '@prisma/client';
 import { decryptPlatformEnvelope, encryptPlatformEnvelope } from './hubOperatorCredentials';
+import { PlatformDataEncryptionKeyError } from './platformDataEncryptionKey';
 
 const APNS_TOKEN = /^(?:[A-Fa-f0-9]{2}){32,256}$/;
 const EXPIRY_MS = 30 * 24 * 60 * 60 * 1000;
@@ -14,7 +15,9 @@ const EXPIRY_MS = 30 * 24 * 60 * 60 * 1000;
 export async function queueHomeownerAccessRemovalNotices(tx: Prisma.TransactionClient, input: {
   homeId: string; membershipId: string; customerAccountId: string; revision: number;
   kind: 'TENANT' | 'PROPERTY_MANAGER' | 'OWNERSHIP_TRANSFER' | 'FULL_HOME_DEREGISTRATION'; now: Date;
+  onPhase?: (phase: 'load_targets' | 'encrypt_email' | 'encrypt_push' | 'enqueue') => void;
 }) {
+  input.onPhase?.('load_targets');
   const [account, devices] = await Promise.all([
     tx.customerAccount.findUnique({ where: { id: input.customerAccountId }, select: { email: true, emailVerifiedAt: true, status: true } }),
     tx.trustedDevice.findMany({ where: { customerAccountId: input.customerAccountId, revokedAt: null,
@@ -28,6 +31,7 @@ export async function queueHomeownerAccessRemovalNotices(tx: Prisma.TransactionC
   const noticeId = crypto.randomUUID();
   const entries: Prisma.NativeDomainOutboxCreateManyInput[] = [];
   if (account?.status === 'ACTIVE' && account.emailVerifiedAt && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(account.email)) {
+    input.onPhase?.('encrypt_email');
     const sealed = encryptPlatformEnvelope(JSON.stringify({ version: 1, channel: 'EMAIL', recipient: account.email }));
     entries.push({ homeId: input.homeId, aggregateType: 'HomeownerAccessRemovalNotice', aggregateId: input.membershipId,
       eventType: type, idempotencyKey: `homeowner-removal:${input.membershipId}:${input.revision}:email`,
@@ -36,6 +40,7 @@ export async function queueHomeownerAccessRemovalNotices(tx: Prisma.TransactionC
   for (const device of devices) {
     if (!device.apnsTokenCiphertext || !device.apnsEnvironment) continue;
     try {
+      input.onPhase?.('encrypt_push');
       const token = decryptPlatformEnvelope(device.apnsTokenCiphertext);
       if (!APNS_TOKEN.test(token)) continue;
       const sealed = encryptPlatformEnvelope(JSON.stringify({ version: 1, channel: 'PUSH', deviceToken: token,
@@ -43,9 +48,15 @@ export async function queueHomeownerAccessRemovalNotices(tx: Prisma.TransactionC
       entries.push({ homeId: input.homeId, aggregateType: 'HomeownerAccessRemovalNotice', aggregateId: input.membershipId,
         eventType: type, idempotencyKey: `homeowner-removal:${input.membershipId}:${input.revision}:push:${device.id}`,
         payload: { noticeId, sealed }, expiresAt });
-    } catch { /* Missing/invalid platform encryption material fails closed: no raw token is queued. */ }
+    } catch (error) {
+      if (error instanceof PlatformDataEncryptionKeyError) throw error;
+      /* An invalid stored APNs envelope is skipped; key-configuration failures abort the transaction. */
+    }
   }
-  if (entries.length) await tx.nativeDomainOutbox.createMany({ data: entries, skipDuplicates: true });
+  if (entries.length) {
+    input.onPhase?.('enqueue');
+    await tx.nativeDomainOutbox.createMany({ data: entries, skipDuplicates: true });
+  }
   return { queued: entries.length };
 }
 
@@ -82,7 +93,10 @@ export async function queueTenantAutomationManagementNotice(tx: Prisma.Transacti
       entries.push({ homeId: input.homeId, aggregateType: 'HomeownerAccessRemovalNotice', aggregateId: input.automationId,
         eventType: 'TENANT_AUTOMATION_MANAGEMENT_NOTICE', idempotencyKey: `tenant-automation-management:${input.automationId}:${input.revision}:push:${device.id}`,
         payload: { noticeId: crypto.randomUUID(), sealed }, expiresAt });
-    } catch { /* No raw notification credential is ever persisted. */ }
+    } catch (error) {
+      if (error instanceof PlatformDataEncryptionKeyError) throw error;
+      /* No raw notification credential is ever persisted. */
+    }
   }
   if (entries.length) await tx.nativeDomainOutbox.createMany({ data: entries, skipDuplicates: true });
   return { queued: entries.length };

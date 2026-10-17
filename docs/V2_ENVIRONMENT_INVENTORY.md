@@ -19,7 +19,7 @@ This document is a value-free contract. Secret values belong only in the new Ver
 | Variable | Owner | Secret | Required from | Rotation |
 |---|---|---:|---|---|
 | `JWT_SECRET` | Platform | Yes | Authentication stage | Deliberate session-key rotation |
-| `PLATFORM_DATA_ENCRYPTION_KEY` | Platform | Yes | Native secret-storage stage | Key-versioned migration |
+| `PLATFORM_DATA_ENCRYPTION_KEY` | Platform | Yes | Native secret-storage stage | Canonical standard base64 of exactly 32 bytes; key-versioned migration for rotation |
 | `CLAIM_REFERENCE_PEPPER` | Platform | Yes | Claim stage | Emergency replacement only |
 | `AUDIT_LOG_HASH_SALT` | Platform | Yes | Audit stage | Versioned rotation |
 | `CRON_SECRET` | Platform | Yes | Shared dispatcher stage | Provider rotation |
@@ -131,7 +131,7 @@ consumer listed here is the only runtime that may read it.
 | `AWS_REGION` / `SES_FROM_EMAIL` | Dinodia release configuration | Vercel SES invitation mailer only | Vercel encrypted environment, temporary ceremony scope | Use the verified SES region and sender; remove after the first-CXO ceremony if no mail consumer remains |
 | `APNS_TEAM_ID` / `APNS_KEY_ID` / `APNS_AUTH_KEY_P8` | Apple Developer account owner | Platform native-operations push dispatcher only | Vercel encrypted Production environment; signing key never stored on Pi, in Git, or in either app | Use an owner-approved Apple Push Notification key for the V2 app topic `com.dinodia.DinodiaV2`; without all three values, receipts remain pending and no push is reported sent |
 | `JWT_SECRET` | Dinodia operator-generated random value | Platform-native signing/compatibility code only | Vercel encrypted environment | Not a Supabase replacement; rotate deliberately and invalidate affected sessions |
-| `PLATFORM_DATA_ENCRYPTION_KEY` | Dinodia operator-generated random value | Platform envelope/data encryption | Vercel encrypted environment | Key-versioned rotation; never put in Prisma or client config |
+| `PLATFORM_DATA_ENCRYPTION_KEY` | Dinodia operator-generated random value | Platform envelope/data encryption and APNs token HMAC | Vercel encrypted environment | Canonical standard base64 of exactly 32 bytes; key-versioned rotation; never put in Prisma or client config |
 | `CLAIM_REFERENCE_PEPPER` | Dinodia operator-generated random value | Platform claim-reference hashing | Vercel encrypted environment | Replacement invalidates affected claim references by policy |
 | `AUDIT_LOG_HASH_SALT` | Dinodia operator-generated random value | Platform audit redaction/hash code | Vercel encrypted environment | Never log or return the salt |
 | `CRON_SECRET` | Dinodia operator-generated random value | Vercel cron endpoint and shared native-operations route | Vercel encrypted environment; Supabase Vault copy only when the Supabase job invokes the route | No secret-specific cron; shared dispatcher only |

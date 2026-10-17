@@ -112,8 +112,11 @@ export async function DELETE(request: Request, context: { params: Promise<{ home
       const homeChanged = await tx.home.updateMany({ where: { id: homeId, managementRevision: home.managementRevision }, data: { managementRevision: { increment: 1 } } });
       if (homeChanged.count !== 1) throw new Stage1AuthError(409, 'REVISION_CONFLICT', 'Home management changed. Refresh and retry.');
       await tx.homeMembership.update({ where: { id: tenantId }, data: { status: 'REMOVED', removedAt: now, removalReason: 'owner_removed_tenant', accessRevision: { increment: 1 } } });
+      phase = 'removal_notice_load_targets';
       await queueHomeownerAccessRemovalNotices(tx, { homeId, membershipId: tenantId, customerAccountId: target.customerAccountId,
-        revision: nextAccessRevision, kind: 'TENANT', now });
+        revision: nextAccessRevision, kind: 'TENANT', now,
+        onPhase: (noticePhase) => { phase = `removal_notice_${noticePhase}`; } });
+      phase = 'revoke_membership_and_private_scope';
       await tx.tenantAreaGrant.updateMany({ where: { membershipId: tenantId, homeId, revokedAt: null }, data: { revokedAt: now, revokeReason: 'owner_removed_tenant', policyRevision: nextAccessRevision } });
       await tx.offlineMembershipAuthorisation.updateMany({ where: { membershipId: tenantId, homeId, revokedAt: null }, data: { revokedAt: now, revokeReason: 'owner_removed_tenant', policyRevision: nextAccessRevision } });
       await tx.stepUpChallenge.updateMany({ where: { homeId, membershipId: tenantId, consumedAt: null, cancelledAt: null }, data: { cancelledAt: now } });

@@ -68,6 +68,7 @@ let capturedCustomerAuthPath;
 let customerFixture;
 let pendingStage11AutomationDisableAck = null;
 let stageHomeSyncReceipts = [];
+const managementFailureRecords = [];
 let fakePhysicalCommandCount = 0;
 let osHarnessNow = Date.now();
 let osHarnessWallAnchor = Date.now();
@@ -109,15 +110,27 @@ function safeProcessEnvironment(source = process.env) {
   }
   return safe;
 }
-function loadOperatorLifecycleService() {
+function loadOperatorLifecycleService(platformKey = crypto.randomBytes(32)) {
   const require = createRequire(import.meta.url);
   const ts = require('typescript');
+  const isolatedPlatformKey = Buffer.from(platformKey);
   const source = fs.readFileSync(path.join(root, 'src/lib/hubOperatorCredentials.ts'), 'utf8');
   const compiled = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, esModuleInterop: true } }).outputText;
   const loaded = { exports: {} };
   const localRequire = (specifier) => {
     if (specifier === './prisma') return { prisma };
     if (specifier === './stage1Crypto') return { randomSecret: (bytes = 32) => crypto.randomBytes(bytes).toString('base64url'), sha256 };
+    if (specifier === './platformDataEncryptionKey') {
+      // This loader exercises operator lifecycle behavior, not shared-key
+      // configuration. Keep its platform-envelope dependency synthetic and
+      // independent of any developer/Production shell environment. The actual
+      // route + encryption helper are exercised by the disposable HTTP server.
+      return {
+        getPlatformDataEncryptionKey: () => isolatedPlatformKey,
+        platformDataEncryptionTokenDigest: (token) => crypto.createHmac('sha256', isolatedPlatformKey)
+          .update('dinodia-v2-apns-token-v1\0').update(token).digest('hex'),
+      };
+    }
     if (specifier === '@prisma/client') return { Prisma };
     return require(specifier);
   };
@@ -189,6 +202,11 @@ function inspectRejectedSyncEnvelope(body) {
 function loadInstallationPushDispatcher(platformDataEncryptionKey = '') {
   const require = createRequire(import.meta.url);
   const ts = require('typescript');
+  const decodedPlatformKey = Buffer.from(platformDataEncryptionKey, 'base64');
+  const isolatedPlatformKey = decodedPlatformKey.length === 32
+    ? decodedPlatformKey
+    : Buffer.alloc(32, 0x5a);
+  class IsolatedPlatformDataEncryptionKeyError extends Error {}
   const loadLocalTypeScript = (relative, localRequire = require) => {
     const moduleSource = fs.readFileSync(path.join(root, relative), 'utf8');
     const moduleCompiled = ts.transpileModule(moduleSource, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, esModuleInterop: true } }).outputText;
@@ -214,6 +232,10 @@ function loadInstallationPushDispatcher(platformDataEncryptionKey = '') {
   const localRequire = (specifier) => {
     if (specifier === './prisma') return { prisma };
     if (specifier === './hubOperatorCredentials') return { decryptPlatformEnvelope };
+    if (specifier === './platformDataEncryptionKey') return {
+      getPlatformDataEncryptionKey: () => isolatedPlatformKey,
+      PlatformDataEncryptionKeyError: IsolatedPlatformDataEncryptionKeyError,
+    };
     if (specifier === './nativeAutomations/notificationPolicy') return notificationPolicy;
     if (specifier === './nativeAutomations/failureNotifications') return failureNotifications;
     if (specifier === './apnsDelivery') return {
@@ -790,6 +812,23 @@ async function startPlatform(runEnv) {
       const lines = pending.split(/\r?\n/);
       pending = lines.pop() ?? '';
       for (const line of lines) {
+        const managementFailureMarker = '[native-v1-management-failure] ';
+        const managementFailureOffset = line.indexOf(managementFailureMarker);
+        if (managementFailureOffset >= 0) {
+          try {
+            const parsed = JSON.parse(line.slice(managementFailureOffset + managementFailureMarker.length));
+            const safe = {
+              requestId: typeof parsed.requestId === 'string' && /^[0-9a-f-]{36}$/i.test(parsed.requestId) ? parsed.requestId : null,
+              operation: typeof parsed.operation === 'string' && /^[a-z_]{1,64}$/.test(parsed.operation) ? parsed.operation : null,
+              phase: typeof parsed.phase === 'string' && /^[a-z0-9_]{1,80}$/.test(parsed.phase) ? parsed.phase : null,
+              errorName: typeof parsed.errorName === 'string' && /^[A-Za-z0-9_.-]{1,48}$/.test(parsed.errorName) ? parsed.errorName : null,
+              failureCode: typeof parsed.failureCode === 'string' && /^PLATFORM_ENCRYPTION_KEY_(?:MISSING|INVALID_ENCODING|INVALID_SIZE)$/.test(parsed.failureCode) ? parsed.failureCode : null,
+              prismaCode: typeof parsed.prismaCode === 'string' && /^P\d{4}$/.test(parsed.prismaCode) ? parsed.prismaCode : null,
+              sqlState: typeof parsed.sqlState === 'string' && /^[0-9A-Z]{5}$/.test(parsed.sqlState) ? parsed.sqlState : null,
+            };
+            if (safe.requestId) managementFailureRecords.push(safe);
+          } catch { /* Never forward malformed or unfiltered application diagnostics. */ }
+        }
         const alexaRevokePhase = line.match(/\[stage12:alexa-revoke\] phase=([a-z-]{1,64})/)?.[1];
         if (alexaRevokePhase) console.log(`[stage12:integration] revoke phase=${alexaRevokePhase}`);
         const alexaRevokeError = line.match(/\[stage12:alexa-revoke\] error code=([A-Za-z0-9_-]{1,16}) column=([A-Za-z0-9_."]{1,120})/);
@@ -5770,6 +5809,250 @@ async function fullHomeDeregistrationChecks(deliveryEnv) {
   console.log('[stage9:integration] PASS: actual loopback full-home deregistration preview/step-up/commit; late failure rolled all rows and proof use back; bounded account cleanup resumed through the existing operations dispatch after restart; current owner/managers/tenants lost Home authority; physical identity/address/areas/hub/tunnel and in-progress work were preserved; private data cleared; unrelated Home access remained; hub enforcement honestly pending');
 }
 
+async function homeownerRemovalEncryptionConfigurationChecks(deliveryEnv) {
+  const base = `http://127.0.0.1:${appPort}`;
+  const fixture = customerFixture;
+  if (!fixture) fail('Homeowner encryption-configuration checks require the disposable completed two-home fixture');
+
+  // This focused case is deliberately independent of the legacy Dashboard
+  // Layout assertions in pendingInvitationRouteChecks. The owner and target,
+  // credentials, keys and recipient are disposable; the HTTP request still
+  // traverses the actual selected-Home DELETE route and notice helper.
+  await stopPlatform();
+  await startPlatform(deliveryEnv);
+  const ownerMembership = await prisma.homeMembership.findUniqueOrThrow({ where: { id: fixture.ownerMembershipId },
+    select: { id: true, customerAccountId: true, homeId: true, role: true, status: true, accessRevision: true } });
+  const homeId = fixture.homeTwoId;
+  if (ownerMembership.customerAccountId !== fixture.accountId || ownerMembership.homeId !== homeId
+    || ownerMembership.role !== 'OWNER' || ownerMembership.status !== 'ACTIVE') {
+    fail('Focused homeowner-removal fixture does not use the exact active Owner membership for Home two');
+  }
+  await prisma.policyAcceptance.upsert({
+    where: { customerAccountId_policyKind_policyVersion: { customerAccountId: ownerMembership.customerAccountId,
+      policyKind: 'DINODIA_NATIVE', policyVersion: deliveryEnv.DINODIA_NATIVE_POLICY_VERSION } },
+    create: { customerAccountId: ownerMembership.customerAccountId, policyKind: 'DINODIA_NATIVE',
+      policyVersion: deliveryEnv.DINODIA_NATIVE_POLICY_VERSION, acceptedAt: new Date() },
+    update: {},
+  });
+  const ownerPhone = keyPair();
+  const ownerLogin = await fetchJson(`${base}/api/v2/mobile/session`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({
+    email: fixture.loginEmail, password: fixture.loginPassword, deviceInstallationId: `stage9-removal-config-owner-${crypto.randomUUID()}`,
+    publicKey: ownerPhone.publicKey, deviceName: 'Disposable removal configuration owner', model: 'integration-test', osFamily: 'test', osVersion: 'test',
+  }) });
+  if (ownerLogin.response.status !== 200 || !/^dno-customer-access-[A-Za-z0-9_-]{32,}$/.test(ownerLogin.body?.accessToken ?? '')) {
+    fail(`Focused removal owner could not establish a disposable selected-Home session (${ownerLogin.response.status}/${ownerLogin.body?.error?.code ?? 'none'})`);
+  }
+  const ownerHeaders = { authorization: `Bearer ${ownerLogin.body.accessToken}`, 'x-dinodia-home-id': homeId, 'content-type': 'application/json' };
+  const tenantEmail = `stage9-encryption-removal-${crypto.randomUUID()}@invalid.test`;
+  const tenantUsername = `stage9-encryption-${crypto.randomUUID().slice(0, 12)}`;
+  const tenant = await prisma.customerAccount.create({ data: { displayName: 'Disposable encryption-removal tenant',
+    username: tenantUsername, usernameNormalized: tenantUsername, email: tenantEmail, emailNormalized: tenantEmail,
+    emailVerifiedAt: new Date(), passwordHash: hashPassword(`unused-${crypto.randomUUID()}`) } });
+  const membership = await prisma.homeMembership.create({ data: { customerAccountId: tenant.id, homeId, role: 'TENANT', status: 'ACTIVE' } });
+  await prisma.tenantAreaGrant.create({ data: { membershipId: membership.id, homeId, areaId: fixture.areaTwoId } });
+  const homeBefore = await prisma.home.findUniqueOrThrow({ where: { id: homeId },
+    select: { managementRevision: true, activeHubInstallationId: true } });
+  const tenantBefore = await prisma.homeMembership.findUniqueOrThrow({ where: { id: membership.id },
+    select: { status: true, accessRevision: true, tenantAreaGrants: { where: { revokedAt: null }, select: { areaId: true } } } });
+  const areaIdsBefore = (await prisma.area.findMany({ where: { homeId, status: 'ACTIVE' }, orderBy: { id: 'asc' }, select: { id: true } })).map((row) => row.id);
+  const propertyDeviceIdsBefore = (await prisma.nativeDevice.findMany({ where: { homeId, managementClass: 'PROPERTY_DEVICE' },
+    orderBy: { id: 'asc' }, select: { id: true } })).map((row) => row.id);
+  const tenantDevice = await prisma.nativeDevice.create({ data: { homeId, hubInstallationId: homeBefore.activeHubInstallationId,
+    osDeviceId: `stage9-encryption-removal-device-${crypto.randomUUID()}`, originalName: 'Disposable tenant lamp',
+    customerLabel: 'Disposable private lamp', technicalLabel: 'tenant_device', managementClass: 'TENANT_DEVICE',
+    ownerMembershipId: membership.id, deviceType: 'light', protocol: 'test', lifecycle: 'DISCOVERED', descriptorRevision: 1 } });
+  await prisma.deviceAreaAssignment.create({ data: { homeId, deviceId: tenantDevice.id, areaId: fixture.areaTwoId,
+    source: 'STAGE9_DISPOSABLE_TENANT_REMOVAL', actorType: 'SYSTEM' } });
+  await prisma.nativeDevice.update({ where: { id: tenantDevice.id }, data: { lifecycle: 'INSTALLED' } });
+  const challengeValue = { expectedAccessRevision: tenantBefore.accessRevision, expectedManagementRevision: homeBefore.managementRevision };
+  const challenge = await fetchJson(`${base}/api/v2/security/step-up/challenge`, { method: 'POST', headers: ownerHeaders,
+    body: JSON.stringify({ operationKind: 'home_tenant_remove', targetIds: [membership.id], value: challengeValue }) });
+  if (challenge.response.status !== 200) fail(`Focused tenant-removal challenge failed (${challenge.response.status}/${challenge.body?.error?.code ?? 'none'})`);
+  const signature = crypto.sign(null, stepUpChallengeMessage({ challengeId: challenge.body.challengeId, nonce: challenge.body.nonce,
+    operationDigest: challenge.body.operationDigest }), crypto.createPrivateKey(ownerPhone.privateKey)).toString('base64url');
+  const issued = await fetchJson(`${base}/api/v2/security/step-up/issue`, { method: 'POST', headers: ownerHeaders,
+    body: JSON.stringify({ challengeId: challenge.body.challengeId, nonce: challenge.body.nonce, deviceSignature: signature }) });
+  if (issued.response.status !== 200 || typeof issued.body?.proof !== 'string') fail('Focused tenant-removal challenge did not issue its signed disposable proof');
+  const idempotencyKey = `stage9-encryption-removal-${crypto.randomUUID()}`;
+  const requestBody = { ...challengeValue, proof: issued.body.proof, idempotencyKey };
+  const proofHash = sha256(issued.body.proof);
+  const nextAccessRevision = tenantBefore.accessRevision + 1;
+  const emailNoticeKey = `homeowner-removal:${membership.id}:${nextAccessRevision}:email`;
+  const membershipTombstoneKey = `homeowner-tenant-removal:${membership.id}:${nextAccessRevision}`;
+  const deviceTombstoneKey = `${membershipTombstoneKey}:device:${tenantDevice.id}`;
+  const removalPath = `${base}/api/v2/homes/${homeId}/tenants/${membership.id}`;
+
+  // The synthetic key is 32 bytes but hex-encoded, reproducing the exact
+  // base64-vs-hex configuration shape without importing any Production secret.
+  await stopPlatform();
+  let failedRemoval;
+  try {
+    await startPlatform({ ...deliveryEnv, PLATFORM_DATA_ENCRYPTION_KEY: crypto.randomBytes(32).toString('hex') });
+    failedRemoval = await fetchJson(removalPath, { method: 'DELETE', headers: ownerHeaders, body: JSON.stringify(requestBody) });
+    const requestId = failedRemoval.body?.error?.requestId;
+    if (typeof requestId === 'string') await waitFor(() => Promise.resolve(
+      managementFailureRecords.some((record) => record.requestId === requestId)), 'bounded malformed-key removal diagnostic');
+  } finally {
+    await stopPlatform();
+    await startPlatform(deliveryEnv);
+  }
+
+  const failedTenant = await prisma.homeMembership.findUniqueOrThrow({ where: { id: membership.id },
+    select: { status: true, accessRevision: true, tenantAreaGrants: { where: { revokedAt: null }, select: { areaId: true } } } });
+  const failedHome = await prisma.home.findUniqueOrThrow({ where: { id: homeId }, select: { managementRevision: true } });
+  const failedProof = await prisma.stepUpAuthorization.findFirst({ where: { nonceHash: proofHash }, select: { consumedAt: true } });
+  const failedAccount = await prisma.customerAccount.findUnique({ where: { id: tenant.id }, select: { status: true } });
+  const failedDevice = await prisma.nativeDevice.findUnique({ where: { id: tenantDevice.id }, select: { id: true } });
+  const failedNoticeCount = await prisma.nativeDomainOutbox.count({ where: { aggregateType: 'HomeownerAccessRemovalNotice', idempotencyKey: emailNoticeKey } });
+  const failedTombstoneCount = await prisma.nativeDomainOutbox.count({ where: { idempotencyKey: { in: [membershipTombstoneKey, deviceTombstoneKey] } } });
+  const failedAuditCount = await prisma.auditEvent.count({ where: { homeId, action: 'home_tenant_membership_removed',
+    targetType: 'HomeMembership', targetId: membership.id } });
+  const failedReceipt = await fetchJson(`${base}/api/v2/homes/${homeId}/tenants/${membership.id}/management-operation-receipt`, {
+    method: 'POST', headers: ownerHeaders, body: JSON.stringify({ operationKind: 'home_tenant_remove', idempotencyKey,
+      expectedAccessRevision: tenantBefore.accessRevision, expectedManagementRevision: homeBefore.managementRevision }),
+  });
+  const failureDiagnostic = managementFailureRecords.find((record) => record.requestId === failedRemoval?.body?.error?.requestId);
+  if (failedRemoval?.response.status !== 503 || failedRemoval.body?.error?.code !== 'INTERNAL_ERROR'
+    || failedRemoval.body?.error?.retryable !== true
+    || failedRemoval.body?.error?.message !== 'The request could not be completed'
+    || JSON.stringify(failedRemoval.body ?? {}).includes('PLATFORM_ENCRYPTION_KEY')
+    || failedTenant.status !== 'ACTIVE' || failedTenant.accessRevision !== tenantBefore.accessRevision
+    || JSON.stringify(failedTenant.tenantAreaGrants.map((grant) => grant.areaId).sort()) !== JSON.stringify(tenantBefore.tenantAreaGrants.map((grant) => grant.areaId).sort())
+    || failedHome.managementRevision !== homeBefore.managementRevision || failedProof?.consumedAt !== null
+    || failedAccount?.status !== 'ACTIVE' || !failedDevice || failedNoticeCount !== 0 || failedTombstoneCount !== 0
+    || failedAuditCount !== 0 || failedReceipt.response.status !== 200 || failedReceipt.body?.status !== 'NOT_FOUND'
+    || failureDiagnostic?.operation !== 'home_tenant_remove' || failureDiagnostic?.phase !== 'removal_notice_encrypt_email'
+    || failureDiagnostic?.errorName !== 'PlatformDataEncryptionKeyError'
+    || failureDiagnostic?.failureCode !== 'PLATFORM_ENCRYPTION_KEY_INVALID_SIZE') {
+    fail(`Malformed-key actual DELETE did not return a safe failure with complete rollback (${JSON.stringify({ status: failedRemoval?.response.status,
+      code: failedRemoval?.body?.error?.code, membership: failedTenant.status, revisionUnchanged: failedTenant.accessRevision === tenantBefore.accessRevision,
+      homeRevisionUnchanged: failedHome.managementRevision === homeBefore.managementRevision, proofConsumed: Boolean(failedProof?.consumedAt),
+      accountActive: failedAccount?.status === 'ACTIVE', devicePreserved: Boolean(failedDevice), notices: failedNoticeCount,
+      tombstones: failedTombstoneCount, audits: failedAuditCount, receipt: failedReceipt.body?.status,
+      diagnostic: failureDiagnostic ? { phase: failureDiagnostic.phase, errorName: failureDiagnostic.errorName, failureCode: failureDiagnostic.failureCode } : null })})`);
+  }
+
+  // Reuse the exact settled operation identity and proof after restoring the
+  // supported key representation. This proves failure did not consume proof
+  // or create a conflicting receipt; it also exercises orphan cleanup.
+  const committedRemoval = await fetchJson(removalPath, { method: 'DELETE', headers: ownerHeaders, body: JSON.stringify(requestBody) });
+  const committedReceipt = await fetchJson(`${base}/api/v2/homes/${homeId}/tenants/${membership.id}/management-operation-receipt`, {
+    method: 'POST', headers: ownerHeaders, body: JSON.stringify({ operationKind: 'home_tenant_remove', idempotencyKey,
+      expectedAccessRevision: tenantBefore.accessRevision, expectedManagementRevision: homeBefore.managementRevision }),
+  });
+  const committedReplay = await fetchJson(removalPath, { method: 'DELETE', headers: ownerHeaders, body: JSON.stringify(requestBody) });
+  const removedAccount = await prisma.customerAccount.findUnique({ where: { id: tenant.id }, select: { id: true } });
+  const removedMembership = await prisma.homeMembership.findUnique({ where: { id: membership.id }, select: { status: true } });
+  const removedDevice = await prisma.nativeDevice.findUnique({ where: { id: tenantDevice.id }, select: { id: true } });
+  const notice = await prisma.nativeDomainOutbox.findUnique({ where: { idempotencyKey: emailNoticeKey }, select: { state: true, payload: true } });
+  const noticeBody = notice?.payload && typeof notice.payload === 'object' && !Array.isArray(notice.payload)
+    ? notice.payload : null;
+  const envelope = noticeBody?.sealed && typeof noticeBody.sealed === 'object' && !Array.isArray(noticeBody.sealed)
+    ? noticeBody.sealed : null;
+  let openedNotice = null;
+  if (envelope) {
+    try {
+      const platformKey = Buffer.from(deliveryEnv.PLATFORM_DATA_ENCRYPTION_KEY, 'base64');
+      const { decryptPlatformEnvelope } = loadOperatorLifecycleService(platformKey);
+      openedNotice = JSON.parse(decryptPlatformEnvelope(JSON.stringify(envelope)));
+    } catch { /* The failure below remains a bounded assertion without plaintext output. */ }
+  }
+  const tombstones = await prisma.nativeDomainOutbox.findMany({ where: { idempotencyKey: { in: [membershipTombstoneKey, deviceTombstoneKey] } },
+    select: { idempotencyKey: true, state: true } });
+  const successfulAuditCount = await prisma.auditEvent.count({ where: { homeId, action: 'home_tenant_membership_removed',
+    targetType: 'HomeMembership', targetId: membership.id } });
+  const homeAfter = await prisma.home.findUniqueOrThrow({ where: { id: homeId }, select: { managementRevision: true } });
+  const areaIdsAfter = (await prisma.area.findMany({ where: { homeId, status: 'ACTIVE' }, orderBy: { id: 'asc' }, select: { id: true } })).map((row) => row.id);
+  const propertyDeviceIdsAfter = (await prisma.nativeDevice.findMany({ where: { homeId, managementClass: 'PROPERTY_DEVICE' },
+    orderBy: { id: 'asc' }, select: { id: true } })).map((row) => row.id);
+  const removalList = await fetchJson(`${base}/api/v2/homes/${homeId}/tenants`, { headers: ownerHeaders });
+  const removedStillListed = Array.isArray(removalList.body?.tenants)
+    && removalList.body.tenants.some((row) => row.id === membership.id || row.membershipId === membership.id);
+  if (committedRemoval.response.status !== 200 || committedRemoval.body?.state !== 'REMOVED'
+    || committedRemoval.body?.hubEnforcement !== 'PENDING'
+    || committedRemoval.body?.managementRevision !== homeBefore.managementRevision + 1
+    || committedRemoval.body?.accessRevision !== nextAccessRevision
+    || committedReceipt.response.status !== 200 || committedReceipt.body?.status !== 'COMMITTED'
+    || committedReceipt.body?.receipt?.state !== 'REMOVED' || committedReceipt.body?.receipt?.idempotentReplay !== true
+    || committedReplay.response.status !== 200 || committedReplay.body?.idempotentReplay !== true
+    || removedAccount || removedMembership || removedDevice || notice?.state !== 'PENDING'
+    || !openedNotice || openedNotice.version !== 1 || openedNotice.channel !== 'EMAIL' || openedNotice.recipient !== tenantEmail
+    || JSON.stringify(notice?.payload ?? {}).includes(tenantEmail) || tombstones.length !== 2 || successfulAuditCount !== 1
+    || homeAfter.managementRevision !== homeBefore.managementRevision + 1
+    || JSON.stringify(areaIdsAfter) !== JSON.stringify(areaIdsBefore)
+    || JSON.stringify(propertyDeviceIdsAfter) !== JSON.stringify(propertyDeviceIdsBefore)
+    || removalList.response.status !== 200
+    || (Array.isArray(removalList.body?.tenants) && removedStillListed)) {
+    fail(`Valid-config exact retry did not commit orphan cleanup, encrypted notice, durable tombstones and an exact receipt without touching property inventory (${JSON.stringify({
+      status: committedRemoval.response.status, state: committedRemoval.body?.state, hub: committedRemoval.body?.hubEnforcement,
+      receipt: committedReceipt.body?.status, replay: committedReplay.body?.idempotentReplay === true, accountDeleted: !removedAccount,
+      membershipRemoved: !removedMembership, privateDeviceRemoved: !removedDevice, noticeQueued: notice?.state === 'PENDING',
+      encryptedEmailRoundTrip: openedNotice?.recipient === tenantEmail, noticeHasPlaintext: JSON.stringify(notice?.payload ?? {}).includes(tenantEmail),
+      tombstones: tombstones.length, audits: successfulAuditCount, areasPreserved: JSON.stringify(areaIdsAfter) === JSON.stringify(areaIdsBefore),
+      propertyDevicesPreserved: JSON.stringify(propertyDeviceIdsAfter) === JSON.stringify(propertyDeviceIdsBefore),
+      listStatus: removalList.response.status, stillListed: removedStillListed })})`);
+  }
+
+  // Cover the complementary relationship rule through the same owner DELETE:
+  // removing one Home must not delete an account that remains a tenant in a
+  // different Home, and its other membership/grant must remain authoritative.
+  const sharedEmail = `stage9-encryption-shared-${crypto.randomUUID()}@invalid.test`;
+  const sharedUsername = `shared-${crypto.randomUUID().slice(0, 12)}`;
+  const sharedAccount = await prisma.customerAccount.create({ data: {
+    displayName: 'Disposable cross-Home tenant', username: sharedUsername, usernameNormalized: sharedUsername,
+    email: sharedEmail, emailNormalized: sharedEmail, emailVerifiedAt: new Date(), passwordHash: hashPassword(`unused-${crypto.randomUUID()}`),
+  } });
+  const sharedTargetMembership = await prisma.homeMembership.create({ data: { customerAccountId: sharedAccount.id, homeId, role: 'TENANT', status: 'ACTIVE' } });
+  const sharedOtherMembership = await prisma.homeMembership.create({ data: { customerAccountId: sharedAccount.id, homeId: fixture.homeOneId, role: 'TENANT', status: 'ACTIVE' } });
+  const sharedTargetGrant = await prisma.tenantAreaGrant.create({ data: { membershipId: sharedTargetMembership.id, homeId, areaId: fixture.areaTwoId } });
+  const sharedOtherGrant = await prisma.tenantAreaGrant.create({ data: { membershipId: sharedOtherMembership.id, homeId: fixture.homeOneId, areaId: fixture.areaOneId } });
+  const sharedHomeBefore = await prisma.home.findUniqueOrThrow({ where: { id: homeId }, select: { managementRevision: true } });
+  const sharedTargetBefore = await prisma.homeMembership.findUniqueOrThrow({ where: { id: sharedTargetMembership.id }, select: { accessRevision: true } });
+  const sharedValue = { expectedAccessRevision: sharedTargetBefore.accessRevision, expectedManagementRevision: sharedHomeBefore.managementRevision };
+  const sharedChallenge = await fetchJson(`${base}/api/v2/security/step-up/challenge`, { method: 'POST', headers: ownerHeaders,
+    body: JSON.stringify({ operationKind: 'home_tenant_remove', targetIds: [sharedTargetMembership.id], value: sharedValue }) });
+  if (sharedChallenge.response.status !== 200) fail('Cross-Home removal challenge failed in the disposable owner flow');
+  const sharedSignature = crypto.sign(null, stepUpChallengeMessage({ challengeId: sharedChallenge.body.challengeId, nonce: sharedChallenge.body.nonce,
+    operationDigest: sharedChallenge.body.operationDigest }), crypto.createPrivateKey(ownerPhone.privateKey)).toString('base64url');
+  const sharedIssued = await fetchJson(`${base}/api/v2/security/step-up/issue`, { method: 'POST', headers: ownerHeaders,
+    body: JSON.stringify({ challengeId: sharedChallenge.body.challengeId, nonce: sharedChallenge.body.nonce, deviceSignature: sharedSignature }) });
+  if (sharedIssued.response.status !== 200 || typeof sharedIssued.body?.proof !== 'string') fail('Cross-Home removal challenge did not issue its signed disposable proof');
+  const sharedKey = `stage9-encryption-shared-removal-${crypto.randomUUID()}`;
+  const sharedNoticeKey = `homeowner-removal:${sharedTargetMembership.id}:${sharedTargetBefore.accessRevision + 1}:email`;
+  const sharedBody = { ...sharedValue, proof: sharedIssued.body.proof, idempotencyKey: sharedKey };
+  const sharedRemoval = await fetchJson(`${base}/api/v2/homes/${homeId}/tenants/${sharedTargetMembership.id}`, {
+    method: 'DELETE', headers: ownerHeaders, body: JSON.stringify(sharedBody),
+  });
+  const sharedReceipt = await fetchJson(`${base}/api/v2/homes/${homeId}/tenants/${sharedTargetMembership.id}/management-operation-receipt`, {
+    method: 'POST', headers: ownerHeaders, body: JSON.stringify({ operationKind: 'home_tenant_remove', idempotencyKey: sharedKey,
+      expectedAccessRevision: sharedTargetBefore.accessRevision, expectedManagementRevision: sharedHomeBefore.managementRevision }),
+  });
+  const sharedReplay = await fetchJson(`${base}/api/v2/homes/${homeId}/tenants/${sharedTargetMembership.id}`, {
+    method: 'DELETE', headers: ownerHeaders, body: JSON.stringify(sharedBody),
+  });
+  const sharedAccountAfter = await prisma.customerAccount.findUnique({ where: { id: sharedAccount.id }, select: { status: true } });
+  const sharedTargetAfter = await prisma.homeMembership.findUnique({ where: { id: sharedTargetMembership.id }, select: { status: true } });
+  const sharedOtherAfter = await prisma.homeMembership.findUnique({ where: { id: sharedOtherMembership.id }, select: { status: true } });
+  const [sharedTargetGrantAfter, sharedOtherGrantAfter, sharedNotice] = await Promise.all([
+    prisma.tenantAreaGrant.findUnique({ where: { id: sharedTargetGrant.id }, select: { revokedAt: true } }),
+    prisma.tenantAreaGrant.findUnique({ where: { id: sharedOtherGrant.id }, select: { revokedAt: true } }),
+    prisma.nativeDomainOutbox.findUnique({ where: { idempotencyKey: sharedNoticeKey }, select: { state: true, payload: true } }),
+  ]);
+  if (sharedRemoval.response.status !== 200 || sharedRemoval.body?.state !== 'REMOVED' || sharedRemoval.body?.hubEnforcement !== 'PENDING'
+    || sharedReceipt.response.status !== 200 || sharedReceipt.body?.status !== 'COMMITTED' || sharedReplay.response.status !== 200
+    || sharedReplay.body?.idempotentReplay !== true || sharedAccountAfter?.status !== 'ACTIVE' || sharedTargetAfter?.status !== 'REMOVED'
+    || sharedOtherAfter?.status !== 'ACTIVE' || !sharedTargetGrantAfter?.revokedAt || sharedOtherGrantAfter?.revokedAt
+    || sharedNotice?.state !== 'PENDING' || JSON.stringify(sharedNotice.payload).includes(sharedEmail)) {
+    fail(`Cross-Home owner removal failed to preserve the other valid account relationship (${JSON.stringify({
+      status: sharedRemoval.response.status, accountActive: sharedAccountAfter?.status === 'ACTIVE',
+      targetRemoved: sharedTargetAfter?.status === 'REMOVED', otherHomeActive: sharedOtherAfter?.status === 'ACTIVE',
+      targetGrantRevoked: Boolean(sharedTargetGrantAfter?.revokedAt), otherGrantPreserved: !sharedOtherGrantAfter?.revokedAt,
+      noticeQueued: sharedNotice?.state === 'PENDING', receipt: sharedReceipt.body?.status, replay: sharedReplay.body?.idempotentReplay === true,
+    })})`);
+  }
+  console.log('[stage9:integration] PASS: malformed-key actual DELETE returns bounded 503/full rollback; exact retry with valid config commits once with decryptable encrypted notice and durable tombstones, deletes only orphan private scope, preserves Home inventory, and exact replay is idempotent; a second actual DELETE preserves a tenant account and grant in another Home');
+}
+
 async function pendingInvitationRouteChecks(deliveryEnv) {
   const base = `http://127.0.0.1:${appPort}`;
   if (!customerFixture) fail('Pending invitation route checks require the disposable two-home owner fixture');
@@ -8135,6 +8418,7 @@ async function pendingInvitationRouteChecks(deliveryEnv) {
     customerAccountId: removalTenantA.id, homeId: customerFixture.homeOneId, role: 'TENANT', status: 'ACTIVE',
   } });
   await prisma.tenantAreaGrant.create({ data: { membershipId: removalTenantMembershipA.id, areaId, homeId: inviter.homeId } });
+  await prisma.tenantAreaGrant.create({ data: { membershipId: removalTenantMembershipB.id, areaId, homeId: inviter.homeId } });
   const removalDeviceHub = await prisma.home.findUniqueOrThrow({ where: { id: inviter.homeId }, select: { activeHubInstallationId: true } });
   const tenantPrivateDevice = await prisma.nativeDevice.create({ data: { homeId: inviter.homeId, hubInstallationId: removalDeviceHub.activeHubInstallationId,
     osDeviceId: `stage9-removed-tenant-device-${crypto.randomUUID()}`, originalName: 'Disposable private device', technicalLabel: 'tenant_device',
@@ -8180,6 +8464,82 @@ async function pendingInvitationRouteChecks(deliveryEnv) {
     const revision = memberId === removalTenantMembershipA.id ? tenantTargetBefore.accessRevision : 1;
     return { expectedAccessRevision: revision, expectedManagementRevision: tenantHomeBefore.managementRevision, proof, idempotencyKey };
   };
+  // Reproduce the previously missed Production boundary through the real
+  // DELETE route and mandatory encrypted-email helper. The disposable server
+  // receives a synthetic 32-byte key encoded as hex while the runtime
+  // requires canonical base64. Every mutation, including proof consumption,
+  // must roll back; then restore the valid environment before later cases.
+  const badEncodingHomeBefore = await prisma.home.findUniqueOrThrow({ where: { id: inviter.homeId }, select: { managementRevision: true } });
+  const badEncodingTenantBefore = await prisma.homeMembership.findUniqueOrThrow({ where: { id: removalTenantMembershipB.id },
+    select: { status: true, accessRevision: true, tenantAreaGrants: { where: { revokedAt: null }, select: { areaId: true } } } });
+  const badEncodingProof = await issueOwnerProof('home_tenant_remove', [removalTenantMembershipB.id], {
+    expectedAccessRevision: badEncodingTenantBefore.accessRevision, expectedManagementRevision: badEncodingHomeBefore.managementRevision,
+  });
+  const badEncodingKey = `stage9-tenant-bad-encryption-key-${crypto.randomUUID()}`;
+  const badEncodingBody = { expectedAccessRevision: badEncodingTenantBefore.accessRevision,
+    expectedManagementRevision: badEncodingHomeBefore.managementRevision, proof: badEncodingProof, idempotencyKey: badEncodingKey };
+  const badEncodingNoticePrefix = `homeowner-removal:${removalTenantMembershipB.id}:${badEncodingTenantBefore.accessRevision + 1}:`;
+  const badEncodingProofHash = sha256(badEncodingProof);
+  await stopPlatform();
+  let badEncodingRemoval;
+  try {
+    await startPlatform({ ...deliveryEnv, PLATFORM_DATA_ENCRYPTION_KEY: crypto.randomBytes(32).toString('hex') });
+    badEncodingRemoval = await fetchJson(tenantRemovalPath(removalTenantMembershipB.id), {
+      method: 'DELETE', headers: selectedHomeHeaders, body: JSON.stringify(badEncodingBody),
+    });
+    const requestId = badEncodingRemoval.body?.error?.requestId;
+    if (typeof requestId === 'string') {
+      await waitFor(() => Promise.resolve(managementFailureRecords.some((record) => record.requestId === requestId)),
+        'bounded malformed-key removal diagnostic');
+    }
+  } finally {
+    await stopPlatform();
+    await startPlatform(deliveryEnv);
+  }
+  const badEncodingTenantAfter = await prisma.homeMembership.findUniqueOrThrow({ where: { id: removalTenantMembershipB.id },
+    select: { status: true, accessRevision: true, tenantAreaGrants: { where: { revokedAt: null }, select: { areaId: true } } } });
+  const badEncodingHomeAfter = await prisma.home.findUniqueOrThrow({ where: { id: inviter.homeId }, select: { managementRevision: true } });
+  const badEncodingProofAfter = await prisma.stepUpAuthorization.findFirst({ where: { nonceHash: badEncodingProofHash }, select: { consumedAt: true } });
+  const badEncodingAccountAfter = await prisma.customerAccount.findUnique({ where: { id: removalTenantB.id }, select: { status: true } });
+  const badEncodingDeviceAfter = await prisma.nativeDevice.findUnique({ where: { id: tenantBPrivateDevice.id }, select: { id: true } });
+  const badEncodingNotices = await prisma.nativeDomainOutbox.count({ where: {
+    aggregateType: 'HomeownerAccessRemovalNotice', idempotencyKey: { startsWith: badEncodingNoticePrefix },
+  } });
+  const badEncodingAuditRows = await prisma.auditEvent.count({ where: {
+    homeId: inviter.homeId, action: 'home_tenant_membership_removed', targetType: 'HomeMembership', targetId: removalTenantMembershipB.id,
+  } });
+  const badEncodingTombstones = await prisma.nativeDomainOutbox.count({ where: { idempotencyKey: { in: [
+    `homeowner-tenant-removal:${removalTenantMembershipB.id}:${badEncodingTenantBefore.accessRevision + 1}`,
+    `homeowner-tenant-removal:${removalTenantMembershipB.id}:${badEncodingTenantBefore.accessRevision + 1}:device:${tenantBPrivateDevice.id}`,
+  ] } } });
+  const badEncodingDiagnostic = managementFailureRecords.find((record) => record.requestId === badEncodingRemoval?.body?.error?.requestId);
+  const badEncodingReceipt = await fetchJson(`${base}/api/v2/homes/${inviter.homeId}/tenants/${removalTenantMembershipB.id}/management-operation-receipt`, {
+    method: 'POST', headers: selectedHomeHeaders, body: JSON.stringify({ operationKind: 'home_tenant_remove', idempotencyKey: badEncodingKey,
+      expectedAccessRevision: badEncodingTenantBefore.accessRevision, expectedManagementRevision: badEncodingHomeBefore.managementRevision }),
+  });
+  if (badEncodingRemoval?.response.status !== 503 || badEncodingRemoval.body?.error?.code !== 'INTERNAL_ERROR'
+    || badEncodingTenantAfter.status !== 'ACTIVE' || badEncodingTenantAfter.accessRevision !== badEncodingTenantBefore.accessRevision
+    || badEncodingTenantAfter.tenantAreaGrants.map((grant) => grant.areaId).sort().join(',') !== badEncodingTenantBefore.tenantAreaGrants.map((grant) => grant.areaId).sort().join(',')
+    || badEncodingHomeAfter.managementRevision !== badEncodingHomeBefore.managementRevision || badEncodingProofAfter?.consumedAt !== null
+    || badEncodingAccountAfter?.status !== 'ACTIVE' || !badEncodingDeviceAfter || badEncodingNotices !== 0
+    || badEncodingAuditRows !== 0 || badEncodingTombstones !== 0
+    || badEncodingReceipt.response.status !== 200 || badEncodingReceipt.body?.status !== 'NOT_FOUND'
+    || badEncodingDiagnostic?.operation !== 'home_tenant_remove' || badEncodingDiagnostic?.phase !== 'removal_notice_encrypt_email'
+    || badEncodingDiagnostic?.errorName !== 'PlatformDataEncryptionKeyError'
+    || badEncodingDiagnostic?.failureCode !== 'PLATFORM_ENCRYPTION_KEY_INVALID_SIZE') {
+    fail(`Malformed synthetic encryption-key configuration did not return a bounded failure with full tenant-removal rollback (${JSON.stringify({
+      status: badEncodingRemoval?.response.status, code: badEncodingRemoval?.body?.error?.code,
+      memberUnchanged: badEncodingTenantAfter.status === 'ACTIVE' && badEncodingTenantAfter.accessRevision === badEncodingTenantBefore.accessRevision,
+      grantsUnchanged: badEncodingTenantAfter.tenantAreaGrants.map((grant) => grant.areaId).sort().join(',') === badEncodingTenantBefore.tenantAreaGrants.map((grant) => grant.areaId).sort().join(','),
+      homeRevisionUnchanged: badEncodingHomeAfter.managementRevision === badEncodingHomeBefore.managementRevision,
+      proofConsumed: Boolean(badEncodingProofAfter?.consumedAt), accountActive: badEncodingAccountAfter?.status === 'ACTIVE',
+      privateDevicePreserved: Boolean(badEncodingDeviceAfter), notices: badEncodingNotices, auditRows: badEncodingAuditRows,
+      tombstones: badEncodingTombstones, receipt: badEncodingReceipt.body?.status,
+      diagnostic: badEncodingDiagnostic ? { phase: badEncodingDiagnostic.phase, errorName: badEncodingDiagnostic.errorName,
+        failureCode: badEncodingDiagnostic.failureCode } : null,
+    })})`);
+  }
+  console.log('[stage9:integration] PASS: the actual homeowner DELETE route rejects a synthetic hex-encoded key with bounded retryable failure and safe encrypt-email phase/code diagnostics; membership, exact grants, Home revision, proof, account, private device, notice, tombstone, audit and exact receipt all roll back');
   const wrongRoleTenantRemoval = await fetchJson(tenantRemovalPath(removalTenantMembershipB.id), { method: 'DELETE',
     headers: { ...newTenantAuthHeaders(), 'x-dinodia-home-id': inviter.homeId },
     body: JSON.stringify(tenantRemovalBody('x'.repeat(40), `stage9-tenant-wrong-role-${crypto.randomUUID()}`, removalTenantMembershipB.id)) });
@@ -11022,7 +11382,9 @@ try {
   await customerAuthorizationChecks(deliveryEnv);
   const stage12AlexaOnly = process.env.STAGE12_ALEXA_ONLY === '1';
   const stage5SyncRecoveryOnly = process.env.STAGE5_SYNC_RECOVERY_ONLY === '1';
-  if (!stage5SyncRecoveryOnly && (stage12AlexaOnly || (process.env.STAGE6_TRANSFER_ONLY !== '1' && process.env.STAGE6_TENANT_REMOVAL_ONLY !== '1'))) {
+  const stage9RemovalEncryptionOnly = process.env.STAGE9_HOMEOWNER_TENANT_REMOVAL_ONLY === '1';
+  if (!stage5SyncRecoveryOnly && !stage9RemovalEncryptionOnly
+    && (stage12AlexaOnly || (process.env.STAGE6_TRANSFER_ONLY !== '1' && process.env.STAGE6_TENANT_REMOVAL_ONLY !== '1'))) {
     await nativeAlexaOAuthChecks(deliveryEnv);
   }
   if (stage5SyncRecoveryOnly) {
@@ -11037,6 +11399,8 @@ try {
     // Focused development mode still runs the real disposable auth fixture
     // and actual OAuth routes, while the normal maintained package command
     // continues to execute the complete integration suite.
+  } else if (stage9RemovalEncryptionOnly) {
+    await homeownerRemovalEncryptionConfigurationChecks(deliveryEnv);
   } else if (process.env.STAGE6_TRANSFER_ONLY === '1') {
     await ownershipTransferChecks(deliveryEnv);
   } else if (process.env.STAGE6_TENANT_REMOVAL_ONLY === '1') {
@@ -11056,7 +11420,8 @@ try {
     await fullHomeDeregistrationChecks(deliveryEnv);
   }
   const childTargets = verifyChildOutboundTargets();
-  if (stage5SyncRecoveryOnly) console.log(`[stage5:integration] PASS: focused signed Native V2 configuration-recovery route checks completed against disposable PostgreSQL; parent=${[...outboundTargets].sort().join(',')}; children=${childTargets.join(',')}`);
+  if (stage9RemovalEncryptionOnly) console.log(`[stage9:integration] PASS: focused homeowner tenant-removal/encryption configuration routes completed against disposable PostgreSQL; parent=${[...outboundTargets].sort().join(',')}; children=${childTargets.join(',')}`);
+  else if (stage5SyncRecoveryOnly) console.log(`[stage5:integration] PASS: focused signed Native V2 configuration-recovery route checks completed against disposable PostgreSQL; parent=${[...outboundTargets].sort().join(',')}; children=${childTargets.join(',')}`);
   else if (stage12AlexaOnly) console.log(`[stage12:integration] PASS: focused Alexa OAuth route checks completed against disposable PostgreSQL; parent=${[...outboundTargets].sort().join(',')}; children=${childTargets.join(',')}`);
   else console.log(`[stage1:integration] PASS: live Platform routes, locked Dinodia OS HTTP, browser isolation, authenticated native WebSocket command authorization and denial exercised against disposable PostgreSQL; parent=${[...outboundTargets].sort().join(',')}; children=${childTargets.join(',')}`);
 } finally {

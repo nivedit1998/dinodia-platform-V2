@@ -3,6 +3,7 @@ import { prisma } from '@/lib/prisma';
 import type { Prisma } from '@prisma/client';
 import { currentCustomerPolicy } from '@/lib/customerPolicyConfig';
 import { decryptPlatformEnvelope, encryptPlatformEnvelope } from '@/lib/hubOperatorCredentials';
+import { PlatformDataEncryptionKeyError } from '@/lib/platformDataEncryptionKey';
 import { serializableTransaction } from '@/lib/serializableTransaction';
 import { refreshNativeAlexaEventToken } from '@/lib/nativeAlexaGrant';
 import { alexaPropertiesFromStates, type AuthorizedEndpoint } from '@/lib/nativeAlexaExecution';
@@ -41,7 +42,10 @@ async function refreshLinkToken(linkId: string, force = false): Promise<boolean>
   if (!force && hint.accessTokenExpiresAt && hint.accessTokenExpiresAt.getTime() > now.getTime() + TOKEN_REFRESH_SKEW_MS) return true;
   let oldRefreshToken: string;
   try { oldRefreshToken = decryptPlatformEnvelope(hint.refreshTokenCiphertext); }
-  catch { return false; }
+  catch (error) {
+    if (error instanceof PlatformDataEncryptionKeyError) throw error;
+    return false;
+  }
   let refreshed: Awaited<ReturnType<typeof refreshNativeAlexaEventToken>>;
   try { refreshed = await refreshNativeAlexaEventToken(oldRefreshToken); }
   catch { return false; }
@@ -218,7 +222,11 @@ async function deliverOne(id: string, nowHint: Date): Promise<'DELIVERED' | 'CAN
       if (!current.link.accessTokenCiphertext || !current.link.refreshTokenCiphertext || !current.link.accessTokenExpiresAt
         || current.link.accessTokenExpiresAt <= now) return 'REFRESH' as const;
       let accessToken = '';
-      try { accessToken = decryptPlatformEnvelope(current.link.accessTokenCiphertext); } catch { /* handled fail-closed below */ }
+      try { accessToken = decryptPlatformEnvelope(current.link.accessTokenCiphertext); }
+      catch (error) {
+        if (error instanceof PlatformDataEncryptionKeyError) throw error;
+        /* A malformed stored envelope is handled fail-closed below. */
+      }
       if (!accessToken || accessToken.length < 16 || accessToken.length > 8192) {
         await tx.nativeDomainOutbox.update({ where: { id }, data: { state: 'FAILED', updatedAt: now } });
         return 'FAILED' as const;
@@ -265,7 +273,8 @@ async function deliverOne(id: string, nowHint: Date): Promise<'DELIVERED' | 'CAN
     }, 1, { timeoutMs: GATEWAY_TIMEOUT_MS + 3000, maxWaitMs: 3000 });
     refreshAfter = outcome === 'REFRESH';
     return outcome;
-  } catch {
+  } catch (error) {
+    if (error instanceof PlatformDataEncryptionKeyError) throw error;
     const latest = await prisma.nativeDomainOutbox.findUnique({ where: { id }, select: { attempts: true, expiresAt: true } }).catch(() => null);
     const attempts = (latest?.attempts ?? 0) + 1;
     await prisma.nativeDomainOutbox.updateMany({ where: { id, state: 'PENDING' }, data: {
@@ -274,7 +283,10 @@ async function deliverOne(id: string, nowHint: Date): Promise<'DELIVERED' | 'CAN
     } }).catch(() => {});
     return 'RETRY';
   } finally {
-    if (refreshAfter) await refreshLinkToken(linkId, true).catch(() => false);
+    if (refreshAfter) await refreshLinkToken(linkId, true).catch((error) => {
+      if (error instanceof PlatformDataEncryptionKeyError) throw error;
+      return false;
+    });
   }
 }
 
