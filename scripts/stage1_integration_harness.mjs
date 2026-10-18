@@ -432,6 +432,11 @@ function canonicalValue(value) {
   if (value && typeof value === 'object') return `{${Object.entries(value).sort(([left], [right]) => left.localeCompare(right)).map(([key, item]) => `${JSON.stringify(key)}:${canonicalValue(item)}`).join(',')}}`;
   return JSON.stringify(value ?? null);
 }
+function canonicalSyncConfiguration(value) {
+  if (Array.isArray(value)) return `[${value.map(canonicalSyncConfiguration).join(',')}]`;
+  if (value && typeof value === 'object') return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonicalSyncConfiguration(value[key])}`).join(',')}}`;
+  return JSON.stringify(value);
+}
 function descriptorBoundValue(value, descriptorDigests = {}) {
   const ordered = Object.fromEntries(Object.entries(descriptorDigests).sort(([left], [right]) => left.localeCompare(right)).map(([id, digest]) => [String(id), digest == null ? null : String(digest)]));
   return { requestedValue: value ?? null, descriptorDigests: ordered };
@@ -1786,6 +1791,94 @@ async function customerAuthorizationChecks(deliveryEnv) {
     email, password: customerPassword, deviceInstallationId: trustedInstallationId, publicKey: phone.publicKey,
     deviceName: 'Disposable automation oversight tenant', model: 'integration-test', osFamily: 'test', osVersion: 'test',
   }) });
+  const hubTenantAutomationRequest = (payload) => machineRequest({ base, path: '/api/hub-agent/v2/tenant-automations', machineSecret,
+    body: { serial: identityOne.serialNumber, identityGeneration: identityOne.identityGeneration, ...payload } });
+  const tenantHubAutomationBase = { schemaVersion: 'dinodia.v1', homeId: homeOne.id,
+    membershipId: tenantMembership.id, accountAccessToken: tenantAutomationLogin.body?.accessToken ?? '' };
+  const delegatedAutomationList = await hubTenantAutomationRequest({ ...tenantHubAutomationBase, operation: 'list' });
+  const wrongMembershipAutomationList = await hubTenantAutomationRequest({ ...tenantHubAutomationBase,
+    membershipId: ownerMembership.id, operation: 'list' });
+  const delegatedAutomationKey = crypto.randomUUID();
+  const delegatedIdempotencyBefore = await prisma.idempotencyRecord.count({ where: { homeId: homeOne.id,
+    actorId: account.id, namespace: { startsWith: 'tenant-automation-' } } });
+  const delegatedAutomationDefinition = { ...automationBody, name: 'Hub-delegated disposable automation',
+    trigger: { minuteOfDay: 513, weekdays: [2, 4, 6] }, actions: [automationBody.actions[0]] };
+  const delegatedCreatePayload = { ...tenantHubAutomationBase, operation: 'create', idempotencyKey: delegatedAutomationKey,
+    definition: delegatedAutomationDefinition };
+  const delegatedAutomationCreate = await hubTenantAutomationRequest(delegatedCreatePayload);
+  const delegatedAutomationRetry = await hubTenantAutomationRequest(delegatedCreatePayload);
+  const delegatedAutomationConflict = await hubTenantAutomationRequest({ ...delegatedCreatePayload,
+    definition: { ...delegatedAutomationDefinition, name: 'Changed body with reused Hub intent key' } });
+  const delegatedCreatedId = delegatedAutomationCreate.body?.automationId;
+  const delegatedAfterCreate = delegatedCreatedId ? await prisma.nativeAutomation.findUnique({ where: { id: delegatedCreatedId },
+    select: { id: true, createdByMembershipId: true, status: true, revision: true } }) : null;
+  const delegatedUpdateKey = crypto.randomUUID();
+  const delegatedUpdateDefinition = { ...delegatedAutomationDefinition, name: 'Hub-delegated updated disposable automation',
+    trigger: { minuteOfDay: 514, weekdays: [2, 4, 6] } };
+  const delegatedUpdate = await hubTenantAutomationRequest({ ...tenantHubAutomationBase, operation: 'update',
+    idempotencyKey: delegatedUpdateKey, automationId: delegatedCreatedId, expectedRevision: 1,
+    definition: delegatedUpdateDefinition });
+  async function acknowledgeDelegatedTenantConfiguration(label) {
+    const before = await prisma.hubInstallation.findUniqueOrThrow({ where: { id: hubOne.id },
+      select: { syncStreamId: true, syncAcceptedSequence: true, acknowledgedCloudRevision: true } });
+    const envelope = {
+      schemaVersion: 1, hubInstallationId: hubOne.id,
+      streamId: String(before.syncStreamId || `tenant-delegation-${crypto.randomUUID()}`),
+      fromSequence: Number(before.syncAcceptedSequence) + 1,
+      toSequence: Number(before.syncAcceptedSequence), events: [], queueDepth: 0,
+      acknowledgedCloudRevision: Number(before.acknowledgedCloudRevision),
+      runtime: { kind: 'dinodia_os', version: `tenant-delegation-${label}`, capabilities: { nativeTenantAutomationProjectionV1: true } },
+      sentAt: new Date().toISOString(),
+    };
+    const identityBody = { serial: identityOne.serialNumber, identityGeneration: identityOne.identityGeneration };
+    const refreshed = await machineRequest({ base, path: '/api/hub-agent/v2/sync', machineSecret,
+      body: { ...identityBody, ...envelope, configurationRefreshOnly: true } });
+    const revision = Number(refreshed.body?.configuration?.revision || 0);
+    if (refreshed.response.status !== 200 || refreshed.body?.configurationRefreshOnly !== true || revision < 1) {
+      fail(`The actual Hub configuration refresh failed between tenant automation mutations (${label}, ${refreshed.response.status}/${refreshed.body?.errorCode || refreshed.body?.error || 'no-code'})`);
+    }
+    const acknowledged = await machineRequest({ base, path: '/api/hub-agent/v2/sync', machineSecret,
+      body: { ...identityBody, ...envelope, acknowledgedCloudRevision: revision } });
+    const after = await prisma.hubInstallation.findUniqueOrThrow({ where: { id: hubOne.id },
+      select: { syncStreamId: true, syncAcceptedSequence: true, acknowledgedCloudRevision: true } });
+    if (acknowledged.response.status !== 200 || Number(after.acknowledgedCloudRevision) !== revision
+      || after.syncStreamId !== before.syncStreamId
+      || Number(after.syncAcceptedSequence) !== Number(before.syncAcceptedSequence)) {
+      fail(`The signed eventless Hub acknowledgement did not apply the exact tenant policy revision without moving the event cursor (${label}, ${acknowledged.response.status})`);
+    }
+  }
+  await acknowledgeDelegatedTenantConfiguration('update');
+  const delegatedDisable = await hubTenantAutomationRequest({ ...tenantHubAutomationBase, operation: 'enable',
+    idempotencyKey: crypto.randomUUID(), automationId: delegatedCreatedId, expectedRevision: 2, enabled: false });
+  await acknowledgeDelegatedTenantConfiguration('disable');
+  const delegatedEnable = await hubTenantAutomationRequest({ ...tenantHubAutomationBase, operation: 'enable',
+    idempotencyKey: crypto.randomUUID(), automationId: delegatedCreatedId, expectedRevision: 3, enabled: true });
+  await acknowledgeDelegatedTenantConfiguration('enable');
+  const delegatedDelete = await hubTenantAutomationRequest({ ...tenantHubAutomationBase, operation: 'delete',
+    idempotencyKey: crypto.randomUUID(), automationId: delegatedCreatedId, expectedRevision: 4 });
+  const delegatedDeleted = delegatedCreatedId ? await prisma.nativeAutomation.findUnique({ where: { id: delegatedCreatedId },
+    select: { status: true, revision: true } }) : null;
+  const delegatedIdempotencyAfter = await prisma.idempotencyRecord.count({ where: { homeId: homeOne.id,
+    actorId: account.id, namespace: { startsWith: 'tenant-automation-' } } });
+  const delegatedOwnedIds = new Set((await prisma.nativeAutomation.findMany({ where: { homeId: homeOne.id,
+    createdByMembershipId: tenantMembership.id }, select: { id: true } })).map((row) => row.id));
+  if (tenantAutomationLogin.response.status !== 200 || delegatedAutomationList.response.status !== 200
+    || !Array.isArray(delegatedAutomationList.body?.automations)
+    || delegatedAutomationList.body.automations.some((row) => !delegatedOwnedIds.has(row.id))
+    || wrongMembershipAutomationList.response.status !== 404
+    || delegatedAutomationCreate.response.status !== 201 || delegatedAutomationRetry.response.status !== 201
+    || delegatedAutomationCreate.body?.automationId !== delegatedAutomationRetry.body?.automationId
+    || delegatedAutomationConflict.response.status !== 409
+    || delegatedAfterCreate?.createdByMembershipId !== tenantMembership.id || delegatedAfterCreate?.revision !== 1
+    || delegatedUpdate.response.status !== 200 || delegatedUpdate.body?.revision !== 2
+    || delegatedDisable.response.status !== 200 || delegatedDisable.body?.revision !== 3
+    || delegatedEnable.response.status !== 200 || delegatedEnable.body?.revision !== 4
+    || delegatedDelete.response.status !== 200 || delegatedDelete.body?.revision !== 5
+    || delegatedDeleted?.status !== 'RETIRED' || delegatedDeleted?.revision !== 5
+    || delegatedIdempotencyAfter !== delegatedIdempotencyBefore + 5) {
+    fail(`The real enrolled-Hub tenant automation routes did not preserve current membership, canonical revisions, and exact idempotent intent semantics (${JSON.stringify({ login: tenantAutomationLogin.response.status, list: delegatedAutomationList.response.status, wrongMembership: wrongMembershipAutomationList.response.status, create: delegatedAutomationCreate.response.status, retry: delegatedAutomationRetry.response.status, conflict: delegatedAutomationConflict.response.status, createdOwnerMatches: delegatedAfterCreate?.createdByMembershipId === tenantMembership.id, update: delegatedUpdate.response.status, disable: delegatedDisable.response.status, enable: delegatedEnable.response.status, enableBody: delegatedEnable.body?.error || delegatedEnable.body, delete: delegatedDelete.response.status, deleteBody: delegatedDelete.body?.error || delegatedDelete.body, terminalState: delegatedDeleted?.status, terminalRevision: delegatedDeleted?.revision })})`);
+  }
+  console.log('[stage11:integration] PASS: actual machine-authenticated Hub tenant automation list/create/exact-retry/conflicting-key/update/disable/enable/delete routes revalidated selected online tenant authority and committed only through canonical Platform services');
   const ownerAutomationHeaders = { authorization: `Bearer ${ownerAutomationLogin.body?.accessToken ?? ''}`, 'x-dinodia-home-id': homeOne.id, 'content-type': 'application/json' };
   const managerAutomationHeaders = { authorization: `Bearer ${managerAutomationLogin.body?.accessToken ?? ''}`, 'x-dinodia-home-id': homeOne.id, 'content-type': 'application/json' };
   const tenantAutomationHeaders = { authorization: `Bearer ${tenantAutomationLogin.body?.accessToken ?? ''}`, 'x-dinodia-home-id': homeOne.id, 'content-type': 'application/json' };
@@ -6898,9 +6991,26 @@ async function pendingInvitationRouteChecks(deliveryEnv) {
       revision: movedInitialCatalog?.revision ?? null, controlRoles: movedInitialCatalog?.controls?.map((control) => control.semanticRole) ?? [],
     })})`);
   }
-  const movementSyncIdleDeadline = Date.now() + 8_000;
+  // A real signed sync can consume the configured 70-second bounded request
+  // deadline (including response-body parsing). This actual-route fixture may
+  // have entered while a preceding durable batch was already in flight, so an
+  // eight-second test-only idle deadline falsely fails under normal network or
+  // disposable-Postgres contention. Allow the active request and one coalesced
+  // follow-up its declared bounded budget, without changing the production
+  // sync deadline or acknowledging/rewriting any event in the fixture.
+  const movementSyncIdleDeadline = Date.now() + Math.max(8_000, (Number(hub.pairing.syncRequestTimeoutMs) || 70_000) * 2 + 5_000);
   while ((hub.pairing.syncing || hub.pairing.queuedImmediateSync) && Date.now() < movementSyncIdleDeadline) await sleep(25);
-  if (hub.pairing.syncing || hub.pairing.queuedImmediateSync) fail('The initial catalogue sync did not settle before controlled Area-movement telemetry');
+  if (hub.pairing.syncing || hub.pairing.queuedImmediateSync) {
+    const outboxAtIdleFailure = hub.store.getSyncOutbox();
+    fail(`The initial catalogue sync did not settle before controlled Area-movement telemetry (${JSON.stringify({
+      syncing: hub.pairing.syncing,
+      queuedImmediateSync: hub.pairing.queuedImmediateSync,
+      lastErrorCode: hub.pairing.status()?.sync?.lastErrorCode || null,
+      acknowledgedSequence: outboxAtIdleFailure?.acknowledgedSequence ?? null,
+      nextSequence: outboxAtIdleFailure?.nextSequence ?? null,
+      inFlight: outboxAtIdleFailure?.inFlight ? { fromSequence: outboxAtIdleFailure.inFlight.fromSequence, toSequence: outboxAtIdleFailure.inFlight.toSequence } : null,
+    })})`);
+  }
   const movementPreviousRetryAt = hub.pairing.nextRetryAt;
   // Keep the live fixture dispatcher from advancing this controlled source
   // clock between the observation and move. The signed HTTP ingestion below
@@ -8049,6 +8159,16 @@ async function pendingInvitationRouteChecks(deliveryEnv) {
     fail(`Exact delayed grant retry did not commit once after a fully rolled-back timeout (${JSON.stringify({ retry: retriedDelayedGrant.response.status,
       receipt: retryTimeoutReceipt.body?.status, accessRevision: timeoutTargetCommitted.accessRevision })})`);
   }
+  const dashboardRestoreHome = await prisma.home.findUniqueOrThrow({ where: { id: inviter.homeId }, select: { managementRevision: true } });
+  const dashboardRestoreProof = await issueGrantProof([areaId], timeoutTargetCommitted.accessRevision, dashboardRestoreHome.managementRevision);
+  const dashboardRestore = await grantRequest([areaId], dashboardRestoreProof, `stage9-grant-dashboard-fixture-${crypto.randomUUID()}`,
+    selectedHomeHeaders, timeoutTargetCommitted.accessRevision, dashboardRestoreHome.managementRevision);
+  const dashboardRestoreCurrent = await prisma.homeMembership.findUniqueOrThrow({ where: { id: newTenantMembershipAfterAccept.id },
+    select: { accessRevision: true, tenantAreaGrants: { where: { revokedAt: null }, select: { areaId: true } } } });
+  if (dashboardRestore.response.status !== 200 || dashboardRestoreCurrent.tenantAreaGrants.map((row) => row.areaId).join(',') !== areaId) {
+    fail(`The dashboard integration fixture could not restore its original invited Area after grant-timeout coverage (${JSON.stringify({ status: dashboardRestore.response.status,
+      accessRevision: dashboardRestoreCurrent.accessRevision, activeGrantCount: dashboardRestoreCurrent.tenantAreaGrants.length })})`);
+  }
   console.log('[stage9:integration] PASS: a >14s disposable DB trigger causes a bounded failure with full rollback, unconsumed proof and no receipt; exact same-key/body retry with fresh phone proof commits once and receipt recovery confirms it');
 
   // Stage 7: exercise the real tenant projection and preference write through
@@ -8147,6 +8267,7 @@ async function pendingInvitationRouteChecks(deliveryEnv) {
     fail(`Owner-only analytics dashboard layout did not save/reload beside legacy device tiles, or the tenant denial changed a revision (${JSON.stringify({ tenantDenied: tenantAnalyticsPreferenceDenied.response.status,
       tenantCode: tenantAnalyticsPreferenceDenied.body?.error?.code, tenantRevisionUnchanged: tenantAnalyticsPreferenceAfter?.revision === tenantAnalyticsPreferenceBefore?.revision,
       legacyLayoutWrite: layoutWrite.response.status, fourSizeWriteStatuses: layoutFourSizeWrites.map((result) => result.response.status),
+      layoutErrors: [layoutWrite, ...layoutFourSizeWrites].map((result) => result.body?.error ?? null),
       wrongOwnerWrite: layoutWrongOwnerWrite.response.status, wrongOwnerCode: layoutWrongOwnerWrite.body?.error?.code,
       ownerWrite: ownerAnalyticsLayoutWrite.response.status, ownerWriteCode: ownerAnalyticsLayoutWrite.body?.error?.code,
       ownerWriteRevision: ownerAnalyticsLayoutWrite.body?.revision, ownerSeedRevision: ownerAnalyticsPreferenceSeed.revision,
@@ -11691,7 +11812,7 @@ async function hubSyncConfigurationRefreshChecks() {
   const hubInstallationId = customerFixture.hubOneId;
   const original = await prisma.hubInstallation.findUniqueOrThrow({ where: { id: hubInstallationId }, select: {
     syncStreamId: true, syncAcceptedSequence: true, acknowledgedCloudRevision: true, cloudConfigurationRevision: true,
-    cloudConfigurationChecksum: true, lastSuccessfulSyncAt: true, lastQueueDepth: true, lastSyncErrorCode: true,
+    cloudConfigurationChecksum: true, lastSuccessfulSyncAt: true, lastQueueDepth: true, lastSyncErrorCode: true, capabilitySummary: true,
   } });
   const fixtureStreamId = original.syncStreamId || `refresh-${crypto.randomUUID()}`;
   const acceptedSequence = Number(original.syncAcceptedSequence || 0);
@@ -11709,10 +11830,11 @@ async function hubSyncConfigurationRefreshChecks() {
       schemaVersion: 1, hubInstallationId, streamId: fixtureStreamId,
       fromSequence: acceptedSequence + 1, toSequence: acceptedSequence,
       events: [], queueDepth: 2, acknowledgedCloudRevision: 0,
-      runtime: { kind: 'dinodia_os', version: 'configuration-refresh-fixture', capabilities: { nativeSyncOutbox: {
-        queueDepth: 2, gapDetected: false, criticalBacklog: false, telemetryPaused: false,
-        droppedTelemetryCount: 0, lastErrorCode: 'hub_sync_configuration_ack_invalid',
-      } } }, sentAt: new Date().toISOString(),
+      runtime: { kind: 'dinodia_os', version: 'configuration-refresh-fixture', capabilities: {
+        nativeTenantAutomationProjectionV1: true,
+        nativeSyncOutbox: { queueDepth: 2, gapDetected: false, criticalBacklog: false, telemetryPaused: false,
+          droppedTelemetryCount: 0, lastErrorCode: 'hub_sync_configuration_ack_invalid' },
+      } }, sentAt: new Date().toISOString(),
     };
     const staleEvent = { id: crypto.randomUUID(), sequence: acceptedSequence + 1, type: 'area.upsert', aggregateId: areaId,
       occurredAt: new Date().toISOString(), critical: true, payload: { osAreaId: areaId, name: 'Disposable recovery room', icon: 'room' } };
@@ -11762,7 +11884,33 @@ async function hubSyncConfigurationRefreshChecks() {
       || await prisma.hubSyncReceipt.count({ where: { hubInstallationId } }) !== originalReceiptCount) {
       fail('Applying refreshed configuration did not preserve the event cursor, receipts, and domain rows');
     }
-    console.log('[stage5:integration] PASS: stale configuration acknowledgement is recovered through an authenticated configuration-only refresh; queued events, stream cursor, receipts, and domain rows remain unchanged until a separate current-revision sync');
+    const expectedTenantAutomation = await prisma.nativeAutomation.findFirst({ where: {
+      homeId: customerFixture.homeOneId, createdByMembershipId: customerFixture.tenantMembershipId,
+    }, orderBy: { id: 'asc' }, select: { id: true, createdByMembershipId: true } });
+    if (!expectedTenantAutomation) fail('The disposable tenant automation fixture was not available for signed local-projection integration coverage');
+    const projectionRefresh = await machineRequest({ base: `http://127.0.0.1:${appPort}`, path: '/api/hub-agent/v2/sync', machineSecret: customerFixture.machineSecret, body: {
+      serial: customerFixture.identityOneSerial, identityGeneration: customerFixture.identityOneGeneration,
+      ...baseEnvelope, configurationRefreshOnly: true, acknowledgedCloudRevision: Number(appliedAck.body.cloudRevision),
+    } });
+    const projection = projectionRefresh.body?.configuration?.tenantAutomationProjection;
+    const projectedTenantAutomation = projection?.automations?.find((automation) => automation.id === expectedTenantAutomation.id);
+    const afterProjectionRefresh = await prisma.hubInstallation.findUniqueOrThrow({ where: { id: hubInstallationId }, select: {
+      syncStreamId: true, syncAcceptedSequence: true, acknowledgedCloudRevision: true, cloudConfigurationRevision: true,
+    } });
+    const projectionReceipts = await prisma.hubSyncReceipt.count({ where: { hubInstallationId } });
+    if (projectionRefresh.response.status !== 200 || projectionRefresh.body?.configurationRefreshOnly !== true
+      || projection?.version !== 1 || typeof projection?.executionEnabled !== 'boolean'
+      || projectedTenantAutomation?.creatorMembershipId !== customerFixture.tenantMembershipId
+      || projectedTenantAutomation?.id !== expectedTenantAutomation.id
+      || !Array.isArray(projectedTenantAutomation?.actions)
+      || projectionRefresh.body.configuration?.revision !== projectionRefresh.body.cloudRevision
+      || projectionRefresh.body.configuration?.checksum !== sha256(canonicalSyncConfiguration(Object.fromEntries(Object.entries(projectionRefresh.body.configuration || {}).filter(([key]) => key !== 'checksum'))))
+      || afterProjectionRefresh.syncStreamId !== fixtureStreamId || Number(afterProjectionRefresh.syncAcceptedSequence) !== acceptedSequence
+      || Number(afterProjectionRefresh.acknowledgedCloudRevision) !== Number(appliedAck.body.cloudRevision)
+      || projectionReceipts !== originalReceiptCount) {
+      fail(`The authenticated capability-negotiated tenant automation projection was not signed/current/cursor-neutral (${JSON.stringify({ status: projectionRefresh.response.status, code: projectionRefresh.body?.errorCode || null, projectionVersion: projection?.version ?? null, executionEnabled: projection?.executionEnabled ?? null, automationPresent: Boolean(projectedTenantAutomation), creatorMatches: projectedTenantAutomation?.creatorMembershipId === customerFixture.tenantMembershipId, cursorStable: afterProjectionRefresh.syncStreamId === fixtureStreamId && Number(afterProjectionRefresh.syncAcceptedSequence) === acceptedSequence, appliedRevisionStable: Number(afterProjectionRefresh.acknowledgedCloudRevision) === Number(appliedAck.body.cloudRevision), receiptsStable: projectionReceipts === originalReceiptCount })})`);
+    }
+    console.log('[stage5:integration] PASS: stale configuration acknowledgement recovers without event effects; enrolled-Hub capability negotiation returns a signed, creator-bound tenant automation projection through the real Platform sync route while preserving the scheduler gate, stream cursor, applied revision, receipts, and household rows');
   } finally {
     await prisma.area.deleteMany({ where: { homeId: customerFixture.homeOneId, osAreaId: areaId } }).catch(() => {});
     await prisma.hubInstallation.update({ where: { id: hubInstallationId }, data: original }).catch(() => {});
