@@ -1,8 +1,9 @@
 import { NextResponse } from 'next/server';
-import { GET as readTenantDeviceContext } from '@/app/api/v2/homes/[homeId]/tenant-device-context/route';
+import { nativeV1ErrorResponse } from '@/lib/contracts/nativeV1Error';
 import { requireCustomerSelectedHome } from '@/lib/customerSelectedHome';
 import { authErrorResponse, Stage1AuthError } from '@/lib/stage1Auth';
 import { authenticateHub } from '@/lib/stage1HubAuth';
+import { mapTenantDeviceContextError, readTenantDeviceContextForSelectedHome } from '@/lib/tenantDeviceContext';
 
 export const dynamic = 'force-dynamic';
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -60,9 +61,12 @@ export async function POST(request: Request) {
       throw new Stage1AuthError(404, 'tenant_context_unavailable', 'The selected tenant context is no longer available');
     }
 
-    const response = await readTenantDeviceContext(authorityRequest, { params: Promise.resolve({ homeId }) });
-    const responseBody = await response.text();
-    return new NextResponse(responseBody, { status: response.status, headers: {
+    // The selected Home was verified once above. Read the projection directly
+    // rather than through the canonical GET, which would verify it again.
+    let projection: Awaited<ReturnType<typeof readTenantDeviceContextForSelectedHome>>;
+    try { projection = await readTenantDeviceContextForSelectedHome(selected, homeId); }
+    catch (error) { return nativeV1ErrorResponse(mapTenantDeviceContextError(error)); }
+    return NextResponse.json(projection, { headers: {
       'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store, private', Pragma: 'no-cache',
     } });
   } catch (error) {

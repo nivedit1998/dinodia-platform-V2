@@ -17,7 +17,8 @@ test('Hub tenant projections authenticate both the active machine and current se
     assert.match(source, /Cache-Control/);
     assert.doesNotMatch(source, /console\.(?:log|error|warn).*accountAccessToken/);
   }
-  assert.match(context, /readTenantDeviceContext\(authorityRequest/);
+  assert.match(context, /readTenantDeviceContextForSelectedHome\(selected, homeId\)/);
+  assert.doesNotMatch(context, /readTenantDeviceContext\(/, 'the hub must not re-run the canonical GET');
   assert.match(automation, /listTenantAutomations\(authorityRequest\)/);
 });
 
