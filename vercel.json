@@ -1,5 +1,6 @@
 {
   "framework": "nextjs",
+  "regions": ["lhr1"],
   "crons": [
     { "path": "/api/cron/native-maintenance", "schedule": "0 3 * * *" }
   ]
