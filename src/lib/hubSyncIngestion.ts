@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import type { Prisma } from '@prisma/client';
 import { Stage1AuthError } from './stage1Auth';
 import { canonicalSyncJson, type HubSyncEvent } from './hubSyncEnvelope';
+import { isAutomationEligibilityUpgrade } from './catalogAutomationEligibility';
 import { queueAutomationFailureNotices } from './nativeAutomations/failureNotifications';
 import { suspendAutomationsForDeviceChange } from './nativeAutomations/revalidation';
 import { retireNativeAutomations } from './nativeAutomations/lifecycle';
@@ -223,6 +224,14 @@ export async function applyHubSyncEvent(tx: Prisma.TransactionClient, input: {
       // signed OS payload. Compare canonical structure while retaining array
       // order, so an exact descriptor retry is idempotent but changed controls
       // at the same revision still conflict.
+      if (priorCatalog.descriptorDigest === payload.descriptorDigest && canonicalSyncJson(priorCatalog.controls) !== canonicalSyncJson(controls)
+        && isAutomationEligibilityUpgrade(priorCatalog.controls, controls)) {
+        // Same revision and digest; only owner-approved controls became schedulable.
+        await tx.nativeDevice.update({ where: { id: device.id }, data: {
+          capabilitySummary: { ...summary, controlCatalog: { revision, descriptorDigest: payload.descriptorDigest, controls } } as Prisma.InputJsonValue,
+        } });
+        return;
+      }
       if (canonicalSyncJson(priorCatalog.controls) !== canonicalSyncJson(controls) || priorCatalog.descriptorDigest !== payload.descriptorDigest) {
         invalid('hub_sync_catalog_conflict', 'This catalogue revision was already used for different controls');
       }
