@@ -11,6 +11,7 @@ const coverage = JSON.parse(fs.readFileSync(path.join(root, coveragePath), 'utf8
 const acRouteMatrix = coverage;
 const yaml = createRequire(import.meta.url)('js-yaml');
 const openApi = yaml.load(fs.readFileSync(path.join(root, 'contracts/dinodia-v1/openapi.yaml'), 'utf8'));
+const roomQrOpenApi = yaml.load(fs.readFileSync(path.join(root, 'contracts/platform-v2-room-qr-plaques.openapi.yaml'), 'utf8'));
 const methodNames = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS', 'HEAD'];
 const acceptanceCriterionPattern = /^AC-(?:02\.(?:[1-9]|[1-3][0-9]|4[0-5])|06\.(?:[1-9]|[1-2][0-9]|3[0-5])|07\.(?:[1-9]|1[0-9]|2[0-3])|08\.(?:[1-9]|1[0-9]|2[0-2])|09\.(?:[1-9]|[1-3][0-9])|10\.(?:[1-9]|1[0-9])|11\.(?:[1-9]|1[0-9]|2[0-5])|12\.(?:[1-9]|1[0-9]|20))$/;
 const authEntries = new Map(stage1RouteInventory.map(([method, route, auth]) => [`${method} ${route}`, auth]));
@@ -184,8 +185,9 @@ test('customer-facing Alexa management routes preserve the canonical Native V1 e
 test('OpenAPI documents every currently executable Native V2 route method', () => {
   for (const row of coverage.routes) {
     const openApiPath = routePath(row.file).replace(/:([^/]+)/g, '{$1}');
+    const contract = openApiPath.includes('/room-qrs') || openApiPath.includes('/room-plaque-requests') ? roomQrOpenApi : openApi;
     for (const method of row.methods) {
-      assert.ok(openApi.paths?.[openApiPath]?.[method.toLowerCase()], `OpenAPI omits ${method} ${openApiPath}`);
+      assert.ok(contract.paths?.[openApiPath]?.[method.toLowerCase()], `OpenAPI omits ${method} ${openApiPath}`);
     }
   }
   assert.equal(openApi.paths?.['/api/v2/support/tickets/{ticketId}/access-request'], undefined, 'the retired singular support path must not compete with the executable plural route');

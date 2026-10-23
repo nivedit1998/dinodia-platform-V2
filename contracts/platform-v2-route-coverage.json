@@ -13,6 +13,10 @@
     "disabled_public": { "principal": "anonymous or authenticated caller", "stage1AuthClasses": ["public-disabled-feature"], "expectedBoundary": "501 FEATURE_NOT_ENABLED; no persistence or fallback" }
   },
   "routes": [
+    { "file": "src/app/api/v2/homes/[homeId]/room-qrs/route.ts", "methods": ["GET"], "boundary": "customer_membership_room_qr", "principalProfile": "customer_membership", "acceptanceCriteria": ["AC-02.14", "AC-02.19"] },
+    { "file": "src/app/api/v2/homes/[homeId]/room-qrs/[areaId]/reveal/route.ts", "methods": ["POST"], "boundary": "customer_membership_room_qr", "principalProfile": "customer_membership", "acceptanceCriteria": ["AC-02.14", "AC-02.19"] },
+    { "file": "src/app/api/v2/homes/[homeId]/room-plaque-requests/route.ts", "methods": ["GET", "POST"], "boundary": "customer_membership_room_plaque", "principalProfile": "customer_membership", "acceptanceCriteria": ["AC-02.14", "AC-02.19"] },
+    { "file": "src/app/api/v2/homes/[homeId]/room-plaque-requests/[requestId]/cancel/route.ts", "methods": ["POST"], "boundary": "customer_membership_room_plaque", "principalProfile": "customer_membership", "acceptanceCriteria": ["AC-02.14", "AC-02.19"] },
     { "file": "src/app/api/v2/session/route.ts", "methods": ["GET", "POST", "DELETE"], "boundary": "delegates_to_canonical_customer_session_handlers", "principalProfile": { "GET": "customer_session", "POST": "public_login", "DELETE": "customer_session" }, "acceptanceCriteria": ["AC-02.5", "AC-02.15", "AC-02.18", "AC-02.24", "AC-02.28", "AC-02.43", "AC-02.44"] },
     { "file": "src/app/api/v2/session/logout/route.ts", "methods": ["POST"], "boundary": "delegates_to_canonical_customer_session_handlers", "principalProfile": "customer_session", "acceptanceCriteria": ["AC-02.13", "AC-02.15", "AC-02.18", "AC-02.19", "AC-02.24", "AC-02.43"] },
     { "file": "src/app/api/v2/support/notifications/route.ts", "methods": ["GET"], "boundary": "customer_scoped_stage1_projection", "principalProfile": "customer_membership", "acceptanceCriteria": ["AC-02.13", "AC-02.14", "AC-02.16", "AC-02.35", "AC-02.40"] },

@@ -1,0 +1,198 @@
+openapi: 3.1.0
+info:
+  title: Dinodia Platform V2 Room QR and Plaque API
+  version: 1.0.0
+  description: >-
+    Platform-only homeowner and Company Portal endpoints for room QR display and
+    physical plaque fulfilment. This is deliberately separate from the shared
+    Dinodia V1 Hub contract bundle; no Hub protocol or authority is added.
+servers:
+  - url: https://dinodia-platform-v2.vercel.app
+security: []
+paths:
+  /api/v2/homes/{homeId}/room-qrs:
+    get:
+      operationId: listHomeRoomQrMetadata
+      summary: List active room QR metadata without printable secrets
+      security: [{ MobileAccessBearer: [] }]
+      parameters:
+        - { name: homeId, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200': { description: Current authorised metadata; no printable references. }
+        '401': { description: Current account session required. }
+        '403': { description: Owner/manager authority denied. }
+        '404': { description: Selected Home or room library unavailable. }
+  /api/v2/homes/{homeId}/room-qrs/{areaId}/reveal:
+    post:
+      operationId: revealHomeAreaRoomQr
+      summary: Reveal one active room QR to its authorised homeowner
+      security: [{ MobileAccessBearer: [] }]
+      parameters:
+        - { name: homeId, in: path, required: true, schema: { type: string, format: uuid } }
+        - { name: areaId, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [expectedGeneration], properties: { expectedGeneration: { type: integer, minimum: 1 } }, additionalProperties: false }
+      responses:
+        '200': { description: Current opaque reference returned only for this explicit reveal. }
+        '401': { description: Current account session required. }
+        '403': { description: Owner/manager authority denied. }
+        '404': { description: Selected Home or room unavailable. }
+        '409': { description: Generation changed or legacy payload requires company recovery. }
+  /api/v2/homes/{homeId}/room-plaque-requests:
+    get:
+      operationId: listHomeRoomPlaqueRequests
+      summary: List this Home's plaque requests
+      security: [{ MobileAccessBearer: [] }]
+      parameters:
+        - { name: homeId, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200': { description: Current authorised request metadata. }
+        '401': { description: Current account session required. }
+        '403': { description: Owner/manager authority denied. }
+        '404': { description: Selected Home unavailable. }
+    post:
+      operationId: createHomeRoomPlaqueRequest
+      summary: Request one plaque per selected canonical room
+      security: [{ MobileAccessBearer: [] }]
+      parameters:
+        - { name: homeId, in: path, required: true, schema: { type: string, format: uuid } }
+        - { name: Idempotency-Key, in: header, required: true, schema: { type: string, minLength: 16, maxLength: 160, pattern: '^[A-Za-z0-9._:-]+$' } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [contractVersion, items, notes, confirmRegisteredAddress]
+              additionalProperties: false
+              properties:
+                contractVersion: { const: 1 }
+                confirmRegisteredAddress: { const: true }
+                notes: { type: string, maxLength: 1000 }
+                items:
+                  type: array
+                  minItems: 1
+                  maxItems: 64
+                  items:
+                    oneOf:
+                      - type: object
+                        required: [areaId, kind]
+                        additionalProperties: false
+                        properties:
+                          areaId: { type: string, format: uuid }
+                          kind: { const: FIRST_ISSUE }
+                      - type: object
+                        required: [areaId, kind, expectedGeneration]
+                        additionalProperties: false
+                        properties:
+                          areaId: { type: string, format: uuid }
+                          kind: { const: REPRINT }
+                          expectedGeneration: { type: integer, minimum: 1 }
+      responses:
+        '201': { description: Durable request received; no QR is issued until staff starts production. }
+        '400': { description: Invalid request. }
+        '401': { description: Current account session required. }
+        '403': { description: Owner/manager authority denied. }
+        '404': { description: Selected Home or Area unavailable. }
+        '409': { description: Duplicate open request, stale generation or idempotency conflict. }
+        '429': { description: Rate limit reached. }
+  /api/v2/homes/{homeId}/room-plaque-requests/{requestId}/cancel:
+    post:
+      operationId: cancelHomeRoomPlaqueRequest
+      summary: Cancel a plaque request before production
+      security: [{ MobileAccessBearer: [] }]
+      parameters:
+        - { name: homeId, in: path, required: true, schema: { type: string, format: uuid } }
+        - { name: requestId, in: path, required: true, schema: { type: string, format: uuid } }
+        - { name: Idempotency-Key, in: header, required: true, schema: { type: string, minLength: 16, maxLength: 160, pattern: '^[A-Za-z0-9._:-]+$' } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [expectedRevision], properties: { expectedRevision: { type: integer, minimum: 1 } }, additionalProperties: false }
+      responses:
+        '200': { description: Request cancelled; already issued room credentials remain valid. }
+        '401': { description: Current account session required. }
+        '403': { description: Owner/manager authority denied. }
+        '404': { description: Request unavailable. }
+        '409': { description: Request is no longer cancellable or revision changed. }
+  /api/company/room-plaque-requests:
+    get:
+      operationId: listCompanyRoomPlaqueRequests
+      summary: List the bounded Company Portal fulfilment queue
+      security: [{ CompanySessionCookie: [] }]
+      parameters:
+        - { name: status, in: query, required: false, schema: { enum: [REQUESTED, IN_PRODUCTION, DISPATCHED, COMPLETED, CANCELLED] } }
+        - { name: after, in: query, required: false, schema: { type: string, format: uuid } }
+      responses:
+        '200': { description: Current operations queue page. }
+        '401': { description: Employee session required. }
+        '403': { description: CXO/Senior Operations Manager role required. }
+  /api/company/room-plaque-requests/{requestId}:
+    get:
+      operationId: getCompanyRoomPlaqueRequest
+      summary: Read one fulfilment request
+      security: [{ CompanySessionCookie: [] }]
+      parameters:
+        - { name: requestId, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200': { description: Current request and Area-bound line details. }
+        '401': { description: Employee session required. }
+        '403': { description: CXO/Senior Operations Manager role required. }
+        '404': { description: Request unavailable. }
+  /api/company/room-plaque-requests/{requestId}/transition:
+    post:
+      operationId: transitionCompanyRoomPlaqueRequest
+      summary: Commit one revision-checked fulfilment transition
+      security: [{ CompanySessionCookie: [] }]
+      parameters:
+        - { name: requestId, in: path, required: true, schema: { type: string, format: uuid } }
+        - { name: Idempotency-Key, in: header, required: true, schema: { type: string, minLength: 16, maxLength: 160, pattern: '^[A-Za-z0-9._:-]+$' } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - { type: object, required: [action, expectedRevision], properties: { action: { enum: [START_PRODUCTION, DISPATCH, COMPLETE] }, expectedRevision: { type: integer, minimum: 1 } }, additionalProperties: false }
+                - { type: object, required: [action, expectedRevision, reason], properties: { action: { const: CANCEL }, expectedRevision: { type: integer, minimum: 1 }, reason: { type: string, minLength: 1, maxLength: 500 } }, additionalProperties: false }
+            description: Staff cancellation closes REQUESTED, IN_PRODUCTION or DISPATCHED orders with an audited reason. Issued codes and production/dispatch timestamps remain intact; cancellation does not recall goods. Customer cancellation remains REQUESTED-only.
+      responses:
+        '200': { description: Transition committed; first QR issuance occurs only at START_PRODUCTION. }
+        '400': { description: Invalid transition request. }
+        '401': { description: Employee session required. }
+        '403': { description: CXO/Senior Operations Manager role or same-origin check denied. }
+        '404': { description: Request unavailable. }
+        '409': { description: Stale revision or fulfilment held for authority/address review. }
+  /api/company/room-plaque-requests/{requestId}/print:
+    post:
+      operationId: prepareCompanyRoomPlaquePrint
+      summary: Prepare the current authenticated print sheet
+      security: [{ CompanySessionCookie: [] }]
+      parameters:
+        - { name: requestId, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [expectedRevision], properties: { expectedRevision: { type: integer, minimum: 1 } }, additionalProperties: false }
+      responses:
+        '200': { description: Current QR payloads rendered for this explicit operations print action. }
+        '401': { description: Employee session required. }
+        '403': { description: CXO/Senior Operations Manager role required. }
+        '404': { description: Request unavailable. }
+        '409': { description: Request, credential or Home authority is no longer printable. }
+components:
+  securitySchemes:
+    MobileAccessBearer:
+      type: http
+      scheme: bearer
+      description: Existing account-access bearer plus exact X-Dinodia-Home-Id; Hub bearer is not accepted.
+    CompanySessionCookie:
+      type: apiKey
+      in: cookie
+      name: dinodia_employee_session
+      description: Existing company employee session; writes also require the canonical same-origin check.
