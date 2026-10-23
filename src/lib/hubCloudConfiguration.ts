@@ -16,7 +16,7 @@ export async function buildHubCloudConfiguration(db: Prisma.TransactionClient, i
       select: { id: true, role: true, accessRevision: true, tenantAreaGrants: { where: { revokedAt: null, area: { status: 'ACTIVE' } }, orderBy: { areaId: 'asc' }, select: { areaId: true, policyRevision: true } } },
     }),
     db.nativeDevice.findMany({ where: { homeId: input.homeId, hubInstallationId: input.hubInstallationId }, orderBy: { id: 'asc' }, take: 2000,
-      select: { osDeviceId: true, managementClass: true, ownerMembershipId: true, analyticsCategory: true, inventoryRevision: true, lifecycle: true, customerLabel: true, overrideName: true, descriptorRevision: true, descriptorDigest: true, assignments: { where: { validUntil: null, area: { status: 'ACTIVE' } }, orderBy: { areaId: 'asc' }, take: 8, select: { areaId: true, area: { select: { osAreaId: true } } } } } }),
+      select: { id: true, osDeviceId: true, managementClass: true, ownerMembershipId: true, analyticsCategory: true, inventoryRevision: true, lifecycle: true, customerLabel: true, overrideName: true, descriptorRevision: true, descriptorDigest: true, assignments: { where: { validUntil: null, area: { status: 'ACTIVE' } }, orderBy: { areaId: 'asc' }, take: 8, select: { areaId: true, area: { select: { osAreaId: true } } } } } }),
     db.nativeAutomation.findMany({ where: { homeId: input.homeId }, orderBy: { id: 'asc' }, take: 100,
       select: { id: true, createdByMembershipId: true, name: true, status: true, revision: true, definitionChecksum: true, timezone: true, retiredAt: true, createdAt: true, updatedAt: true,
         triggers: { orderBy: { id: 'asc' }, take: 16, select: { id: true, kind: true, configuration: true, revision: true } },
@@ -27,13 +27,19 @@ export async function buildHubCloudConfiguration(db: Prisma.TransactionClient, i
         } },
         executions: { where: { purgeAt: { gt: new Date() } }, orderBy: { startedAt: 'desc' }, take: 1, select: { status: true, startedAt: true, completedAt: true, safeOutcome: true } },
       } }),
-    db.hubInstallation.findUnique({ where: { id: input.hubInstallationId }, select: { accessPolicyRevision: true, capabilitySummary: true } }),
+    db.hubInstallation.findUnique({ where: { id: input.hubInstallationId }, select: { accessPolicyRevision: true, capabilitySummary: true, analyticsWriterEnabled: true, analyticsCollectionEnabled: true, manufacturingIdentity: { select: { identityGeneration: true } } } }),
   ]);
   if (!home) throw new Error('Hub home is no longer available');
   const automations = automationActivationEnabled ? automationRows.filter((automation) => automation.status !== 'RETIRED') : [];
   const capabilitySummary = hub?.capabilitySummary && typeof hub.capabilitySummary === 'object' && !Array.isArray(hub.capabilitySummary)
     ? hub.capabilitySummary as Record<string, unknown> : {};
   const supportsTenantAutomationProjection = capabilitySummary.nativeTenantAutomationProjectionV1 === true;
+  const analyticsIntervals = capabilitySummary.nativeUniversalAnalyticsV2 === true ? await db.nativeAnalyticsInterval.findMany({
+    where: { homeId: input.homeId, hubInstallationId: input.hubInstallationId, validUntil: null,
+      sourceGeneration: hub?.manufacturingIdentity?.identityGeneration ?? -1 }, take: 2000,
+  }) : [];
+  // Configuration construction is read-only. Activation/generation reconciliation
+  // seeds intervals in the audited operator transaction, never on every sync.
   const tenantAutomationProjection = supportsTenantAutomationProjection ? {
     version: 1,
     executionEnabled: automationActivationEnabled,
@@ -92,6 +98,12 @@ export async function buildHubCloudConfiguration(db: Prisma.TransactionClient, i
       inventoryRevision: device.inventoryRevision,
       descriptorRevision: device.descriptorRevision, descriptorDigest: device.descriptorDigest,
       osAreaIds: device.assignments.map((assignment) => assignment.area.osAreaId),
+      ...(() => { const interval = analyticsIntervals.find(row => row.deviceId === device.id); return interval ? { analyticsInterval: {
+        id: interval.id, revision: interval.revision, validFrom: interval.validFrom.toISOString(), sourceGeneration: interval.sourceGeneration,
+        selectedControlId: interval.selectedControlId, writerEnabled: hub?.analyticsWriterEnabled === true,
+        genericCollectionEnabled: hub?.analyticsCollectionEnabled === true,
+        authorizedControlIds: Array.isArray(interval.authorizedControls) ? interval.authorizedControls.map(control => String((control as Record<string, unknown>).controlId)) : [],
+      } } : {}; })(),
     })),
     automations: automations.map((automation) => ({
       id: automation.id, name: automation.name, status: automation.status, revision: automation.revision, definitionChecksum: automation.definitionChecksum, timezone: automation.timezone,

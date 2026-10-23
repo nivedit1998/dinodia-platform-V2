@@ -2,14 +2,23 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import crypto from 'node:crypto';
+import { execFileSync } from 'node:child_process';
 const platform = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const source = path.join(platform, 'contracts/dinodia-v1');
-const repos = [
-  ['../Dinodia OS', 'test/fixtures/contracts/dinodia-v1'],
-  ['../dinodia-ios-app-V2', 'DinodiaTests/Fixtures/DinodiaV1'],
-  ['../dinodia-alexa-skill-V2', 'test/fixtures/dinodia-v1'],
-  ['../dinodia-edge-worker-V2', 'test/fixtures/dinodia-v1'],
-];
+// Every destination must be explicitly supplied. Never discover writable sibling checkouts.
+const targets = JSON.parse(process.env.DINODIA_CONTRACT_TARGETS || '{}');
+const paths = { hub: 'test/fixtures/contracts/dinodia-v1', ios: 'DinodiaTests/Fixtures/DinodiaV1',
+  alexa: 'test/fixtures/dinodia-v1', edge: 'test/fixtures/dinodia-v1' };
+if (!Object.keys(targets).length || Object.keys(targets).some(key => !Object.hasOwn(paths, key)))
+  throw new Error('DINODIA_CONTRACT_TARGETS must explicitly map supported consumer names to claimed durable worktrees');
+const repos = Object.entries(targets).map(([consumer, directory]) => {
+  if (!path.isAbsolute(directory)) throw new Error('Consumer root must be absolute');
+  const root = fs.realpathSync(directory);
+  if (!root.includes('/worktrees/')) throw new Error('Refusing to mutate a primary checkout');
+  const branch = execFileSync('git', ['-C', root, 'branch', '--show-current'], { encoding: 'utf8' }).trim();
+  if (!branch.endsWith('universal-category-analytics-20261023')) throw new Error('Consumer branch is not claimed for this task');
+  return [root, paths[consumer]];
+});
 for (const [repo, relative] of repos) {
   const target = path.resolve(platform, repo, relative);
   fs.mkdirSync(target, { recursive: true });
@@ -21,7 +30,8 @@ for (const [repo, relative] of repos) {
   for (const [name, bytes] of files) hash.update(name).update('\0').update(bytes).update('\0');
   fs.writeFileSync(path.join(target, 'manifest.json'), JSON.stringify({ contractVersion: 'dinodia.v1', bundleSha256: hash.digest('hex') }, null, 2) + '\n');
 }
-const iosPrototype = path.resolve(platform, '../dinodia-ios-app-V2/Dinodia/DebugFixtures');
+if (targets.ios) {
+const iosPrototype = path.resolve(targets.ios, 'Dinodia/DebugFixtures');
 fs.mkdirSync(iosPrototype, { recursive: true });
 fs.copyFileSync(path.join(source, 'V2_STATIC_TO_LIVE_MATRIX.md'), path.join(iosPrototype, 'V2_STATIC_TO_LIVE_MATRIX.md'));
 const iosPrototypeContracts = path.join(iosPrototype, 'DinodiaV1');
@@ -91,4 +101,5 @@ for (const fixture of debugScreenFixturePaths) {
   fs.mkdirSync(path.dirname(target), { recursive: true });
   fs.copyFileSync(path.join(source, 'fixtures', fixture), target);
 }
-console.log(`Synchronized dinodia.v1 schemas and fixtures to ${repos.length} consumers and the DEBUG-only iOS prototype`);
+}
+console.log(`Synchronized dinodia.v1 schemas and fixtures to ${repos.length} explicit consumers`);

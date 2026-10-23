@@ -1,6 +1,7 @@
 import { prisma } from './prisma';
+import type { Prisma } from '@prisma/client';
 import { currentNativeDisplayName } from './nativeDisplayNames';
-import { aggregateNativeTemperature, aggregateNativeUsage, NATIVE_TEMPERATURE_MAX_VALIDITY_MS, parseAnalyticsWindow, retentionStart, type NativeAnalyticsLevel, type NativeUsageRow } from './nativeAnalytics';
+import { aggregateNativeTemperature, aggregateNativeUsage, reconcileNativeUsageCoverage, NATIVE_TEMPERATURE_MAX_VALIDITY_MS, parseAnalyticsWindow, retentionStart, type NativeAnalyticsLevel, type NativeUsageRow } from './nativeAnalytics';
 import { ANALYTICS_MAX_AREAS, ANALYTICS_MAX_DEVICES, ANALYTICS_MAX_ROWS, currentAnalyticsGroups, metricCategory, parseUuidList, type AnalyticsArea } from './nativeAnalyticsAccess';
 import { Stage1AuthError } from './stage1Auth';
 
@@ -77,7 +78,7 @@ export async function readNativeAnalyticsBootstrap(homeId: string, timezone: str
   const summaries = await Promise.all((['LIGHT', 'RADIATOR', 'BOILER'] as const).map(async (category) => {
     const rows = await prisma.nativeDeviceUsageBucket.findMany({ where: { homeId, analyticsCategory: category,
       bucketStart: { gte: sevenDays, lte: now }, purgeAt: { gt: now },
-      device: { is: { homeId, managementClass: 'PROPERTY_DEVICE', analyticsCategory: category } }, area: { is: { homeId } } },
+      device: { is: { homeId, managementClass: 'PROPERTY_DEVICE' } }, area: { is: { homeId } } },
       orderBy: { bucketStart: 'asc' }, take: ANALYTICS_MAX_ROWS + 1,
       select: { deviceId: true, areaId: true, bucketStart: true, coverageStartAt: true, coverageEndAt: true, closedAt: true, onSeconds: true, offSeconds: true, unknownSeconds: true } });
     if (rows.length > ANALYTICS_MAX_ROWS) throw boundedQueryError();
@@ -119,7 +120,8 @@ async function resolveFilters(homeId: string, search: URLSearchParams, metric: '
     if (matches !== resolvedAreaIds.length) throw new Stage1AuthError(404, 'RESOURCE_NOT_FOUND', 'Analytics is not available for this selected Home');
   }
   if (deviceIds?.length) {
-    const matches = await prisma.nativeDevice.findMany({ where: { id: { in: deviceIds }, homeId, managementClass: 'PROPERTY_DEVICE', analyticsCategory: metric === 'TEMPERATURE' ? 'RADIATOR' : metric }, select: { id: true } });
+    const matches = await prisma.nativeDevice.findMany({ where: { id: { in: deviceIds }, homeId, managementClass: 'PROPERTY_DEVICE',
+      ...(metric === 'TEMPERATURE' ? { analyticsCategory: 'RADIATOR' as const } : { OR: [{ analyticsCategory: metric }, { usageBuckets: { some: { homeId, analyticsCategory: metric } } }] }) }, select: { id: true } });
     if (matches.length !== deviceIds.length) throw new Stage1AuthError(404, 'RESOURCE_NOT_FOUND', 'Analytics is not available for this selected Home');
   }
   return { areaIds: resolvedAreaIds, deviceIds };
@@ -134,7 +136,7 @@ export async function readNativeUsageDetail(homeId: string, timezone: string, se
   const rows = await prisma.nativeDeviceUsageBucket.findMany({ where: { homeId, analyticsCategory: metric,
     bucketStart: { gte: window.from, lt: window.to }, purgeAt: { gt: now },
     ...(filters.areaIds ? { areaId: { in: filters.areaIds } } : {}), ...(filters.deviceIds ? { deviceId: { in: filters.deviceIds } } : {}),
-    device: { is: { homeId, managementClass: 'PROPERTY_DEVICE', analyticsCategory: metric } }, area: { is: { homeId } } },
+    device: { is: { homeId, managementClass: 'PROPERTY_DEVICE' } }, area: { is: { homeId } } },
     orderBy: [{ bucketStart: 'asc' }, { deviceId: 'asc' }], take: ANALYTICS_MAX_ROWS + 1,
       select: { deviceId: true, areaId: true, bucketStart: true, coverageStartAt: true, coverageEndAt: true, closedAt: true, onSeconds: true, offSeconds: true, unknownSeconds: true } });
   if (rows.length > ANALYTICS_MAX_ROWS) throw boundedQueryError();
@@ -143,13 +145,26 @@ export async function readNativeUsageDetail(homeId: string, timezone: string, se
   const assignments = candidateDeviceIds.length ? await prisma.deviceAreaAssignment.findMany({ where: { homeId, deviceId: { in: candidateDeviceIds }, areaId: { in: areaIds } },
     select: { deviceId: true, areaId: true, validFrom: true, validUntil: true }, take: ANALYTICS_MAX_ROWS + 1 }) : [];
   if (assignments.length > ANALYTICS_MAX_ROWS) throw boundedQueryError();
-  const eligible = rows.filter((row) => inCoverageAssignment(row, assignments));
+  const reconciled = reconcileNativeUsageCoverage(rows.filter((row) => inCoverageAssignment(row, assignments)));
+  const eligible = reconciled.rows;
   const deviceIds = [...new Set(eligible.map((row) => row.deviceId))];
-  const buckets = aggregateNativeUsage(eligible as NativeUsageRow[], interval, timezone);
-  const responseDevices = deviceIds.length ? await prisma.nativeDevice.findMany({ where: { id: { in: deviceIds }, homeId, managementClass: 'PROPERTY_DEVICE', analyticsCategory: metric },
+  const buckets = aggregateNativeUsage(eligible as NativeUsageRow[], interval, timezone)
+    .map(bucket => reconciled.excludedDeviceHours ? { ...bucket, isPartial: true } : bucket);
+  const responseDevices = deviceIds.length ? await prisma.nativeDevice.findMany({ where: { id: { in: deviceIds }, homeId, managementClass: 'PROPERTY_DEVICE' },
     select: { id: true, originalName: true, overrideName: true, lifecycle: true, customerLabel: true } }) : [];
+  const coverageWhere: Prisma.NativeDeviceWhereInput = { homeId, managementClass: 'PROPERTY_DEVICE', analyticsCategory: metric,
+    lifecycle: { in: ['INSTALLED', 'VIEW_ONLY'] }, ...(filters.deviceIds ? { id: { in: filters.deviceIds } } : {}),
+    assignments: { some: { validUntil: null, area: { status: 'ACTIVE' }, ...(filters.areaIds ? { areaId: { in: filters.areaIds } } : {}) } } };
+  const [eligibleDeviceCount, reportingDeviceCount] = await Promise.all([
+    prisma.nativeDevice.count({ where: coverageWhere }),
+    prisma.nativeDevice.count({ where: { AND: [coverageWhere, { id: { in: deviceIds } }] } }),
+  ]);
+  const unallocatedEventCount = await prisma.nativeAnalyticsUnallocated.count({ where: { homeId, analyticsCategory: metric, coverageStartAt: { lt: window.to }, coverageEndAt: { gt: window.from },
+    ...(filters.deviceIds ? { deviceId: { in: filters.deviceIds } } : {}), ...(filters.areaIds ? { areaId: { in: filters.areaIds } } : {}) } });
   return { schemaVersion: 'dinodia.v1', ok: true, homeId, metric: metric.toLowerCase(), level: interval, timezone,
     from: window.from.toISOString(), to: window.to.toISOString(), retentionStartAt: window.retentionStart.toISOString(), generatedAt: now.toISOString(),
+    coverageStatus: { eligibleDeviceCount, reportingDeviceCount, missingDeviceCount: Math.max(0, eligibleDeviceCount - reportingDeviceCount), unallocatedEventCount,
+      excludedOverlapDeviceHours: reconciled.excludedDeviceHours },
     selectedDeviceCount: responseDevices.length, devices: responseDevices.map((device) => ({ id: device.id,
       label: ['RETIRED', 'REMOVED'].includes(device.lifecycle) ? 'Retired device' : device.customerLabel ?? displayName(device),
       historicalOnly: ['RETIRED', 'REMOVED'].includes(device.lifecycle) })), buckets };

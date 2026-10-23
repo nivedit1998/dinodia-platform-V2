@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 
 const routePath = new URL('../src/app/api/hub-agent/v2/sync/route.ts', import.meta.url);
@@ -39,7 +41,8 @@ test('oversized signed sync batches are explicitly rejected before opening the P
   const envelope = fs.readFileSync(new URL('../src/lib/hubSyncEnvelope.ts', import.meta.url), 'utf8');
   const processingLimit = Number(envelope.match(/HUB_SYNC_PROCESSING_MAX_EVENTS\s*=\s*(\d+)/)?.[1] || 0);
   assert.equal(processingLimit, 40);
-  const osOutbox = fs.readFileSync(new URL('../../Dinodia%20OS/src/sync/syncOutbox.js', import.meta.url), 'utf8');
+  const osRoot = process.env.DINODIA_OS_ROOT || fileURLToPath(new URL('../../Dinodia%20OS', import.meta.url));
+  const osOutbox = fs.readFileSync(path.join(osRoot, 'src/sync/syncOutbox.js'), 'utf8');
   const osLimit = Number(osOutbox.match(/SYNC_BATCH_MAX_EVENTS\s*=\s*(\d+)/)?.[1] || 0);
   assert.equal(osLimit, processingLimit, 'the Producer and authenticated receiver must enforce the same event cap');
 });

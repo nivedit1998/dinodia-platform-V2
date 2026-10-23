@@ -6,11 +6,13 @@ export const FOUNDATION_MODEL_COUNT = 32;
 export const STAGE1_MIGRATION = '20260922000000_stage1_security_authorities';
 export const STAGE1_MODEL_COUNT = 40;
 // Readiness anchors this application generation to the completed Stage 3
-// schema. Exact listed additive later-stage migrations are accepted so a
-// schema-compatible prior application rollback remains healthy.
+// schema. Exact listed later-stage migrations are accepted by THIS candidate.
+// The analytics interval index/trigger migration is not an old-Platform
+// rollback guarantee; use the documented compatible forward-recovery path.
 export const REQUIRED_MIGRATION = '20261003000000_native_v2_stage3_domain_schema';
 export const REQUIRED_MODEL_COUNT = 65;
 export const COMPATIBLE_ADDITIVE_MIGRATIONS: Readonly<Record<string, string>> = Object.freeze({
+  '20261023110000_category_analytics_intervals': 'b6a25359b7bfeb9a453ccc8ecc45fc4f32de63050ac85bd31821cae58e910d05',
   '20261006120000_stage6_invited_tenant_username_setup': '9b01d403fac2d37a59fc53be24c3f6296d3f0eaced2485530123b9e09946581c',
   '20261006150000_stage6_ownership_transfer_claim': '7ec2190ff0da90755807a07683f441a8dee9063aea24234c80f5167052634226',
   '20261006170000_stage6_prospective_room_access': '9477efc725c6f6a40b509842cd6a63f77eb7e1391ea4ce8a3fe87a933c2a8620',
@@ -55,5 +57,6 @@ export function isSchemaReady(migrations: readonly CompletedMigration[], modelCo
   const hasStage8 = newer.some((migration) => migration.migration_name === '20261006180000_stage8_commissioning_and_installation');
   if (hasStage8 && (!hasStage5 || !hasProspectiveRoomAccess || !hasMobileAccess)) return false;
   const hasStage12Alexa = newer.some((migration) => migration.migration_name === '20261009110000_stage12_alexa_oauth_scope');
-  return modelCount === REQUIRED_MODEL_COUNT + (hasStage5 ? 1 : 0) + (hasProspectiveRoomAccess ? 1 : 0) + (hasStage12Alexa ? 8 : 0);
+  const hasAnalyticsIntervals = newer.some(migration => migration.migration_name === '20261023110000_category_analytics_intervals');
+  return modelCount === REQUIRED_MODEL_COUNT + (hasStage5 ? 1 : 0) + (hasProspectiveRoomAccess ? 1 : 0) + (hasStage12Alexa ? 8 : 0) + (hasAnalyticsIntervals ? 2 : 0);
 }

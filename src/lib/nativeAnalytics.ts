@@ -90,9 +90,10 @@ const rounded = (value: number) => Math.floor(value + 0.5);
  * larger buckets average each contributing device's local-day sample. Missing
  * source rows remain gaps and are never synthesized as Off/zero.
  */
-export function aggregateNativeUsage(rows: readonly NativeUsageRow[], level: NativeAnalyticsLevel, timezone: string) {
-  if (!validAnalyticsTimezone(timezone) || !['hour', 'day', 'week', 'month', 'year'].includes(level)) throw new TypeError('Invalid analytics period');
-  const byPeriod = new Map<string, { period: ReturnType<typeof usagePeriod>; samples: Map<string, { on: number; off: number; unknown: number; coverage: number; count: number }>; openBucket: boolean; partialCoverage: boolean }>();
+export function reconcileNativeUsageCoverage(rows: readonly NativeUsageRow[]) {
+  const spansByDeviceHour = new Map<string, Array<[number, number]>>();
+  const excluded = new Set<string>();
+  const validated: Array<{ row: NativeUsageRow; identity: string; sum: number }> = [];
   for (const row of rows) {
     const start = new Date(row.bucketStart);
     if (!Number.isFinite(start.getTime()) || ![row.onSeconds, row.offSeconds, row.unknownSeconds].every((n) => Number.isSafeInteger(n) && n >= 0)) throw new TypeError('Invalid usage row');
@@ -108,10 +109,29 @@ export function aggregateNativeUsage(rows: readonly NativeUsageRow[], level: Nat
       || coverageStart < start || coverageEnd > new Date(start.getTime() + 3600000) || coverageEnd <= coverageStart
       || coverageEnd.getTime() - coverageStart.getTime() !== sum * 1000
       || (closed && (closed.getTime() !== start.getTime() + 3600000 || closed.getTime() !== coverageEnd.getTime()))) throw new TypeError('Invalid usage coverage span');
+    const identity = `${row.deviceId}:${start.toISOString()}`;
+    const spans = spansByDeviceHour.get(identity) ?? [];
+    if (spans.some(([from, to]) => from < coverageEnd.getTime() && to > coverageStart.getTime())) excluded.add(identity);
+    spans.push([coverageStart.getTime(), coverageEnd.getTime()]); spansByDeviceHour.set(identity, spans);
+    validated.push({ row, identity, sum });
+  }
+  // Absolute counters cannot be truthfully split to resolve overlapping spans.
+  // Exclude the entire affected physical device-hour, independently of row order.
+  // Do not leak device identities or fabricate Unknown/Off measurements.
+  if (excluded.size) console.warn('analytics_usage_overlap_excluded', { deviceHourCount: excluded.size });
+  return { rows: validated.filter(item => !excluded.has(item.identity)).map(item => item.row), excludedDeviceHours: excluded.size };
+}
+
+export function aggregateNativeUsage(rows: readonly NativeUsageRow[], level: NativeAnalyticsLevel, timezone: string) {
+  if (!validAnalyticsTimezone(timezone) || !['hour', 'day', 'week', 'month', 'year'].includes(level)) throw new TypeError('Invalid analytics period');
+  const byPeriod = new Map<string, { period: ReturnType<typeof usagePeriod>; samples: Map<string, { on: number; off: number; unknown: number; coverage: number; count: number }>; openBucket: boolean; partialCoverage: boolean }>();
+  const reconciled = reconcileNativeUsageCoverage(rows);
+  for (const row of reconciled.rows) {
+    const sum = row.onSeconds + row.offSeconds + row.unknownSeconds;
     const period = usagePeriod(row, level, timezone);
     const result = byPeriod.get(period.key) ?? { period, samples: new Map(), openBucket: false, partialCoverage: false };
     result.openBucket ||= row.closedAt === null;
-    result.partialCoverage ||= sum < 3600;
+    result.partialCoverage ||= sum < 3600 || reconciled.excludedDeviceHours > 0;
     const sampleKey = level === 'hour' ? row.deviceId : `${row.deviceId}:${period.localDay}`;
     const sample = result.samples.get(sampleKey) ?? { on: 0, off: 0, unknown: 0, coverage: 0, count: 0 };
     sample.on += row.onSeconds; sample.off += row.offSeconds; sample.unknown += row.unknownSeconds; sample.coverage += sum; sample.count += 1;

@@ -55,6 +55,8 @@ Reviewed source is the post-Stage-2 Prisma schema and the additive migration `20
 | PermanentDeviceInstallationRequest | Add native |
 | NativeCommissioningSession | Add native |
 | NativeDeviceUsageBucket | Add native |
+| NativeAnalyticsInterval | Add native |
+| NativeAnalyticsUnallocated | Add native |
 | NativeTemperatureSample | Add native |
 | NativeAutomation | Add native |
 | NativeAutomationTrigger | Add native |
@@ -84,6 +86,8 @@ Reviewed source is the post-Stage-2 Prisma schema and the additive migration `20
 | PermanentDeviceInstallationRequest | Customer service request progresses SUBMITTED→IN_PROGRESS→COMPLETED/CANCELLED | Requester and optional area bind to same Home; customer notes visible to assigned installer roles only | Unique customer reference and email idempotency key; deleted with supported home lifecycle; Company Portal installer queue, Stage 5 |
 | NativeCommissioningSession | Bounded pairing/recovery attempt with terminal state and final canonical device ID | Home, hub, requester, optional Area and result device are same-home; requester-only progress plus installer execution | Unique home/idempotency digest; expiry timestamp and bounded cleanup; OS commissioning flow, Stage 5 |
 | NativeDeviceUsageBucket | OS-authored hourly absolute On/Off/Unknown counters, revisioned while open and immutable when closed | Permanent property device and observation-time canonical Area only; tenant devices excluded | Unique device/area/category/control/hour/source generation; purge ceiling 12 months; analytics, Stage 10 |
+| NativeAnalyticsInterval | Platform assigned-staff category/source authorization with monotonic revisions and immediate effective boundaries | Exact permanent device, Home, enrolled Hub and generation; separate from customer control permissions | One nonoverlapping interval per physical device; retention follows authorized retained history; signed configuration and ingestion consumers |
+| NativeAnalyticsUnallocated | Immutable original signed evidence that cannot be allocated across an immediate policy boundary without guessing | Exact permanent device, enrolled Hub and Home Area; accessible only through existing authorized analytics summaries | Unique installation/event identity and digest; purge at the original twelve-month deadline; excluded from measured counters |
 | NativeTemperatureSample | OS-authored temperature sample from a trustworthy permanent Radiator role | Permanent Radiator and canonical observation-time Area; homeowner projection only | Indexed by home/device/time; purge ceiling 12 months; Home Temperature, Stage 10 |
 | NativeAutomation | Canonical home automation header, revision and content checksum | Creator is same-home membership; property management and privacy follow role | Opaque ID plus revision/checksum; retired records purge by bounded policy; automation composer, Stage 11 |
 | NativeAutomationTrigger | Typed/versioned trigger configuration owned by one automation | Parent automation is sole access authority | Indexed by automation/kind; cascades with parent; automation engine, Stage 11 |

@@ -166,7 +166,17 @@ export async function runNativeMaintenance(now = new Date()) {
 
   await isolate('retentionCleanup', async () => {
     const batchSize = 1000; const maxBatchesPerTable = 8;
-    let usageDeleted = 0; let temperatureDeleted = 0; let automationTombstonesDeleted = 0;
+    let usageDeleted = 0; let temperatureDeleted = 0; let automationTombstonesDeleted = 0; let unallocatedDeleted = 0;
+    for (let batch = 0; batch < maxBatchesPerTable; batch += 1) {
+      const deleted = await prisma.$executeRaw`
+        WITH doomed AS (
+          SELECT "id" FROM "NativeAnalyticsUnallocated" WHERE "purgeAt" <= ${now}
+          ORDER BY "purgeAt", "id" LIMIT ${batchSize} FOR UPDATE SKIP LOCKED
+        )
+        DELETE FROM "NativeAnalyticsUnallocated" AS target USING doomed WHERE target."id" = doomed."id"`;
+      unallocatedDeleted += Number(deleted);
+      if (Number(deleted) < batchSize) break;
+    }
     for (let batch = 0; batch < maxBatchesPerTable; batch += 1) {
       const deleted = await prisma.$executeRaw`
         WITH doomed AS (
@@ -206,12 +216,13 @@ export async function runNativeMaintenance(now = new Date()) {
       automationTombstonesDeleted += Number(deleted);
       if (Number(deleted) < batchSize) break;
     }
-    const [usageRemainder, temperatureRemainder] = await Promise.all([
+    const [usageRemainder, temperatureRemainder, unallocatedRemainder] = await Promise.all([
       prisma.nativeDeviceUsageBucket.findFirst({ where: { purgeAt: { lte: now } }, select: { id: true } }),
       prisma.nativeTemperatureSample.findFirst({ where: { purgeAt: { lte: now } }, select: { id: true } }),
+      prisma.nativeAnalyticsUnallocated.findFirst({ where: { purgeAt: { lte: now } }, select: { id: true } }),
     ]);
-    const checkpoint = { through: now.toISOString(), usageDeleted, temperatureDeleted, automationTombstonesDeleted,
-      backlogRemains: Boolean(usageRemainder || temperatureRemainder), batchLimitPerTable: batchSize * maxBatchesPerTable };
+    const checkpoint = { through: now.toISOString(), usageDeleted, temperatureDeleted, automationTombstonesDeleted, unallocatedDeleted,
+      backlogRemains: Boolean(usageRemainder || temperatureRemainder || unallocatedRemainder), batchLimitPerTable: batchSize * maxBatchesPerTable };
     result.retentionCleanup = checkpoint;
     (result as { taskCursors?: Record<string, unknown> }).taskCursors = {
       ...((result as { taskCursors?: Record<string, unknown> }).taskCursors ?? {}), retentionCleanup: checkpoint,

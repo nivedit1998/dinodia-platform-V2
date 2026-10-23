@@ -4,6 +4,8 @@ export interface ActivityEvidenceV1 {
   category: AnalyticsCategory;
   quality: 'fresh' | 'stale' | 'unknown' | 'unavailable';
   validUntil: string;
+  powerCapabilityPresent?: boolean;
+  brightnessMeaning?: 'actual_output' | 'remembered_level' | 'unverified';
   signals: { powerOn?: unknown; brightness?: unknown; activeHeatDemand?: unknown; activeHeatProduction?: unknown };
 }
 export interface UsageSampleV1 { bucket: string; onMinutes: number; offMinutes: number; unknownMinutes: number }
@@ -15,9 +17,11 @@ export function classifyActivityV1(evidence: ActivityEvidenceV1, nowMs: number):
   if (evidence.quality !== 'fresh' || !Number.isFinite(deadline) || deadline <= nowMs) return 'unknown';
   const { signals, category } = evidence;
   if (category === 'light') {
-    if (signals.powerOn === true || typeof signals.brightness === 'number' && Number.isFinite(signals.brightness) && signals.brightness > 0) return 'on';
-    if (signals.powerOn === false || typeof signals.brightness === 'number' && Number.isFinite(signals.brightness) && signals.brightness === 0) return 'off';
-    return 'unknown';
+    const hasPower = evidence.powerCapabilityPresent ?? Object.hasOwn(signals, 'powerOn');
+    if (hasPower) return typeof signals.powerOn === 'boolean' ? signals.powerOn ? 'on' : 'off' : 'unknown';
+    if (evidence.brightnessMeaning !== 'actual_output') return 'unknown';
+    const value = signals.brightness;
+    return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value > 0 ? 'on' : 'off' : 'unknown';
   }
   if (category === 'radiator') return typeof signals.activeHeatDemand === 'boolean' ? signals.activeHeatDemand ? 'on' : 'off' : 'unknown';
   if (category === 'boiler') return typeof signals.activeHeatProduction === 'boolean' ? signals.activeHeatProduction ? 'on' : 'off' : 'unknown';

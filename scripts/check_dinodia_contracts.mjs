@@ -8,16 +8,25 @@ import yaml from "js-yaml";
 import { assertStage2DecisionFixtures, assertPrototypeActionMatrixBindings, executeIndexedFixtureScenario } from "./dinodia_stage2_decisions.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const consumerRoots = Object.fromEntries([
+  ['Dinodia OS', 'DINODIA_OS_ROOT'], ['dinodia-ios-app-V2', 'DINODIA_IOS_ROOT'],
+  ['dinodia-alexa-skill-V2', 'DINODIA_ALEXA_ROOT'], ['dinodia-edge-worker-V2', 'DINODIA_EDGE_ROOT'],
+].map(([name, variable]) => [name, path.resolve(process.env[variable] || path.resolve(root, '..', name))]));
+function consumerPath(relative, ...parts) {
+  const match = /^\.\.\/([^/]+)(?:\/(.*))?$/.exec(relative);
+  if (!match || !consumerRoots[match[1]]) throw new Error('Unknown contract consumer');
+  return path.resolve(consumerRoots[match[1]], match[2] || '', ...parts);
+}
 const require = createRequire(import.meta.url);
-const osContractRuntime = require(path.resolve(root, "../Dinodia OS/src/contracts/dinodiaV1.js"));
-const osAnalyticsRuntime = require(path.resolve(root, "../Dinodia OS/src/contracts/analyticsV1.js"));
+const osContractRuntime = require(consumerPath("../Dinodia OS/src/contracts/dinodiaV1.js"));
+const osAnalyticsRuntime = require(consumerPath("../Dinodia OS/src/contracts/analyticsV1.js"));
 const typescript = require("typescript");
 const platformContractSource = fs.readFileSync(path.join(root, "src/lib/contracts/dinodiaV1.ts"), "utf8");
 const platformContractModule = { exports: {} };
 const platformContractCompiled = typescript.transpileModule(platformContractSource, { compilerOptions: { module: typescript.ModuleKind.CommonJS, target: typescript.ScriptTarget.ES2022 } }).outputText;
 new Function("require", "module", "exports", platformContractCompiled)(require, platformContractModule, platformContractModule.exports);
 const platformContractRuntime = platformContractModule.exports;
-const alexaContractSource = fs.readFileSync(path.resolve(root, "../dinodia-alexa-skill-V2/src/dinodiaV1.ts"), "utf8");
+const alexaContractSource = fs.readFileSync(consumerPath("../dinodia-alexa-skill-V2/src/dinodiaV1.ts"), "utf8");
 const alexaContractModule = { exports: {} };
 const alexaContractCompiled = typescript.transpileModule(alexaContractSource, { compilerOptions: { module: typescript.ModuleKind.CommonJS, target: typescript.ScriptTarget.ES2022 } }).outputText;
 new Function("require", "module", "exports", alexaContractCompiled)(require, alexaContractModule, alexaContractModule.exports);
@@ -69,6 +78,11 @@ for (const schema of fs
   );
 }
 const fixtureRoot = path.join(root, "contracts/dinodia-v1/fixtures");
+const intervalUsage = JSON.parse(fs.readFileSync(path.join(fixtureRoot, 'analytics-interval-usage.json'), 'utf8'));
+if (!schemas.get('analytics-interval-usage')(intervalUsage)) throw new Error('Interval usage fixture failed its canonical schema');
+for (const changed of [{ ...intervalUsage, bindingRevision: 0 }, { ...intervalUsage, analyticsPolicyVersion: 1 }, { ...intervalUsage, unexpectedAuthority: true }]) {
+  if (schemas.get('analytics-interval-usage')(changed)) throw new Error('Interval usage accepted an invalid version/authority extension');
+}
 const valid = JSON.parse(
   fs.readFileSync(path.join(fixtureRoot, "multi-control-device.json"), "utf8"),
 );
@@ -237,6 +251,7 @@ for (const [schemaName, filename, select] of fixtureChecks) {
 // a newly added valid or adversarial fixture from silently becoming an
 // unvalidated documentation-only artifact.
 const fixtureCases = [
+  ["analytics-interval-usage.json", "analyticsIntervalUsage", (v) => v, true],
   ["account-session-two-homes.json", "accountSessionContext", (v) => v, true],
   ["customer-session-receipt.json", "customerSessionReceipt", (v) => v, true],
   ["customer-hub-session-test-only.json", "customerHubSession", (v) => v, true],
@@ -1014,11 +1029,11 @@ if (!platformAuth.includes("validateMembership") || !platformAuth.includes("./co
 const customerLoginRoute = fs.readFileSync(path.join(root, "src/app/api/v2/auth/session/route.ts"), "utf8");
 if (!customerLoginRoute.includes("validateCustomerSessionLoginRequest(body)"))
   throw new Error("The actual customer login route must validate its canonical request DTO before processing credentials");
-const osRoot = path.resolve(root, "../Dinodia OS");
+const osRoot = consumerPath("../Dinodia OS");
 const osServer = fs.readFileSync(path.join(osRoot, "src/server.js"), "utf8");
 if (!osServer.includes('require("./contracts/dinodiaV1")') || !osServer.includes("serializeNativeDevice") || !osServer.includes('pathname === "/api/dinodia/v1/commands"'))
   throw new Error("Dinodia OS native HTTP serializer/command route is not connected to the canonical validator");
-const iosRoot = path.resolve(root, "../dinodia-ios-app-V2");
+const iosRoot = consumerPath("../dinodia-ios-app-V2");
 const iosMapping = fs.readFileSync(path.join(iosRoot, "Dinodia/LiveContracts/DinodiaV1Mapping.swift"), "utf8");
 const iosComposition = fs.readFileSync(path.join(iosRoot, "Dinodia/ContentView.swift"), "utf8");
 const iosSessionShell = fs.readFileSync(path.join(iosRoot, "Dinodia/LiveContracts/DinodiaV1SessionShell.swift"), "utf8");
@@ -1039,7 +1054,7 @@ for (const fixtureName of prototypeFixtureReferences) {
   if (!copiedPrototypeFixtures.has(fixtureName) || !fs.existsSync(canonicalPath) || !fs.existsSync(debugPath))
     throw new Error(`DEBUG prototype fixture is missing from canonical source or synchronization inventory: ${fixtureName}`);
 }
-const alexaRoot = path.resolve(root, "../dinodia-alexa-skill-V2");
+const alexaRoot = consumerPath("../dinodia-alexa-skill-V2");
 const alexaRuntime = fs.readFileSync(path.join(alexaRoot, "src/index.ts"), "utf8");
 const alexaAdapter = fs.readFileSync(path.join(alexaRoot, "src/dinodiaV1.ts"), "utf8");
 if (!alexaRuntime.includes("decodeNativeAlexaDiscovery") || !alexaRuntime.includes("forwardNativeDirective(directive, token)") || !alexaRuntime.includes("!isNativeEndpointId(endpointId)") || !alexaRuntime.includes("https://dinodia-platform-v2.vercel.app") || !alexaRuntime.includes("NativeAlexaUnavailableError") || /\/api\/alexa\/|ha_[a-z0-9]/i.test(alexaRuntime) || !alexaAdapter.includes("d.ownerMembershipId !== context.homeMembershipId"))
@@ -1255,11 +1270,11 @@ if (!Array.isArray(vercelConfig.crons) || vercelConfig.crons.length !== 1 || ver
 const stage1Migration = fs.readFileSync(path.join(root, "prisma/migrations/20260922000000_stage1_security_authorities/migration.sql"), "utf8");
 if ((stage1Migration.match(/cron\.schedule\s*\(/g) || []).length !== 1 || !stage1Migration.includes("dinodia-native-operations") || !stage1Migration.includes("'*/2 * * * *'"))
   throw new Error("Supabase must own exactly one two-minute operational dispatcher");
-const edgeRoot = path.resolve(root, "../dinodia-edge-worker-V2");
+const edgeRoot = consumerPath("../dinodia-edge-worker-V2");
 const edgeConfig = fs.readFileSync(path.join(edgeRoot, "wrangler.toml"), "utf8");
 if (/\[\[triggers\]\]|\bcrons\s*=/.test(edgeConfig))
   throw new Error("The Edge Worker must not own a schedule");
-const osExample = fs.readFileSync(path.resolve(root, "../Dinodia OS/.env.example"), "utf8");
+const osExample = fs.readFileSync(consumerPath("../Dinodia OS/.env.example"), "utf8");
 if (/^(?:DATABASE_URL|DIRECT_URL|SUPABASE_SERVICE_ROLE_KEY|SUPABASE_DB_PASSWORD)=/m.test(osExample))
   throw new Error("Dinodia OS environment inventory must not request a broad database credential");
 if (decisions.routeFamilies.length !== new Set(decisions.routeFamilies).size)
@@ -1531,7 +1546,7 @@ for (const [repo, relative] of [
   ["../dinodia-alexa-skill-V2", "test/fixtures/dinodia-v1"],
   ["../dinodia-edge-worker-V2", "test/fixtures/dinodia-v1"],
 ]) {
-  const target = path.resolve(root, repo, relative);
+  const target = consumerPath(repo, relative);
   const manifest = JSON.parse(
     fs.readFileSync(path.join(target, "manifest.json"), "utf8"),
   );
@@ -1543,10 +1558,10 @@ for (const [repo, relative] of [
   )
     throw new Error(`Consumer contract bundle drift: ${repo}`);
 }
-const iosPrototypeMatrix = path.resolve(root, "../dinodia-ios-app-V2/Dinodia/DebugFixtures/V2_STATIC_TO_LIVE_MATRIX.md");
+const iosPrototypeMatrix = consumerPath("../dinodia-ios-app-V2/Dinodia/DebugFixtures/V2_STATIC_TO_LIVE_MATRIX.md");
 if (fs.readFileSync(iosPrototypeMatrix, "utf8") !== matrix)
   throw new Error("iOS DEBUG contract prototype matrix differs from the canonical Platform matrix");
-const iosPrototypeSource = path.resolve(root, "../dinodia-ios-app-V2/Dinodia/LiveContracts/Stage2ContractPrototypeView.swift");
+const iosPrototypeSource = consumerPath("../dinodia-ios-app-V2/Dinodia/LiveContracts/Stage2ContractPrototypeView.swift");
 const iosPrototypeText = fs.readFileSync(iosPrototypeSource, "utf8");
 const iosFixtureSyncScript = fs.readFileSync(path.join(root, "scripts/sync_dinodia_contract_fixtures.mjs"), "utf8");
 const debugFixtureList = iosFixtureSyncScript.match(/for \(const fixture of \[([\s\S]*?)\]\) \{/);
