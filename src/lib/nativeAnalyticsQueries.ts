@@ -1,4 +1,5 @@
 import { prisma } from './prisma';
+import type { Prisma } from '@prisma/client';
 import { currentNativeDisplayName } from './nativeDisplayNames';
 import { aggregateNativeTemperature, aggregateNativeUsage, NATIVE_TEMPERATURE_MAX_VALIDITY_MS, parseAnalyticsWindow, retentionStart, type NativeAnalyticsLevel, type NativeUsageRow } from './nativeAnalytics';
 import { ANALYTICS_MAX_AREAS, ANALYTICS_MAX_DEVICES, ANALYTICS_MAX_ROWS, currentAnalyticsGroups, metricCategory, parseUuidList, type AnalyticsArea } from './nativeAnalyticsAccess';
@@ -149,14 +150,18 @@ export async function readNativeUsageDetail(homeId: string, timezone: string, se
   const buckets = aggregateNativeUsage(eligible as NativeUsageRow[], interval, timezone);
   const responseDevices = deviceIds.length ? await prisma.nativeDevice.findMany({ where: { id: { in: deviceIds }, homeId, managementClass: 'PROPERTY_DEVICE' },
     select: { id: true, originalName: true, overrideName: true, lifecycle: true, customerLabel: true } }) : [];
-  const eligibleDeviceCount = await prisma.nativeDevice.count({ where: { homeId, managementClass: 'PROPERTY_DEVICE', analyticsCategory: metric,
+  const coverageWhere: Prisma.NativeDeviceWhereInput = { homeId, managementClass: 'PROPERTY_DEVICE', analyticsCategory: metric,
     lifecycle: { in: ['INSTALLED', 'VIEW_ONLY'] }, ...(filters.deviceIds ? { id: { in: filters.deviceIds } } : {}),
-    ...(filters.areaIds ? { assignments: { some: { areaId: { in: filters.areaIds }, validUntil: null } } } : {}) } });
+    assignments: { some: { validUntil: null, area: { status: 'ACTIVE' }, ...(filters.areaIds ? { areaId: { in: filters.areaIds } } : {}) } } };
+  const [eligibleDeviceCount, reportingDeviceCount] = await Promise.all([
+    prisma.nativeDevice.count({ where: coverageWhere }),
+    prisma.nativeDevice.count({ where: { AND: [coverageWhere, { id: { in: deviceIds } }] } }),
+  ]);
   const unallocatedEventCount = await prisma.nativeAnalyticsUnallocated.count({ where: { homeId, analyticsCategory: metric, coverageStartAt: { lt: window.to }, coverageEndAt: { gt: window.from },
     ...(filters.deviceIds ? { deviceId: { in: filters.deviceIds } } : {}), ...(filters.areaIds ? { areaId: { in: filters.areaIds } } : {}) } });
   return { schemaVersion: 'dinodia.v1', ok: true, homeId, metric: metric.toLowerCase(), level: interval, timezone,
     from: window.from.toISOString(), to: window.to.toISOString(), retentionStartAt: window.retentionStart.toISOString(), generatedAt: now.toISOString(),
-    coverageStatus: { eligibleDeviceCount, reportingDeviceCount: responseDevices.length, missingDeviceCount: Math.max(0, eligibleDeviceCount - responseDevices.length), unallocatedEventCount },
+    coverageStatus: { eligibleDeviceCount, reportingDeviceCount, missingDeviceCount: Math.max(0, eligibleDeviceCount - reportingDeviceCount), unallocatedEventCount },
     selectedDeviceCount: responseDevices.length, devices: responseDevices.map((device) => ({ id: device.id,
       label: ['RETIRED', 'REMOVED'].includes(device.lifecycle) ? 'Retired device' : device.customerLabel ?? displayName(device),
       historicalOnly: ['RETIRED', 'REMOVED'].includes(device.lifecycle) })), buckets };
