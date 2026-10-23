@@ -35,6 +35,7 @@ export function validateStaffCancellationReason(value: unknown): string {
   if(typeof value!=='string') invalid('A staff cancellation reason is required');
   const reason=value.normalize('NFC').trim();
   if(!reason||reason.length>500||/[\u0000-\u001f\u007f]/u.test(reason)) invalid('Use a cancellation reason of 1–500 characters, without control characters');
+  if(/dno_room_/iu.test(reason)) invalid('Do not include room QR references in a cancellation reason');
   return reason;
 }
 export function nextPlaqueStatus(status: string, action: string, actor: 'employee'|'customer' = 'customer') {

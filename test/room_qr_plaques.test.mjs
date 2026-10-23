@@ -36,7 +36,7 @@ test('only staff may resolve production or dispatched holds by explicit cancella
   }
   assert.throws(()=>nextPlaqueStatus('COMPLETED','CANCEL','employee'));
   assert.equal(validateStaffCancellationReason('  Address corrected  '),'Address corrected');
-  for(const reason of [undefined,'',' '.repeat(5),'x'.repeat(501),'bad\u0000reason']) assert.throws(()=>validateStaffCancellationReason(reason));
+  for(const reason of [undefined,'',' '.repeat(5),'x'.repeat(501),'bad\u0000reason','Wrong plaque dno_room_'+ 'a'.repeat(43),'DNO_ROOM_'+ 'b'.repeat(43)]) assert.throws(()=>validateStaffCancellationReason(reason));
 });
 
 test('Platform-only plaque API contract stays separate from the shared Hub V1 bundle',()=>{

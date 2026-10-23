@@ -104,6 +104,13 @@ export async function roomPlaqueIntegration({ base, prisma, homeId, headers, own
     // mutations affect only the disposable harness Home and are restored.
     const cancelPath=orderId=>`/api/company/room-plaque-requests/${orderId}/transition`;
     const cancelBody={action:'CANCEL',expectedRevision:2,reason:'Registered address changed; stop physical fulfilment'};
+    const beforeRejectedCancellation=await prisma.roomPlaqueRequest.findUniqueOrThrow({where:{id:rid}});
+    const auditCountBefore=await prisma.auditEvent.count({where:{targetId:rid}});
+    const rejectedReason=await post(cancelPath(rid),{...cancelBody,reason:`Incorrect plaque ${reference} was supplied`},staff);
+    assert.equal(rejectedReason.response.status,400,'embedded raw room reference is refused before audit persistence');noLeak(rejectedReason.body);
+    assert.deepEqual(await prisma.roomPlaqueRequest.findUniqueOrThrow({where:{id:rid}}),beforeRejectedCancellation,'refused reason leaves status/revision/timestamps unchanged');
+    assert.equal(await prisma.roomPlaqueRequestItem.count({where:{requestId:rid,closedAt:null}}),1,'refused reason retains reservation');
+    assert.equal(await prisma.auditEvent.count({where:{targetId:rid}}),auditCountBefore,'refused reason creates no audit entry');
     assert.equal((await post(cancelPath(rid),{action:'CANCEL',expectedRevision:2},staff)).response.status,400,'staff reason is mandatory');
     assert.equal((await post(`${root}/room-plaque-requests/${rid}/cancel`,{expectedRevision:2})).response.status,409,'customers cannot cancel after production starts');
     assert.equal((await post(cancelPath(rid),cancelBody,installerHeaders)).response.status,403,'installer cannot resolve a hold');
