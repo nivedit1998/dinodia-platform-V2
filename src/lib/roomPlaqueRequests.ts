@@ -7,7 +7,7 @@ import { sha256 } from './stage1Crypto';
 import { encryptPlatformEnvelope } from './hubOperatorCredentials';
 import { currentCustomerPolicy } from './customerPolicyConfig';
 import { issueFirstRoomQr, readRoomQrPayload } from './roomQrCredentials';
-import { nextPlaqueStatus, type PlaqueItem } from './contracts/roomQrPlaques';
+import { nextPlaqueStatus, validateStaffCancellationReason, type PlaqueItem } from './contracts/roomQrPlaques';
 
 type Tx=Prisma.TransactionClient;
 type Actor=CustomerPrincipal|EmployeePrincipal;
@@ -67,8 +67,8 @@ function orderReceipt(row:Order) {
     productionStartedAt:row.productionStartedAt?.toISOString()??null,dispatchedAt:row.dispatchedAt?.toISOString()??null,completedAt:row.completedAt?.toISOString()??null,cancelledAt:row.cancelledAt?.toISOString()??null,
     canCancel:row.status==='REQUESTED',notes:row.notes,items:row.items.map(item=>({areaId:item.areaId,kind:item.kind,roomLabel:item.area.overrideName||item.area.originalName,roomLabelSnapshot:item.roomLabelSnapshot,generation:item.credentialGeneration,areaActive:item.area.status==='ACTIVE'}))};
 }
-async function audit(tx:Tx,p:Actor,homeId:string,id:string,action:string) {
-  await tx.auditEvent.create({data:{homeId,actorType:p.kind==='employee'?'EMPLOYEE':'CUSTOMER',actorId:p.id,category:'ACCESS',action:`room_plaque_${action}`,targetType:'RoomPlaqueRequest',targetId:id,metadata:{outcome:'committed'},purgeAt:new Date(Date.now()+365*86400000)}});
+async function audit(tx:Tx,p:Actor,homeId:string,id:string,action:string,details:Prisma.InputJsonObject={}) {
+  await tx.auditEvent.create({data:{homeId,actorType:p.kind==='employee'?'EMPLOYEE':'CUSTOMER',actorId:p.id,category:'ACCESS',action:`room_plaque_${action}`,targetType:'RoomPlaqueRequest',targetId:id,metadata:{outcome:'committed',...details},purgeAt:new Date(Date.now()+365*86400000)}});
 }
 async function replay(tx:Tx,p:Actor,namespace:string,key:string,body:unknown) {
   if(!/^[A-Za-z0-9._:-]{16,160}$/.test(key)) throw new Stage1AuthError(400,'VALIDATION_FAILED','A request key is required');
@@ -147,14 +147,15 @@ async function fulfilmentHome(tx:Tx,row:Order) {
   if(!home.addressLine1||!home.city||!home.postcode||!home.country||sha256(JSON.stringify(address(home)))!==row.addressFingerprint) throw new Stage1AuthError(409,'REVISION_CONFLICT','Fulfilment details required: confirm the current registered address with the homeowner');
   return home;
 }
-export async function transitionRoomPlaqueOrder(tx:Tx,p:Actor,requestId:string,expectedRevision:number,action:string,key:string,homeId?:string) {
+export async function transitionRoomPlaqueOrder(tx:Tx,p:Actor,requestId:string,expectedRevision:number,action:string,key:string,homeId?:string,cancellationReason?:unknown) {
   if(p.kind==='customer') {await assertRoomCustomer(tx,p,homeId!);if(action!=='CANCEL') throw new Stage1AuthError(403,'SCOPE_DENIED');} else await assertRoomEmployee(tx,p);
   const row=await currentOrder(tx,requestId);
   if(p.kind==='customer'&&row.homeId!==homeId) throw new Stage1AuthError(404,'RESOURCE_NOT_FOUND');
-  const namespace='room-plaque:transition:v1',record=await replay(tx,p,namespace,key,{requestId,expectedRevision,action,homeId:homeId??null});
+  const reason=p.kind==='employee'&&action==='CANCEL'?validateStaffCancellationReason(cancellationReason):undefined;
+  const namespace='room-plaque:transition:v1',record=await replay(tx,p,namespace,key,{requestId,expectedRevision,action,homeId:homeId??null,...(reason?{reason}: {})});
   if(record.saved) return record.saved;
   if(row.revision!==expectedRevision) throw new Stage1AuthError(409,'REVISION_CONFLICT','This request changed. Refresh its status.');
-  const status=nextPlaqueStatus(row.status,action);
+  const status=nextPlaqueStatus(row.status,action,p.kind);
   if(action!=='CANCEL') {
     await fulfilmentHome(tx,row);
     for(const item of [...row.items].sort((a,b)=>a.areaId.localeCompare(b.areaId))) {
@@ -175,7 +176,7 @@ export async function transitionRoomPlaqueOrder(tx:Tx,p:Actor,requestId:string,e
   const updated=await tx.roomPlaqueRequest.update({where:{id:requestId},data:{status,revision:{increment:1},...(status==='IN_PRODUCTION'?{productionStartedAt:now}:status==='DISPATCHED'?{dispatchedAt:now}:status==='COMPLETED'?{completedAt:now}:{cancelledAt:now})},include:orderInclude});
   if(['CANCELLED','COMPLETED'].includes(status)) await tx.roomPlaqueRequestItem.updateMany({where:{requestId},data:{closedAt:now}});
   const result={schemaVersion:'dinodia.v1',contractVersion:1,request:orderReceipt(updated)};
-  await audit(tx,p,row.homeId,row.id,action.toLowerCase());await remember(tx,p,row.homeId,namespace,record,result);return result;
+  await audit(tx,p,row.homeId,row.id,action.toLowerCase(),reason?{reason,previousStatus:row.status,physicalWorkMayExist:row.status!=='REQUESTED'}:{});await remember(tx,p,row.homeId,namespace,record,result);return result;
 }
 export async function staffRoomPlaqueDetail(tx:Tx,p:EmployeePrincipal,requestId:string) {
   await assertRoomEmployee(tx,p);const row=await currentOrder(tx,requestId);

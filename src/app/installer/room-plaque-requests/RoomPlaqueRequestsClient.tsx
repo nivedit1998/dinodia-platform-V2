@@ -8,6 +8,7 @@ export default function RoomPlaqueRequestsClient() {
   const [orders,setOrders]=useState<Order[]>([]),[order,setOrder]=useState<Order|null>(null),[plaques,setPlaques]=useState<Plaque[]>([]);
   const [filter,setFilter]=useState('REQUESTED'),[cursor,setCursor]=useState<string|null>(null),[error,setError]=useState(''),[busy,setBusy]=useState(false);
   const keys=useRef(new Map<string,string>());
+  const cancellationReasons=useRef(new Map<string,string>());
   const printing=useRef(false);
   async function api(path:string,init:RequestInit={}) {
     const response=await fetch(`/api/company/room-plaque-requests${path}`,{credentials:'same-origin',cache:'no-store',...init});
@@ -33,12 +34,21 @@ export default function RoomPlaqueRequestsClient() {
     setPlaques([]);setBusy(true);setError('');try{setOrder((await api(`/${id}`)).request);}catch(e){setError(e instanceof Error?e.message:'Unable to load request');}finally{setBusy(false);}
   }
   async function transition(action:string) {
-    if(!order||!window.confirm(action==='START_PRODUCTION'?'Start production and issue any missing room codes?':action==='DISPATCH'?'Confirm these plaques have actually been dispatched.':action==='COMPLETE'?'Confirm this physical order is complete.':'Cancel this requested order?'))return;
-    setBusy(true);setError('');const identity=`${order.id}:${order.revision}:${action}`;
+    if(!order)return;
+    const identity=`${order.id}:${order.revision}:${action}`;
+    if(action==='CANCEL'&&!cancellationReasons.current.has(identity)) {
+      const reason=window.prompt('Reason for cancelling this order (1–500 characters). Do not include personal information or QR codes.');
+      if(reason===null)return;
+      const normalized=reason.normalize('NFC').trim();
+      if(!normalized||normalized.length>500||/[\u0000-\u001f\u007f]/u.test(normalized)){setError('Enter a cancellation reason of 1–500 characters without control characters.');return;}
+      cancellationReasons.current.set(identity,normalized);
+    }
+    if(!window.confirm(action==='START_PRODUCTION'?'Start production and issue any missing room codes?':action==='DISPATCH'?'Confirm these plaques have actually been dispatched.':action==='COMPLETE'?'Confirm this physical order is complete.':order.status==='REQUESTED'?'Cancel this requested order?':'Close this order as cancelled? Physical work or dispatched goods may already exist. This does not recall goods or revoke room QR codes. Coordinate physical fulfilment separately.'))return;
+    setBusy(true);setError('');setPlaques([]);
     if(!keys.current.has(identity))keys.current.set(identity,crypto.randomUUID());
     try {
-      await api(`/${order.id}/transition`,{method:'POST',headers:{'Content-Type':'application/json','Idempotency-Key':keys.current.get(identity)!},body:JSON.stringify({action,expectedRevision:order.revision})});
-      keys.current.delete(identity);await detail(order.id);await load();
+      await api(`/${order.id}/transition`,{method:'POST',headers:{'Content-Type':'application/json','Idempotency-Key':keys.current.get(identity)!},body:JSON.stringify({action,expectedRevision:order.revision,...(action==='CANCEL'?{reason:cancellationReasons.current.get(identity)}:{})})});
+      keys.current.delete(identity);cancellationReasons.current.delete(identity);await detail(order.id);await load();
     }catch(e){setError(e instanceof Error?e.message:'Outcome uncertain. Retry the same action or refresh its status.');}finally{setBusy(false);}
   }
   async function preparePrint() {
@@ -64,6 +74,7 @@ export default function RoomPlaqueRequestsClient() {
           {order.status==='REQUESTED'&&<><button disabled={busy||!!order.blockedReason} onClick={()=>void transition('START_PRODUCTION')} className="rounded border p-3">Start production</button><button disabled={busy} onClick={()=>void transition('CANCEL')} className="rounded border p-3">Cancel request</button></>}
           {order.status==='IN_PRODUCTION'&&<button disabled={busy||!!order.blockedReason} onClick={()=>void transition('DISPATCH')} className="rounded border p-3">Mark dispatched</button>}
           {order.status==='DISPATCHED'&&<button disabled={busy||!!order.blockedReason} onClick={()=>void transition('COMPLETE')} className="rounded border p-3">Mark completed</button>}
+          {['IN_PRODUCTION','DISPATCHED'].includes(order.status)&&<button disabled={busy} onClick={()=>void transition('CANCEL')} className="rounded border p-3">Cancel order with reason</button>}
           {['IN_PRODUCTION','DISPATCHED','COMPLETED'].includes(order.status)&&<button disabled={busy||!!order.blockedReason} onClick={()=>void preparePrint()} className="rounded border p-3">Prepare plaque sheet</button>}
         </div>
       </section>}

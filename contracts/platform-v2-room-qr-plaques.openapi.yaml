@@ -155,7 +155,11 @@ paths:
         required: true
         content:
           application/json:
-            schema: { type: object, required: [action, expectedRevision], properties: { action: { enum: [START_PRODUCTION, DISPATCH, COMPLETE, CANCEL] }, expectedRevision: { type: integer, minimum: 1 } }, additionalProperties: false }
+            schema:
+              oneOf:
+                - { type: object, required: [action, expectedRevision], properties: { action: { enum: [START_PRODUCTION, DISPATCH, COMPLETE] }, expectedRevision: { type: integer, minimum: 1 } }, additionalProperties: false }
+                - { type: object, required: [action, expectedRevision, reason], properties: { action: { const: CANCEL }, expectedRevision: { type: integer, minimum: 1 }, reason: { type: string, minLength: 1, maxLength: 500 } }, additionalProperties: false }
+            description: Staff cancellation closes REQUESTED, IN_PRODUCTION or DISPATCHED orders with an audited reason. Issued codes and production/dispatch timestamps remain intact; cancellation does not recall goods. Customer cancellation remains REQUESTED-only.
       responses:
         '200': { description: Transition committed; first QR issuance occurs only at START_PRODUCTION. }
         '400': { description: Invalid transition request. }

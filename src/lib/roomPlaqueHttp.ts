@@ -48,7 +48,7 @@ export async function roomPlaqueHttp(request:Request,params:Record<string,string
       switch(operation) {
         case 'staff-orders':result=await roomTransaction(tx=>listRoomPlaqueOrders(tx,actor,null,after,status));break;
         case 'detail':result=await roomTransaction(tx=>staffRoomPlaqueDetail(tx,actor,params.requestId));break;
-        case 'transition':exact(input!,['action','expectedRevision']);if(typeof input!.action!=='string'||!['START_PRODUCTION','DISPATCH','COMPLETE','CANCEL'].includes(input!.action)) throw new Stage1AuthError(400,'VALIDATION_FAILED');result=await roomTransaction(tx=>transitionRoomPlaqueOrder(tx,actor,params.requestId,revision(input!.expectedRevision),String(input!.action),key));break;
+        case 'transition':exact(input!,input!.action==='CANCEL'?['action','expectedRevision','reason']:['action','expectedRevision']);if(typeof input!.action!=='string'||!['START_PRODUCTION','DISPATCH','COMPLETE','CANCEL'].includes(input!.action)) throw new Stage1AuthError(400,'VALIDATION_FAILED');result=await roomTransaction(tx=>transitionRoomPlaqueOrder(tx,actor,params.requestId,revision(input!.expectedRevision),String(input!.action),key,undefined,input!.reason));break;
         case 'print': {
           exact(input!,['expectedRevision']);const bundle=await roomTransaction(tx=>printRoomPlaqueOrder(tx,actor,params.requestId,revision(input!.expectedRevision)));
           const plaques=await Promise.all(bundle.plaques.map(async plaque=>({areaId:plaque.areaId,roomLabel:plaque.roomLabel,roomLabelSnapshot:plaque.roomLabelSnapshot,generation:plaque.generation,

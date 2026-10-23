@@ -31,7 +31,15 @@ export function validatePlaqueOrder(value: unknown) {
   if(notes.length>1000||/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/u.test(notes)) invalid('Use a note of at most 1000 characters');
   return {items,notes};
 }
-export function nextPlaqueStatus(status: string, action: string) {
+export function validateStaffCancellationReason(value: unknown): string {
+  if(typeof value!=='string') invalid('A staff cancellation reason is required');
+  const reason=value.normalize('NFC').trim();
+  if(!reason||reason.length>500||/[\u0000-\u001f\u007f]/u.test(reason)) invalid('Use a cancellation reason of 1–500 characters, without control characters');
+  return reason;
+}
+export function nextPlaqueStatus(status: string, action: string, actor: 'employee'|'customer' = 'customer') {
+  // Explicit operations closure, never a rewind: preserve all production/dispatch timestamps.
+  if(actor==='employee'&&action==='CANCEL'&&['IN_PRODUCTION','DISPATCHED'].includes(status)) return 'CANCELLED';
   const next:Record<string,Record<string,string>>={REQUESTED:{START_PRODUCTION:'IN_PRODUCTION',CANCEL:'CANCELLED'},IN_PRODUCTION:{DISPATCH:'DISPATCHED'},DISPATCHED:{COMPLETE:'COMPLETED'}};
   const value=next[status]?.[action];
   if(!value) throw new Stage1AuthError(409,'REVISION_CONFLICT','This plaque request cannot make that transition');

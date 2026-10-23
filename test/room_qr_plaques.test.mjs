@@ -28,6 +28,17 @@ test('only permitted physical fulfilment transitions are accepted',()=>{
   assert.throws(()=>nextPlaqueStatus('DISPATCHED','CANCEL'));
 });
 
+test('only staff may resolve production or dispatched holds by explicit cancellation',()=>{
+  const {nextPlaqueStatus,validateStaffCancellationReason}=load('contracts/roomQrPlaques',stubs);
+  for(const status of ['IN_PRODUCTION','DISPATCHED']) {
+    assert.equal(nextPlaqueStatus(status,'CANCEL','employee'),'CANCELLED');
+    assert.throws(()=>nextPlaqueStatus(status,'CANCEL','customer'));
+  }
+  assert.throws(()=>nextPlaqueStatus('COMPLETED','CANCEL','employee'));
+  assert.equal(validateStaffCancellationReason('  Address corrected  '),'Address corrected');
+  for(const reason of [undefined,'',' '.repeat(5),'x'.repeat(501),'bad\u0000reason']) assert.throws(()=>validateStaffCancellationReason(reason));
+});
+
 test('Platform-only plaque API contract stays separate from the shared Hub V1 bundle',()=>{
   const yaml=require('js-yaml');
   const spec=yaml.load(fs.readFileSync('contracts/platform-v2-room-qr-plaques.openapi.yaml','utf8'));

@@ -100,6 +100,54 @@ export async function roomPlaqueIntegration({ base, prisma, homeId, headers, own
     assert.equal((await post(`/api/company/room-plaque-requests/${rid}/transition`,{action:'START_PRODUCTION',expectedRevision:1},staff)).response.status,200);
     await prisma.home.update({where:{id:homeId},data:{city:'Changed Synthetic City'}});
     assert.equal((await post(`/api/company/room-plaque-requests/${rid}/transition`,{action:'DISPATCH',expectedRevision:2},staff)).response.status,409,'dispatch is held when registered fulfilment address changes');
+    // B1: actual HTTP/DB recovery, not just a state-machine fixture. These
+    // mutations affect only the disposable harness Home and are restored.
+    const cancelPath=orderId=>`/api/company/room-plaque-requests/${orderId}/transition`;
+    const cancelBody={action:'CANCEL',expectedRevision:2,reason:'Registered address changed; stop physical fulfilment'};
+    assert.equal((await post(cancelPath(rid),{action:'CANCEL',expectedRevision:2},staff)).response.status,400,'staff reason is mandatory');
+    assert.equal((await post(`${root}/room-plaque-requests/${rid}/cancel`,{expectedRevision:2})).response.status,409,'customers cannot cancel after production starts');
+    assert.equal((await post(cancelPath(rid),cancelBody,installerHeaders)).response.status,403,'installer cannot resolve a hold');
+    const cancelKey=crypto.randomUUID(),cancelled=await post(cancelPath(rid),cancelBody,staff,cancelKey);
+    assert.equal(cancelled.response.status,200,'address-held production can be closed without repairing the address first');
+    assert.deepEqual((await post(cancelPath(rid),cancelBody,staff,cancelKey)).body,cancelled.body,'same cancellation replay returns original receipt');
+    assert.equal((await post(cancelPath(rid),{...cancelBody,reason:'Different intent'},staff,cancelKey)).response.status,409,'reason is bound to the idempotency key');
+    const verifyClosed=async(orderId,reason,previousStatus)=>{
+      const closed=await prisma.roomPlaqueRequest.findUniqueOrThrow({where:{id:orderId}});
+      assert.equal(closed.status,'CANCELLED');assert.ok(closed.productionStartedAt);assert.ok(closed.cancelledAt);
+      if(previousStatus==='DISPATCHED')assert.ok(closed.dispatchedAt,'cancellation never rewinds dispatch history');
+      assert.equal(await prisma.roomPlaqueRequestItem.count({where:{requestId:orderId,closedAt:null}}),0);
+      const events=await prisma.auditEvent.findMany({where:{targetId:orderId,action:'room_plaque_cancel'}});
+      assert.equal(events.length,1);assert.equal(events[0].actorId,employee.id);
+      assert.equal(events[0].metadata.reason,reason);assert.equal(events[0].metadata.previousStatus,previousStatus);noLeak(events);
+      assert.equal(await prisma.areaQrCredential.count({where:{areaId:areaIds[0]}}),1);
+      assert.equal((await prisma.areaQrCredential.findUniqueOrThrow({where:{id:row.id}})).resolverHash,row.resolverHash,'closure never changes issued QR');
+    };
+    await verifyClosed(rid,cancelBody.reason,'IN_PRODUCTION');
+    const makeReplacement=async(h=headers)=>{
+      const result=await post(`${root}/room-plaque-requests`,{...body,items:[{areaId:areaIds[0],kind:'REPRINT',expectedGeneration:1}]},h);
+      assert.equal(result.response.status,201,'resolved rooms can immediately be ordered again');orderIds.push(result.body.request.id);return result.body.request.id;
+    };
+    const transferredId=await makeReplacement();
+    assert.equal((await post(cancelPath(transferredId),{action:'START_PRODUCTION',expectedRevision:1},staff)).response.status,200);
+    await prisma.home.update({where:{id:homeId},data:{authorityGeneration:{increment:1}}});
+    assert.equal((await post(cancelPath(transferredId),{action:'DISPATCH',expectedRevision:2},staff)).response.status,409,'ownership generation holds dispatch');
+    const transferReason='Ownership changed; physical work stopped';
+    assert.equal((await post(cancelPath(transferredId),{action:'CANCEL',expectedRevision:2,reason:transferReason},staff)).response.status,200);
+    await verifyClosed(transferredId,transferReason,'IN_PRODUCTION');
+    const managerOrder=await makeReplacement(managerHeaders);
+    assert.equal((await post(cancelPath(managerOrder),{action:'START_PRODUCTION',expectedRevision:1},staff)).response.status,200);
+    assert.equal((await post(cancelPath(managerOrder),{action:'DISPATCH',expectedRevision:2},staff)).response.status,200);
+    const managerMembership=await prisma.homeMembership.findFirstOrThrow({where:{homeId,role:'PROPERTY_MANAGER',status:'ACTIVE'}});
+    try {
+      await prisma.homeMembership.update({where:{id:managerMembership.id},data:{status:'REMOVED'}});
+      assert.equal((await post(cancelPath(managerOrder),{action:'COMPLETE',expectedRevision:3},staff)).response.status,409,'removed requester holds completion even after dispatch');
+      const reason='Requester removed; goods handled separately';
+      assert.equal((await post(cancelPath(managerOrder),{action:'CANCEL',expectedRevision:3,reason},staff)).response.status,200,'explicit staff cancellation resolves dispatched hold without pretending delivery');
+      await verifyClosed(managerOrder,reason,'DISPATCHED');
+      const reopened=await makeReplacement();
+      assert.equal((await post(`${root}/room-plaque-requests/${reopened}/cancel`,{expectedRevision:1})).response.status,200);
+    } finally {await prisma.homeMembership.update({where:{id:managerMembership.id},data:{status:managerMembership.status}});}
+    console.log('[room-plaques:integration] PASS: B1 address/authority/requester holds resolved; audited reason, actor scope, exact replay, retained QR and reorder verified');
     await prisma.home.update({where:{id:homeId},data:{city:'Test City'}});
     assert.equal((await post(`${root}/room-qrs/${areaIds[0]}/reveal`,{expectedGeneration:1})).body.reference,reference);
     assert.equal(await prisma.areaQrCredential.count({where:{areaId:areaIds[0]}}),1,'reprint preserves credential');
