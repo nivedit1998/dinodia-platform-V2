@@ -72,6 +72,24 @@ export async function readNativeAnalyticsBootstrap(homeId: string, timezone: str
   const currentTemperature = currentTemperatureCandidates.find((sample) => currentTemperatureAssignments.some((assignment) =>
     assignment.deviceId === sample.deviceId && assignment.areaId === sample.areaId
       && assignment.validFrom <= sample.sourceObservedAt && (assignment.validUntil === null || assignment.validUntil >= now))) ?? null;
+  // No reading is current (the valve reports on change, so its newest value often ages past the 30-minute
+  // window). Show the newest measured reading from a room this Home still uses, labelled stale with its time.
+  // It is never presented as current, and nothing is inferred from an unrelated room or a removed Area.
+  const activeRadiators = devices.filter((device) => device.analyticsCategory === 'RADIATOR');
+  const lastTemperature = !currentTemperature && activeRadiators.length ? await prisma.nativeTemperatureSample.findFirst({ where: {
+    homeId, deviceId: { in: activeRadiators.map((device) => device.id) }, sourceObservedAt: { gte: new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000), lte: now }, purgeAt: { gt: now },
+    device: { is: { homeId, managementClass: 'PROPERTY_DEVICE', analyticsCategory: 'RADIATOR' } } }, orderBy: { sourceObservedAt: 'desc' },
+    select: { deviceId: true, areaId: true, temperature: true, sourceObservedAt: true, validUntil: true } }) : null;
+  const lastIsCurrentlyAssigned = Boolean(lastTemperature && activeRadiators.some((device) => device.id === lastTemperature.deviceId
+    && device.assignments.some((assignment) => assignment.areaId === lastTemperature.areaId)));
+  const temperature = currentTemperature
+    ? { latestCelsius: Number(currentTemperature.temperature), quality: 'fresh' as const,
+        sourceAt: currentTemperature.sourceObservedAt.toISOString(), validUntil: currentTemperature.validUntil.toISOString() }
+    : lastTemperature && lastIsCurrentlyAssigned
+      ? { latestCelsius: Number(lastTemperature.temperature), quality: 'stale' as const,
+          sourceAt: lastTemperature.sourceObservedAt.toISOString(), validUntil: lastTemperature.validUntil.toISOString() }
+      : { latestCelsius: null, quality: 'unknown' as const,
+          sourceAt: latestTemperature?.sourceObservedAt.toISOString() ?? null, validUntil: latestTemperature?.validUntil.toISOString() ?? null };
   const areas = areaRows as AnalyticsArea[];
   const groups = currentAnalyticsGroups(homeId, areas);
   const sevenDays = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
@@ -93,10 +111,7 @@ export async function readNativeAnalyticsBootstrap(homeId: string, timezone: str
     devices: devices.map((device) => ({ id: device.id, label: device.customerLabel ?? displayName(device), category: device.analyticsCategory.toLowerCase(), deviceType: device.deviceType,
       areaIds: device.assignments.map((assignment) => assignment.areaId) })),
     historicalDevices: retiredDevices.map((device) => ({ id: device.id, label: 'Retired device', category: device.analyticsCategory.toLowerCase(), retiredAt: device.retiredAt?.toISOString() ?? null })),
-    summaries, temperature: { latestCelsius: currentTemperature ? Number(currentTemperature.temperature) : null,
-      quality: currentTemperature ? 'fresh' : 'unknown',
-      sourceAt: (currentTemperature ?? latestTemperature)?.sourceObservedAt.toISOString() ?? null,
-      validUntil: (currentTemperature ?? latestTemperature)?.validUntil.toISOString() ?? null },
+    summaries, temperature,
     historyState: first ? 'available' : 'empty',
   };
 }
