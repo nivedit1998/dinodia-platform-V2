@@ -16,6 +16,15 @@ function loadTypeScript(relative) {
 }
 const { aggregateNativeUsage, aggregateNativeTemperature, parseAnalyticsWindow, retentionStart } = loadTypeScript('src/lib/nativeAnalytics.ts');
 
+test('epoch fragments count one physical device and reject overlapping coverage', () => {
+  const base = { deviceId: 'a', areaId: 'area', bucketStart: '2026-10-23T10:00:00Z', closedAt: null, offSeconds: 0, unknownSeconds: 0 };
+  const rows = [0, 10, 20].map(minute => ({ ...base, coverageStartAt: `2026-10-23T10:${String(minute).padStart(2, '0')}:00Z`,
+    coverageEndAt: `2026-10-23T10:${String(minute + 10).padStart(2, '0')}:00Z`, onSeconds: 600 }));
+  const [result] = aggregateNativeUsage(rows, 'hour', 'UTC');
+  assert.equal(result.contributingDeviceDays, 1); assert.equal(result.onMinutes, 30);
+  assert.throws(() => aggregateNativeUsage([...rows, rows[0]], 'hour', 'UTC'), /overlap/);
+});
+
 function hourlyRows(start, count, overrides = {}) {
   return Array.from({ length: count }, (_, index) => {
     const bucketStart = new Date(Date.parse(start) + index * 3_600_000);

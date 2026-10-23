@@ -185,6 +185,7 @@ test('native task registry dispatches business operations and daily lease cleanu
       $executeRaw: async () => 0,
       $queryRaw: async () => [{ scanned: 0n, invalidPartitions: 0n, onSeconds: 0n, offSeconds: 0n, unknownSeconds: 0n }],
       nativeDeviceUsageBucket: { findFirst: async () => null },
+      nativeAnalyticsUnallocated: { findFirst: async () => null },
       nativeTemperatureSample: { findFirst: async () => null, count: async () => 0 },
       $transaction: async (callback) => callback({ nativeBackgroundTaskState: { updateMany: async () => ({ count: 0 }) } }),
       supportSession: { findMany: async () => [] },

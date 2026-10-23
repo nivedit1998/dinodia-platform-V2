@@ -87,6 +87,86 @@ function setOsHarnessClock(timestamp, { frozen = true } = {}) {
 }
 
 function fail(message) { throw new Error(`[stage1:integration] ${message}`); }
+function analyticsIntervalDomain() {
+  const require = createRequire(import.meta.url); const ts = require('typescript');
+  const compiled = ts.transpileModule(fs.readFileSync(path.join(root, 'src/lib/analyticsIntervals.ts'), 'utf8'),
+    { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText;
+  const module = { exports: {} }; new Function('require', 'module', 'exports', compiled)(require, module, module.exports); return module.exports;
+}
+
+async function universalCategoryIngestionCheck({ base, homeId, installationId, areaId, osAreaId, catalog }) {
+  const { changeAnalyticsInterval } = analyticsIntervalDomain();
+  const osDeviceId = `universal-${crypto.randomUUID()}`, controlId = `power-${crypto.randomUUID()}`;
+  const controls = catalog.map(control => ({ ...control, deviceId: osDeviceId }));
+  const heat = controls.find(control => control.semanticRole === 'active_heat_demand');
+  controls.push({ ...heat, deviceId: osDeviceId, controlId, surfaceId: 'universal-light', semanticRole: 'power', valueType: 'boolean',
+    interactionKind: 'read_only', writable: false, automatable: false, idempotency: 'none', confirmationPolicy: 'none' });
+  const start = Date.parse('2026-10-08T08:00:00Z');
+  const device = await prisma.nativeDevice.create({ data: { homeId, hubInstallationId: installationId, osDeviceId, originalName: 'Synthetic universal device',
+    technicalLabel: 'Synthetic', managementClass: 'PROPERTY_DEVICE', analyticsCategory: 'RADIATOR', deviceType: 'synthetic', protocol: 'zigbee', lifecycle: 'INSTALLED',
+    descriptorRevision: 1, capabilitySummary: { controlCatalog: { revision: 1, controls } } } });
+  await prisma.deviceAreaAssignment.create({ data: { homeId, deviceId: device.id, areaId, validFrom: new Date(start), source: 'OS_SYNC' } });
+  const prior = await prisma.hubInstallation.findUniqueOrThrow({ where: { id: installationId }, select: { analyticsWriterEnabled: true } });
+  const priorIntervalIds = (await prisma.nativeAnalyticsInterval.findMany({ where: { hubInstallationId: installationId }, select: { id: true } })).map(row => row.id);
+  const retryAt = hub.pairing.nextRetryAt; hub.pairing.nextRetryAt = Date.now() + 60000;
+  try {
+    await prisma.hubInstallation.update({ where: { id: installationId }, data: { analyticsWriterEnabled: true } });
+    const intervals = [];
+    for (let index = 0; index < 3; index++) {
+      const category = index === 1 ? 'LIGHT' : 'RADIATOR'; const selected = index === 1 ? controlId : heat.controlId;
+      intervals.push(await prisma.$transaction(async tx => {
+        await tx.nativeDevice.update({ where: { id: device.id }, data: { analyticsCategory: category } });
+        return changeAnalyticsInterval(tx, { homeId, hubInstallationId: installationId, deviceId: device.id, category, selectedControlId: selected,
+          generation: customerFixture.identityOneGeneration, at: new Date(start + index * 600000) });
+      }));
+    }
+    const payloadFor = (interval, index) => ({ osDeviceId, osAreaId, analyticsCategory: interval.analyticsCategory, controlId: interval.selectedControlId,
+      sourceGeneration: customerFixture.identityOneGeneration, bucketStart: new Date(start).toISOString(), revision: 1, onSeconds: 600, offSeconds: 0, unknownSeconds: 0,
+      coverageStartAt: new Date(start + index * 600000).toISOString(), coverageEndAt: new Date(start + (index + 1) * 600000).toISOString(), closedAt: null,
+      purgeAt: new Date('2027-10-08T08:00:00Z').toISOString(), analyticsIntervalId: interval.id, bindingRevision: interval.revision, analyticsPolicyVersion: 2 });
+    const aggregate = payload => sha256([payload.osDeviceId, payload.osAreaId, payload.analyticsCategory, payload.controlId, payload.sourceGeneration, start,
+      ...(payload.bindingRevision ? [payload.bindingRevision] : [])].join('|'));
+    for (let i = 0; i < 3; i++) { const payload = payloadFor(intervals[i], i); await hub.store.queueSyncEvent('usage.bucket', aggregate(payload), payload); }
+    const batch = await hub.store.prepareSyncBatch(installationId, hub.pairing.runtime, Date.now());
+    const send = body => machineRequest({ base, path: '/api/hub-agent/v2/sync', machineSecret: customerFixture.machineSecret,
+      body: { serial: customerFixture.identityOneSerial, identityGeneration: customerFixture.identityOneGeneration, ...body } });
+    const wrongSelection = structuredClone(batch);
+    const wrongEvent = wrongSelection.events.find(event => event.payload.osDeviceId === osDeviceId);
+    wrongEvent.payload.controlId = controlId; wrongEvent.aggregateId = aggregate(wrongEvent.payload);
+    const deniedSelection = await send(wrongSelection);
+    if (deniedSelection.response.status !== 409 || await prisma.nativeDeviceUsageBucket.count({ where: { deviceId: device.id } })) fail('A mismatched historical source selection was not denied atomically');
+    const accepted = await send(batch);
+    if (accepted.response.status !== 200) fail(`Universal historical intervals did not pass real signed ingestion (${accepted.response.status}/${accepted.body?.errorCode || 'no-code'})`);
+    const duplicate = await send(batch);
+    if (duplicate.response.status !== 200) fail('Exact signed interval retry did not reconcile');
+    await hub.store.acknowledgeSyncBatch({ streamId: accepted.body.streamId, acceptedThroughSequence: Number(accepted.body.acceptedThroughSequence),
+      cloudRevision: Number(accepted.body.cloudRevision), configurationAppliedRevision: Number(accepted.body.configurationAppliedRevision) });
+    const rows = await prisma.nativeDeviceUsageBucket.findMany({ where: { deviceId: device.id }, orderBy: { bindingRevision: 'asc' } });
+    if (rows.length !== 3 || rows.reduce((n, row) => n + row.onSeconds, 0) !== 1800 || rows.some((row, i) => row.bindingRevision !== i + 1)) fail('Interval switches collided or exact retry duplicated coverage');
+    const legacy = { ...payloadFor(intervals[2], 2), coverageStartAt: new Date(start).toISOString(), onSeconds: 1800 };
+    delete legacy.analyticsIntervalId; delete legacy.bindingRevision; delete legacy.analyticsPolicyVersion;
+    await hub.store.queueSyncEvent('usage.bucket', aggregate(legacy), legacy);
+    const legacyBatch = await hub.store.prepareSyncBatch(installationId, hub.pairing.runtime, Date.now());
+    const preserved = await send(legacyBatch);
+    if (preserved.response.status !== 200 || await prisma.nativeAnalyticsUnallocated.count({ where: { deviceId: device.id } }) !== 1
+      || await prisma.nativeDeviceUsageBucket.count({ where: { deviceId: device.id } }) !== 3) fail(`Old-code overlap was not durably preserved outside measured counters (${preserved.response.status}/${preserved.body?.errorCode || 'no-code'})`);
+    await hub.store.acknowledgeSyncBatch({ streamId: preserved.body.streamId, acceptedThroughSequence: Number(preserved.body.acceptedThroughSequence),
+      cloudRevision: Number(preserved.body.cloudRevision), configurationAppliedRevision: Number(preserved.body.configurationAppliedRevision) });
+    console.log('[universal:integration] PASS: actual OS outbox -> signed ingestion retained delayed category/source switch-back epochs, exact retry, and preserved legacy overlap as unallocated without double counting');
+  } finally {
+    // Enabling this disposable installation also seeds its other fixture
+    // devices during configuration construction. Restore that test-only state
+    // so later legacy scenarios do not inherit this activation exercise.
+    await prisma.nativeAnalyticsInterval.deleteMany({ where: { hubInstallationId: installationId, deviceId: { not: device.id }, id: { notIn: priorIntervalIds } } });
+    hub.pairing.nextRetryAt = retryAt;
+    await prisma.hubInstallation.update({ where: { id: installationId }, data: prior });
+    await prisma.nativeAnalyticsUnallocated.deleteMany({ where: { deviceId: device.id } });
+    await prisma.nativeDeviceUsageBucket.deleteMany({ where: { deviceId: device.id } });
+    await prisma.nativeAnalyticsInterval.deleteMany({ where: { deviceId: device.id } });
+    await prisma.deviceAreaAssignment.deleteMany({ where: { deviceId: device.id } });
+    await prisma.nativeDevice.delete({ where: { id: device.id } });
+  }
+}
 const nativeFetch = globalThis.fetch.bind(globalThis);
 globalThis.fetch = async (input, init) => {
   const parsed = new URL(typeof input === 'string' ? input : input.url);
@@ -288,7 +368,7 @@ function loadHubCloudConfigurationBuilder() {
   const source = fs.readFileSync(path.join(root, 'src/lib/hubCloudConfiguration.ts'), 'utf8');
   const compiled = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, esModuleInterop: true } }).outputText;
   const loaded = { exports: {} };
-  const localRequire = (specifier) => specifier === './hubSyncEnvelope' ? envelope : require(specifier);
+  const localRequire = (specifier) => specifier === './hubSyncEnvelope' ? envelope : specifier === './analyticsIntervals' ? analyticsIntervalDomain() : require(specifier);
   new Function('require', 'module', 'exports', compiled)(localRequire, loaded, loaded.exports);
   return loaded.exports.buildHubCloudConfiguration;
 }
@@ -5162,6 +5242,21 @@ async function tenantMembershipRemovalChecks() {
   const validBody = { expectedAccessRevision: preview.body.accessRevision,
     expectedManagementRevision: preview.body.homeManagementRevision, confirmFinalAccountDeletion: false,
     proof: proof.proof, idempotencyKey };
+  // Isolate the stale-ack boundary from the real test Hub's background sync.
+  // Otherwise that client may legitimately apply and acknowledge revocation
+  // before this scenario submits its deliberately old acknowledgement.
+  const establishDeadline = Date.now() + 10_000;
+  while (hub.pairing.syncing && Date.now() < establishDeadline) await sleep(10);
+  hub.pairing.nextRetryAt = 0; await hub.pairing.syncNow();
+  hub.pairing.nextRetryAt = 0; await hub.pairing.syncNow();
+  if (!hub.store.getPlatform()?.cloudConfiguration?.memberships?.some(row => row.id === otherHome.memberships[0].id)) {
+    fail('The stale-ack fixture must first establish the membership on the actual disposable Hub');
+  }
+  hub.pairing.nextRetryAt = Date.now() + 60_000;
+  const pauseDeadline = Date.now() + 10_000;
+  while (hub.pairing.syncing && Date.now() < pauseDeadline) await sleep(10);
+  if (hub.pairing.syncing) fail('Could not quiesce the disposable Hub at the stale-ack boundary');
+  hub.pairing.nextRetryAt = Date.now() + 60_000;
   const removed = await fetchJson(`${base}/api/v2/homes/${fixture.homeOneId}/tenant/access`, { method: 'DELETE', headers: proof.headers, body: JSON.stringify(validBody) });
   const removedMembership = await prisma.homeMembership.findUniqueOrThrow({ where: { id: otherHome.memberships[0].id }, select: { status: true, accessRevision: true, removalReason: true } });
   const preservedMembership = await prisma.homeMembership.findUniqueOrThrow({ where: { id: otherHome.memberships[1].id }, select: { status: true, role: true } });
@@ -5186,10 +5281,7 @@ async function tenantMembershipRemovalChecks() {
     syncStreamId: true, syncAcceptedSequence: true, acknowledgedCloudRevision: true,
     cloudConfigurationRevision: true, cleanupState: true,
   } });
-  if (!removalHubBeforeSync.syncStreamId
-    || Number(removalHubBeforeSync.acknowledgedCloudRevision) >= Number(removalHubBeforeSync.cloudConfigurationRevision)) {
-    fail('Disposable tenant removal did not create a newer unacknowledged signed Home configuration');
-  }
+  if (!removalHubBeforeSync.syncStreamId) fail('Disposable tenant removal lacks its existing signed stream');
   const currentCursor = Number(removalHubBeforeSync.syncAcceptedSequence);
   const staleAckEnvelope = {
     schemaVersion: 1, hubInstallationId: fixture.hubOneId,
@@ -5201,8 +5293,12 @@ async function tenantMembershipRemovalChecks() {
   const staleAck = await machineRequest({ base, path: '/api/hub-agent/v2/sync', machineSecret: fixture.machineSecret,
     body: { serial: fixture.identityOneSerial, identityGeneration: fixture.identityOneGeneration, ...staleAckEnvelope } });
   const pendingAfterStaleAck = await prisma.nativeDomainOutbox.findUniqueOrThrow({ where: { id: removalOutbox.id }, select: { state: true, attempts: true } });
+  // Configuration revision is finalized by signed sync, not by the removal
+  // mutation. Verify the newer unacknowledged revision after publishing it.
+  const removalHubAfterStale = await prisma.hubInstallation.findUniqueOrThrow({ where: { id: fixture.hubOneId }, select: { acknowledgedCloudRevision: true, cloudConfigurationRevision: true } });
   if (staleAck.response.status !== 200 || Number(staleAck.body?.cloudRevision) <= Number(staleAckEnvelope.acknowledgedCloudRevision)
     || Number(staleAck.body?.configurationAppliedRevision) !== staleAckEnvelope.acknowledgedCloudRevision
+    || Number(removalHubAfterStale.acknowledgedCloudRevision) >= Number(removalHubAfterStale.cloudConfigurationRevision)
     || pendingAfterStaleAck.state !== 'PENDING' || pendingAfterStaleAck.attempts !== 0) {
     fail(`An old signed configuration acknowledgement completed tenant revocation or failed to deliver the current policy (${JSON.stringify({ status: staleAck.response.status, cloudRevision: staleAck.body?.cloudRevision, applied: staleAck.body?.configurationAppliedRevision, outbox: pendingAfterStaleAck.state, attempts: pendingAfterStaleAck.attempts })})`);
   }
@@ -6964,15 +7060,15 @@ async function pendingInvitationRouteChecks(deliveryEnv) {
     areaId: telemetryOsAreaId, setup: { status: 'ready', assignmentMode: 'device_inherited_v1', completedAt: movedSourceAt.toISOString() },
     state: { heatDemand: 'on', ambientTemperature: 20.8 },
     entities: {
-      heatDemand: { id: 'stage10-move-heat-entity', name: 'Heat demand', state: 'on', sourceObservedAt: movedSourceAt.toISOString(), domain: 'climate', category: 'control', capability: {
+      heatDemand: { id: 'stage10-move-heat-entity', stateKey: 'heatDemand', logicalKey: 'heatDemand', endpointId: '1', name: 'Heat demand', state: 'on', sourceObservedAt: movedSourceAt.toISOString(), domain: 'climate', category: 'control', capability: {
         controlId: movedUsageControlId, kind: 'binary', category: 'control', readable: true, writable: false, observable: true, semanticRole: 'active_heat_demand',
         maxStateValiditySeconds: 1800, bindings: [],
       } },
-      ambientTemperature: { id: 'stage10-move-temperature-entity', name: 'Ambient temperature', state: 20.8, sourceObservedAt: movedSourceAt.toISOString(), domain: 'sensor', category: 'measurement', capability: {
+      ambientTemperature: { id: 'stage10-move-temperature-entity', stateKey: 'ambientTemperature', logicalKey: 'ambientTemperature', endpointId: '1', name: 'Ambient temperature', state: 20.8, sourceObservedAt: movedSourceAt.toISOString(), domain: 'sensor', category: 'measurement', capability: {
         controlId: movedTemperatureControlId, kind: 'number', category: 'measurement', readable: true, writable: false, observable: true, semanticRole: 'ambient_temperature',
         maxStateValiditySeconds: 1800, bindings: [],
       } },
-      setpoint: { id: 'stage10-move-setpoint-entity', name: 'Target temperature', state: 21, sourceObservedAt: movedSourceAt.toISOString(), domain: 'climate', capability: {
+      setpoint: { id: 'stage10-move-setpoint-entity', stateKey: 'setpoint', logicalKey: 'setpoint', endpointId: '1', name: 'Target temperature', state: 21, sourceObservedAt: movedSourceAt.toISOString(), domain: 'climate', capability: {
         controlId: `stage10-move-target-${crypto.randomUUID()}`, kind: 'number', readable: true, writable: true, observable: true, semanticRole: 'target_temperature',
         maxStateValiditySeconds: 1800, bindings: [{ serviceId: 'climate.set_temperature', parameter: { key: 'temperature', type: 'number', min: 5, max: 35, step: 0.5 } }],
       } },
@@ -7056,7 +7152,7 @@ async function pendingInvitationRouteChecks(deliveryEnv) {
     || movedStoredRows[0].onSeconds !== (movedAt.getTime() - movedSourceAt.getTime()) / 1_000
     || movedStoredTemperature.length !== 1 || movedStoredTemperature[0].areaId !== telemetryAreaId
     || movedStoredTemperature[0].sourceObservedAt.toISOString() !== movedSourceAt.toISOString()) {
-    fail(`The actual signed ingestion route misattributed movement-boundary evidence (${JSON.stringify({ status: movedSync.response.status,
+    fail(`The actual signed ingestion route misattributed movement-boundary evidence (${JSON.stringify({ status: movedSync.response.status, errorCode: movedSync.body?.errorCode ?? null,
       rows: movedStoredRows.map((row) => ({ areaId: row.areaId, on: row.onSeconds, start: row.coverageStartAt, end: row.coverageEndAt })),
       temperatureAreas: movedStoredTemperature.map((row) => row.areaId),
       acceptedThrough: movedSync.body?.acceptedThroughSequence ?? null,
@@ -7110,6 +7206,7 @@ async function pendingInvitationRouteChecks(deliveryEnv) {
     await tx.nativeDevice.delete({ where: { id: movedPlatformDevice.id } });
   });
   console.log('[stage10:integration] PASS: actual Store/route moved an exact 10:30–10:45 partial bucket across Areas, the assigned old-Area projection retained 900 seconds, maintenance accepted it, and source identity was preserved');
+  await universalCategoryIngestionCheck({ base, homeId: telemetryHomeId, installationId: telemetryHubId, areaId: telemetryAreaId, osAreaId: telemetryOsAreaId, catalog: movedInitialCatalog.controls });
 
   // F10-G: query a real, retained Radiator validity interval that starts ten
   // minutes before UTC midnight. The row is disposable test data; the owner
@@ -7307,7 +7404,7 @@ async function pendingInvitationRouteChecks(deliveryEnv) {
     cloudRevision: Number(closedAccepted.body.cloudRevision), configurationAppliedRevision: Number(closedAccepted.body.configurationAppliedRevision) });
   const closedRowWhere = { deviceId_areaId_analyticsCategory_controlId_bucketStart_sourceGeneration: {
     deviceId: telemetryDevice.id, areaId: telemetryAreaId, analyticsCategory: 'RADIATOR', controlId: telemetryControlId,
-    bucketStart: closedBucketStart, sourceGeneration: customerFixture.identityOneGeneration,
+    bucketStart: closedBucketStart, sourceGeneration: customerFixture.identityOneGeneration, bindingRevision: 0,
   } };
   const closedRowBeforeConflict = await prisma.nativeDeviceUsageBucket.findUniqueOrThrow({ where: closedRowWhere });
   if (!closedRowBeforeConflict.closedAt || closedRowBeforeConflict.onSeconds + closedRowBeforeConflict.offSeconds + closedRowBeforeConflict.unknownSeconds !== 3600) fail('Accepted closed history did not persist as a complete immutable hour');
@@ -7424,7 +7521,7 @@ async function pendingInvitationRouteChecks(deliveryEnv) {
   const [recoveredBucket, recoveryCursorAfter, recoveryReceipts, recoveryAudit, recoveryReceiptCountAfter] = await Promise.all([
     prisma.nativeDeviceUsageBucket.findUniqueOrThrow({ where: { deviceId_areaId_analyticsCategory_controlId_bucketStart_sourceGeneration: {
       deviceId: telemetryDevice.id, areaId: telemetryAreaId, analyticsCategory: 'RADIATOR', controlId: telemetryControlId,
-      bucketStart: recoveryStart, sourceGeneration: customerFixture.identityOneGeneration,
+      bucketStart: recoveryStart, sourceGeneration: customerFixture.identityOneGeneration, bindingRevision: 0,
     } } }),
     prisma.hubInstallation.findUniqueOrThrow({ where: { id: telemetryHubId }, select: { syncStreamId: true, syncAcceptedSequence: true } }),
     prisma.hubSyncReceipt.findMany({ where: { hubInstallationId: telemetryHubId, streamId: recoveredBatch.streamId,
@@ -8410,6 +8507,10 @@ async function pendingInvitationRouteChecks(deliveryEnv) {
   const currentPolicyVersion = deliveryEnv.DINODIA_NATIVE_POLICY_VERSION;
   const currentPolicyText = deliveryEnv.DINODIA_NATIVE_POLICY_TEXT;
   const currentPolicyHash = sha256(currentPolicyText);
+  // The identical-invitation scenario above explicitly accepted this policy
+  // for the same disposable recipient. Reset only that fixture before testing
+  // the not-yet-accepted gate; otherwise this scenario contradicts its setup.
+  await prisma.policyAcceptance.deleteMany({ where: { customerAccountId: account.id, policyKind: 'DINODIA_NATIVE', policyVersion: currentPolicyVersion } });
   const requirementsBeforePolicy = await fetchJson(`${base}/api/v2/auth/requirements`, { headers });
   const protectedBeforePolicy = await fetchJson(`${base}/api/v2/me/pending-relationships`, { headers });
   const policyBeforeCount = await prisma.policyAcceptance.count({ where: { customerAccountId: account.id, policyKind: 'DINODIA_NATIVE', policyVersion: currentPolicyVersion } });
@@ -8425,7 +8526,7 @@ async function pendingInvitationRouteChecks(deliveryEnv) {
     || wrongPolicyHash.response.status !== 409 || wrongPolicyHash.body.error?.code !== 'UPDATE_REQUIRED'
     || policyAfterWrongHash !== policyBeforeCount || acceptPolicy.response.status !== 200 || acceptPolicy.body.idempotentReplay
     || replayPolicy.response.status !== 200 || !replayPolicy.body.idempotentReplay || requirementsAfterPolicy.body.nextAction !== 'CONTINUE'
-    || policyAcceptanceCount !== 1) fail('Account-global current-policy review/acceptance did not bind exact server-owned content or idempotently gate continuation');
+    || policyAcceptanceCount !== 1) fail(`Account-global current-policy review/acceptance did not bind exact server-owned content or idempotently gate continuation (${JSON.stringify({ before: requirementsBeforePolicy.response.status, beforeAction: requirementsBeforePolicy.body.nextAction, protected: protectedBeforePolicy.response.status, wrongHash: wrongPolicyHash.response.status, accept: acceptPolicy.response.status, replay: replayPolicy.response.status, afterAction: requirementsAfterPolicy.body.nextAction, beforeCount: policyBeforeCount, afterWrongCount: policyAfterWrongHash, count: policyAcceptanceCount })})`);
   console.log('[stage6:integration] PASS: account-global policy requirement gates protected reads, serves only configured version/hash, denies mismatched content without acceptance, and records explicit acceptance once');
   const initialHome = await prisma.home.findUniqueOrThrow({ where: { id: inviter.homeId }, select: { managementRevision: true } });
   const pending = await fetchJson(`${base}/api/v2/me/pending-relationships`, { headers });

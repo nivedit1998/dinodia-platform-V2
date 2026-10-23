@@ -6,6 +6,7 @@ import { sha256 } from '@/lib/stage1Crypto';
 import { Stage1AuthError } from '@/lib/stage1Auth';
 import { EMPLOYEE_SESSION_SECONDS, OPERATOR_SESSION_SECONDS } from '@/lib/stage1SessionPolicy';
 import { observeDeviceSourceAlias } from '@/lib/nativeSourceAliases';
+import { changeAnalyticsInterval } from '@/lib/analyticsIntervals';
 
 export const dynamic = 'force-dynamic';
 const HASH = /^[a-f0-9]{64}$/i;
@@ -370,6 +371,8 @@ export async function POST(request: Request) {
       await observeDeviceSourceAlias(tx, { homeId: authority.home.id, deviceId: created.id, hubInstallationId: hub.installation.id,
         protocol: sourceProtocol, sourceDeviceId: String(device.osDeviceId),
         ...(typeof device.protocolIdentityHash === 'string' ? { protocolIdentityHash: device.protocolIdentityHash } : {}), now });
+      if (isStaff) await changeAnalyticsInterval(tx, { homeId: authority.home.id, hubInstallationId: hub.installation.id, deviceId: created.id,
+        category: analyticsCategory as 'NONE' | 'LIGHT' | 'RADIATOR' | 'BOILER', selectedControlId: null, generation: hub.identity.identityGeneration, at: now });
       const updated = await tx.nativeCommissioningSession.updateMany({ where: { id: row.id, state: 'READY', revision: row.revision, expiresAt: { gt: now } }, data: { state: 'COMPLETED', closedAt: now, finalDeviceId: created.id, revision: { increment: 1 } } });
       if (updated.count !== 1) fail(409, 'commissioning_revision_conflict', 'The commissioning session changed before ownership could be recorded');
       await tx.nativeDomainOutbox.create({ data: { homeId: authority.home.id, aggregateType: 'NativeDevice', aggregateId: created.id,

@@ -5,6 +5,7 @@ import { authenticateHub } from '@/lib/stage1HubAuth';
 import { sha256 } from '@/lib/stage1Crypto';
 import { Stage1AuthError } from '@/lib/stage1Auth';
 import { EMPLOYEE_SESSION_SECONDS, OPERATOR_SESSION_SECONDS } from '@/lib/stage1SessionPolicy';
+import { changeAnalyticsInterval } from '@/lib/analyticsIntervals';
 
 export const dynamic = 'force-dynamic';
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -79,7 +80,11 @@ export async function POST(request: Request) {
     // `expectedManagementRevision`. Accept precisely one spelling while those
     // builds remain deployed; new builds use the accurately named field.
     const revisionFields = ['expectedCloudConfigurationRevision', 'expectedManagementRevision'].filter((key) => Object.hasOwn(body, key));
-    const allowed = [...required, ...revisionFields, ...(Object.hasOwn(body, 'expectedInventoryRevision') ? ['expectedInventoryRevision'] : [])];
+    const selectionFields = ['selectedControlId', 'expectedSelectedControlId'].filter(key => Object.hasOwn(body, key));
+    if (selectionFields.length && (selectionFields.length !== 2 || selectionFields.some(key => body[key] !== null && !/^[A-Za-z0-9:_./-]{1,160}$/.test(String(body[key]))))) {
+      fail(400, 'analytics_category_request_invalid', 'An exact expected and new source selection is required');
+    }
+    const allowed = [...required, ...revisionFields, ...selectionFields, ...(Object.hasOwn(body, 'expectedInventoryRevision') ? ['expectedInventoryRevision'] : [])];
     const expectedCloudConfigurationRevision = Number(body.expectedCloudConfigurationRevision ?? body.expectedManagementRevision);
     if (!exactKeys(body, allowed) || body.homeId !== hub.installation.homeId || body.hubInstallationId !== hub.installation.id
       || !UUID.test(String(body.operationId || '')) || !/^[A-Za-z0-9:_-]{1,160}$/.test(String(body.osDeviceId || ''))
@@ -90,15 +95,19 @@ export async function POST(request: Request) {
     }
 
     return await prisma.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT id FROM "Home" WHERE id = ${hub.installation.homeId}::uuid FOR UPDATE`;
       const authority = await currentAssignedStaff(tx, body, hub);
       const device = await tx.nativeDevice.findFirst({ where: { homeId: authority.home.id, hubInstallationId: hub.installation.id, osDeviceId: String(body.osDeviceId),
         managementClass: 'PROPERTY_DEVICE', ownerMembershipId: null, lifecycle: { in: ['INSTALLED', 'VIEW_ONLY'] }, retiredAt: null },
       select: { id: true, osDeviceId: true, analyticsCategory: true, inventoryRevision: true, assignments: { where: { validUntil: null, area: { homeId: authority.home.id, status: 'ACTIVE' } }, select: { areaId: true }, take: 8 } } });
       if (!device || device.assignments.length === 0) fail(404, 'analytics_category_device_unavailable', 'Only an active permanent property device in a current Home Area can be updated');
+      const currentInterval = await tx.nativeAnalyticsInterval.findFirst({ where: { deviceId: device.id, validUntil: null }, select: { selectedControlId: true } });
+      const selectedControlId = selectionFields.length ? body.selectedControlId as string | null : body.analyticsCategory === body.expectedAnalyticsCategory ? currentInterval?.selectedControlId ?? null : null;
       const requestHash = sha256(JSON.stringify({ homeId: authority.home.id, hubInstallationId: hub.installation.id, employeeId: authority.employee.id,
         workItemId: authority.work.id, workRevision: authority.work.workRevision, osDeviceId: device.osDeviceId,
         expectedCloudConfigurationRevision, expectedInventoryRevision: body.expectedInventoryRevision ?? null,
-        expectedAnalyticsCategory: body.expectedAnalyticsCategory, analyticsCategory: body.analyticsCategory }));
+        expectedAnalyticsCategory: body.expectedAnalyticsCategory, analyticsCategory: body.analyticsCategory,
+        ...(selectionFields.length ? { selectedControlId, expectedSelectedControlId: body.expectedSelectedControlId } : {}) }));
       const keyHash = sha256(String(body.operationId));
       const prior = await tx.idempotencyRecord.findUnique({ where: { namespace_keyHash: { namespace: NAMESPACE, keyHash } }, select: { actorId: true, homeId: true, hubInstallationId: true, requestHash: true, responseBody: true } });
       if (prior) {
@@ -107,6 +116,7 @@ export async function POST(request: Request) {
         return NextResponse.json({ ...(prior.responseBody as Record<string, unknown>), idempotentReplay: true }, { headers: { 'Cache-Control': 'no-store' } });
       }
       if (device.analyticsCategory !== body.expectedAnalyticsCategory) fail(409, 'analytics_category_revision_conflict', 'The device category changed; refresh the signed device policy before retrying');
+      if (selectionFields.length && (currentInterval?.selectedControlId ?? null) !== body.expectedSelectedControlId) fail(409, 'analytics_category_revision_conflict', 'The analytics source changed; refresh before retrying');
       // Analytics category is an independent, device-scoped classification.
       // Names, assignments, observations, and other inventory edits can advance
       // inventoryRevision without changing this category. The expected category
@@ -120,22 +130,25 @@ export async function POST(request: Request) {
         fail(409, 'analytics_category_revision_conflict', 'The signed cloud configuration changed; refresh the Home dashboard before changing this category');
       }
 
+      const policyChanged = body.analyticsCategory !== body.expectedAnalyticsCategory || selectedControlId !== (currentInterval?.selectedControlId ?? null);
       const changedHome = await tx.home.updateMany({ where: { id: authority.home.id, lifecycle: 'ACTIVE', installationStatus: 'COMPLETE', activeHubInstallationId: hub.installation.id,
-        managementRevision: authority.home.managementRevision }, data: { managementRevision: { increment: body.analyticsCategory === body.expectedAnalyticsCategory ? 0 : 1 } } });
+        managementRevision: authority.home.managementRevision }, data: { managementRevision: { increment: policyChanged ? 1 : 0 } } });
       if (changedHome.count !== 1) fail(409, 'analytics_category_revision_conflict', 'The Home configuration changed; refresh the dashboard before changing this category');
-      const changedDevice = body.analyticsCategory === body.expectedAnalyticsCategory ? { count: 1 } : await tx.nativeDevice.updateMany({ where: {
+      const changedDevice = !policyChanged ? { count: 1 } : await tx.nativeDevice.updateMany({ where: {
         id: device.id, homeId: authority.home.id, hubInstallationId: hub.installation.id, managementClass: 'PROPERTY_DEVICE', ownerMembershipId: null,
         lifecycle: { in: ['INSTALLED', 'VIEW_ONLY'] }, analyticsCategory: body.expectedAnalyticsCategory as AnalyticsCategory,
       }, data: { analyticsCategory: body.analyticsCategory as AnalyticsCategory, inventoryRevision: { increment: 1 } } });
       if (changedDevice.count !== 1) fail(409, 'analytics_category_revision_conflict', 'The permanent device changed; refresh the dashboard before retrying');
-      const managementRevision = authority.home.managementRevision + (body.analyticsCategory === body.expectedAnalyticsCategory ? 0 : 1);
-      const inventoryRevision = device.inventoryRevision + (body.analyticsCategory === body.expectedAnalyticsCategory ? 0 : 1);
+      const interval = await changeAnalyticsInterval(tx, { homeId: authority.home.id, hubInstallationId: hub.installation.id, deviceId: device.id,
+        category: String(body.analyticsCategory) as AnalyticsCategory, selectedControlId, generation: hub.identity.identityGeneration, at: new Date() });
+      const managementRevision = authority.home.managementRevision + (policyChanged ? 1 : 0);
+      const inventoryRevision = device.inventoryRevision + (policyChanged ? 1 : 0);
       const responseBody = { ok: true, homeId: authority.home.id, osDeviceId: device.osDeviceId, analyticsCategory: String(body.analyticsCategory),
-        managementRevision, inventoryRevision, configurationSync: 'PENDING', idempotentReplay: false };
-      if (body.analyticsCategory !== body.expectedAnalyticsCategory) {
+        managementRevision, inventoryRevision, analyticsIntervalId: interval.id, selectedControlId, configurationSync: 'PENDING', idempotentReplay: false };
+      if (policyChanged) {
         await tx.auditEvent.create({ data: { homeId: authority.home.id, actorType: 'EMPLOYEE', actorId: authority.actorId, category: 'INSTALLATION',
           action: 'permanent_device_analytics_category_changed', targetType: 'NativeDevice', targetId: device.id,
-          metadata: { from: String(body.expectedAnalyticsCategory), to: String(body.analyticsCategory), managementRevision, workItemId: authority.work.id, accessScope: authority.accessScope },
+          metadata: { from: String(body.expectedAnalyticsCategory), to: String(body.analyticsCategory), selectedControlId, managementRevision, workItemId: authority.work.id, accessScope: authority.accessScope },
           purgeAt: new Date(Date.now() + 365 * 24 * 60 * 60 * 1000) } });
       }
       await tx.idempotencyRecord.create({ data: { namespace: NAMESPACE, keyHash, actorId: authority.actorId, homeId: authority.home.id,
@@ -144,6 +157,9 @@ export async function POST(request: Request) {
       return NextResponse.json(responseBody, { headers: { 'Cache-Control': 'no-store' } });
     }, { isolationLevel: 'Serializable', maxWait: 5000, timeout: 12000 });
   } catch (error) {
+    if (error && typeof error === 'object' && 'code' in error && error.code === 'analytics_source_invalid') {
+      return NextResponse.json({ error: { code: 'analytics_source_invalid', message: 'Choose a current authorized activity signal' } }, { status: 400, headers: { 'Cache-Control': 'no-store' } });
+    }
     const status = error instanceof Stage1AuthError ? error.status : 503;
     const code = error instanceof Stage1AuthError ? error.code : 'analytics_category_unavailable';
     return NextResponse.json({ error: { code, message: error instanceof Stage1AuthError ? error.message : 'The permanent-device category service is temporarily unavailable' } }, { status, headers: { 'Cache-Control': 'no-store' } });

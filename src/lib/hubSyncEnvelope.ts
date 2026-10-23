@@ -207,7 +207,10 @@ function validEvent(event: unknown): event is HubSyncEvent {
     case 'usage.bucket': {
       const legacyKeys = ['osDeviceId', 'osAreaId', 'analyticsCategory', 'controlId', 'sourceGeneration', 'bucketStart', 'revision', 'onSeconds', 'offSeconds', 'unknownSeconds', 'closedAt', 'purgeAt'];
       const coveredKeys = [...legacyKeys.slice(0, 6), 'coverageStartAt', 'coverageEndAt', ...legacyKeys.slice(6)];
-      const hasCoverage = exactKeys(payload, coveredKeys);
+      const versionTwo = exactKeys(payload, [...coveredKeys, 'analyticsIntervalId', 'bindingRevision', 'analyticsPolicyVersion']);
+      if (versionTwo && (payload.analyticsPolicyVersion !== 2 || !Number.isSafeInteger(payload.bindingRevision) || Number(payload.bindingRevision) < 1
+        || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(String(payload.analyticsIntervalId)))) return false;
+      const hasCoverage = versionTwo || exactKeys(payload, coveredKeys);
       if ((!hasCoverage && !exactKeys(payload, legacyKeys))
         || !boundedText(payload.osDeviceId, 160) || !boundedText(payload.osAreaId, 160)
         || !['LIGHT', 'BOILER', 'RADIATOR'].includes(String(payload.analyticsCategory)) || !boundedText(payload.controlId, 160)
@@ -238,7 +241,7 @@ function validEvent(event: unknown): event is HubSyncEvent {
       expectedPurge.setUTCDate(Math.min(originalDay, finalDay));
       const expectedAggregate = createHash('sha256').update([
         String(payload.osDeviceId), String(payload.osAreaId), String(payload.analyticsCategory),
-        String(payload.controlId), String(payload.sourceGeneration), String(start),
+        String(payload.controlId), String(payload.sourceGeneration), String(start), ...(versionTwo ? [String(payload.bindingRevision)] : []),
       ].join('|'), 'utf8').digest('hex');
       if (purge !== expectedPurge.getTime() || event.aggregateId !== expectedAggregate) return false;
       return true;

@@ -64,3 +64,32 @@ test('tenant automation projection is capability-gated and independent of the ex
     else process.env.DINODIA_NATIVE_AUTOMATIONS_ENABLED = previous;
   }
 });
+
+test('signed analytics config seeds existing devices and renews generation without enabling collection or churning intervals', async () => {
+  const db = database({ supportsProjection: false }); let generation = 1; let writerEnabled = false; const rows = [];
+  const devices = await db.nativeDevice.findMany(); devices[0].id = deviceId;
+  db.nativeDevice.findMany = async () => devices;
+  db.nativeDevice.findFirst = async () => ({ capabilitySummary: { controlCatalog: { controls: [
+    { controlId: 'heat_demand', semanticRole: 'active_heat_demand', observable: true, writable: false, surfaceId: '1' },
+  ] } } });
+  db.$queryRaw = async () => [];
+  db.hubInstallation.findUnique = async () => ({ accessPolicyRevision: 8, capabilitySummary: { nativeUniversalAnalyticsV2: true },
+    analyticsWriterEnabled: writerEnabled, analyticsCollectionEnabled: false, manufacturingIdentity: { identityGeneration: generation } });
+  db.nativeAnalyticsInterval = {
+    findMany: async () => rows.filter(row => row.validUntil === null),
+    findFirst: async () => rows.at(-1) || null,
+    updateMany: async ({ data }) => { for (const row of rows.filter(item => item.validUntil === null)) Object.assign(row, data); },
+    create: async ({ data }) => { const row = { id: `interval-${rows.length}`, validUntil: null, ...data }; rows.push(row); return row; },
+  };
+  await buildHubCloudConfiguration(db, { homeId, hubInstallationId: hubId }); assert.equal(rows.length, 0, 'capability advertisement cannot activate or seed a writer');
+  writerEnabled = true;
+  const first = await buildHubCloudConfiguration(db, { homeId, hubInstallationId: hubId });
+  assert.equal(rows.length, 1); assert.equal(first.devicePolicies[0].analyticsInterval.writerEnabled, true);
+  assert.equal(first.devicePolicies[0].analyticsInterval.genericCollectionEnabled, false);
+  assert.deepEqual(first.devicePolicies[0].analyticsInterval.authorizedControlIds, ['heat_demand']);
+  await buildHubCloudConfiguration(db, { homeId, hubInstallationId: hubId }); assert.equal(rows.length, 1);
+  rows[0].validFrom = new Date(Date.now() - 1000); generation = 2;
+  const renewed = await buildHubCloudConfiguration(db, { homeId, hubInstallationId: hubId });
+  assert.equal(rows.length, 2); assert.ok(rows[0].validUntil);
+  assert.equal(renewed.devicePolicies[0].analyticsInterval.sourceGeneration, 2);
+});

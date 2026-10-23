@@ -93,6 +93,7 @@ const rounded = (value: number) => Math.floor(value + 0.5);
 export function aggregateNativeUsage(rows: readonly NativeUsageRow[], level: NativeAnalyticsLevel, timezone: string) {
   if (!validAnalyticsTimezone(timezone) || !['hour', 'day', 'week', 'month', 'year'].includes(level)) throw new TypeError('Invalid analytics period');
   const byPeriod = new Map<string, { period: ReturnType<typeof usagePeriod>; samples: Map<string, { on: number; off: number; unknown: number; coverage: number; count: number }>; openBucket: boolean; partialCoverage: boolean }>();
+  const spansByDeviceHour = new Map<string, Array<[number, number]>>();
   for (const row of rows) {
     const start = new Date(row.bucketStart);
     if (!Number.isFinite(start.getTime()) || ![row.onSeconds, row.offSeconds, row.unknownSeconds].every((n) => Number.isSafeInteger(n) && n >= 0)) throw new TypeError('Invalid usage row');
@@ -108,6 +109,10 @@ export function aggregateNativeUsage(rows: readonly NativeUsageRow[], level: Nat
       || coverageStart < start || coverageEnd > new Date(start.getTime() + 3600000) || coverageEnd <= coverageStart
       || coverageEnd.getTime() - coverageStart.getTime() !== sum * 1000
       || (closed && (closed.getTime() !== start.getTime() + 3600000 || closed.getTime() !== coverageEnd.getTime()))) throw new TypeError('Invalid usage coverage span');
+    const identity = `${row.deviceId}:${start.toISOString()}`;
+    const spans = spansByDeviceHour.get(identity) ?? [];
+    if (spans.some(([from, to]) => from < coverageEnd.getTime() && to > coverageStart.getTime())) throw new TypeError('Usage coverage overlap for one physical device');
+    spans.push([coverageStart.getTime(), coverageEnd.getTime()]); spansByDeviceHour.set(identity, spans);
     const period = usagePeriod(row, level, timezone);
     const result = byPeriod.get(period.key) ?? { period, samples: new Map(), openBucket: false, partialCoverage: false };
     result.openBucket ||= row.closedAt === null;

@@ -78,6 +78,11 @@ for (const schema of fs
   );
 }
 const fixtureRoot = path.join(root, "contracts/dinodia-v1/fixtures");
+const intervalUsage = JSON.parse(fs.readFileSync(path.join(fixtureRoot, 'analytics-interval-usage.json'), 'utf8'));
+if (!schemas.get('analytics-interval-usage')(intervalUsage)) throw new Error('Interval usage fixture failed its canonical schema');
+for (const changed of [{ ...intervalUsage, bindingRevision: 0 }, { ...intervalUsage, analyticsPolicyVersion: 1 }, { ...intervalUsage, unexpectedAuthority: true }]) {
+  if (schemas.get('analytics-interval-usage')(changed)) throw new Error('Interval usage accepted an invalid version/authority extension');
+}
 const valid = JSON.parse(
   fs.readFileSync(path.join(fixtureRoot, "multi-control-device.json"), "utf8"),
 );
@@ -246,6 +251,7 @@ for (const [schemaName, filename, select] of fixtureChecks) {
 // a newly added valid or adversarial fixture from silently becoming an
 // unvalidated documentation-only artifact.
 const fixtureCases = [
+  ["analytics-interval-usage.json", "analyticsIntervalUsage", (v) => v, true],
   ["account-session-two-homes.json", "accountSessionContext", (v) => v, true],
   ["customer-session-receipt.json", "customerSessionReceipt", (v) => v, true],
   ["customer-hub-session-test-only.json", "customerHubSession", (v) => v, true],

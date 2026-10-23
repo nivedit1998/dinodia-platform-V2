@@ -31,9 +31,16 @@ function categoryRouteHarness({ homeRevision = 8, cloudConfigurationRevision = 1
     identityGeneration: 3, serialNumber: 'DIN-HUB-TEST-1',
   } };
   const device = { id: 'permanent-device-db-id', osDeviceId: 'zigbee:permanent-radiator', analyticsCategory, inventoryRevision,
+    capabilitySummary: { controlCatalog: { controls: ['power-1', 'power-2'].map((controlId, index) => ({ controlId, surfaceId: String(index + 1), semanticRole: 'power', observable: true, writable: true })) } },
     assignments: [{ areaId: 'active-area-id' }] };
   const writes = {};
   const tx = {
+    $queryRaw: async () => [],
+    nativeAnalyticsInterval: {
+      findFirst: async () => null,
+      updateMany: async () => ({ count: 0 }),
+      create: async ({ data }) => { writes.interval = data; return { id: 'interval-id', ...data }; },
+    },
     companyEmployeeAccount: { findFirst: async () => ({ id: ids.employee, role: 'CXO' }) },
     employeeSession: { findFirst: async () => ({ id: ids.employeeSession, employeeId: ids.employee, status: 'ACTIVE',
       createdAt: new Date(Date.now() - 60_000), expiresAt: new Date(Date.now() + 20 * 60 * 60_000) }) },
@@ -71,6 +78,7 @@ function categoryRouteHarness({ homeRevision = 8, cloudConfigurationRevision = 1
     '@/lib/stage1Crypto': { sha256: (value) => `digest:${value}` },
     '@/lib/stage1Auth': { Stage1AuthError },
     '@/lib/stage1SessionPolicy': { EMPLOYEE_SESSION_SECONDS: 24 * 60 * 60, OPERATOR_SESSION_SECONDS: 30 * 60 },
+    '@/lib/analyticsIntervals': loadTypeScript('src/lib/analyticsIntervals.ts'),
   });
   const body = { serial: 'DIN-HUB-TEST-1', identityGeneration: 3, homeId: ids.home, hubInstallationId: ids.hub,
     accessScope: 'os:admin', employeeId: ids.employee, employeeSessionId: ids.employeeSession, operatorHandoffId: ids.handoff,
@@ -81,6 +89,23 @@ function categoryRouteHarness({ homeRevision = 8, cloudConfigurationRevision = 1
   });
   return { route, request, writes };
 }
+
+test('an exact source-only edit advances authority revisions and keeps one installer-selected channel', async () => {
+  const { route, request, writes } = categoryRouteHarness({ analyticsCategory: 'LIGHT' });
+  const body = { ...await request.json(), expectedAnalyticsCategory: 'LIGHT', analyticsCategory: 'LIGHT', selectedControlId: 'power-2', expectedSelectedControlId: null };
+  const response = await route.POST(new Request(request.url, { method: 'POST', body: JSON.stringify(body) }));
+  assert.equal(response.status, 200);
+  assert.equal(writes.home.data.managementRevision.increment, 1);
+  assert.equal(writes.device.data.inventoryRevision.increment, 1);
+  assert.equal(writes.interval.selectedControlId, 'power-2');
+  assert.equal(writes.audit.data.metadata.selectedControlId, 'power-2');
+});
+
+test('an installer cannot select a control absent from the permanent catalog', async () => {
+  const { route, request } = categoryRouteHarness({ analyticsCategory: 'LIGHT' });
+  const body = { ...await request.json(), expectedAnalyticsCategory: 'LIGHT', analyticsCategory: 'LIGHT', selectedControlId: 'foreign-control', expectedSelectedControlId: null };
+  assert.equal((await route.POST(new Request(request.url, { method: 'POST', body: JSON.stringify(body) }))).status, 400);
+});
 
 test('a current device category update tolerates unrelated Home revision changes and advances from the latest revision', async () => {
   const { route, request, writes } = categoryRouteHarness({ homeRevision: 8 });

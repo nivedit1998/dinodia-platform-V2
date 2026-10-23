@@ -7,6 +7,7 @@ import { queueAutomationFailureNotices } from './nativeAutomations/failureNotifi
 import { suspendAutomationsForDeviceChange } from './nativeAutomations/revalidation';
 import { retireNativeAutomations } from './nativeAutomations/lifecycle';
 import { currentCustomerPolicy } from './customerPolicyConfig';
+import { allowedAnalyticsControls, classifyUsageAuthority } from './analyticsIntervals';
 
 function invalid(code: string, message: string): never {
   throw new Stage1AuthError(409, code, message);
@@ -81,7 +82,7 @@ export async function assertUsageClosureRecoveryCurrent(tx: Prisma.TransactionCl
   const bucket = await tx.nativeDeviceUsageBucket.findUnique({ where: {
     deviceId_areaId_analyticsCategory_controlId_bucketStart_sourceGeneration: {
       deviceId: device.id, areaId: area.id, analyticsCategory: category as 'LIGHT' | 'BOILER' | 'RADIATOR', controlId: String(payload.controlId),
-      bucketStart: new Date(String(payload.bucketStart)), sourceGeneration: Number(payload.sourceGeneration),
+      bucketStart: new Date(String(payload.bucketStart)), sourceGeneration: Number(payload.sourceGeneration), bindingRevision: Number(payload.bindingRevision || 0),
     },
   }, select: { revision: true, onSeconds: true, offSeconds: true, unknownSeconds: true, closedAt: true } });
   if (bucket && (bucket.closedAt || bucket.revision >= Number(payload.revision)
@@ -146,7 +147,7 @@ export async function applyHubSyncEvent(tx: Prisma.TransactionClient, input: {
     const device = await tx.nativeDevice.findUnique({ where: { hubInstallationId_osDeviceId: { hubInstallationId, osDeviceId } }, select: {
       id: true, homeId: true, managementClass: true, lifecycle: true, descriptorRevision: true, descriptorDigest: true, protocol: true, originalName: true,
       capabilitySummary: true,
-      assignments: { where: { validUntil: null }, select: { id: true, areaId: true } },
+      assignments: { where: { validUntil: null }, select: { id: true, areaId: true, validFrom: true } },
     } });
     // OS discovery is not itself authority to decide whether an unknown device
     // belongs to the property or a tenant. Commissioning must create the
@@ -185,11 +186,19 @@ export async function applyHubSyncEvent(tx: Prisma.TransactionClient, input: {
       onlineState: payload.available === true ? 'ONLINE' : 'OFFLINE',
       ...(observedAt ? { lastSeenAt: observedAt } : {}),
     } });
-    if (areaId !== null && !device.assignments.some((assignment) => assignment.areaId === areaId)) {
-      await tx.deviceAreaAssignment.updateMany({ where: { deviceId: device.id, validUntil: null }, data: { validUntil: now } });
-      await tx.deviceAreaAssignment.create({ data: { homeId, deviceId: device.id, areaId, source: 'DINODIA_OS_SYNC', validFrom: now } });
-    } else if (areaId === null && device.assignments.length) {
-      await tx.deviceAreaAssignment.updateMany({ where: { deviceId: device.id, validUntil: null }, data: { validUntil: now } });
+    const assignmentBoundary = strictDate(event.occurredAt, now);
+    // Delivery time is not the assignment time. An older queued inventory
+    // event must not resurrect an Area after a newer canonical move, nor
+    // create a zero-length assignment when both events share a transaction.
+    const latestAssignment = areaChanged ? await tx.deviceAreaAssignment.findFirst({ where: { deviceId: device.id, homeId },
+      orderBy: [{ validFrom: 'desc' }, { id: 'desc' }], select: { validFrom: true, validUntil: true } }) : null;
+    const assignmentCanAdvance = !latestAssignment || (latestAssignment.validUntil
+      ? latestAssignment.validUntil <= assignmentBoundary : latestAssignment.validFrom < assignmentBoundary);
+    if (areaId !== null && assignmentCanAdvance && !device.assignments.some((assignment) => assignment.areaId === areaId)) {
+      await tx.deviceAreaAssignment.updateMany({ where: { deviceId: device.id, validUntil: null }, data: { validUntil: assignmentBoundary } });
+      await tx.deviceAreaAssignment.create({ data: { homeId, deviceId: device.id, areaId, source: 'DINODIA_OS_SYNC', validFrom: assignmentBoundary } });
+    } else if (areaId === null && assignmentCanAdvance && device.assignments.length) {
+      await tx.deviceAreaAssignment.updateMany({ where: { deviceId: device.id, validUntil: null }, data: { validUntil: assignmentBoundary } });
     }
     return;
   }
@@ -240,6 +249,10 @@ export async function applyHubSyncEvent(tx: Prisma.TransactionClient, input: {
     await tx.nativeDevice.update({ where: { id: device.id }, data: {
       capabilitySummary: { ...summary, controlCatalog: { revision, descriptorDigest: payload.descriptorDigest, controls } } as Prisma.InputJsonValue,
     } });
+    const initialInterval = await tx.nativeAnalyticsInterval.findFirst({ where: { deviceId: device.id, validUntil: null, newWriterFrom: null } });
+    if (initialInterval && Array.isArray(initialInterval.authorizedControls) && initialInterval.authorizedControls.length === 0) {
+      await tx.nativeAnalyticsInterval.update({ where: { id: initialInterval.id }, data: { authorizedControls: controls as Prisma.InputJsonValue } });
+    }
     return;
   }
 
@@ -423,23 +436,25 @@ export async function applyHubSyncEvent(tx: Prisma.TransactionClient, input: {
     // A newer staff policy may have revoked analytics or changed classification
     // while an old bounded event was in flight. Consume that stale event without
     // restoring the former projection.
-    if (device.managementClass !== 'PROPERTY_DEVICE' || device.analyticsCategory !== payload.analyticsCategory
+    if (device.managementClass !== 'PROPERTY_DEVICE'
       || ['RETIRED', 'REMOVED', 'REMOVAL_PENDING'].includes(device.lifecycle)) return;
-    if (Number(payload.sourceGeneration) !== Number(input.identityGeneration)) return;
+    if (Number(payload.sourceGeneration) !== Number(input.identityGeneration)) {
+      if (payload.analyticsIntervalId) invalid('hub_sync_usage_generation_invalid', 'The analytics writer generation is not current');
+      return;
+    }
     const summary = device.capabilitySummary && typeof device.capabilitySummary === 'object' && !Array.isArray(device.capabilitySummary)
       ? device.capabilitySummary as Record<string, unknown> : {};
     const catalog = summary.controlCatalog && typeof summary.controlCatalog === 'object' && !Array.isArray(summary.controlCatalog)
       ? summary.controlCatalog as Record<string, unknown> : null;
     const controls = Array.isArray(catalog?.controls) ? catalog.controls as Array<Record<string, unknown>> : [];
     const roles = payload.analyticsCategory === 'LIGHT' ? ['power', 'brightness'] : payload.analyticsCategory === 'RADIATOR' ? ['active_heat_demand'] : ['active_heat_production'];
-    if (Number(catalog?.revision) !== Number(device.descriptorRevision)
-      || !controls.some((control) => control.controlId === payload.controlId && roles.includes(String(control.semanticRole)) && control.observable === true)) return;
     const area = await tx.area.findUnique({ where: { homeId_osAreaId: { homeId, osAreaId: String(payload.osAreaId) } }, select: { id: true } });
     if (!area) invalid('hub_sync_usage_area_invalid', 'The usage bucket area is not part of this home');
     const bucketStart = strictDate(payload.bucketStart, now);
     const where = { deviceId_areaId_analyticsCategory_controlId_bucketStart_sourceGeneration: {
       deviceId: device.id, areaId: area.id, analyticsCategory: payload.analyticsCategory as 'LIGHT' | 'BOILER' | 'RADIATOR',
       controlId: String(payload.controlId), bucketStart, sourceGeneration: Number(payload.sourceGeneration),
+      bindingRevision: Number(payload.bindingRevision || 0),
     } };
     const previous = await tx.nativeDeviceUsageBucket.findUnique({ where, select: {
       id: true, revision: true, onSeconds: true, offSeconds: true, unknownSeconds: true,
@@ -466,6 +481,33 @@ export async function applyHubSyncEvent(tx: Prisma.TransactionClient, input: {
       invalid('hub_sync_usage_bucket_closure_invalid', 'Usage counters must partition exactly their bounded covered span; closed buckets must end at the hour boundary');
     }
     await requireAreaAssignmentForCoverage(tx, { homeId, deviceId: device.id, areaId: area.id, start: coverageStartAt, end: coverageEndAt });
+    const intervals = await tx.nativeAnalyticsInterval.findMany({ where: { deviceId: device.id, homeId, hubInstallationId }, orderBy: { revision: 'asc' }, take: 1001 });
+    if (intervals.length > 1000) invalid('hub_sync_analytics_interval_limit', 'Analytics policy history requires maintenance');
+    const newWriterFrom = intervals.map(row => row.newWriterFrom).filter((value): value is Date => value !== null).sort((a, b) => a.getTime() - b.getTime())[0];
+    const authority = classifyUsageAuthority({ intervals, start: coverageStartAt, end: coverageEndAt, category: String(payload.analyticsCategory),
+      controlId: String(payload.controlId), generation: Number(payload.sourceGeneration), intervalId: payload.analyticsIntervalId ? String(payload.analyticsIntervalId) : undefined,
+      bindingRevision: Number(payload.bindingRevision || 0), newWriterFrom });
+    if (authority.status === 'denied') invalid('hub_sync_analytics_interval_invalid', 'The usage interval does not authorize these measurements');
+    const installationWriter = payload.analyticsIntervalId ? await tx.hubInstallation.findUnique({ where: { id: hubInstallationId }, select: { analyticsWriterEnabled: true } }) : null;
+    const writerDisabled = Boolean(payload.analyticsIntervalId) && installationWriter?.analyticsWriterEnabled !== true;
+    if (authority.status === 'unallocated' || writerDisabled || intervals.length === 0 && device.analyticsCategory !== payload.analyticsCategory) {
+      const digest = createHash('sha256').update(canonicalSyncJson(payload)).digest('hex');
+      const prior = await tx.nativeAnalyticsUnallocated.findUnique({ where: { hubInstallationId_eventId: { hubInstallationId, eventId: event.id } } });
+      if (prior && prior.evidenceDigest !== digest) invalid('hub_sync_unallocated_conflict', 'Unallocated evidence is immutable');
+      if (!prior) await tx.nativeAnalyticsUnallocated.create({ data: { homeId, hubInstallationId, deviceId: device.id, areaId: area.id,
+        analyticsCategory: payload.analyticsCategory as 'LIGHT' | 'RADIATOR' | 'BOILER', eventId: event.id,
+        evidenceDigest: digest, payload: payload as Prisma.InputJsonValue, reason: authority.reason || (writerDisabled ? 'writer_disabled' : 'legacy_authority_unverified'), coverageStartAt, coverageEndAt, purgeAt } });
+      return;
+    }
+    const interval = intervals.find(row => payload.analyticsIntervalId ? row.id === payload.analyticsIntervalId
+      : row.analyticsCategory === payload.analyticsCategory && row.sourceGeneration === Number(payload.sourceGeneration)
+        && row.validFrom <= coverageStartAt && (!row.validUntil || row.validUntil >= coverageEndAt));
+    const authorizedControls = interval && Array.isArray(interval.authorizedControls) ? interval.authorizedControls as Array<Record<string, unknown>> : controls;
+    if (payload.analyticsIntervalId ? !allowedAnalyticsControls(String(payload.analyticsCategory), authorizedControls, interval?.selectedControlId ?? null).includes(String(payload.controlId))
+      : !authorizedControls.some(control => control.controlId === payload.controlId && roles.includes(String(control.semanticRole)) && control.observable === true)) {
+      invalid('hub_sync_analytics_control_invalid', 'The historical policy does not authorize this activity control');
+    }
+    if (payload.analyticsIntervalId) await tx.nativeAnalyticsInterval.updateMany({ where: { id: String(payload.analyticsIntervalId), newWriterFrom: null }, data: { newWriterFrom: coverageStartAt } });
     data.coverageStartAt = coverageStartAt; data.coverageEndAt = coverageEndAt;
     if (previous) {
       if (previous.revision > incomingRevision) return;
@@ -490,7 +532,8 @@ export async function applyHubSyncEvent(tx: Prisma.TransactionClient, input: {
     }
     await tx.nativeDeviceUsageBucket.create({ data: {
       homeId, deviceId: device.id, areaId: area.id, analyticsCategory: payload.analyticsCategory as 'LIGHT' | 'BOILER' | 'RADIATOR',
-      controlId: String(payload.controlId), bucketStart, sourceGeneration: Number(payload.sourceGeneration), ...data,
+      controlId: String(payload.controlId), bucketStart, sourceGeneration: Number(payload.sourceGeneration), bindingRevision: Number(payload.bindingRevision || 0),
+      analyticsPolicyVersion: Number(payload.analyticsPolicyVersion || 1), analyticsIntervalId: payload.analyticsIntervalId ? String(payload.analyticsIntervalId) : null, ...data,
     } });
     return;
   }

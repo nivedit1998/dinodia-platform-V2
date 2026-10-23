@@ -148,7 +148,7 @@ export async function POST(request: Request) {
       const bucket = await tx.nativeDeviceUsageBucket.findUnique({ where: {
         deviceId_areaId_analyticsCategory_controlId_bucketStart_sourceGeneration: {
           deviceId: device.id, areaId: area.id, analyticsCategory: category as 'LIGHT' | 'BOILER' | 'RADIATOR', controlId: String(targetPayload.controlId),
-          bucketStart: new Date(String(targetPayload.bucketStart)), sourceGeneration: Number(targetPayload.sourceGeneration),
+          bucketStart: new Date(String(targetPayload.bucketStart)), sourceGeneration: Number(targetPayload.sourceGeneration), bindingRevision: Number(targetPayload.bindingRevision || 0),
         },
       }, select: { revision: true, onSeconds: true, offSeconds: true, unknownSeconds: true, closedAt: true } });
       if (bucket && (bucket.closedAt || bucket.revision >= Number(targetPayload.revision)

@@ -855,6 +855,8 @@ model CompanyOperationalWorkItem {
 }
 
 model HubInstallation {
+  analyticsWriterEnabled Boolean @default(false)
+  analyticsCollectionEnabled Boolean @default(false)
   id                               String                   @id @default(uuid()) @db.Uuid
   homeId                           String                   @db.Uuid
   manufacturingIdentityId          String                   @unique @db.Uuid
@@ -1857,6 +1859,9 @@ model NativeDeviceUsageBucket {
   controlId         String                  @db.VarChar(160)
   bucketStart       DateTime
   sourceGeneration  Int
+  bindingRevision   Int                     @default(0)
+  analyticsPolicyVersion Int                @default(1)
+  analyticsIntervalId String?               @db.Uuid
   revision          Int                     @default(1)
   onSeconds         Int                     @default(0)
   offSeconds        Int                     @default(0)
@@ -1872,8 +1877,47 @@ model NativeDeviceUsageBucket {
   device NativeDevice @relation(fields: [deviceId], references: [id], onDelete: Restrict)
   area   Area         @relation(fields: [areaId], references: [id], onDelete: Restrict)
 
-  @@unique([deviceId, areaId, analyticsCategory, controlId, bucketStart, sourceGeneration])
+  @@unique([deviceId, areaId, analyticsCategory, controlId, bucketStart, sourceGeneration, bindingRevision], name: "deviceId_areaId_analyticsCategory_controlId_bucketStart_sourceGeneration", map: "NativeDeviceUsageBucket_epoch_key")
   @@index([homeId, bucketStart, analyticsCategory])
+  @@index([purgeAt])
+}
+
+// Platform authority, not a Hub-created permission. No retrospective interval
+// is fabricated for old rows. Legacy bytes crossing an edit remain unallocated.
+model NativeAnalyticsInterval {
+  id                 String @id @default(uuid()) @db.Uuid
+  homeId             String @db.Uuid
+  hubInstallationId  String @db.Uuid
+  deviceId           String @db.Uuid
+  analyticsCategory  DeviceAnalyticsCategory
+  selectedControlId  String? @db.VarChar(160)
+  authorizedControls Json
+  sourceGeneration   Int
+  revision           Int
+  validFrom          DateTime
+  validUntil         DateTime?
+  newWriterFrom      DateTime?
+  @@unique([deviceId, revision])
+  @@index([homeId, deviceId, validFrom])
+}
+
+model NativeAnalyticsUnallocated {
+  id                 String @id @default(uuid()) @db.Uuid
+  homeId             String @db.Uuid
+  hubInstallationId  String @db.Uuid
+  deviceId           String @db.Uuid
+  areaId             String @db.Uuid
+  analyticsCategory  DeviceAnalyticsCategory
+  eventId            String @db.Uuid
+  payload            Json
+  evidenceDigest     String @db.VarChar(64)
+  reason             String @db.VarChar(80)
+  coverageStartAt    DateTime
+  coverageEndAt      DateTime
+  purgeAt            DateTime
+  createdAt          DateTime @default(now())
+  @@unique([hubInstallationId, eventId])
+  @@index([homeId, coverageStartAt])
   @@index([purgeAt])
 }
 
