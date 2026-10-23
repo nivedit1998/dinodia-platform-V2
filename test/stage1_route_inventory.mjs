@@ -1,6 +1,15 @@
 // Method-level inventory of the Platform HTTP security boundary. Every route
 // is explicit so adding a new Stage 1 API requires an intentional auth class.
 export const stage1RouteInventory = [
+  ['GET', '/api/v2/homes/:homeId/room-qrs', 'customer'],
+  ['POST', '/api/v2/homes/:homeId/room-qrs/:areaId/reveal', 'customer'],
+  ['GET', '/api/v2/homes/:homeId/room-plaque-requests', 'customer'],
+  ['POST', '/api/v2/homes/:homeId/room-plaque-requests', 'customer'],
+  ['POST', '/api/v2/homes/:homeId/room-plaque-requests/:requestId/cancel', 'customer'],
+  ['GET', '/api/company/room-plaque-requests', 'employee'],
+  ['GET', '/api/company/room-plaque-requests/:requestId', 'employee'],
+  ['POST', '/api/company/room-plaque-requests/:requestId/transition', 'employee'],
+  ['POST', '/api/company/room-plaque-requests/:requestId/print', 'employee'],
   ['GET', '/api/health', 'public'],
   ['GET', '/api/readiness', 'public'],
   ['GET', '/api/automations', 'customer'],

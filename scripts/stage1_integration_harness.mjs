@@ -10,6 +10,7 @@ import net from 'node:net';
 import { isDeepStrictEqual } from 'node:util';
 import { Prisma, PrismaClient } from '@prisma/client';
 import { stage1RouteInventory } from '../test/stage1_route_inventory.mjs';
+import { roomPlaqueIntegration } from './room_plaque_integration.mjs';
 
 const root = process.cwd();
 const osRoot = process.env.DINODIA_OS_ROOT || path.resolve(root, '../Dinodia OS');
@@ -91,7 +92,7 @@ function analyticsIntervalDomain() {
   const require = createRequire(import.meta.url); const ts = require('typescript');
   const compiled = ts.transpileModule(fs.readFileSync(path.join(root, 'src/lib/analyticsIntervals.ts'), 'utf8'),
     { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText;
-  const module = { exports: {} }; new Function('require', 'module', 'exports', compiled)(require, module, module.exports); return module.exports;
+  const compiledModule = { exports: {} }; new Function('require', 'module', 'exports', compiled)(require, compiledModule, compiledModule.exports); return compiledModule.exports;
 }
 
 async function universalCategoryIngestionCheck({ base, homeId, installationId, areaId, osAreaId, catalog }) {
@@ -12362,16 +12363,36 @@ try {
   await bootstrapDeliveryChecks(deliveryEnv);
   await customerAuthenticationLifecycleChecks(deliveryEnv);
   await customerAuthorizationChecks(deliveryEnv);
+  const plaqueOwner = await fetchJson(`http://127.0.0.1:${appPort}/api/v2/mobile/session`, { method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify({
+    email:customerFixture.propertyEmail,password:customerFixture.propertyPassword,deviceInstallationId:customerFixture.propertyInstallationId,
+    publicKey:customerFixture.propertyPublicKey,deviceName:'Disposable plaque owner phone',model:'integration-test',osFamily:'test',osVersion:'test' }) });
+  if(plaqueOwner.response.status!==200||!plaqueOwner.body.accessToken) fail('Plaque workflow requires the real owner mobile session');
+  await roomPlaqueIntegration({base:`http://127.0.0.1:${appPort}`,prisma,homeId:customerFixture.homeOneId,
+    headers:{authorization:`Bearer ${plaqueOwner.body.accessToken}`,'x-dinodia-home-id':customerFixture.homeOneId,'content-type':'application/json'},fetchJson,loginEmployee,hashPassword,
+    manager:{email:customerFixture.managerEmail,password:customerFixture.managerPassword,deviceInstallationId:customerFixture.managerInstallationId,publicKey:customerFixture.managerPublicKey,signingKey:customerFixture.managerPhonePrivateKey},
+    tenant:{email:customerFixture.loginEmail,password:customerFixture.loginPassword,deviceInstallationId:customerFixture.loginInstallationId,publicKey:customerFixture.loginPublicKey}});
+  // The real plaque scan/approval test advances the tenant's access revision.
+  // Refresh through the ordinary session route after its synthetic Area is
+  // removed; do not rewind authority revisions or reuse its stale Hub token
+  // in the unrelated OS checks that follow.
+  const plaqueTenantSession=await fetchJson(`http://127.0.0.1:${appPort}/api/v2/hub-sessions`,{
+    method:'POST',headers:{'content-type':'application/json','x-dinodia-session':customerFixture.customerSessionSecret},
+    body:JSON.stringify({homeId:customerFixture.homeOneId})});
+  if(plaqueTenantSession.response.status!==200||!plaqueTenantSession.body.token) fail('Could not refresh the disposable tenant authority after plaque approval');
+  customerFixture.tenantToken=plaqueTenantSession.body.token;
+  const roomPlaquesOnly=process.env.ROOM_PLAQUES_ONLY==='1';
   const stage12AlexaOnly = process.env.STAGE12_ALEXA_ONLY === '1';
   const stage5SyncRecoveryOnly = process.env.STAGE5_SYNC_RECOVERY_ONLY === '1';
   const stage9RemovalEncryptionOnly = process.env.STAGE9_HOMEOWNER_TENANT_REMOVAL_ONLY === '1';
   const stage6InvitationLockOnly = process.env.STAGE6_INVITATION_LOCK_ONLY === '1';
   const stage6TenantInvitationDecisionOnly = process.env.STAGE6_TENANT_INVITATION_DECISION_ONLY === '1';
-  if (!stage5SyncRecoveryOnly && !stage9RemovalEncryptionOnly && !stage6InvitationLockOnly && !stage6TenantInvitationDecisionOnly
+  if (!roomPlaquesOnly && !stage5SyncRecoveryOnly && !stage9RemovalEncryptionOnly && !stage6InvitationLockOnly && !stage6TenantInvitationDecisionOnly
     && (stage12AlexaOnly || (process.env.STAGE6_TRANSFER_ONLY !== '1' && process.env.STAGE6_TENANT_REMOVAL_ONLY !== '1'))) {
     await nativeAlexaOAuthChecks(deliveryEnv);
   }
-  if (stage6TenantInvitationDecisionOnly) {
+  if (roomPlaquesOnly) {
+    console.log('[room-plaques:integration] Focused mode completed real authentication and plaque HTTP/database acceptance. Other harness scenarios were not run in this mode.');
+  } else if (stage6TenantInvitationDecisionOnly) {
     await pendingInvitationRouteChecks(deliveryEnv);
   } else if (stage5SyncRecoveryOnly) {
     await pendingInvitationRouteChecks(deliveryEnv);

@@ -402,6 +402,7 @@ model CustomerAccount {
 
   lastUsedHome           Home?                               @relation("CustomerLastUsedHome", fields: [lastUsedHomeId], references: [id], onDelete: SetNull)
   memberships            HomeMembership[]
+  roomPlaqueRequests     RoomPlaqueRequest[]
   trustedDevices         TrustedDevice[]
   sessions               CustomerSession[]
   policyAcceptances      PolicyAcceptance[]
@@ -603,6 +604,7 @@ model Home {
 
   lastUsedBy                 CustomerAccount[]                    @relation("CustomerLastUsedHome")
   memberships                HomeMembership[]
+  roomPlaqueRequests         RoomPlaqueRequest[]
   areas                      Area[]
   devices                    NativeDevice[]
   hubInstallations           HubInstallation[]
@@ -653,6 +655,7 @@ model HomeMembership {
   customerAccount        CustomerAccount                      @relation(fields: [customerAccountId], references: [id], onDelete: Cascade)
   home                   Home                                 @relation(fields: [homeId], references: [id], onDelete: Cascade)
   tenantAreaGrants       TenantAreaGrant[]
+  roomPlaqueRequests     RoomPlaqueRequest[]
   ownedDevices           NativeDevice[]
   preferences            MemberPreferenceDocument[]
   invitationsSent        MembershipInvitation[]               @relation("InvitationInviter")
@@ -688,6 +691,7 @@ model Area {
   tenantGrants              TenantAreaGrant[]
   assignments               DeviceAreaAssignment[]
   qrCredentials             AreaQrCredential[]
+  plaqueItems               RoomPlaqueRequestItem[]
   accessRequests            AreaAccessRequest[]
   membershipInvitationAreas MembershipInvitationArea[]
   sourceAliases             AreaSourceAlias[]
@@ -1097,12 +1101,71 @@ model AreaQrCredential {
   disabledAt                DateTime?
 
   area           Area                     @relation(fields: [areaId], references: [id], onDelete: Cascade)
+  plaqueItems    RoomPlaqueRequestItem[]
   accessRequests AreaAccessRequest[]
   emailAttempts  RoomAccessEmailAttempt[]
 
   @@unique([areaId, generation])
   @@unique([id, areaId])
   @@index([areaId, status])
+}
+
+enum RoomPlaqueStatus {
+  REQUESTED
+  IN_PRODUCTION
+  DISPATCHED
+  COMPLETED
+  CANCELLED
+}
+
+enum RoomPlaqueKind {
+  FIRST_ISSUE
+  REPRINT
+}
+
+model RoomPlaqueRequest {
+  id                     String @id @default(uuid()) @db.Uuid
+  publicReference        String @unique @db.VarChar(40)
+  homeId                 String @db.Uuid
+  requesterAccountId     String? @db.Uuid
+  requesterMembershipId  String? @db.Uuid
+  requesterRole          String @db.VarChar(32)
+  authorityGeneration    Int
+  addressFingerprint     String @db.VarChar(64)
+  encryptedAddress       Json
+  status                 RoomPlaqueStatus @default(REQUESTED)
+  revision               Int @default(1)
+  notes                  String @db.VarChar(1000)
+  createdAt              DateTime @default(now())
+  updatedAt              DateTime @updatedAt
+  productionStartedAt    DateTime?
+  dispatchedAt           DateTime?
+  completedAt            DateTime?
+  cancelledAt            DateTime?
+  home                   Home @relation(fields: [homeId], references: [id], onDelete: Cascade)
+  requester              CustomerAccount? @relation(fields: [requesterAccountId], references: [id], onDelete: SetNull)
+  membership             HomeMembership? @relation(fields: [requesterMembershipId], references: [id], onDelete: SetNull)
+  items                  RoomPlaqueRequestItem[]
+
+  @@index([homeId, createdAt, id])
+  @@index([status, createdAt, id])
+}
+
+model RoomPlaqueRequestItem {
+  id                    String @id @default(uuid()) @db.Uuid
+  requestId             String @db.Uuid
+  areaId                String @db.Uuid
+  kind                  RoomPlaqueKind
+  roomLabelSnapshot     String @db.VarChar(160)
+  credentialId          String? @db.Uuid
+  credentialGeneration  Int?
+  closedAt              DateTime?
+  request               RoomPlaqueRequest @relation(fields: [requestId], references: [id], onDelete: Cascade)
+  area                  Area @relation(fields: [areaId], references: [id], onDelete: Restrict)
+  credential            AreaQrCredential? @relation(fields: [credentialId], references: [id], onDelete: Restrict)
+
+  @@unique([requestId, areaId])
+  @@index([areaId, closedAt])
 }
 
 model AreaAccessRequest {

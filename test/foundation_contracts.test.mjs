@@ -180,12 +180,13 @@ test('foundation, Stage 1 and additive Stage 12 Alexa schema remain native and b
     'AlexaOAuthAuthorizationCode', 'AlexaOAuthAuthorizationCodeIntent', 'AlexaOAuthTokenFamily',
     'AlexaOAuthAccessToken', 'AlexaOAuthRefreshToken',
   ];
-  assert.equal(modelNames.length, 77);
+  assert.equal(modelNames.length, 79);
+  assert.deepEqual(modelNames.filter(name => ['RoomPlaqueRequest', 'RoomPlaqueRequestItem'].includes(name)).sort(), ['RoomPlaqueRequest', 'RoomPlaqueRequestItem']);
   assert.deepEqual(modelNames.filter(name => ['NativeAnalyticsInterval', 'NativeAnalyticsUnallocated'].includes(name)).sort(), ['NativeAnalyticsInterval', 'NativeAnalyticsUnallocated']);
   assert.equal(modelNames.filter((name) => name === 'HubSyncReceipt').length, 1);
   assert.deepEqual(modelNames.filter((name) => stage3Models.includes(name)).sort(), [...stage3Models].sort());
   assert.deepEqual(modelNames.filter((name) => stage12AlexaModels.includes(name)).sort(), [...stage12AlexaModels].sort());
-  assert.equal(modelNames.length - stage3Models.length - stage12AlexaModels.length - 2, 46, 'Existing foundation models remain intact; two analytics interval/evidence models are additive');
+  assert.equal(modelNames.length - stage3Models.length - stage12AlexaModels.length - 4, 46, 'Existing foundation models remain intact; two analytics and two plaque models are additive');
   assert.doesNotMatch(schema, /HaConnection|HomeAssistant|SupportRequest|AlexaRefreshToken/);
   assert.match(schema, /model HomeMembership/);
   assert.match(schema, /model TenantAreaGrant/);
