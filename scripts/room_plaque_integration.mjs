@@ -6,7 +6,7 @@ import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 
 // Called by the existing guarded, disposable Docker/HTTP harness. Never Production.
-export async function roomPlaqueIntegration({ base, prisma, homeId, headers, fetchJson, loginEmployee, hashPassword, manager, tenant }) {
+export async function roomPlaqueIntegration({ base, prisma, homeId, headers, ownerSession, fetchJson, loginEmployee, hashPassword, manager, tenant }) {
   assert.ok(new URL(base).hostname === '127.0.0.1' || new URL(base).hostname === 'localhost');
   const home=await prisma.home.findUniqueOrThrow({where:{id:homeId}});
   const areaIds=[],orderIds=[],employees=[];
@@ -133,6 +133,31 @@ export async function roomPlaqueIntegration({ base, prisma, homeId, headers, fet
     assert.equal((await post(`/api/company/room-plaque-requests/${rid}/transition`,{action:'DISPATCH',expectedRevision:2},{...staff,origin:'https://untrusted.invalid'})).response.status,403);
     await prisma.home.update({where:{id:homeId},data:{authorityGeneration:{increment:1}}});
     assert.equal((await post(`/api/company/room-plaque-requests/${rid}/print`,{expectedRevision:2},staff)).response.status,409,'transfer generation holds printing');
+    if(process.env.ROOM_QR_IOS_LIVE==='1') {
+      assert.equal(process.platform,'darwin');
+      const iosRoot=process.env.DINODIA_IOS_ROOT,derived=process.env.ROOM_QR_IOS_DERIVED_DATA,simulator=process.env.ROOM_QR_SIMULATOR_ID;
+      assert.ok(iosRoot&&derived&&simulator&&fs.existsSync(derived),'reuse an existing iOS worktree, DerivedData and simulator');
+      const fixture=path.join(iosRoot,'.room-qr-live-test.json');
+      assert.ok(!fs.existsSync(fixture),'never overwrite an existing live-test fixture');
+      const membership=await prisma.homeMembership.findFirstOrThrow({where:{homeId,customerAccountId:ownerSession.accountId,role:'OWNER',status:'ACTIVE'}});
+      const appArea=await prisma.area.create({data:{homeId,osAreaId:`plaque-app-${crypto.randomUUID()}`,originalName:'Simulator requested room'}});areaIds.push(appArea.id);
+      const log=path.join(path.dirname(derived),'ios-live-platform.log'),fd=fs.openSync(log,'w',0o600);
+      try {
+        fs.writeFileSync(fixture,JSON.stringify({base,homeId,accountId:ownerSession.accountId,membershipId:membership.id,areaId:areaIds[0],requestAreaId:appArea.id,refreshToken:ownerSession.refreshToken,staffToken:session.token}),{mode:0o600,flag:'wx'});
+        execFileSync('xcodebuild',['-project',path.join(iosRoot,'Dinodia.xcodeproj'),'-scheme','Dinodia','-configuration','Debug',
+          '-destination',`platform=iOS Simulator,id=${simulator}`,'-derivedDataPath',derived,'ONLY_ACTIVE_ARCH=YES','CODE_SIGNING_ALLOWED=NO',
+          '-only-testing:DinodiaTests/DinodiaV1SessionShellTests/testRoomQrProviderAndModelAgainstDisposablePlatform','test'],{cwd:iosRoot,stdio:['ignore',fd,fd],timeout:240000});
+        const testLog=fs.readFileSync(log,'utf8');
+        assert.match(testLog,/testRoomQrProviderAndModelAgainstDisposablePlatform.*passed/);
+        assert.match(testLog,/Executed 1 test, with 0 failures/);
+        assert.ok(!/testRoomQrProviderAndModelAgainstDisposablePlatform.*skipped/.test(testLog),'the connected test must execute, not skip');
+        console.log('[room-plaques:integration] PASS: production iOS provider/model refreshed and revealed the staff-issued QR against this actual disposable Platform');
+      } finally {
+        fs.closeSync(fd);if(fs.existsSync(fixture))fs.unlinkSync(fixture);
+        const appOrders=await prisma.roomPlaqueRequest.findMany({where:{items:{some:{areaId:appArea.id}}},select:{id:true}});
+        orderIds.push(...appOrders.map(order=>order.id));
+      }
+    }
     console.log('[room-plaques:integration] PASS: real HTTP/database request, staff issue, encrypted retrieval, repeat printing/QR decode, scan, rename, reprint, cancellation, legacy recovery and authority hold');
   } finally {
     await prisma.tenantAreaGrant.deleteMany({where:{areaId:{in:areaIds}}});

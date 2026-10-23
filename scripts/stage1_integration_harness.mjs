@@ -12368,7 +12368,7 @@ try {
     publicKey:customerFixture.propertyPublicKey,deviceName:'Disposable plaque owner phone',model:'integration-test',osFamily:'test',osVersion:'test' }) });
   if(plaqueOwner.response.status!==200||!plaqueOwner.body.accessToken) fail('Plaque workflow requires the real owner mobile session');
   await roomPlaqueIntegration({base:`http://127.0.0.1:${appPort}`,prisma,homeId:customerFixture.homeOneId,
-    headers:{authorization:`Bearer ${plaqueOwner.body.accessToken}`,'x-dinodia-home-id':customerFixture.homeOneId,'content-type':'application/json'},fetchJson,loginEmployee,hashPassword,
+    headers:{authorization:`Bearer ${plaqueOwner.body.accessToken}`,'x-dinodia-home-id':customerFixture.homeOneId,'content-type':'application/json'},ownerSession:plaqueOwner.body,fetchJson,loginEmployee,hashPassword,
     manager:{email:customerFixture.managerEmail,password:customerFixture.managerPassword,deviceInstallationId:customerFixture.managerInstallationId,publicKey:customerFixture.managerPublicKey,signingKey:customerFixture.managerPhonePrivateKey},
     tenant:{email:customerFixture.loginEmail,password:customerFixture.loginPassword,deviceInstallationId:customerFixture.loginInstallationId,publicKey:customerFixture.loginPublicKey}});
   // The real plaque scan/approval test advances the tenant's access revision.
