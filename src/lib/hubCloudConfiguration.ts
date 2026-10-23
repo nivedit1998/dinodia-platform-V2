@@ -1,6 +1,5 @@
 import type { Prisma } from '@prisma/client';
 import { canonicalSyncJson, hashSyncConfiguration } from './hubSyncEnvelope';
-import { changeAnalyticsInterval } from './analyticsIntervals';
 
 const MAX_CONFIGURATION_BYTES = 1024 * 1024;
 
@@ -36,22 +35,11 @@ export async function buildHubCloudConfiguration(db: Prisma.TransactionClient, i
     ? hub.capabilitySummary as Record<string, unknown> : {};
   const supportsTenantAutomationProjection = capabilitySummary.nativeTenantAutomationProjectionV1 === true;
   const analyticsIntervals = capabilitySummary.nativeUniversalAnalyticsV2 === true ? await db.nativeAnalyticsInterval.findMany({
-    where: { homeId: input.homeId, hubInstallationId: input.hubInstallationId, validUntil: null }, take: 2000,
+    where: { homeId: input.homeId, hubInstallationId: input.hubInstallationId, validUntil: null,
+      sourceGeneration: hub?.manufacturingIdentity?.identityGeneration ?? -1 }, take: 2000,
   }) : [];
-  if (capabilitySummary.nativeUniversalAnalyticsV2 === true && hub?.manufacturingIdentity
-    && (hub.analyticsWriterEnabled || hub.analyticsCollectionEnabled)) {
-    // Seed existing permanent devices and renew generation-bound authority at
-    // the canonical cloud boundary. This never enables either activation flag.
-    for (const device of devices.filter(item => item.managementClass === 'PROPERTY_DEVICE' && item.ownerMembershipId === null
-      && ['INSTALLED', 'VIEW_ONLY'].includes(item.lifecycle))) {
-      const current = analyticsIntervals.find(row => row.deviceId === device.id);
-      if (current && current.sourceGeneration === hub.manufacturingIdentity.identityGeneration && current.analyticsCategory === device.analyticsCategory) continue;
-      const interval = await changeAnalyticsInterval(db, { ...input, deviceId: device.id, category: device.analyticsCategory,
-        selectedControlId: current?.selectedControlId ?? null, generation: hub.manufacturingIdentity.identityGeneration, at: new Date() });
-      const index = analyticsIntervals.findIndex(row => row.deviceId === device.id);
-      if (index >= 0) analyticsIntervals[index] = interval; else analyticsIntervals.push(interval);
-    }
-  }
+  // Configuration construction is read-only. Activation/generation reconciliation
+  // seeds intervals in the audited operator transaction, never on every sync.
   const tenantAutomationProjection = supportsTenantAutomationProjection ? {
     version: 1,
     executionEnabled: automationActivationEnabled,

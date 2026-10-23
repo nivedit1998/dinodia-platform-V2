@@ -65,7 +65,7 @@ test('tenant automation projection is capability-gated and independent of the ex
   }
 });
 
-test('signed analytics config seeds existing devices and renews generation without enabling collection or churning intervals', async () => {
+test('signed analytics config only reads audited intervals; it never seeds or renews authority on sync', async () => {
   const db = database({ supportsProjection: false }); let generation = 1; let writerEnabled = false; const rows = [];
   const devices = await db.nativeDevice.findMany(); devices[0].id = deviceId;
   db.nativeDevice.findMany = async () => devices;
@@ -76,13 +76,17 @@ test('signed analytics config seeds existing devices and renews generation witho
   db.hubInstallation.findUnique = async () => ({ accessPolicyRevision: 8, capabilitySummary: { nativeUniversalAnalyticsV2: true },
     analyticsWriterEnabled: writerEnabled, analyticsCollectionEnabled: false, manufacturingIdentity: { identityGeneration: generation } });
   db.nativeAnalyticsInterval = {
-    findMany: async () => rows.filter(row => row.validUntil === null),
+    findMany: async ({ where }) => rows.filter(row => row.validUntil === null && row.sourceGeneration === where.sourceGeneration),
     findFirst: async () => rows.at(-1) || null,
     updateMany: async ({ data }) => { for (const row of rows.filter(item => item.validUntil === null)) Object.assign(row, data); },
     create: async ({ data }) => { const row = { id: `interval-${rows.length}`, validUntil: null, ...data }; rows.push(row); return row; },
   };
   await buildHubCloudConfiguration(db, { homeId, hubInstallationId: hubId }); assert.equal(rows.length, 0, 'capability advertisement cannot activate or seed a writer');
   writerEnabled = true;
+  await buildHubCloudConfiguration(db, { homeId, hubInstallationId: hubId });
+  assert.equal(rows.length, 0, 'even a flag alone cannot make configuration construction write intervals');
+  rows.push({ id: 'audited-interval', deviceId, revision: 1, sourceGeneration: 1, validFrom: new Date(Date.now() - 1000),
+    validUntil: null, selectedControlId: null, authorizedControls: [{ controlId: 'heat_demand' }] });
   const first = await buildHubCloudConfiguration(db, { homeId, hubInstallationId: hubId });
   assert.equal(rows.length, 1); assert.equal(first.devicePolicies[0].analyticsInterval.writerEnabled, true);
   assert.equal(first.devicePolicies[0].analyticsInterval.genericCollectionEnabled, false);
@@ -90,6 +94,6 @@ test('signed analytics config seeds existing devices and renews generation witho
   await buildHubCloudConfiguration(db, { homeId, hubInstallationId: hubId }); assert.equal(rows.length, 1);
   rows[0].validFrom = new Date(Date.now() - 1000); generation = 2;
   const renewed = await buildHubCloudConfiguration(db, { homeId, hubInstallationId: hubId });
-  assert.equal(rows.length, 2); assert.ok(rows[0].validUntil);
-  assert.equal(renewed.devicePolicies[0].analyticsInterval.sourceGeneration, 2);
+  assert.equal(rows.length, 1); assert.equal(rows[0].validUntil, null);
+  assert.equal(renewed.devicePolicies[0].analyticsInterval, undefined, 'generation rotation requires an audited authority renewal');
 });

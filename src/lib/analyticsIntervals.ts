@@ -45,7 +45,7 @@ export function classifyUsageAuthority(input: Input): { status: 'accepted' | 'un
 // Device lock makes source/category revisions monotonic under simultaneous edits.
 export async function changeAnalyticsInterval(tx: Prisma.TransactionClient, input: {
   homeId: string; hubInstallationId: string; deviceId: string; category: 'NONE' | 'LIGHT' | 'RADIATOR' | 'BOILER';
-  selectedControlId: string | null; generation: number; at: Date;
+  selectedControlId: string | null; generation: number; at: Date; forceNew?: boolean;
 }) {
   await tx.$queryRaw`SELECT id FROM "NativeDevice" WHERE id = ${input.deviceId}::uuid FOR UPDATE`;
   const device = await tx.nativeDevice.findFirst({ where: { id: input.deviceId, homeId: input.homeId, hubInstallationId: input.hubInstallationId,
@@ -58,7 +58,7 @@ export async function changeAnalyticsInterval(tx: Prisma.TransactionClient, inpu
   const authorizedControls = controls.filter(control => role.includes(String(control.semanticRole)) && control.observable === true).slice(0, 64);
   if (input.selectedControlId && !allowedAnalyticsControls(input.category, authorizedControls, input.selectedControlId).length) throw Object.assign(new Error('Selected analytics signal is not authorized by the current catalog'), { code: 'analytics_source_invalid' });
   const prior = await tx.nativeAnalyticsInterval.findFirst({ where: { deviceId: input.deviceId }, orderBy: { revision: 'desc' } });
-  if (prior && prior.validUntil === null && prior.analyticsCategory === input.category && prior.selectedControlId === input.selectedControlId
+  if (!input.forceNew && prior && prior.validUntil === null && prior.analyticsCategory === input.category && prior.selectedControlId === input.selectedControlId
     && prior.sourceGeneration === input.generation) {
     if (Array.isArray(prior.authorizedControls) && !prior.authorizedControls.length && authorizedControls.length && !prior.newWriterFrom) {
       return tx.nativeAnalyticsInterval.update({ where: { id: prior.id }, data: { authorizedControls: authorizedControls as Prisma.InputJsonValue } });

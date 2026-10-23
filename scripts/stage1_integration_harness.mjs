@@ -126,15 +126,28 @@ async function universalCategoryIngestionCheck({ base, homeId, installationId, a
       purgeAt: new Date('2027-10-08T08:00:00Z').toISOString(), analyticsIntervalId: interval.id, bindingRevision: interval.revision, analyticsPolicyVersion: 2 });
     const aggregate = payload => sha256([payload.osDeviceId, payload.osAreaId, payload.analyticsCategory, payload.controlId, payload.sourceGeneration, start,
       ...(payload.bindingRevision ? [payload.bindingRevision] : [])].join('|'));
-    for (let i = 0; i < 3; i++) { const payload = payloadFor(intervals[i], i); await hub.store.queueSyncEvent('usage.bucket', aggregate(payload), payload); }
-    const batch = await hub.store.prepareSyncBatch(installationId, hub.pairing.runtime, Date.now());
     const send = body => machineRequest({ base, path: '/api/hub-agent/v2/sync', machineSecret: customerFixture.machineSecret,
       body: { serial: customerFixture.identityOneSerial, identityGeneration: customerFixture.identityOneGeneration, ...body } });
-    const wrongSelection = structuredClone(batch);
-    const wrongEvent = wrongSelection.events.find(event => event.payload.osDeviceId === osDeviceId);
-    wrongEvent.payload.controlId = controlId; wrongEvent.aggregateId = aggregate(wrongEvent.payload);
-    const deniedSelection = await send(wrongSelection);
-    if (deniedSelection.response.status !== 409 || await prisma.nativeDeviceUsageBucket.count({ where: { deviceId: device.id } })) fail('A mismatched historical source selection was not denied atomically');
+    const ack = async response => hub.store.acknowledgeSyncBatch({ streamId: response.body.streamId,
+      acceptedThroughSequence: Number(response.body.acceptedThroughSequence), cloudRevision: Number(response.body.cloudRevision),
+      configurationAppliedRevision: Number(response.body.configurationAppliedRevision) });
+    const wrongPayload = { ...payloadFor(intervals[0], 0), controlId };
+    await hub.store.queueSyncEvent('usage.bucket', aggregate(wrongPayload), wrongPayload);
+    const deniedSelection = await send(await hub.store.prepareSyncBatch(installationId, hub.pairing.runtime, Date.now()));
+    if (deniedSelection.response.status !== 200 || await prisma.nativeDeviceUsageBucket.count({ where: { deviceId: device.id } })
+      || await prisma.nativeAnalyticsUnallocated.count({ where: { deviceId: device.id } }) !== 1)
+      fail('A mismatched historical source must be archived, never measured or block the stream');
+    await ack(deniedSelection);
+    await prisma.nativeAnalyticsInterval.update({ where: { id: intervals[0].id }, data: { authorizedControls: [] } });
+    const missingControlPayload = payloadFor(intervals[0], 0);
+    await hub.store.queueSyncEvent('usage.bucket', aggregate(missingControlPayload), missingControlPayload);
+    const missingControl = await send(await hub.store.prepareSyncBatch(installationId, hub.pairing.runtime, Date.now()));
+    if (missingControl.response.status !== 200 || !await prisma.nativeAnalyticsUnallocated.count({ where: {
+      deviceId: device.id, reason: 'hub_sync_analytics_control_invalid' } })) fail('Missing historical catalog control blocked the stream or became measured');
+    await ack(missingControl);
+    await prisma.nativeAnalyticsInterval.update({ where: { id: intervals[0].id }, data: { authorizedControls: intervals[0].authorizedControls } });
+    for (let i = 0; i < 3; i++) { const payload = payloadFor(intervals[i], i); await hub.store.queueSyncEvent('usage.bucket', aggregate(payload), payload); }
+    const batch = await hub.store.prepareSyncBatch(installationId, hub.pairing.runtime, Date.now());
     const accepted = await send(batch);
     if (accepted.response.status !== 200) fail(`Universal historical intervals did not pass real signed ingestion (${accepted.response.status}/${accepted.body?.errorCode || 'no-code'})`);
     const duplicate = await send(batch);
@@ -148,14 +161,79 @@ async function universalCategoryIngestionCheck({ base, homeId, installationId, a
     await hub.store.queueSyncEvent('usage.bucket', aggregate(legacy), legacy);
     const legacyBatch = await hub.store.prepareSyncBatch(installationId, hub.pairing.runtime, Date.now());
     const preserved = await send(legacyBatch);
-    if (preserved.response.status !== 200 || await prisma.nativeAnalyticsUnallocated.count({ where: { deviceId: device.id } }) !== 1
+    if (preserved.response.status !== 200 || await prisma.nativeAnalyticsUnallocated.count({ where: { deviceId: device.id } }) !== 3
       || await prisma.nativeDeviceUsageBucket.count({ where: { deviceId: device.id } }) !== 3) fail(`Old-code overlap was not durably preserved outside measured counters (${preserved.response.status}/${preserved.body?.errorCode || 'no-code'})`);
     await hub.store.acknowledgeSyncBatch({ streamId: preserved.body.streamId, acceptedThroughSequence: Number(preserved.body.acceptedThroughSequence),
       cloudRevision: Number(preserved.body.cloudRevision), configurationAppliedRevision: Number(preserved.body.configurationAppliedRevision) });
-    console.log('[universal:integration] PASS: actual OS outbox -> signed ingestion retained delayed category/source switch-back epochs, exact retry, and preserved legacy overlap as unallocated without double counting');
+    // Re-enrolment can leave signed old-generation events queued. They and a
+    // real SQL-trigger overlap must not poison the transaction or later events.
+    const stale = { ...payloadFor(intervals[0], 0), sourceGeneration: customerFixture.identityOneGeneration + 1 };
+    await hub.store.queueSyncEvent('usage.bucket', aggregate(stale), stale);
+    // A legacy row can predate activation. A newly authorized v2 span may
+    // overlap it: admission passes but the actual SQL overlap trigger rejects.
+    const overlapDeviceId = `overlap-${crypto.randomUUID()}`;
+    const overlapDevice = await prisma.nativeDevice.create({ data: { homeId, hubInstallationId: installationId,
+      osDeviceId: overlapDeviceId, originalName: 'Synthetic overlap', technicalLabel: 'Synthetic', managementClass: 'PROPERTY_DEVICE',
+      analyticsCategory: 'RADIATOR', deviceType: 'synthetic', protocol: 'zigbee', lifecycle: 'INSTALLED', descriptorRevision: 1,
+      capabilitySummary: { controlCatalog: { revision: 1, controls: controls.map(control => ({ ...control, deviceId: overlapDeviceId })) } } } });
+    await prisma.deviceAreaAssignment.create({ data: { homeId, deviceId: overlapDevice.id, areaId, validFrom: new Date(start), source: 'OS_SYNC' } });
+    await prisma.nativeDeviceUsageBucket.create({ data: { homeId, deviceId: overlapDevice.id, areaId, analyticsCategory: 'RADIATOR',
+      controlId: heat.controlId, sourceGeneration: customerFixture.identityOneGeneration, bucketStart: new Date(start), revision: 1,
+      onSeconds: 600, offSeconds: 0, unknownSeconds: 0, coverageStartAt: new Date(start), coverageEndAt: new Date(start + 600000),
+      purgeAt: new Date('2027-10-08T08:00:00Z') } });
+    const overlapInterval = await prisma.$transaction(tx => changeAnalyticsInterval(tx, { homeId, hubInstallationId: installationId,
+      deviceId: overlapDevice.id, category: 'RADIATOR', selectedControlId: heat.controlId,
+      generation: customerFixture.identityOneGeneration, at: new Date(start) }));
+    const overlapPayload = { ...payloadFor(overlapInterval, 0), osDeviceId: overlapDeviceId };
+    await hub.store.queueSyncEvent('usage.bucket', aggregate(overlapPayload), overlapPayload);
+    const markerId = `post-unallocated-${crypto.randomUUID()}`;
+    await hub.store.queueSyncEvent('area.upsert', markerId, { osAreaId: markerId, name: 'Synthetic recovery marker', icon: 'room' });
+    const resumed = await send(await hub.store.prepareSyncBatch(installationId, hub.pairing.runtime, Date.now()));
+    if (resumed.response.status !== 200 || !await prisma.area.findUnique({ where: { homeId_osAreaId: { homeId, osAreaId: markerId } } })
+      || !await prisma.nativeAnalyticsUnallocated.count({ where: { deviceId: device.id, reason: 'hub_sync_usage_generation_invalid' } })
+      || !await prisma.nativeAnalyticsUnallocated.count({ where: { deviceId: overlapDevice.id, reason: 'analytics_constraint_unallocated' } }))
+      fail(`Queued stale generation failed to preserve evidence and advance later events (${resumed.response.status})`);
+    await ack(resumed);
+    const adminEmail = `analytics-${crypto.randomUUID()}@example.test`, adminPassword = 'Synthetic-activation-password-2026';
+    const admin = await prisma.companyEmployeeAccount.create({ data: { displayName: 'Synthetic analytics operator', email: adminEmail,
+      emailNormalized: adminEmail, role: 'CXO', status: 'ACTIVE', passwordHash: hashPassword(adminPassword) } });
+    const session = await loginEmployee(base, admin, adminPassword);
+    const activate = async (writerEnabled, operationId = crypto.randomUUID()) => {
+      const state = await prisma.hubInstallation.findUniqueOrThrow({ where: { id: installationId } });
+      const body = { homeId, hubInstallationId: installationId, operationId, expectedCloudRevision: state.cloudConfigurationRevision,
+        expectedWriterEnabled: state.analyticsWriterEnabled, expectedCollectionEnabled: state.analyticsCollectionEnabled,
+        writerEnabled, collectionEnabled: false };
+      const request = () => fetchJson(`${base}/api/company/analytics-activation`, { method: 'POST',
+        headers: { 'content-type': 'application/json', origin: 'https://dinodia-platform-v2.vercel.app', 'x-dinodia-employee-session': session.token }, body: JSON.stringify(body) });
+      const crossOrigin = await fetchJson(`${base}/api/company/analytics-activation`, { method: 'POST',
+        headers: { 'content-type': 'application/json', origin: 'https://untrusted.invalid', 'x-dinodia-employee-session': session.token }, body: JSON.stringify(body) });
+      if (crossOrigin.response.status !== 403) fail('Cross-origin activation was not refused');
+      const first = await request(), retry = await request();
+      if (first.response.status !== 200 || retry.response.status !== 200 || first.body.cloudRevision !== retry.body.cloudRevision
+        || first.body.acknowledged !== false) fail(`Audited analytics activation failed (${first.response.status})`);
+      return first;
+    };
+    await activate(false);
+    const afterDisable = { ...payloadFor(intervals[2], 2), revision: 3 };
+    await hub.store.queueSyncEvent('usage.bucket', aggregate(afterDisable), afterDisable);
+    const drained = await send(await hub.store.prepareSyncBatch(installationId, hub.pairing.runtime, Date.now()));
+    if (drained.response.status !== 200 || !await prisma.nativeAnalyticsUnallocated.count({ where: { deviceId: device.id, reason: 'writer_disabled' } }))
+      fail('Disabled writer failed to drain in-flight v2 to unallocated');
+    await ack(drained);
+    await activate(true);
+    const resumedInterval = await prisma.nativeAnalyticsInterval.findFirstOrThrow({ where: { deviceId: device.id, validUntil: null } });
+    if (resumedInterval.id === intervals[2].id || resumedInterval.revision <= intervals[2].revision)
+      fail('Resuming a paused writer must allocate a distinct prospective interval, not merge separated hour spans');
+    if (await prisma.auditEvent.count({ where: { targetId: installationId, action: 'analytics_installation_activation_changed', actorId: admin.id } }) !== 2)
+      fail('Activation retries duplicated or omitted audit entries');
+    await prisma.nativeAnalyticsUnallocated.deleteMany({ where: { deviceId: overlapDevice.id } });
+    await prisma.nativeDeviceUsageBucket.deleteMany({ where: { deviceId: overlapDevice.id } });
+    await prisma.nativeAnalyticsInterval.deleteMany({ where: { deviceId: overlapDevice.id } });
+    await prisma.deviceAreaAssignment.deleteMany({ where: { deviceId: overlapDevice.id } });
+    await prisma.nativeDevice.delete({ where: { id: overlapDevice.id } });
+    console.log('[universal:integration] PASS: actual signed sync preserved stale generation, missing historical control and SQL-trigger overlap as unallocated, advanced later events, retained distinct switch-back epochs, and exact-retried audited activation/disable with flags-off in-flight drainage; cross-origin denied');
   } finally {
-    // Enabling this disposable installation also seeds its other fixture
-    // devices during configuration construction. Restore that test-only state
+    // The audited activation seeds its other fixture devices. Restore test-only state
     // so later legacy scenarios do not inherit this activation exercise.
     await prisma.nativeAnalyticsInterval.deleteMany({ where: { hubInstallationId: installationId, deviceId: { not: device.id }, id: { notIn: priorIntervalIds } } });
     hub.pairing.nextRetryAt = retryAt;

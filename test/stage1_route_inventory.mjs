@@ -26,6 +26,8 @@ export const stage1RouteInventory = [
   ['DELETE', '/api/company/auth/session', 'public-idempotent-logout'],
   ['GET', '/api/company/auth/session', 'employee'],
   ['GET', '/api/company/support/tickets', 'employee'],
+  ['GET', '/api/company/analytics-activation', 'employee'],
+  ['POST', '/api/company/analytics-activation', 'employee'],
   ['GET', '/api/cron/native-maintenance', 'cron'],
   ['POST', '/api/cron/native-operations', 'cron'],
   ['POST', '/api/v2/alexa/directives', 'public-disabled-feature'],

@@ -112,9 +112,58 @@ function oneCalendarYearBefore(source: Date): Date {
   return result;
 }
 
-export async function applyHubSyncEvent(tx: Prisma.TransactionClient, input: {
+type SyncEventInput = {
   event: HubSyncEvent; homeId: string; hubInstallationId: string; identityGeneration?: number; now: Date;
-}) {
+};
+
+// Only validated, authenticated usage events enter this boundary. A savepoint is
+// essential: PostgreSQL constraint errors otherwise poison the outer batch even
+// if JavaScript catches them. Never consume malformed envelopes or database outages.
+export async function applyHubSyncEvent(tx: Prisma.TransactionClient, input: SyncEventInput) {
+  if (input.event.type !== 'usage.bucket') return applyHubSyncEventInner(tx, input);
+  await tx.$executeRawUnsafe('SAVEPOINT analytics_usage_event');
+  try {
+    await applyHubSyncEventInner(tx, input);
+    await tx.$executeRawUnsafe('RELEASE SAVEPOINT analytics_usage_event');
+  } catch (error) {
+    await tx.$executeRawUnsafe('ROLLBACK TO SAVEPOINT analytics_usage_event');
+    const code = error instanceof Stage1AuthError ? error.code : '';
+    const reasons = new Set(['hub_sync_usage_generation_invalid', 'hub_sync_analytics_interval_invalid',
+      'hub_sync_analytics_control_invalid', 'hub_sync_analytics_interval_limit']);
+    const dbError = error as { code?: string; meta?: { code?: string; message?: string; database_error?: string }; message?: string };
+    const constraintMessage = String(dbError.meta?.database_error || dbError.meta?.message || dbError.message || '');
+    // Prisma model writes can surface PL/pgSQL RAISE as an UnknownRequestError
+    // (SQLSTATE E23514 in its message), not only P2004/P2010.
+    const constraint = (dbError.code === 'P2004' || dbError.code === 'P2010' && dbError.meta?.code === '23514'
+      || /\bE?23514\b/.test(constraintMessage))
+      && /physical-device usage coverage cannot overlap|usage requires its exact authorized analytics interval|legacy usage requires authorized category coverage|analytics intervals cannot overlap/.test(constraintMessage);
+    if (!reasons.has(code) && !constraint
+      && !(code === 'hub_sync_area_assignment_invalid' && input.event.payload.analyticsIntervalId)) throw error;
+    const { event, homeId, hubInstallationId } = input;
+    const payload = event.payload;
+    const device = await tx.nativeDevice.findUnique({ where: { hubInstallationId_osDeviceId: {
+      hubInstallationId, osDeviceId: String(payload.osDeviceId),
+    } }, select: { id: true, homeId: true, managementClass: true, ownerMembershipId: true } });
+    const area = await tx.area.findUnique({ where: { homeId_osAreaId: { homeId, osAreaId: String(payload.osAreaId) } }, select: { id: true } });
+    // Archival never grants authority to a private/cross-Home device or Area.
+    if (!device || device.homeId !== homeId || device.managementClass !== 'PROPERTY_DEVICE' || device.ownerMembershipId || !area) throw error;
+    const digest = createHash('sha256').update(canonicalSyncJson(payload)).digest('hex');
+    const prior = await tx.nativeAnalyticsUnallocated.findUnique({ where: { hubInstallationId_eventId: { hubInstallationId, eventId: event.id } } });
+    // Event-id/body conflicts are forged/reused identities, not stale analytics authority.
+    if (prior && prior.evidenceDigest !== digest) invalid('hub_sync_unallocated_conflict', 'An authenticated event identity was reused');
+    if (!prior) await tx.nativeAnalyticsUnallocated.create({ data: { homeId, hubInstallationId, deviceId: device.id, areaId: area.id,
+      analyticsCategory: payload.analyticsCategory as 'LIGHT' | 'RADIATOR' | 'BOILER', eventId: event.id, payload: payload as Prisma.InputJsonValue,
+      evidenceDigest: digest, reason: constraint ? 'analytics_constraint_unallocated' : code,
+      coverageStartAt: new Date(String(payload.coverageStartAt ?? new Date(Date.parse(String(payload.closedAt || payload.bucketStart))
+        + (payload.closedAt ? -1 : 0) * (Number(payload.onSeconds) + Number(payload.offSeconds) + Number(payload.unknownSeconds)) * 1000).toISOString())),
+      coverageEndAt: new Date(String(payload.coverageEndAt ?? payload.closedAt ?? new Date(Date.parse(String(payload.bucketStart))
+        + (Number(payload.onSeconds) + Number(payload.offSeconds) + Number(payload.unknownSeconds)) * 1000).toISOString())),
+      purgeAt: new Date(String(payload.purgeAt)) } });
+    await tx.$executeRawUnsafe('RELEASE SAVEPOINT analytics_usage_event');
+  }
+}
+
+async function applyHubSyncEventInner(tx: Prisma.TransactionClient, input: SyncEventInput) {
   const { event, homeId, hubInstallationId, now } = input;
   const payload = event.payload;
   if (event.type === 'sync.compacted') return;

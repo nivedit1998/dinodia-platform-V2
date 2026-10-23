@@ -1,7 +1,7 @@
 import { prisma } from './prisma';
 import type { Prisma } from '@prisma/client';
 import { currentNativeDisplayName } from './nativeDisplayNames';
-import { aggregateNativeTemperature, aggregateNativeUsage, NATIVE_TEMPERATURE_MAX_VALIDITY_MS, parseAnalyticsWindow, retentionStart, type NativeAnalyticsLevel, type NativeUsageRow } from './nativeAnalytics';
+import { aggregateNativeTemperature, aggregateNativeUsage, reconcileNativeUsageCoverage, NATIVE_TEMPERATURE_MAX_VALIDITY_MS, parseAnalyticsWindow, retentionStart, type NativeAnalyticsLevel, type NativeUsageRow } from './nativeAnalytics';
 import { ANALYTICS_MAX_AREAS, ANALYTICS_MAX_DEVICES, ANALYTICS_MAX_ROWS, currentAnalyticsGroups, metricCategory, parseUuidList, type AnalyticsArea } from './nativeAnalyticsAccess';
 import { Stage1AuthError } from './stage1Auth';
 
@@ -145,9 +145,11 @@ export async function readNativeUsageDetail(homeId: string, timezone: string, se
   const assignments = candidateDeviceIds.length ? await prisma.deviceAreaAssignment.findMany({ where: { homeId, deviceId: { in: candidateDeviceIds }, areaId: { in: areaIds } },
     select: { deviceId: true, areaId: true, validFrom: true, validUntil: true }, take: ANALYTICS_MAX_ROWS + 1 }) : [];
   if (assignments.length > ANALYTICS_MAX_ROWS) throw boundedQueryError();
-  const eligible = rows.filter((row) => inCoverageAssignment(row, assignments));
+  const reconciled = reconcileNativeUsageCoverage(rows.filter((row) => inCoverageAssignment(row, assignments)));
+  const eligible = reconciled.rows;
   const deviceIds = [...new Set(eligible.map((row) => row.deviceId))];
-  const buckets = aggregateNativeUsage(eligible as NativeUsageRow[], interval, timezone);
+  const buckets = aggregateNativeUsage(eligible as NativeUsageRow[], interval, timezone)
+    .map(bucket => reconciled.excludedDeviceHours ? { ...bucket, isPartial: true } : bucket);
   const responseDevices = deviceIds.length ? await prisma.nativeDevice.findMany({ where: { id: { in: deviceIds }, homeId, managementClass: 'PROPERTY_DEVICE' },
     select: { id: true, originalName: true, overrideName: true, lifecycle: true, customerLabel: true } }) : [];
   const coverageWhere: Prisma.NativeDeviceWhereInput = { homeId, managementClass: 'PROPERTY_DEVICE', analyticsCategory: metric,
@@ -161,7 +163,8 @@ export async function readNativeUsageDetail(homeId: string, timezone: string, se
     ...(filters.deviceIds ? { deviceId: { in: filters.deviceIds } } : {}), ...(filters.areaIds ? { areaId: { in: filters.areaIds } } : {}) } });
   return { schemaVersion: 'dinodia.v1', ok: true, homeId, metric: metric.toLowerCase(), level: interval, timezone,
     from: window.from.toISOString(), to: window.to.toISOString(), retentionStartAt: window.retentionStart.toISOString(), generatedAt: now.toISOString(),
-    coverageStatus: { eligibleDeviceCount, reportingDeviceCount, missingDeviceCount: Math.max(0, eligibleDeviceCount - reportingDeviceCount), unallocatedEventCount },
+    coverageStatus: { eligibleDeviceCount, reportingDeviceCount, missingDeviceCount: Math.max(0, eligibleDeviceCount - reportingDeviceCount), unallocatedEventCount,
+      excludedOverlapDeviceHours: reconciled.excludedDeviceHours },
     selectedDeviceCount: responseDevices.length, devices: responseDevices.map((device) => ({ id: device.id,
       label: ['RETIRED', 'REMOVED'].includes(device.lifecycle) ? 'Retired device' : device.customerLabel ?? displayName(device),
       historicalOnly: ['RETIRED', 'REMOVED'].includes(device.lifecycle) })), buckets };
