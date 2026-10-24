@@ -236,6 +236,24 @@ async function applyHubSyncEventInner(tx: Prisma.TransactionClient, input: SyncE
       ...(observedAt ? { lastSeenAt: observedAt } : {}),
     } });
     const assignmentBoundary = strictDate(event.occurredAt, now);
+    // A signed, trusted OFFLINE transition ends currentness for previously
+    // checked temperature evidence. Keep the measured value and source time
+    // for last-reported display/history, but permanently clip its validity at
+    // the source event boundary. A later ONLINE inventory event cannot revive
+    // it; only a newly admitted temperature.sample can establish new evidence.
+    // Do not clip a sample reported at or after this boundary, or one whose
+    // validity already ended. The policy-3 database check permits equality.
+    if (payload.available === false) {
+      await tx.nativeTemperatureSample.updateMany({
+        where: {
+          deviceId: device.id,
+          analyticsPolicyVersion: 3,
+          sourceObservedAt: { lt: assignmentBoundary },
+          validUntil: { gt: assignmentBoundary },
+        },
+        data: { validUntil: assignmentBoundary },
+      });
+    }
     // Delivery time is not the assignment time. An older queued inventory
     // event must not resurrect an Area after a newer canonical move, nor
     // create a zero-length assignment when both events share a transaction.

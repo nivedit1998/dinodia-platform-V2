@@ -213,7 +213,7 @@ async function universalCategoryIngestionCheck({ base, homeId, installationId, a
       if (crossOrigin.response.status !== 403) fail('Cross-origin activation was not refused');
       const first = await request(), retry = await request();
       if (first.response.status !== 200 || retry.response.status !== 200 || first.body.cloudRevision !== retry.body.cloudRevision
-        || first.body.acknowledged !== false) fail(`Audited analytics activation failed (${first.response.status})`);
+        || first.body.acknowledged !== false) fail(`Audited analytics activation failed (${JSON.stringify({ first: first.response.status, firstBody: first.body, retry: retry.response.status, retryBody: retry.body })})`);
       return first;
     };
     await activate(false);
@@ -488,6 +488,20 @@ function run(command, args, envOrOptions = null) {
   if (result.status !== 0) {
     const detail = `${result.stdout || ''}\n${result.stderr || ''}`.trim().slice(-4000);
     fail(`${command} ${args.join(' ')} failed with exit ${result.status ?? 1}${detail ? `: ${detail}` : ''}`);
+  }
+}
+function assertExistingOsDependenciesMatchLock(osRoot) {
+  const expected = JSON.parse(fs.readFileSync(path.join(osRoot, 'package-lock.json'), 'utf8')).packages || {};
+  const installedPath = path.join(osRoot, 'node_modules', '.package-lock.json');
+  if (!fs.existsSync(installedPath)) fail('STAGE1_REUSE_OS_DEPS requires npm’s installed dependency lock metadata');
+  const installed = JSON.parse(fs.readFileSync(installedPath, 'utf8')).packages || {};
+  for (const [packagePath, lock] of Object.entries(expected)) {
+    if (!packagePath) continue;
+    const actual = installed[packagePath];
+    if (!actual || actual.version !== lock.version || (actual.integrity || null) !== (lock.integrity || null)
+      || (actual.resolved || null) !== (lock.resolved || null)) {
+      fail(`Existing OS dependency does not match package-lock.json: ${packagePath}`);
+    }
   }
 }
 function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
@@ -7005,6 +7019,69 @@ async function pendingInvitationRouteChecks(deliveryEnv) {
     fail(`Owner Home state did not retain the legacy measured temperature as explicitly last-reported (${JSON.stringify({ status: ownerHomeContext.response.status, reading: reportedRadiator ?? null })})`);
   }
   console.log('[state-evidence:integration] PASS: authenticated homeowner projection retains legacy temperature and original age while refusing to label unverified fixed-window evidence current');
+
+  // A checked sample must stop being current at a trusted offline boundary,
+  // and an ONLINE inventory event must not revive it without a new report.
+  // The sample is a disposable checked-policy fixture; OFFLINE/ONLINE travel
+  // through the real OS Store, durable outbox, signed Hub sync and owner APIs.
+  const checkedObservedAt = new Date(Date.now() - 30_000);
+  const checkedValidUntil = new Date(Date.now() + 10 * 60_000);
+  const checkedEventKey = sha256(`stage10-checked-offline:${telemetryDevice.id}:${checkedObservedAt.toISOString()}`);
+  await prisma.nativeTemperatureSample.create({ data: { homeId: telemetryHomeId, deviceId: telemetryDevice.id, areaId: telemetryAreaId,
+    sourceEventKey: checkedEventKey, temperature: 21.25, sourceObservedAt: checkedObservedAt, validUntil: checkedValidUntil,
+    sourceGeneration: customerFixture.identityOneGeneration, analyticsPolicyVersion: 3,
+    purgeAt: new Date(checkedObservedAt.getTime() + 366 * 86_400_000) } });
+  const syncAvailability = async (available) => {
+    const inventoryPayload = telemetryPending.find((event) => event.type === 'device.upsert')?.payload;
+    if (!inventoryPayload) fail('The real OS device fixture has no canonical inventory payload');
+    // Replay only the signed availability observation. This isolates device
+    // reachability from temperature reports and avoids asking the synthetic
+    // Store to re-emit unrelated usage observations.
+    hub.store.queueSyncEvent('device.upsert', telemetryOsDeviceId, { ...inventoryPayload, available, observedAt: null });
+    const availabilityBatch = await hub.store.prepareSyncBatch(telemetryHubId, hub.pairing.runtime, Date.now());
+    const availabilityEvent = availabilityBatch?.events?.find((item) => item.type === 'device.upsert'
+      && item.payload?.osDeviceId === telemetryOsDeviceId && item.payload?.available === available);
+    if (!availabilityBatch || !availabilityEvent) fail(`The real Store did not enqueue availability=${available}`);
+    const accepted = await hub.pairing.requestWithHubIdentity('/api/hub-agent/v2/sync', availabilityBatch);
+    if (Number(accepted?.acceptedThroughSequence) < Number(availabilityEvent.sequence)) {
+      fail(`The signed Platform sync did not accept availability=${available}`);
+    }
+    await hub.store.acknowledgeSyncBatch({ streamId: accepted.streamId, acceptedThroughSequence: Number(accepted.acceptedThroughSequence),
+      cloudRevision: Number(accepted.cloudRevision), configurationAppliedRevision: Number(accepted.configurationAppliedRevision) });
+    return new Date(availabilityEvent.occurredAt);
+  };
+  const checkedReading = (response) => response.body?.devices?.find((device) => device.id === telemetryDevice.id)
+    ?.readings?.find((reading) => reading.kind === 'radiator_temperature');
+  const initiallyChecked = await fetchJson(`${base}/api/v2/homes/${telemetryHomeId}/homeowner-context`, { headers: telemetryHeaders });
+  if (initiallyChecked.response.status !== 200 || checkedReading(initiallyChecked)?.quality !== 'fresh'
+    || checkedReading(initiallyChecked)?.value !== 21.25) {
+    fail(`The checked sample fixture was not current before the offline boundary (${JSON.stringify({ status: initiallyChecked.response.status, reading: checkedReading(initiallyChecked) ?? null })})`);
+  }
+  const offlineAt = await syncAvailability(false);
+  const offlineDevice = await prisma.nativeDevice.findUniqueOrThrow({ where: { id: telemetryDevice.id }, select: { onlineState: true } });
+  const offlineSample = await prisma.nativeTemperatureSample.findUniqueOrThrow({ where: { sourceEventKey: checkedEventKey },
+    select: { temperature: true, sourceObservedAt: true, validUntil: true, analyticsPolicyVersion: true } });
+  const offlineProjection = await fetchJson(`${base}/api/v2/homes/${telemetryHomeId}/homeowner-context`, { headers: telemetryHeaders });
+  if (offlineDevice.onlineState !== 'OFFLINE' || offlineSample.validUntil > offlineAt
+    || offlineSample.analyticsPolicyVersion !== 3 || Number(offlineSample.temperature) !== 21.25
+    || checkedReading(offlineProjection)?.quality !== 'stale' || checkedReading(offlineProjection)?.value !== 21.25) {
+    fail(`Trusted OFFLINE did not end currentness while preserving the genuine value (${JSON.stringify({ device: offlineDevice.onlineState,
+      sample: { value: Number(offlineSample.temperature), validUntil: offlineSample.validUntil.toISOString(), policy: offlineSample.analyticsPolicyVersion },
+      reading: checkedReading(offlineProjection) ?? null })})`);
+  }
+  await syncAvailability(true);
+  const onlineProjection = await fetchJson(`${base}/api/v2/homes/${telemetryHomeId}/homeowner-context`, { headers: telemetryHeaders });
+  const onlineDevice = await prisma.nativeDevice.findUniqueOrThrow({ where: { id: telemetryDevice.id }, select: { onlineState: true } });
+  const onlineSample = await prisma.nativeTemperatureSample.findUniqueOrThrow({ where: { sourceEventKey: checkedEventKey }, select: { validUntil: true } });
+  if (onlineDevice.onlineState !== 'ONLINE' || onlineSample.validUntil > offlineAt
+    || checkedReading(onlineProjection)?.quality !== 'stale' || checkedReading(onlineProjection)?.value !== 21.25) {
+    fail(`ONLINE without a new report revived an old checked sample (${JSON.stringify({ device: onlineDevice.onlineState,
+      validUntil: onlineSample.validUntil.toISOString(), reading: checkedReading(onlineProjection) ?? null })})`);
+  }
+  console.log('[state-evidence:integration] PASS: a checked measured value becomes last-reported at the real signed OFFLINE boundary, remains retained, and does not revive after signed ONLINE without a new sample');
+  // This transient fixture must not become the newest reading for later
+  // assertions that independently verify the OS-produced temperature.
+  await prisma.nativeTemperatureSample.delete({ where: { sourceEventKey: checkedEventKey } });
   const delayedTemperatureProjections = await Promise.all(delayedTemperatureResults.map(async (sample) => {
     const from = new Date(Date.parse(sample.sourceObservedAt) - 60 * 60_000).toISOString();
     const to = telemetryNow.toISOString();
@@ -12412,7 +12489,8 @@ try {
   const dataDir = path.join(tempRoot, 'os-data');
   fs.mkdirSync(dataDir, { recursive: true, mode: 0o700 });
   if (!fs.existsSync(path.join(osRoot, 'node_modules', 'ws'))) {
-    run('npm', ['ci', '--ignore-scripts'], { cwd: osRoot, env: { ...safeProcessEnvironment(), CI: '1', NODE_ENV: 'test' } });
+    if (process.env.STAGE1_REUSE_OS_DEPS === '1') assertExistingOsDependenciesMatchLock(osRoot);
+    else run('npm', ['ci', '--ignore-scripts'], { cwd: osRoot, env: { ...safeProcessEnvironment(), CI: '1', NODE_ENV: 'test' } });
   }
   await prisma.hubManufacturingIdentity.create({ data: {
     serialNumber: harnessProvisioningIdentity.serial,
@@ -12496,6 +12574,7 @@ try {
   const stage6InvitationLockOnly = process.env.STAGE6_INVITATION_LOCK_ONLY === '1';
   const stage6TenantInvitationDecisionOnly = process.env.STAGE6_TENANT_INVITATION_DECISION_ONLY === '1';
   if (!roomPlaquesOnly && !stage5SyncRecoveryOnly && !stage9RemovalEncryptionOnly && !stage6InvitationLockOnly && !stage6TenantInvitationDecisionOnly
+    && process.env.STAGE10_SKIP_ALEXA !== '1'
     && (stage12AlexaOnly || (process.env.STAGE6_TRANSFER_ONLY !== '1' && process.env.STAGE6_TENANT_REMOVAL_ONLY !== '1'))) {
     await nativeAlexaOAuthChecks(deliveryEnv);
   }
