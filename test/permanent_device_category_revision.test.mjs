@@ -17,7 +17,8 @@ function loadTypeScript(relative, overrides = {}) {
   return module.exports;
 }
 
-function categoryRouteHarness({ homeRevision = 8, cloudConfigurationRevision = 11, inventoryRevision = 4, analyticsCategory = 'NONE' } = {}) {
+function categoryRouteHarness({ homeRevision = 8, cloudConfigurationRevision = 11, inventoryRevision = 4, analyticsCategory = 'NONE',
+  writerEnabled = false, evidenceCapable = false } = {}) {
   const ids = {
     home: '11111111-1111-4111-8111-111111111111', hub: '22222222-2222-4222-8222-222222222222',
     employee: '33333333-3333-4333-8333-333333333333', employeeSession: '44444444-4444-4444-8444-444444444444',
@@ -54,6 +55,7 @@ function categoryRouteHarness({ homeRevision = 8, cloudConfigurationRevision = 1
     },
     hubInstallation: {
       findFirst: async () => ({ cloudConfigurationRevision }),
+      findUnique: async () => ({ analyticsWriterEnabled: writerEnabled, capabilitySummary: { nativeStateEvidenceV2: evidenceCapable } }),
     },
     nativeDevice: {
       findFirst: async () => device,
@@ -105,6 +107,17 @@ test('an installer cannot select a control absent from the permanent catalog', a
   const { route, request } = categoryRouteHarness({ analyticsCategory: 'LIGHT' });
   const body = { ...await request.json(), expectedAnalyticsCategory: 'LIGHT', analyticsCategory: 'LIGHT', selectedControlId: 'foreign-control', expectedSelectedControlId: null };
   assert.equal((await route.POST(new Request(request.url, { method: 'POST', body: JSON.stringify(body) }))).status, 400);
+});
+
+test('the actual category route selects policy3 only for an enabled evidence-capable installation', async () => {
+  for (const [writerEnabled, evidenceCapable, expected] of [[true, true, 3], [false, true, 2], [true, false, 2]]) {
+    const { route, request, writes } = categoryRouteHarness({ analyticsCategory: 'LIGHT', writerEnabled, evidenceCapable });
+    const body = { ...await request.json(), expectedAnalyticsCategory: 'LIGHT', analyticsCategory: 'LIGHT',
+      selectedControlId: 'power-2', expectedSelectedControlId: null };
+    const response = await route.POST(new Request(request.url, { method: 'POST', body: JSON.stringify(body) }));
+    assert.equal(response.status, 200);
+    assert.equal(writes.interval.analyticsPolicyVersion, expected);
+  }
 });
 
 test('a current device category update tolerates unrelated Home revision changes and advances from the latest revision', async () => {

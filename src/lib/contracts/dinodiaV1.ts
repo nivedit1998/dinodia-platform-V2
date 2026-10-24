@@ -1082,7 +1082,8 @@ export function validateStateEvidence2(value: unknown, device: NativeDevice, con
     || !Number.isSafeInteger(reported.sourceGeneration) || Number(reported.sourceGeneration) < 1
     || !/^[a-f0-9]{64}$/.test(String(reported.observationId)) || !/^[a-f0-9]{64}$/.test(String(reported.sourceKey))
     || !['device_report','device_read','provider_read','integration_snapshot'].includes(String(reported.provenance)) || !commandValueMatches(control, reported.value))) return false;
-  const { stateEvidenceVersion: _version, lastReported: _reported, evidence: _evidence, ...current } = value;
+  const current = { ...value };
+  delete current.stateEvidenceVersion; delete current.lastReported; delete current.evidence;
   if (value.quality === 'fresh') return object(reported) && evidence.status === 'verified' && id(evidence.guaranteeId)
     && value.observedAt === reported.observedAt && value.receivedAt === reported.receivedAt
     && JSON.stringify(value.value) === JSON.stringify(reported.value) && validateControlState(current, device, control);
