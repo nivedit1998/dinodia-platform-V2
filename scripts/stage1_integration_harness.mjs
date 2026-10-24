@@ -5065,8 +5065,20 @@ async function nativeAlexaOAuthChecks(deliveryEnv) {
         && event.payload?.causeType === 'APP_INTERACTION' && event.sequence > nativeStateEvent.sequence) ?? null;
       if (!secondNativeStateEvent) await sleep(20);
     }
+    if (!secondNativeStateEvent) {
+      const actual = hub.store.getDevice(propertyDeviceRow.osDeviceId);
+      const entity = Object.values(actual.entities || {}).find(item => item.capability?.controlId === 'power');
+      const projection = await fetchJson(`${loopbackOsOrigin}/api/dinodia/v1/snapshot`, { headers: {
+        authorization: `Bearer ${selectedOsSession.body.token}`, 'x-dinodia-state-evidence-version': '2' } });
+      fail(`A second genuine observation did not enter the outbox (${JSON.stringify({
+        state: entity?.state, observedAt: entity?.sourceObservedAt, admission: entity?.admittedEvidence?.quality,
+        proof: Object.values(hub.store.getObservationPolicyRecords()).map(record => ({ state: record.state, suspended: record.suspended,
+          sourceGeneration: record.sourceGeneration, lifecycleMatches: record.deviceLifecycleId === actual.stateEvidenceLifecycleId })),
+        evidence: projection.body?.data?.states?.find(state => state.deviceId === actual.id && state.controlId === 'power')?.evidence?.status,
+        receipt: hub.store.getNativeCommandReceipt?.(secondAppCommand.commandId)?.status,
+      })})`);
+    }
     const secondObservationAt = secondNativeStateEvent.payload.observedAt;
-    if (!secondNativeStateEvent) fail('A second physical-state observation did not enter the durable Native OS outbox');
     hub.pairing.nextRetryAt = 0;
     await hub.pairing.syncNow();
     for (let attempt = 0; attempt < 20 && hub.store.getSyncOutbox().acknowledgedSequence < secondNativeStateEvent.sequence; attempt += 1) {
