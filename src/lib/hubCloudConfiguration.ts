@@ -100,7 +100,9 @@ export async function buildHubCloudConfiguration(db: Prisma.TransactionClient, i
       osAreaIds: device.assignments.map((assignment) => assignment.area.osAreaId),
       ...(() => { const interval = analyticsIntervals.find(row => row.deviceId === device.id); return interval ? { analyticsInterval: {
         id: interval.id, revision: interval.revision, validFrom: interval.validFrom.toISOString(), sourceGeneration: interval.sourceGeneration,
-        selectedControlId: interval.selectedControlId, writerEnabled: hub?.analyticsWriterEnabled === true,
+        selectedControlId: interval.selectedControlId, writerEnabled: hub?.analyticsWriterEnabled === true
+          && (interval.analyticsPolicyVersion !== 3 || capabilitySummary.nativeStateEvidenceV2 === true),
+        ...(capabilitySummary.nativeStateEvidenceV2 === true ? { analyticsPolicyVersion: interval.analyticsPolicyVersion } : {}),
         genericCollectionEnabled: hub?.analyticsCollectionEnabled === true,
         authorizedControlIds: Array.isArray(interval.authorizedControls) ? interval.authorizedControls.map(control => String((control as Record<string, unknown>).controlId)) : [],
       } } : {}; })(),

@@ -39,6 +39,7 @@ export async function setAnalyticsActivation(tx: Prisma.TransactionClient, actor
       await changeAnalyticsInterval(tx, { homeId: input.homeId, hubInstallationId: hub.id, deviceId: device.id,
         category: device.analyticsCategory, selectedControlId: interval?.selectedControlId ?? null,
         generation: hub.manufacturingIdentity!.identityGeneration, at: now,
+        analyticsPolicyVersion: capability?.nativeStateEvidenceV2 === true ? 3 : 2,
         // A resumed writer needs a distinct key: merging separated same-hour
         // spans under one absolute bucket would falsely bridge the pause.
         forceNew: input.writerEnabled && !hub.analyticsWriterEnabled });

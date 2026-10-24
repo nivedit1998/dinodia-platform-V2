@@ -1960,6 +1960,7 @@ model NativeAnalyticsInterval {
   validFrom          DateTime
   validUntil         DateTime?
   newWriterFrom      DateTime?
+  analyticsPolicyVersion Int @default(2)
   @@unique([deviceId, revision])
   @@index([homeId, deviceId, validFrom])
 }
@@ -1993,7 +1994,9 @@ model NativeTemperatureSample {
   temperature      Decimal  @db.Decimal(6, 2)
   sourceObservedAt DateTime
   validUntil       DateTime
+  currentnessEndedAt DateTime?
   sourceGeneration Int
+  analyticsPolicyVersion Int @default(2)
   purgeAt          DateTime
   createdAt        DateTime @default(now())
 

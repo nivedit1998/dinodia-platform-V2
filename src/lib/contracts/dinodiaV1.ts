@@ -1063,6 +1063,33 @@ export function validateControlState(value: unknown, device: NativeDevice, contr
   const valueMatches = state.value === null ? ['unknown','unavailable'].includes(state.quality) : commandValueMatches(control, state.value);
   return state.deviceId === device.id && state.controlId === control.controlId && state.homeId === device.homeId && state.descriptorRevision === device.descriptorRevision && state.descriptorRevision === control.catalogRevision && Number.isInteger(state.revision) && state.revision >= 0 && utcTimestamp(state.observedAt) && utcTimestamp(state.receivedAt) && utcTimestamp(state.validUntil) && Number.isFinite(observedAt) && Number.isFinite(receivedAt) && Number.isFinite(validUntil) && receivedAt >= observedAt && validUntil > observedAt && Number.isInteger(control.maxStateValiditySeconds) && validUntil - observedAt <= control.maxStateValiditySeconds * 1000 && ['fresh','stale','unknown','unavailable'].includes(state.quality) && valueMatches && ['online','offline','unknown'].includes(state.deviceAvailability) && ['on','off','unknown'].includes(state.analyticsActivity);
 }
+/** Negotiated evidence v2 is independent of v1's strict positive-deadline state shape. */
+export function validateStateEvidence2(value: unknown, device: NativeDevice, control: NativeControl): boolean {
+  if (!object(value) || !hasOnlyKeys(value, ['stateEvidenceVersion','deviceId','controlId','homeId','descriptorRevision','revision','observedAt','receivedAt','quality','value','validUntil','deviceAvailability','analyticsActivity','lastReported','evidence'])
+    || value.stateEvidenceVersion !== 2 || value.deviceId !== device.id || value.controlId !== control.controlId
+    || value.homeId !== device.homeId || value.descriptorRevision !== device.descriptorRevision || value.descriptorRevision !== control.catalogRevision
+    || !Number.isSafeInteger(value.revision) || Number(value.revision) < 0
+    || !['online','offline','unknown'].includes(String(value.deviceAvailability)) || !['on','off','unknown'].includes(String(value.analyticsActivity))) return false;
+  const evidence = value.evidence;
+  if (!object(evidence) || !hasOnlyKeys(evidence, ['status','guaranteeId','policyRevision']) || evidence.policyRevision !== 3
+    || !['verified','no_observation','clock_untrusted','device_offline','no_verified_guarantee','unsupported_guarantee','expired','descriptor_limit','timestamp_unavailable'].includes(String(evidence.status))
+    || !(evidence.guaranteeId === null || id(evidence.guaranteeId))) return false;
+  const reported = value.lastReported;
+  if (reported !== null && (!object(reported) || !hasOnlyKeys(reported, ['value','observedAt','receivedAt','observationId','sourceKey','sourceGeneration','provenance'])
+    || !(reported.provenance === 'integration_snapshot'
+      ? reported.observedAt === null && reported.receivedAt === null && evidence.status === 'timestamp_unavailable' && value.quality !== 'fresh'
+      : utcTimestamp(reported.observedAt) && utcTimestamp(reported.receivedAt) && Date.parse(String(reported.receivedAt)) >= Date.parse(String(reported.observedAt)))
+    || !Number.isSafeInteger(reported.sourceGeneration) || Number(reported.sourceGeneration) < 1
+    || !/^[a-f0-9]{64}$/.test(String(reported.observationId)) || !/^[a-f0-9]{64}$/.test(String(reported.sourceKey))
+    || !['device_report','device_read','provider_read','integration_snapshot'].includes(String(reported.provenance)) || !commandValueMatches(control, reported.value))) return false;
+  const current = { ...value };
+  delete current.stateEvidenceVersion; delete current.lastReported; delete current.evidence;
+  if (value.quality === 'fresh') return object(reported) && evidence.status === 'verified' && id(evidence.guaranteeId)
+    && value.observedAt === reported.observedAt && value.receivedAt === reported.receivedAt
+    && JSON.stringify(value.value) === JSON.stringify(reported.value) && validateControlState(current, device, control);
+  return ['unknown','unavailable','stale'].includes(String(value.quality)) && value.value === null
+    && value.observedAt === null && value.receivedAt === null && value.validUntil === null && value.analyticsActivity === 'unknown';
+}
 function commandValueMatches(control: NativeControl, value: unknown): boolean {
   if (control.valueType === 'boolean') return typeof value === 'boolean';
   if (control.valueType === 'number') {

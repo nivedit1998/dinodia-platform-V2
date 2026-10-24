@@ -1,9 +1,9 @@
 import type { Prisma } from '@prisma/client';
 
 type Interval = { id: string; revision: number; analyticsCategory: string; selectedControlId: string | null;
-  sourceGeneration: number; validFrom: Date; validUntil: Date | null };
+  sourceGeneration: number; validFrom: Date; validUntil: Date | null; analyticsPolicyVersion?: number };
 type Input = { intervals: Interval[]; start: Date; end: Date; category: string; controlId: string; generation: number;
-  intervalId?: string; bindingRevision?: number; newWriterFrom?: Date | null };
+  intervalId?: string; bindingRevision?: number; newWriterFrom?: Date | null; analyticsPolicyVersion?: number };
 
 export function allowedAnalyticsControls(category: string, controls: Array<Record<string, unknown>>, selection: string | null): string[] {
   const roles = category === 'RADIATOR' ? ['active_heat_demand'] : category === 'BOILER' ? ['active_heat_production'] : category === 'LIGHT' ? ['power', 'brightness'] : [];
@@ -33,6 +33,8 @@ export function classifyUsageAuthority(input: Input): { status: 'accepted' | 'un
       && row.sourceGeneration === input.generation && row.analyticsCategory === input.category
       && (!row.selectedControlId || row.selectedControlId === input.controlId));
     if (!declared) return { status: 'denied', reason: 'analytics_interval_authority_invalid' };
+    if ((declared.analyticsPolicyVersion ?? 2) !== (input.analyticsPolicyVersion ?? 2))
+      return { status: 'denied', reason: 'analytics_policy_version_mismatch' };
     return matches.some(row => row.id === declared.id) ? { status: 'accepted', reason: null }
       : { status: 'unallocated', reason: 'interval_boundary_unallocated' };
   }
@@ -45,7 +47,7 @@ export function classifyUsageAuthority(input: Input): { status: 'accepted' | 'un
 // Device lock makes source/category revisions monotonic under simultaneous edits.
 export async function changeAnalyticsInterval(tx: Prisma.TransactionClient, input: {
   homeId: string; hubInstallationId: string; deviceId: string; category: 'NONE' | 'LIGHT' | 'RADIATOR' | 'BOILER';
-  selectedControlId: string | null; generation: number; at: Date; forceNew?: boolean;
+  selectedControlId: string | null; generation: number; at: Date; forceNew?: boolean; analyticsPolicyVersion?: 2 | 3;
 }) {
   await tx.$queryRaw`SELECT id FROM "NativeDevice" WHERE id = ${input.deviceId}::uuid FOR UPDATE`;
   const device = await tx.nativeDevice.findFirst({ where: { id: input.deviceId, homeId: input.homeId, hubInstallationId: input.hubInstallationId,
@@ -58,8 +60,17 @@ export async function changeAnalyticsInterval(tx: Prisma.TransactionClient, inpu
   const authorizedControls = controls.filter(control => role.includes(String(control.semanticRole)) && control.observable === true).slice(0, 64);
   if (input.selectedControlId && !allowedAnalyticsControls(input.category, authorizedControls, input.selectedControlId).length) throw Object.assign(new Error('Selected analytics signal is not authorized by the current catalog'), { code: 'analytics_source_invalid' });
   const prior = await tx.nativeAnalyticsInterval.findFirst({ where: { deviceId: input.deviceId }, orderBy: { revision: 'desc' } });
+  let analyticsPolicyVersion = input.analyticsPolicyVersion ?? prior?.analyticsPolicyVersion;
+  if (analyticsPolicyVersion === undefined) {
+    const installation = await tx.hubInstallation.findUnique({ where: { id: input.hubInstallationId },
+      select: { analyticsWriterEnabled: true, capabilitySummary: true } });
+    const capabilities = installation?.capabilitySummary as Record<string, unknown> | null;
+    // New devices on an enabled compatible installation must not silently
+    // return to fixed-window accounting. Existing epochs retain their policy.
+    analyticsPolicyVersion = installation?.analyticsWriterEnabled && capabilities?.nativeStateEvidenceV2 === true ? 3 : 2;
+  }
   if (!input.forceNew && prior && prior.validUntil === null && prior.analyticsCategory === input.category && prior.selectedControlId === input.selectedControlId
-    && prior.sourceGeneration === input.generation) {
+    && prior.sourceGeneration === input.generation && prior.analyticsPolicyVersion === analyticsPolicyVersion) {
     if (Array.isArray(prior.authorizedControls) && !prior.authorizedControls.length && authorizedControls.length && !prior.newWriterFrom) {
       return tx.nativeAnalyticsInterval.update({ where: { id: prior.id }, data: { authorizedControls: authorizedControls as Prisma.InputJsonValue } });
     }
@@ -68,6 +79,6 @@ export async function changeAnalyticsInterval(tx: Prisma.TransactionClient, inpu
   if (prior && input.at <= prior.validFrom) throw new Error('Analytics policy time must advance');
   await tx.nativeAnalyticsInterval.updateMany({ where: { deviceId: input.deviceId, validUntil: null }, data: { validUntil: input.at } });
   return tx.nativeAnalyticsInterval.create({ data: { homeId: input.homeId, hubInstallationId: input.hubInstallationId, deviceId: input.deviceId,
-    analyticsCategory: input.category, selectedControlId: input.selectedControlId, sourceGeneration: input.generation,
+    analyticsCategory: input.category, selectedControlId: input.selectedControlId, sourceGeneration: input.generation, analyticsPolicyVersion,
     revision: (prior?.revision ?? 0) + 1, validFrom: input.at, authorizedControls: authorizedControls as Prisma.InputJsonValue } });
 }

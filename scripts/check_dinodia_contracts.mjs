@@ -251,6 +251,7 @@ for (const [schemaName, filename, select] of fixtureChecks) {
 // a newly added valid or adversarial fixture from silently becoming an
 // unvalidated documentation-only artifact.
 const fixtureCases = [
+  ["state-evidence-retained.json", "controlStateEvidence2", (v) => v, true],
   ["analytics-interval-usage.json", "analyticsIntervalUsage", (v) => v, true],
   ["account-session-two-homes.json", "accountSessionContext", (v) => v, true],
   ["customer-session-receipt.json", "customerSessionReceipt", (v) => v, true],

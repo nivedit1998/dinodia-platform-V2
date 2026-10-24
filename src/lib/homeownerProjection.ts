@@ -4,8 +4,6 @@ import { nativeDisplayGroups } from './nativeDisplayGroups';
 import { currentCloudflareTunnelStatus } from './hubSyncTelemetry';
 
 const HEARTBEAT_ONLINE_SECONDS = 420;
-const RADIATOR_FRESH_MS = 30 * 60 * 1000;
-
 function defaultFloorplan(areaIds: string[]) {
   const columns = 6;
   const rows = Math.max(1, Math.ceil(areaIds.length / columns));
@@ -82,6 +80,9 @@ export async function readHomeownerProjection(db: Prisma.TransactionClient, inpu
         id: true, originalName: true, overrideName: true, deviceType: true, manufacturer: true, model: true, protocol: true,
         onlineState: true, lastSeenAt: true, lifecycle: true, installedAt: true, inventoryRevision: true,
         radiatorTemperature: true, radiatorReadingAt: true,
+        temperatureSamples: { where: { sourceObservedAt: { lte: now }, purgeAt: { gt: now } },
+          orderBy: { sourceObservedAt: 'desc' }, take: 1,
+          select: { temperature: true, sourceObservedAt: true, validUntil: true, currentnessEndedAt: true, analyticsPolicyVersion: true } },
         assignments: { where: { validUntil: null, area: { status: 'ACTIVE' } }, orderBy: { areaId: 'asc' }, take: 8, select: { areaId: true } },
       },
       orderBy: [{ originalName: 'asc' }, { id: 'asc' }], take: 500,
@@ -117,17 +118,21 @@ export async function readHomeownerProjection(db: Prisma.TransactionClient, inpu
   const devices = deviceRows.flatMap((device) => {
     const canonicalAreaIds = device.assignments.map((row) => row.areaId).filter((id) => areaIds.has(id));
     if (canonicalAreaIds.length === 0) return [];
-    const readingAt = device.radiatorReadingAt;
+    const latestTemperature = device.temperatureSamples[0];
+    const readingAt = latestTemperature?.sourceObservedAt ?? device.radiatorReadingAt;
     const readingAge = readingAt ? now.getTime() - readingAt.getTime() : Number.POSITIVE_INFINITY;
-    const readingFresh = readingAt !== null && readingAge >= 0 && readingAge <= RADIATOR_FRESH_MS;
+    const readingValue = latestTemperature ? Number(latestTemperature.temperature) : device.radiatorTemperature;
+    const effectiveValidUntil = latestTemperature?.currentnessEndedAt && latestTemperature.currentnessEndedAt < latestTemperature.validUntil
+      ? latestTemperature.currentnessEndedAt : latestTemperature?.validUntil;
+    const readingFresh = latestTemperature?.analyticsPolicyVersion === 3 && Boolean(effectiveValidUntil && effectiveValidUntil > now) && readingAge >= 0;
     return [{
       id: device.id, originalName: device.originalName, overrideName: device.overrideName,
       displayName: currentNativeDisplayName(device.originalName, device.overrideName),
       deviceType: device.deviceType, manufacturer: device.manufacturer, model: device.model, protocol: device.protocol,
       canonicalAreaIds, onlineState: device.onlineState, lastSeenAt: device.lastSeenAt?.toISOString() ?? null,
       lifecycle: device.lifecycle, installedAt: device.installedAt?.toISOString() ?? null, revision: device.inventoryRevision,
-      readings: device.radiatorTemperature === null ? [] : [{
-        kind: 'radiator_temperature', value: readingFresh ? Number(device.radiatorTemperature) : null,
+      readings: readingValue === null ? [] : [{
+        kind: 'radiator_temperature', value: Number(readingValue),
         unit: 'celsius', quality: readingFresh ? 'fresh' : 'stale', sourceAt: readingAt?.toISOString() ?? null,
       }],
     }];

@@ -9,10 +9,11 @@ export type NativeUsageRow = {
 
 export type NativeTemperatureRow = {
   deviceId: string; areaId: string; sourceObservedAt: Date | string;
-  validUntil: Date | string; temperature: number | string;
+  validUntil: Date | string; temperature: number | string; analyticsPolicyVersion?: number;
 };
 
 export const NATIVE_TEMPERATURE_MAX_VALIDITY_MS = 30 * 60 * 1000;
+export const NATIVE_EVIDENCE_TEMPERATURE_MAX_VALIDITY_MS = 65595 * 1000;
 
 export function validAnalyticsTimezone(value: string): boolean {
   try { new Intl.DateTimeFormat('en', { timeZone: value }).format(0); return true; } catch { return false; }
@@ -152,11 +153,13 @@ export function aggregateNativeUsage(rows: readonly NativeUsageRow[], level: Nat
 export function aggregateNativeTemperature(rows: readonly NativeTemperatureRow[], level: NativeAnalyticsLevel, timezone: string, now: Date,
   window?: { from: Date; to: Date; retentionStart?: Date }) {
   if (!validAnalyticsTimezone(timezone) || !Number.isFinite(now.getTime())) throw new TypeError('Invalid temperature query');
-  const grouped = new Map<string, { period: ReturnType<typeof usagePeriod>; rows: Array<{ deviceId: string; source: number; validUntil: number; value: number; intervalStart: number; intervalEnd: number }> }>();
+  const grouped = new Map<string, { period: ReturnType<typeof usagePeriod>; rows: Array<{ deviceId: string; source: number; validUntil: number; value: number;
+    analyticsPolicyVersion: number; intervalStart: number; intervalEnd: number }> }>();
   for (const row of rows) {
     const source = new Date(row.sourceObservedAt); const validUntil = new Date(row.validUntil); const value = Number(row.temperature);
     if (!Number.isFinite(source.getTime()) || !Number.isFinite(validUntil.getTime()) || !Number.isFinite(value) || value < -50 || value > 80
-      || validUntil <= source || validUntil.getTime() - source.getTime() > NATIVE_TEMPERATURE_MAX_VALIDITY_MS) continue;
+      || validUntil <= source || validUntil.getTime() - source.getTime() > (row.analyticsPolicyVersion === 3
+        ? NATIVE_EVIDENCE_TEMPERATURE_MAX_VALIDITY_MS : NATIVE_TEMPERATURE_MAX_VALIDITY_MS)) continue;
     const requestedStart = window?.from.getTime() ?? Number.NEGATIVE_INFINITY;
     const requestedEnd = Math.min(window?.to.getTime() ?? now.getTime(), now.getTime());
     const retentionStart = window?.retentionStart?.getTime() ?? Number.NEGATIVE_INFINITY;
@@ -173,6 +176,7 @@ export function aggregateNativeTemperature(rows: readonly NativeTemperatureRow[]
       if (!Number.isFinite(periodEnd) || clippedEnd <= cursor) break;
       const entry = grouped.get(period.key) ?? { period, rows: [] };
       entry.rows.push({ deviceId: row.deviceId, source: source.getTime(), validUntil: validUntil.getTime(), value,
+        analyticsPolicyVersion: row.analyticsPolicyVersion ?? 2,
         intervalStart: cursor, intervalEnd: clippedEnd });
       grouped.set(period.key, entry);
       cursor = clippedEnd;
@@ -220,7 +224,8 @@ export function aggregateNativeTemperature(rows: readonly NativeTemperatureRow[]
     return { id, start: entry.period.start, end: entry.period.end, label: entry.period.label,
       celsius: Math.round((covered ? weighted / covered : latest.value) * 100) / 100,
       sampleCount: entry.rows.length, sourceAt: new Date(latest.source).toISOString(), validUntil: new Date(latest.validUntil).toISOString(),
-      currentFresh: now.getTime() < latest.validUntil, coverageSeconds: Math.floor(covered / 1000), segments };
+      currentFresh: latest.analyticsPolicyVersion === 3 && now.getTime() < latest.validUntil,
+      coverageSeconds: Math.floor(covered / 1000), segments };
   });
 }
 

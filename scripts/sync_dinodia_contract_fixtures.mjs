@@ -7,6 +7,7 @@ const platform = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..'
 const source = path.join(platform, 'contracts/dinodia-v1');
 // Every destination must be explicitly supplied. Never discover writable sibling checkouts.
 const targets = JSON.parse(process.env.DINODIA_CONTRACT_TARGETS || '{}');
+const targetBranches = JSON.parse(process.env.DINODIA_CONTRACT_TARGET_BRANCHES || '{}');
 const paths = { hub: 'test/fixtures/contracts/dinodia-v1', ios: 'DinodiaTests/Fixtures/DinodiaV1',
   alexa: 'test/fixtures/dinodia-v1', edge: 'test/fixtures/dinodia-v1' };
 if (!Object.keys(targets).length || Object.keys(targets).some(key => !Object.hasOwn(paths, key)))
@@ -16,7 +17,8 @@ const repos = Object.entries(targets).map(([consumer, directory]) => {
   const root = fs.realpathSync(directory);
   if (!root.includes('/worktrees/')) throw new Error('Refusing to mutate a primary checkout');
   const branch = execFileSync('git', ['-C', root, 'branch', '--show-current'], { encoding: 'utf8' }).trim();
-  if (!branch.endsWith('universal-category-analytics-20261023')) throw new Error('Consumer branch is not claimed for this task');
+  if (targetBranches[consumer] ? branch !== targetBranches[consumer] : !branch.endsWith('universal-category-analytics-20261023'))
+    throw new Error('Consumer branch is not claimed for this task');
   return [root, paths[consumer]];
 });
 for (const [repo, relative] of repos) {
