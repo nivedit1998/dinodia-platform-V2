@@ -53,7 +53,7 @@ export async function readNativeAnalyticsBootstrap(homeId: string, timezone: str
       device: { is: { homeId, managementClass: 'PROPERTY_DEVICE', analyticsCategory: 'RADIATOR' } } }, orderBy: { sourceObservedAt: 'asc' }, select: { sourceObservedAt: true } }),
     prisma.nativeTemperatureSample.findMany({ where: { homeId, sourceObservedAt: { gte: new Date(Math.max(cutoff.getTime(), now.getTime() - NATIVE_EVIDENCE_TEMPERATURE_MAX_VALIDITY_MS)), lte: now }, purgeAt: { gt: now },
       device: { is: { homeId, managementClass: 'PROPERTY_DEVICE', analyticsCategory: 'RADIATOR' } } }, orderBy: { sourceObservedAt: 'desc' }, take: ANALYTICS_MAX_ROWS + 1,
-      select: { deviceId: true, areaId: true, temperature: true, sourceObservedAt: true, validUntil: true, analyticsPolicyVersion: true } }),
+      select: { deviceId: true, areaId: true, temperature: true, sourceObservedAt: true, validUntil: true, currentnessEndedAt: true, analyticsPolicyVersion: true } }),
     prisma.nativeDevice.findMany({ where: { homeId, managementClass: 'PROPERTY_DEVICE', lifecycle: 'RETIRED',
       usageBuckets: { some: { homeId, bucketStart: { gte: cutoff, lte: now }, purgeAt: { gt: now } } } },
       orderBy: [{ retiredAt: 'desc' }, { id: 'asc' }], take: 100,
@@ -61,7 +61,9 @@ export async function readNativeAnalyticsBootstrap(homeId: string, timezone: str
   ]);
   if (areaRows.length > ANALYTICS_MAX_AREAS || devices.length > ANALYTICS_MAX_DEVICES || latestTemperatureRows.length > ANALYTICS_MAX_ROWS) throw boundedQueryError();
   const latestTemperature = latestTemperatureRows[0] ?? null;
-  const currentTemperatureCandidates = latestTemperatureRows.filter((sample) => sample.analyticsPolicyVersion === 3 && sample.validUntil > now);
+  const effectiveEnd = (sample: { validUntil: Date; currentnessEndedAt: Date | null }) =>
+    sample.currentnessEndedAt && sample.currentnessEndedAt < sample.validUntil ? sample.currentnessEndedAt : sample.validUntil;
+  const currentTemperatureCandidates = latestTemperatureRows.filter((sample) => sample.analyticsPolicyVersion === 3 && effectiveEnd(sample) > now);
   const temperatureAssignmentDeviceIds = [...new Set(currentTemperatureCandidates.map((sample) => sample.deviceId))];
   const temperatureAssignmentAreaIds = [...new Set(currentTemperatureCandidates.map((sample) => sample.areaId))];
   const currentTemperatureAssignments = temperatureAssignmentDeviceIds.length ? await prisma.deviceAreaAssignment.findMany({ where: {
@@ -79,17 +81,18 @@ export async function readNativeAnalyticsBootstrap(homeId: string, timezone: str
   const lastTemperature = !currentTemperature && activeRadiators.length ? await prisma.nativeTemperatureSample.findFirst({ where: {
     homeId, deviceId: { in: activeRadiators.map((device) => device.id) }, sourceObservedAt: { gte: new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000), lte: now }, purgeAt: { gt: now },
     device: { is: { homeId, managementClass: 'PROPERTY_DEVICE', analyticsCategory: 'RADIATOR' } } }, orderBy: { sourceObservedAt: 'desc' },
-    select: { deviceId: true, areaId: true, temperature: true, sourceObservedAt: true, validUntil: true } }) : null;
+    select: { deviceId: true, areaId: true, temperature: true, sourceObservedAt: true, validUntil: true, currentnessEndedAt: true } }) : null;
   const lastIsCurrentlyAssigned = Boolean(lastTemperature && activeRadiators.some((device) => device.id === lastTemperature.deviceId
     && device.assignments.some((assignment) => assignment.areaId === lastTemperature.areaId)));
   const temperature = currentTemperature
     ? { latestCelsius: Number(currentTemperature.temperature), quality: 'fresh' as const,
-        sourceAt: currentTemperature.sourceObservedAt.toISOString(), validUntil: currentTemperature.validUntil.toISOString() }
+        sourceAt: currentTemperature.sourceObservedAt.toISOString(), validUntil: effectiveEnd(currentTemperature).toISOString() }
     : lastTemperature && lastIsCurrentlyAssigned
       ? { latestCelsius: Number(lastTemperature.temperature), quality: 'stale' as const,
-          sourceAt: lastTemperature.sourceObservedAt.toISOString(), validUntil: lastTemperature.validUntil.toISOString() }
-      : { latestCelsius: null, quality: 'unknown' as const,
-          sourceAt: latestTemperature?.sourceObservedAt.toISOString() ?? null, validUntil: latestTemperature?.validUntil.toISOString() ?? null };
+          sourceAt: lastTemperature.sourceObservedAt.toISOString(), validUntil: effectiveEnd(lastTemperature).toISOString() }
+        : { latestCelsius: null, quality: 'unknown' as const,
+          sourceAt: latestTemperature?.sourceObservedAt.toISOString() ?? null,
+          validUntil: latestTemperature ? effectiveEnd(latestTemperature).toISOString() : null };
   const areas = areaRows as AnalyticsArea[];
   const groups = currentAnalyticsGroups(homeId, areas);
   const sevenDays = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
@@ -194,11 +197,12 @@ export async function readNativeTemperatureDetail(homeId: string, timezone: stri
   // scanning unbounded history or extending its original deadline.
   const overlapStart = new Date(Math.max(window.retentionStart.getTime(), window.from.getTime() - NATIVE_EVIDENCE_TEMPERATURE_MAX_VALIDITY_MS));
   const rows = await prisma.nativeTemperatureSample.findMany({ where: { homeId,
-    sourceObservedAt: { gte: overlapStart, lt: window.to }, validUntil: { gt: window.from }, purgeAt: { gt: now },
+    sourceObservedAt: { gte: overlapStart, lt: window.to }, validUntil: { gt: window.from },
+    OR: [{ currentnessEndedAt: null }, { currentnessEndedAt: { gt: window.from } }], purgeAt: { gt: now },
     device: { is: { homeId, managementClass: 'PROPERTY_DEVICE', analyticsCategory: 'RADIATOR' } }, area: { is: { homeId } },
     ...(filters.areaIds ? { areaId: { in: filters.areaIds } } : {}), ...(filters.deviceIds ? { deviceId: { in: filters.deviceIds } } : {}) },
     orderBy: [{ sourceObservedAt: 'asc' }, { deviceId: 'asc' }], take: ANALYTICS_MAX_ROWS + 1,
-    select: { deviceId: true, areaId: true, sourceObservedAt: true, validUntil: true, temperature: true, analyticsPolicyVersion: true } });
+    select: { deviceId: true, areaId: true, sourceObservedAt: true, validUntil: true, currentnessEndedAt: true, temperature: true, analyticsPolicyVersion: true } });
   if (rows.length > ANALYTICS_MAX_ROWS) throw boundedQueryError();
   const candidateDeviceIds = [...new Set(rows.map((row) => row.deviceId))];
   const areaIds = [...new Set(rows.map((row) => row.areaId))];
@@ -207,7 +211,8 @@ export async function readNativeTemperatureDetail(homeId: string, timezone: stri
   const eligible = rows.flatMap((row) => {
     const assignment = assignmentForTemperatureSource(row, assignments);
     if (!assignment) return [];
-    const validUntil = assignment.validUntil && assignment.validUntil < row.validUntil ? assignment.validUntil : row.validUntil;
+    const evidenceEnd = row.currentnessEndedAt && row.currentnessEndedAt < row.validUntil ? row.currentnessEndedAt : row.validUntil;
+    const validUntil = assignment.validUntil && assignment.validUntil < evidenceEnd ? assignment.validUntil : evidenceEnd;
     if (validUntil <= row.sourceObservedAt) return [];
     return [{ ...row, validUntil }];
   });

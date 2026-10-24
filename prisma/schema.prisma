@@ -1994,6 +1994,7 @@ model NativeTemperatureSample {
   temperature      Decimal  @db.Decimal(6, 2)
   sourceObservedAt DateTime
   validUntil       DateTime
+  currentnessEndedAt DateTime?
   sourceGeneration Int
   analyticsPolicyVersion Int @default(2)
   purgeAt          DateTime

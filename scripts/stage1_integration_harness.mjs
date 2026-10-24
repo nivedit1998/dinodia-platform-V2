@@ -6867,6 +6867,7 @@ async function pendingInvitationRouteChecks(deliveryEnv) {
   const telemetryPending = hub.store.getSyncOutbox().events.filter((event) => event.sequence > hub.store.getSyncOutbox().acknowledgedSequence
     && ['device.upsert', 'control.catalog.upsert', 'usage.bucket', 'temperature.sample'].includes(event.type)
     && event.payload?.osDeviceId === telemetryOsDeviceId);
+  const telemetryTemperatureObservation = telemetryPending.find((event) => event.type === 'temperature.sample');
   const telemetryCatalog = telemetryPending.find((event) => event.type === 'control.catalog.upsert')?.payload;
   const telemetryTemperatureDescriptor = telemetryCatalog?.controls?.find((control) => control.controlId === telemetryTemperatureControlId);
   const telemetryValiditySeconds = Number(telemetryTemperatureDescriptor?.maxStateValiditySeconds);
@@ -7024,12 +7025,20 @@ async function pendingInvitationRouteChecks(deliveryEnv) {
   // and an ONLINE inventory event must not revive it without a new report.
   // The sample is a disposable checked-policy fixture; OFFLINE/ONLINE travel
   // through the real OS Store, durable outbox, signed Hub sync and owner APIs.
+  if (!telemetryTemperatureObservation) fail('The real OS temperature observation is unavailable for offline/replay coverage');
   const checkedObservedAt = new Date(Date.now() - 30_000);
-  const checkedValidUntil = new Date(Date.now() + 10 * 60_000);
-  const checkedEventKey = sha256(`stage10-checked-offline:${telemetryDevice.id}:${checkedObservedAt.toISOString()}`);
+  const checkedValidUntil = new Date(checkedObservedAt.getTime() + 10 * 60_000);
+  const checkedTemperaturePayload = {
+    osDeviceId: telemetryOsDeviceId, osAreaId: telemetryOsAreaId, controlId: telemetryTemperatureControlId,
+    sourceGeneration: customerFixture.identityOneGeneration,
+    sourceEventKey: sha256([telemetryOsDeviceId, telemetryTemperatureControlId, String(customerFixture.identityOneGeneration), checkedObservedAt.toISOString()].join('\n')),
+    temperature: 21.25, sourceObservedAt: checkedObservedAt.toISOString(), validUntil: checkedValidUntil.toISOString(),
+    quality: 'fresh', analyticsPolicyVersion: 3,
+  };
+  const checkedEventKey = checkedTemperaturePayload.sourceEventKey;
   await prisma.nativeTemperatureSample.create({ data: { homeId: telemetryHomeId, deviceId: telemetryDevice.id, areaId: telemetryAreaId,
-    sourceEventKey: checkedEventKey, temperature: 21.25, sourceObservedAt: checkedObservedAt, validUntil: checkedValidUntil,
-    sourceGeneration: customerFixture.identityOneGeneration, analyticsPolicyVersion: 3,
+    sourceEventKey: checkedEventKey, temperature: checkedTemperaturePayload.temperature, sourceObservedAt: checkedObservedAt,
+    validUntil: checkedValidUntil, sourceGeneration: customerFixture.identityOneGeneration, analyticsPolicyVersion: 3,
     purgeAt: new Date(checkedObservedAt.getTime() + 366 * 86_400_000) } });
   const syncAvailability = async (available) => {
     const inventoryPayload = telemetryPending.find((event) => event.type === 'device.upsert')?.payload;
@@ -7060,9 +7069,10 @@ async function pendingInvitationRouteChecks(deliveryEnv) {
   const offlineAt = await syncAvailability(false);
   const offlineDevice = await prisma.nativeDevice.findUniqueOrThrow({ where: { id: telemetryDevice.id }, select: { onlineState: true } });
   const offlineSample = await prisma.nativeTemperatureSample.findUniqueOrThrow({ where: { sourceEventKey: checkedEventKey },
-    select: { temperature: true, sourceObservedAt: true, validUntil: true, analyticsPolicyVersion: true } });
+    select: { temperature: true, sourceObservedAt: true, validUntil: true, currentnessEndedAt: true, analyticsPolicyVersion: true } });
   const offlineProjection = await fetchJson(`${base}/api/v2/homes/${telemetryHomeId}/homeowner-context`, { headers: telemetryHeaders });
-  if (offlineDevice.onlineState !== 'OFFLINE' || offlineSample.validUntil > offlineAt
+  if (offlineDevice.onlineState !== 'OFFLINE' || offlineSample.validUntil <= offlineAt || !offlineSample.currentnessEndedAt
+    || offlineSample.currentnessEndedAt > offlineAt
     || offlineSample.analyticsPolicyVersion !== 3 || Number(offlineSample.temperature) !== 21.25
     || checkedReading(offlineProjection)?.quality !== 'stale' || checkedReading(offlineProjection)?.value !== 21.25) {
     fail(`Trusted OFFLINE did not end currentness while preserving the genuine value (${JSON.stringify({ device: offlineDevice.onlineState,
@@ -7070,17 +7080,26 @@ async function pendingInvitationRouteChecks(deliveryEnv) {
       reading: checkedReading(offlineProjection) ?? null })})`);
   }
   await syncAvailability(true);
+  await hub.store.queueSyncEvent('temperature.sample', checkedEventKey, checkedTemperaturePayload);
+  const replayBatch = await hub.store.prepareSyncBatch(telemetryHubId, hub.pairing.runtime, Date.now());
+  const replayEvent = replayBatch?.events?.find((event) => event.type === 'temperature.sample' && event.aggregateId === checkedEventKey);
+  if (!replayBatch || !replayEvent) fail('The real OS outbox did not re-enqueue the identical temperature observation');
+  const replayAccepted = await hub.pairing.requestWithHubIdentity('/api/hub-agent/v2/sync', replayBatch);
+  if (Number(replayAccepted?.acceptedThroughSequence) < Number(replayEvent.sequence)) {
+    fail(`The signed Platform sync rejected an idempotent temperature observation replay (${replayAccepted?.errorCode || replayAccepted?.code || 'no-code'})`);
+  }
+  await hub.store.acknowledgeSyncBatch({ streamId: replayAccepted.streamId, acceptedThroughSequence: Number(replayAccepted.acceptedThroughSequence),
+    cloudRevision: Number(replayAccepted.cloudRevision), configurationAppliedRevision: Number(replayAccepted.configurationAppliedRevision) });
   const onlineProjection = await fetchJson(`${base}/api/v2/homes/${telemetryHomeId}/homeowner-context`, { headers: telemetryHeaders });
   const onlineDevice = await prisma.nativeDevice.findUniqueOrThrow({ where: { id: telemetryDevice.id }, select: { onlineState: true } });
-  const onlineSample = await prisma.nativeTemperatureSample.findUniqueOrThrow({ where: { sourceEventKey: checkedEventKey }, select: { validUntil: true } });
-  if (onlineDevice.onlineState !== 'ONLINE' || onlineSample.validUntil > offlineAt
+  const onlineSample = await prisma.nativeTemperatureSample.findUniqueOrThrow({ where: { sourceEventKey: checkedEventKey }, select: { validUntil: true, currentnessEndedAt: true } });
+  if (onlineDevice.onlineState !== 'ONLINE' || onlineSample.validUntil <= offlineAt || !onlineSample.currentnessEndedAt
+    || onlineSample.currentnessEndedAt > offlineAt
     || checkedReading(onlineProjection)?.quality !== 'stale' || checkedReading(onlineProjection)?.value !== 21.25) {
     fail(`ONLINE without a new report revived an old checked sample (${JSON.stringify({ device: onlineDevice.onlineState,
       validUntil: onlineSample.validUntil.toISOString(), reading: checkedReading(onlineProjection) ?? null })})`);
   }
-  console.log('[state-evidence:integration] PASS: a checked measured value becomes last-reported at the real signed OFFLINE boundary, remains retained, and does not revive after signed ONLINE without a new sample');
-  // This transient fixture must not become the newest reading for later
-  // assertions that independently verify the OS-produced temperature.
+  console.log('[state-evidence:integration] PASS: real signed OFFLINE ends currentness without mutating source identity; identical observation replay remains idempotent after ONLINE and cannot revive the value');
   await prisma.nativeTemperatureSample.delete({ where: { sourceEventKey: checkedEventKey } });
   const delayedTemperatureProjections = await Promise.all(delayedTemperatureResults.map(async (sample) => {
     const from = new Date(Date.parse(sample.sourceObservedAt) - 60 * 60_000).toISOString();

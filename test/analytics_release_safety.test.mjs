@@ -92,11 +92,38 @@ test('checked temperature evidence ends at trusted OFFLINE and cannot revive on 
     now: new Date('2026-10-24T10:20:00Z'), event: event(false, '2026-10-24T10:10:00Z') });
   assert.equal(clipped.length, 1, 'trusted offline must durably end prior checked sample validity');
   assert.deepEqual(clipped[0].where, { deviceId: 'device', analyticsPolicyVersion: 3,
-    sourceObservedAt: { lt: new Date('2026-10-24T10:10:00Z') }, validUntil: { gt: new Date('2026-10-24T10:10:00Z') } });
-  assert.deepEqual(clipped[0].data, { validUntil: new Date('2026-10-24T10:10:00Z') });
+    sourceObservedAt: { lt: new Date('2026-10-24T10:10:00Z') }, validUntil: { gt: new Date('2026-10-24T10:10:00Z') },
+    OR: [{ currentnessEndedAt: null }, { currentnessEndedAt: { gt: new Date('2026-10-24T10:10:00Z') } }] });
+  assert.deepEqual(clipped[0].data, { currentnessEndedAt: new Date('2026-10-24T10:10:00Z') });
   await applyHubSyncEvent(tx, { homeId: 'home', hubInstallationId: 'hub', identityGeneration: 1,
     now: new Date('2026-10-24T10:20:00Z'), event: event(true, '2026-10-24T10:15:00Z') });
   assert.equal(clipped.length, 1, 'online without a new observation cannot extend or revive the clipped sample');
+});
+
+test('temperature observation replay after OFFLINE clipping is idempotent but changed sample data conflicts', async () => {
+  const { applyHubSyncEvent } = load('hubSyncIngestion');
+  const sourceObservedAt = new Date('2026-10-24T10:00:00Z');
+  const originalValidUntil = new Date('2026-10-24T11:00:00Z');
+  const sourceGeneration = 1;
+  const controlId = 'temperature';
+  const osDeviceId = 'os-device';
+  const sourceEventKey = require('node:crypto').createHash('sha256').update([
+    osDeviceId, controlId, String(sourceGeneration), sourceObservedAt.toISOString(),
+  ].join('\n'), 'utf8').digest('hex');
+  const device = { id: 'device', homeId: 'home', managementClass: 'PROPERTY_DEVICE', analyticsCategory: 'RADIATOR',
+    lifecycle: 'INSTALLED', descriptorRevision: 4, radiatorReadingAt: sourceObservedAt,
+    capabilitySummary: { controlCatalog: { revision: 4, controls: [{ controlId, semanticRole: 'ambient_temperature',
+      valueType: 'number', observable: true, maxStateValiditySeconds: 3600 }] } } };
+  const alreadyOfflineClipped = { id: 'sample', homeId: 'home', deviceId: 'device', temperature: 21.25,
+    sourceObservedAt, validUntil: originalValidUntil, currentnessEndedAt: new Date('2026-10-24T10:10:00Z') };
+  const tx = { nativeDevice: { findUnique: async () => device, update: async () => ({}) },
+    nativeTemperatureSample: { findUnique: async () => alreadyOfflineClipped } };
+  const applyReplay = (temperature) => applyHubSyncEvent(tx, { homeId: 'home', hubInstallationId: 'hub', identityGeneration: 1,
+    now: new Date('2026-10-24T10:20:00Z'), event: { id: 'temperature-replay', type: 'temperature.sample', aggregateId: sourceEventKey,
+      payload: { osDeviceId, controlId, sourceGeneration, sourceEventKey, temperature, sourceObservedAt: sourceObservedAt.toISOString(),
+        validUntil: originalValidUntil.toISOString(), quality: 'fresh', analyticsPolicyVersion: 3 } } });
+  await applyReplay(21.25);
+  await assert.rejects(applyReplay(22.0), error => error.code === 'hub_sync_temperature_key_conflict');
 });
 
 for (const dbError of [

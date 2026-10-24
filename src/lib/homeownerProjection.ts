@@ -82,7 +82,7 @@ export async function readHomeownerProjection(db: Prisma.TransactionClient, inpu
         radiatorTemperature: true, radiatorReadingAt: true,
         temperatureSamples: { where: { sourceObservedAt: { lte: now }, purgeAt: { gt: now } },
           orderBy: { sourceObservedAt: 'desc' }, take: 1,
-          select: { temperature: true, sourceObservedAt: true, validUntil: true, analyticsPolicyVersion: true } },
+          select: { temperature: true, sourceObservedAt: true, validUntil: true, currentnessEndedAt: true, analyticsPolicyVersion: true } },
         assignments: { where: { validUntil: null, area: { status: 'ACTIVE' } }, orderBy: { areaId: 'asc' }, take: 8, select: { areaId: true } },
       },
       orderBy: [{ originalName: 'asc' }, { id: 'asc' }], take: 500,
@@ -122,7 +122,9 @@ export async function readHomeownerProjection(db: Prisma.TransactionClient, inpu
     const readingAt = latestTemperature?.sourceObservedAt ?? device.radiatorReadingAt;
     const readingAge = readingAt ? now.getTime() - readingAt.getTime() : Number.POSITIVE_INFINITY;
     const readingValue = latestTemperature ? Number(latestTemperature.temperature) : device.radiatorTemperature;
-    const readingFresh = latestTemperature?.analyticsPolicyVersion === 3 && latestTemperature.validUntil > now && readingAge >= 0;
+    const effectiveValidUntil = latestTemperature?.currentnessEndedAt && latestTemperature.currentnessEndedAt < latestTemperature.validUntil
+      ? latestTemperature.currentnessEndedAt : latestTemperature?.validUntil;
+    const readingFresh = latestTemperature?.analyticsPolicyVersion === 3 && Boolean(effectiveValidUntil && effectiveValidUntil > now) && readingAge >= 0;
     return [{
       id: device.id, originalName: device.originalName, overrideName: device.overrideName,
       displayName: currentNativeDisplayName(device.originalName, device.overrideName),
