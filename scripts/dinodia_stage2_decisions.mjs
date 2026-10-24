@@ -485,6 +485,18 @@ function executeSemanticFixture(path, value, adapters) {
   const { os, platform, alexa, schema, analytics } = adapters;
   const result = (outcome, details = {}) => ({ outcome, ...details });
   switch (path) {
+    case "state-evidence-retained.json": {
+      const device = { id: value.deviceId, homeId: value.homeId, descriptorRevision: value.descriptorRevision };
+      const control = { controlId: value.controlId, catalogRevision: value.descriptorRevision,
+        valueType: 'boolean', maxStateValiditySeconds: 420 };
+      assert(schema('controlStateEvidence2', value) && platform.validateStateEvidence2(value, device, control)
+        && value.value === null && value.lastReported?.value === false
+        && value.evidence.status === 'no_verified_guarantee',
+      'Retained false must survive without becoming current or known analytics');
+      const malformed = structuredClone(value); malformed.lastReported.value = 'false';
+      assert(!platform.validateStateEvidence2(malformed, device, control), 'Typed retained values reject boolean strings');
+      return result('accepted', { protectedEffects: 0 });
+    }
     case "account-relationship-lifecycle.json": {
       return result("accepted", assertAccountRelationshipLifecycle(value));
     }

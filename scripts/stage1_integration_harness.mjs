@@ -996,6 +996,8 @@ async function startPlatform(runEnv) {
           } catch { /* Never forward malformed or unfiltered application diagnostics. */ }
         }
         const alexaRevokePhase = line.match(/\[stage12:alexa-revoke\] phase=([a-z-]{1,64})/)?.[1];
+        const deliveryCode = line.match(/\[native-alexa-delivery\] database code=(P\d{4})/)?.[1];
+        if (deliveryCode) console.log(`[state-evidence:integration] delivery database code=${deliveryCode}`);
         if (alexaRevokePhase) console.log(`[stage12:integration] revoke phase=${alexaRevokePhase}`);
         const alexaRevokeError = line.match(/\[stage12:alexa-revoke\] error code=([A-Za-z0-9_-]{1,16}) column=([A-Za-z0-9_."]{1,120})/);
         if (alexaRevokeError) console.log(`[stage12:integration] revoke query error code=${alexaRevokeError[1]} column=${alexaRevokeError[2]}`);
@@ -4073,6 +4075,22 @@ async function nativeAlexaOAuthChecks(deliveryEnv) {
   const fixture = customerFixture;
   if (!fixture) fail('Native Alexa OAuth checks require the disposable customer fixture');
 
+  // This suite drives signed sync explicitly. Do not let the unrelated
+  // heartbeat race the same authority rows during the OAuth/delivery checks.
+  // Restore the normal scheduler after this isolated fixture finishes.
+  const scheduledPairingWasRunning = Boolean(hub.pairing.timer);
+  hub.pairing.stop();
+  const pairingDrainDeadline = Date.now() + 8000;
+  while ((hub.pairing.syncing || hub.pairing.queuedImmediateSync || hub.pairing.recoveryEndpointInFlight)
+    && Date.now() < pairingDrainDeadline) await sleep(25);
+  if (hub.pairing.syncing || hub.pairing.queuedImmediateSync || hub.pairing.recoveryEndpointInFlight)
+    fail('The scheduled sync did not settle before the isolated Alexa fixture');
+  const syncAlexaFixture = async () => {
+    hub.pairing.stopped = false;
+    try { return await hub.pairing.syncNow(); }
+    finally { hub.pairing.stop(); }
+  };
+
   const base = `http://127.0.0.1:${appPort}`;
   const clientId = 'stage12-loopback-client';
   const clientSecret = 'stage12-disposable-client-secret-for-loopback';
@@ -4851,9 +4869,9 @@ async function nativeAlexaOAuthChecks(deliveryEnv) {
     }
     hub.eventBus.off('state_changed', observeStateNotification);
     hub.pairing.nextRetryAt = 0;
-    await hub.pairing.syncNow();
+    await syncAlexaFixture();
     for (let attempt = 0; attempt < 20 && hub.store.getSyncOutbox().acknowledgedSequence < nativeStateEvent.sequence; attempt += 1) {
-      if (!hub.pairing.syncing) { hub.pairing.nextRetryAt = 0; await hub.pairing.syncNow(); }
+      if (!hub.pairing.syncing) { hub.pairing.nextRetryAt = 0; await syncAlexaFixture(); }
       if (hub.store.getSyncOutbox().acknowledgedSequence < nativeStateEvent.sequence) await sleep(50);
     }
     const acceptedStateEvent = await prisma.nativeDevice.findUniqueOrThrow({ where: { id: permanentDeviceId }, select: { capabilitySummary: true } });
@@ -5072,17 +5090,27 @@ async function nativeAlexaOAuthChecks(deliveryEnv) {
         authorization: `Bearer ${selectedOsSession.body.token}`, 'x-dinodia-state-evidence-version': '2' } });
       fail(`A second genuine observation did not enter the outbox (${JSON.stringify({
         state: entity?.state, observedAt: entity?.sourceObservedAt, admission: entity?.admittedEvidence?.quality,
+        device: { managementClass: actual.managementClass, hasOwner: Boolean(actual.ownerMembershipId || actual.tenantOwnerMembershipId),
+          protocol: actual.protocol, online: actual.online, availability: actual.availability },
+        entity: { endpoint: entity?.endpointId, binding: entity?.binding, stateKey: entity?.stateKey,
+          timing: entity?.stateEvidenceTiming, receivedAt: entity?.sourceReceivedAt, validUntil: entity?.sourceValidUntil,
+          retained: entity?.lastReported, admission: entity?.admittedEvidence },
+        now: osHarnessClock(), sourceGeneration: hub.store.syncSourceGeneration,
         proof: Object.values(hub.store.getObservationPolicyRecords()).map(record => ({ state: record.state, suspended: record.suspended,
-          sourceGeneration: record.sourceGeneration, lifecycleMatches: record.deviceLifecycleId === actual.stateEvidenceLifecycleId })),
+          sourceGeneration: record.sourceGeneration, lifecycleMatches: record.deviceLifecycleId === actual.stateEvidenceLifecycleId,
+          runtimeMatches: record.runtimeSessionId === hub.store.observationSessionId, controlId: record.controlId,
+          endpoint: record.endpoint, property: record.property, cluster: record.cluster, attribute: record.attribute,
+          readBack: record.readBack, cadence: record.cadence, evidenceVerifiedAt: record.evidenceVerifiedAt,
+          invalidatedAt: record.invalidatedAt, evidenceVersion: record.evidenceVersion })),
         evidence: projection.body?.data?.states?.find(state => state.deviceId === actual.id && state.controlId === 'power')?.evidence?.status,
         receipt: hub.store.getNativeCommandReceipt?.(secondAppCommand.commandId)?.status,
       })})`);
     }
     const secondObservationAt = secondNativeStateEvent.payload.observedAt;
     hub.pairing.nextRetryAt = 0;
-    await hub.pairing.syncNow();
+    await syncAlexaFixture();
     for (let attempt = 0; attempt < 20 && hub.store.getSyncOutbox().acknowledgedSequence < secondNativeStateEvent.sequence; attempt += 1) {
-      if (!hub.pairing.syncing) { hub.pairing.nextRetryAt = 0; await hub.pairing.syncNow(); }
+      if (!hub.pairing.syncing) { hub.pairing.nextRetryAt = 0; await syncAlexaFixture(); }
       if (hub.store.getSyncOutbox().acknowledgedSequence < secondNativeStateEvent.sequence) await sleep(50);
     }
     const secondQueuedReport = await prisma.nativeDomainOutbox.findFirst({ where: {
@@ -5218,6 +5246,7 @@ async function nativeAlexaOAuthChecks(deliveryEnv) {
     } finally {
       await stopPlatform();
       await startPlatform(deliveryEnv);
+      if (scheduledPairingWasRunning) hub.pairing.start();
     }
   }
 }

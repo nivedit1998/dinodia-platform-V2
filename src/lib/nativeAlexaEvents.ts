@@ -275,6 +275,11 @@ async function deliverOne(id: string, nowHint: Date): Promise<'DELIVERED' | 'CAN
     return outcome;
   } catch (error) {
     if (error instanceof PlatformDataEncryptionKeyError) throw error;
+    // Never log the event, token, endpoint or exception message. A bounded
+    // database code distinguishes a rolled-back delivery from gateway refusal.
+    const failureCode = typeof error === 'object' && error !== null && 'code' in error
+      ? String(error.code) : '';
+    if (/^P\d{4}$/.test(failureCode)) console.warn(`[native-alexa-delivery] database code=${failureCode}`);
     const latest = await prisma.nativeDomainOutbox.findUnique({ where: { id }, select: { attempts: true, expiresAt: true } }).catch(() => null);
     const attempts = (latest?.attempts ?? 0) + 1;
     await prisma.nativeDomainOutbox.updateMany({ where: { id, state: 'PENDING' }, data: {
