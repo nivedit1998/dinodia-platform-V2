@@ -349,13 +349,29 @@ function adjustmentOperation(controls: JsonObject[], role: string, adjustmentDel
   return { control, value: 0, alexaNamespace, propertyName, propertyValue: null, adjustmentDelta };
 }
 
+// A setting (writable control) stays as last set until changed, so its last report is the baseline when no
+// current value exists. The Hub sends it separately as lastSetting; its revision must equal the state's, and
+// the Hub re-checks that revision at dispatch, so a newer report always wins.
+function settingBaseline(control: JsonObject, state: JsonObject, now: number): number | null {
+  const last = record(state.lastSetting);
+  if (control.writable !== true || !last || typeof last.value !== 'number' || !Number.isFinite(last.value)
+    || last.revision !== state.revision || typeof last.observedAt !== 'string'
+    || !Number.isFinite(Date.parse(last.observedAt)) || Date.parse(last.observedAt) > now) return null;
+  return last.value;
+}
+
 function resolveAdjustment(control: JsonObject, stateValue: unknown, adjustmentDelta: number, now: number) {
   const state = record(stateValue);
   if (!state || state.controlId !== control.controlId || state.descriptorRevision !== control.catalogRevision
-    || state.quality !== 'fresh' || typeof state.observedAt !== 'string' || typeof state.validUntil !== 'string'
-    || !Number.isSafeInteger(state.revision) || !Number.isFinite(Date.parse(state.observedAt)) || Date.parse(state.observedAt) > now
-    || !Number.isFinite(Date.parse(state.validUntil)) || Date.parse(state.validUntil) <= now
-    || typeof state.value !== 'number' || !Number.isFinite(state.value)) {
+    || !Number.isSafeInteger(state.revision)) {
+    throw new Stage1AuthError(409, 'alexa_state_not_current', 'Current device state is unavailable; no adjustment was sent');
+  }
+  const current = state.quality === 'fresh' && typeof state.observedAt === 'string' && typeof state.validUntil === 'string'
+    && Number.isFinite(Date.parse(state.observedAt)) && Date.parse(state.observedAt) <= now
+    && Number.isFinite(Date.parse(state.validUntil)) && Date.parse(state.validUntil) > now
+    && typeof state.value === 'number' && Number.isFinite(state.value) ? state.value : null;
+  const baseline = current ?? settingBaseline(control, state, now);
+  if (baseline === null) {
     throw new Stage1AuthError(409, 'alexa_state_not_current', 'Current device state is unavailable; no adjustment was sent');
   }
   const bounds = record(control.constraints);
@@ -363,7 +379,7 @@ function resolveAdjustment(control: JsonObject, stateValue: unknown, adjustmentD
     || typeof bounds.step !== 'number' || bounds.step <= 0) {
     throw new Stage1AuthError(409, 'alexa_descriptor_changed', 'The current control range is unavailable');
   }
-  const value = state.value + adjustmentDelta;
+  const value = baseline + adjustmentDelta;
   const steps = (value - bounds.minimum) / bounds.step;
   if (value < bounds.minimum || value > bounds.maximum || Math.abs(steps - Math.round(steps)) > 1e-7) {
     throw new Stage1AuthError(400, 'alexa_value_invalid', 'The requested change is outside the current control range or step');
