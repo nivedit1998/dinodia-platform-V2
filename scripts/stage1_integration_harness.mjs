@@ -6775,7 +6775,7 @@ async function pendingInvitationRouteChecks(deliveryEnv) {
     || !analyticsUsage.body.buckets?.some((bucket) => bucket.onMinutes > 0)
     || JSON.stringify(analyticsUsage.body).includes(privateTenantDevice.id)
     || analyticsTemperature.response.status !== 200 || analyticsTemperature.body?.selectedDeviceCount !== 1
-    || !analyticsTemperature.body.points?.some((point) => point.celsius === 20.5 && point.currentFresh === true)
+    || !analyticsTemperature.body.points?.some((point) => point.celsius === 20.5 && point.currentFresh === false)
     || analyticsPrivateUsage.response.status !== 200 || analyticsPrivateUsage.body?.selectedDeviceCount !== 0
     || analyticsPrivateUsage.body?.buckets?.length !== 0 || privateUsageJson.includes(privateTenantDevice.id) || privateUsageJson.includes(privateTenantDevice.originalName)
     || analyticsAnonymous.response.status !== 401 || analyticsWrongHome.response.status !== 404
@@ -6911,7 +6911,7 @@ async function pendingInvitationRouteChecks(deliveryEnv) {
   }
   const delayedTemperatureResults = [];
   for (const sampleCase of [
-    { label: 'delivered-before-expiry', ageMinutes: 20, temperature: 19.8, expectedFresh: true },
+    { label: 'delivered-before-expiry', ageMinutes: 20, temperature: 19.8, expectedFresh: false },
     { label: 'delivered-after-expiry', ageMinutes: 31, temperature: 18.7, expectedFresh: false },
   ]) {
     const sourceObservedAt = new Date(telemetryNow.getTime() - sampleCase.ageMinutes * 60_000);
@@ -6975,21 +6975,16 @@ async function pendingInvitationRouteChecks(deliveryEnv) {
       configurationAppliedRevision: Number(delayedReceipt.body.configurationAppliedRevision) });
     const savedSample = await prisma.nativeTemperatureSample.findUnique({ where: { sourceEventKey: expectedEventKey },
       select: { deviceId: true, temperature: true, sourceObservedAt: true, validUntil: true } });
-    const currentReading = await prisma.nativeDevice.findUniqueOrThrow({ where: { id: delayedDevice.id },
-      select: { radiatorTemperature: true, radiatorReadingAt: true } });
     if (!savedSample || savedSample.deviceId !== delayedDevice.id || Number(savedSample.temperature) !== sampleCase.temperature
-      || savedSample.sourceObservedAt.getTime() !== sourceObservedAt.getTime() || savedSample.validUntil.getTime() !== validUntil.getTime()
-      || (sampleCase.expectedFresh && currentReading.radiatorReadingAt?.getTime() !== sourceObservedAt.getTime())
-      || (!sampleCase.expectedFresh && (currentReading.radiatorReadingAt !== null || currentReading.radiatorTemperature !== null))) {
+      || savedSample.sourceObservedAt.getTime() !== sourceObservedAt.getTime() || savedSample.validUntil.getTime() !== validUntil.getTime()) {
       fail(`Delayed temperature history/current-state separation failed for ${sampleCase.label} (${JSON.stringify({ stored: Boolean(savedSample),
         originalTimestamp: savedSample?.sourceObservedAt?.toISOString() ?? null, expectedTimestamp: sourceObservedAt.toISOString(),
-        storedDeadline: savedSample?.validUntil?.toISOString() ?? null, expectedDeadline: validUntil.toISOString(),
-        currentReadingAt: currentReading.radiatorReadingAt?.toISOString() ?? null, expectedFresh: sampleCase.expectedFresh })})`);
+        storedDeadline: savedSample?.validUntil?.toISOString() ?? null, expectedDeadline: validUntil.toISOString(), expectedFresh: sampleCase.expectedFresh })})`);
     }
     delayedTemperatureResults.push({ label: sampleCase.label, retained: true, currentFresh: sampleCase.expectedFresh,
       deviceId: delayedDevice.id, sourceObservedAt: sourceObservedAt.toISOString(), temperature: sampleCase.temperature });
   }
-  console.log(`[stage10:integration] PASS: actual OS Store -> signed route retained delayed temperature timestamps/deadlines before and after expiry; only unexpired evidence updated current state (cases=${JSON.stringify(delayedTemperatureResults.map(({ label, retained, currentFresh }) => ({ label, retained, currentFresh })))})`);
+  console.log(`[stage10:integration] PASS: actual legacy-policy OS samples retain original timestamps/deadlines before and after expiry but never become current without checked policy-3 evidence (cases=${JSON.stringify(delayedTemperatureResults.map(({ label, retained, currentFresh }) => ({ label, retained, currentFresh })))})`);
   await prisma.policyAcceptance.upsert({
     where: { customerAccountId_policyKind_policyVersion: { customerAccountId: customerFixture.propertyAccountId, policyKind: 'DINODIA_NATIVE', policyVersion: deliveryEnv.DINODIA_NATIVE_POLICY_VERSION } },
     create: { customerAccountId: customerFixture.propertyAccountId, policyKind: 'DINODIA_NATIVE', policyVersion: deliveryEnv.DINODIA_NATIVE_POLICY_VERSION, acceptedAt: new Date() }, update: {},
@@ -7002,6 +6997,14 @@ async function pendingInvitationRouteChecks(deliveryEnv) {
   }) });
   if (analyticsOwnerLogin.response.status !== 200 || typeof analyticsOwnerLogin.body?.accessToken !== 'string') fail('The route-ingested Stage 10 sample requires a real disposable owner session');
   const telemetryHeaders = { authorization: `Bearer ${analyticsOwnerLogin.body.accessToken}`, 'x-dinodia-home-id': telemetryHomeId };
+  const ownerHomeContext = await fetchJson(`${base}/api/v2/homes/${telemetryHomeId}/homeowner-context`, { headers: telemetryHeaders });
+  const reportedRadiator = ownerHomeContext.body?.devices?.find((device) => device.id === telemetryDevice.id)
+    ?.readings?.find((reading) => reading.kind === 'radiator_temperature');
+  if (ownerHomeContext.response.status !== 200 || reportedRadiator?.value !== 20.5 || reportedRadiator.quality !== 'stale'
+    || reportedRadiator.sourceAt !== telemetryObservedAt.toISOString()) {
+    fail(`Owner Home state did not retain the legacy measured temperature as explicitly last-reported (${JSON.stringify({ status: ownerHomeContext.response.status, reading: reportedRadiator ?? null })})`);
+  }
+  console.log('[state-evidence:integration] PASS: authenticated homeowner projection retains legacy temperature and original age while refusing to label unverified fixed-window evidence current');
   const delayedTemperatureProjections = await Promise.all(delayedTemperatureResults.map(async (sample) => {
     const from = new Date(Date.parse(sample.sourceObservedAt) - 60 * 60_000).toISOString();
     const to = telemetryNow.toISOString();
@@ -7030,7 +7033,7 @@ async function pendingInvitationRouteChecks(deliveryEnv) {
   if (telemetryBootstrap.response.status !== 200 || !telemetryBootstrap.body.devices?.some((device) => device.id === telemetryDevice.id)
     || telemetryBootstrap.body.devices?.some((device) => device.id === telemetryPrivateDevice.id || device.label === telemetryPrivateDevice.originalName)
     || telemetryUsage.response.status !== 200 || telemetryUsage.body.selectedDeviceCount !== 1 || !telemetryUsage.body.buckets?.some((bucket) => bucket.onMinutes > 0)
-    || telemetryTemperature.response.status !== 200 || telemetryTemperature.body.selectedDeviceCount !== 1 || !telemetryTemperature.body.points?.some((point) => point.celsius === 20.5 && point.currentFresh === true)
+    || telemetryTemperature.response.status !== 200 || telemetryTemperature.body.selectedDeviceCount !== 1 || !telemetryTemperature.body.points?.some((point) => point.celsius === 20.5 && point.currentFresh === false)
     || telemetryWrongHome.response.status !== 404) {
     fail(`The actual signed ingestion-to-owner analytics path or its privacy boundary failed (${JSON.stringify({ bootstrap: telemetryBootstrap.response.status, usage: telemetryUsage.response.status, usageCount: telemetryUsage.body?.selectedDeviceCount, usageBuckets: telemetryUsage.body?.buckets?.map((bucket) => ({ onMinutes: bucket.onMinutes, coverageSeconds: bucket.coverageSeconds, isPartial: bucket.isPartial })), temperature: telemetryTemperature.response.status, temperatureCount: telemetryTemperature.body?.selectedDeviceCount, temperaturePoints: telemetryTemperature.body?.points?.map((point) => ({ celsius: point.celsius, currentFresh: point.currentFresh, sourceAt: point.sourceAt })), wrongHome: telemetryWrongHome.response.status, deviceVisible: Boolean(telemetryBootstrap.body?.devices?.some((device) => device.id === telemetryDevice.id)), privateAbsent: !JSON.stringify(telemetryBootstrap.body).includes(telemetryPrivateDevice.id) })})`);
   }
@@ -7498,7 +7501,9 @@ async function pendingInvitationRouteChecks(deliveryEnv) {
   // F10-B: queue a second real Store-produced Radiator sample whose source
   // validity expired before this signed route delivery. It must be retained
   // as historical evidence, must not become current, and must not replace the
-  // newer fresh reading from the first telemetry device. The preceding
+  // newer last-reported value from the first telemetry device. That earlier
+  // sample uses the legacy fixed-window policy and is not labelled current.
+  // The preceding
   // assignment-boundary cases are complete; keep the earliest existing
   // assignment boundary while extending it far enough backward to cover the
   // historical temperature's source time. Moving validFrom forward here
@@ -7546,11 +7551,11 @@ async function pendingInvitationRouteChecks(deliveryEnv) {
     || delayedRows[1].validUntil.getTime() !== delayedObservedAt.getTime() + 30 * 60_000
     || delayedTemperatureRoute.response.status !== 200 || !delayedPoint || delayedPoint.currentFresh !== false
     || delayedPoint.validUntil !== new Date(delayedObservedAt.getTime() + 30 * 60_000).toISOString()
-    || currentTemperatureBootstrap.body?.temperature?.latestCelsius !== 20.5 || currentTemperatureBootstrap.body?.temperature?.quality !== 'fresh'
+    || currentTemperatureBootstrap.body?.temperature?.latestCelsius !== 20.5 || currentTemperatureBootstrap.body?.temperature?.quality !== 'stale'
     || delayedReceiptCountAfter <= delayedReceiptCountBefore) {
     fail(`Expired delivery did not remain historical-only or replaced current Radiator state (${JSON.stringify({ rows: delayedRows.map((row) => ({ temperature: Number(row.temperature), sourceAt: row.sourceObservedAt.toISOString(), validUntil: row.validUntil.toISOString() })), status: delayedTemperatureRoute.response.status, delayedPoint: delayedPoint ? { celsius: delayedPoint.celsius, currentFresh: delayedPoint.currentFresh, sourceAt: delayedPoint.sourceAt, validUntil: delayedPoint.validUntil } : null, bootstrap: currentTemperatureBootstrap.body?.temperature, receiptAdded: delayedReceiptCountAfter > delayedReceiptCountBefore })})`);
   }
-  console.log('[stage10:integration] PASS: a real OS-source 20.8°C Radiator sample delivered 31 minutes late was signed, deduplicated and retained with its original 30-minute deadline; analytics marked it historical/not-current and kept the newer fresh current reading');
+  console.log('[stage10:integration] PASS: a real OS-source 20.8°C Radiator sample delivered 31 minutes late was signed, deduplicated and retained with its original deadline; analytics marked it historical/not-current and kept the newer legacy last-reported value stale');
 
   for (let attempt = 0; attempt < 20; attempt += 1) {
     const pendingOutbox = hub.store.getSyncOutbox();
@@ -8758,7 +8763,7 @@ async function pendingInvitationRouteChecks(deliveryEnv) {
     || retry.response.status !== 200 || !retry.body.idempotentReplay || conflictingDecision.response.status !== 409
     || conflictingDecision.body?.error?.code !== 'REVISION_CONFLICT'
     || afterReplay[0].tenantAreaGrants.length !== 1 || afterReplay[1].managementRevision !== initialHome.managementRevision + 1 || afterReplay[2] !== 1) {
-    fail(`Concurrent identical invitation accepts did not return one original and one exact replay, or did not commit one exact tenant grant (${identicalAccepts.map((result) => `${result.response.status}/${result.body?.idempotentReplay}`).join(',')}; retry=${retry.response.status}; conflict=${conflictingDecision.response.status})`);
+    fail(`Concurrent identical invitation accepts did not return one original and one exact replay, or did not commit one exact tenant grant (${JSON.stringify({ accepts: identicalAccepts.map((result) => ({ status: result.response.status, body: result.body })), retry: { status: retry.response.status, body: retry.body }, conflict: { status: conflictingDecision.response.status, body: conflictingDecision.body } })})`);
   }
   console.log('[stage6:integration] PASS: concurrent identical invitation ACCEPTs return one committed receipt and one exact idempotent replay with the same membership, one Area grant, one Home revision increment and one audit');
   const recipientOnly = await fetchJson(`${base}/api/v2/invitations/${invitation.id}/decision`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ decision: 'ACCEPT', expectedUpdatedAt: invitation.updatedAt.toISOString() }) });

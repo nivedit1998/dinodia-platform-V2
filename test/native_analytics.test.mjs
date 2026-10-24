@@ -84,13 +84,15 @@ test('a closed first partial hour preserves exactly its observed 30-minute span'
   assert.throws(() => aggregateNativeUsage([{ ...row, coverageEndAt: '2026-10-04T11:00:00.001Z' }], 'hour', 'Europe/London'), /coverage span/);
 });
 
-test('temperature aggregation keeps point timestamps and reports current freshness without fabricating samples', () => {
+test('temperature aggregation keeps point timestamps and requires checked policy-3 evidence for currentness', () => {
   const rows = [{ deviceId: 'radiator-a', areaId: 'area-a', sourceObservedAt: '2026-10-08T10:00:00.000Z',
     validUntil: '2026-10-08T10:20:00.000Z', temperature: '20.25' }];
   const data = aggregateNativeTemperature(rows, 'hour', 'Europe/London', new Date('2026-10-08T10:10:00.000Z'));
   assert.equal(data.length, 1);
   assert.equal(data[0].celsius, 20.25);
-  assert.equal(data[0].currentFresh, true);
+  assert.equal(data[0].currentFresh, false, 'legacy fixed-window evidence remains historical even before its deadline');
+  const checked = aggregateNativeTemperature([{ ...rows[0], analyticsPolicyVersion: 3 }], 'hour', 'Europe/London', new Date('2026-10-08T10:10:00.000Z'));
+  assert.equal(checked[0].currentFresh, true, 'a bounded policy-3 observation is current before its checked deadline');
   assert.equal(aggregateNativeTemperature(rows, 'hour', 'Europe/London', new Date('2026-10-08T10:20:00.000Z'))[0].currentFresh, false);
   assert.equal(aggregateNativeTemperature([], 'hour', 'Europe/London', new Date()).length, 0);
 });

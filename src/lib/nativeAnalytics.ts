@@ -153,7 +153,8 @@ export function aggregateNativeUsage(rows: readonly NativeUsageRow[], level: Nat
 export function aggregateNativeTemperature(rows: readonly NativeTemperatureRow[], level: NativeAnalyticsLevel, timezone: string, now: Date,
   window?: { from: Date; to: Date; retentionStart?: Date }) {
   if (!validAnalyticsTimezone(timezone) || !Number.isFinite(now.getTime())) throw new TypeError('Invalid temperature query');
-  const grouped = new Map<string, { period: ReturnType<typeof usagePeriod>; rows: Array<{ deviceId: string; source: number; validUntil: number; value: number; intervalStart: number; intervalEnd: number }> }>();
+  const grouped = new Map<string, { period: ReturnType<typeof usagePeriod>; rows: Array<{ deviceId: string; source: number; validUntil: number; value: number;
+    analyticsPolicyVersion: number; intervalStart: number; intervalEnd: number }> }>();
   for (const row of rows) {
     const source = new Date(row.sourceObservedAt); const validUntil = new Date(row.validUntil); const value = Number(row.temperature);
     if (!Number.isFinite(source.getTime()) || !Number.isFinite(validUntil.getTime()) || !Number.isFinite(value) || value < -50 || value > 80
@@ -175,6 +176,7 @@ export function aggregateNativeTemperature(rows: readonly NativeTemperatureRow[]
       if (!Number.isFinite(periodEnd) || clippedEnd <= cursor) break;
       const entry = grouped.get(period.key) ?? { period, rows: [] };
       entry.rows.push({ deviceId: row.deviceId, source: source.getTime(), validUntil: validUntil.getTime(), value,
+        analyticsPolicyVersion: row.analyticsPolicyVersion ?? 2,
         intervalStart: cursor, intervalEnd: clippedEnd });
       grouped.set(period.key, entry);
       cursor = clippedEnd;
@@ -222,7 +224,8 @@ export function aggregateNativeTemperature(rows: readonly NativeTemperatureRow[]
     return { id, start: entry.period.start, end: entry.period.end, label: entry.period.label,
       celsius: Math.round((covered ? weighted / covered : latest.value) * 100) / 100,
       sampleCount: entry.rows.length, sourceAt: new Date(latest.source).toISOString(), validUntil: new Date(latest.validUntil).toISOString(),
-      currentFresh: now.getTime() < latest.validUntil, coverageSeconds: Math.floor(covered / 1000), segments };
+      currentFresh: latest.analyticsPolicyVersion === 3 && now.getTime() < latest.validUntil,
+      coverageSeconds: Math.floor(covered / 1000), segments };
   });
 }
 

@@ -23,6 +23,8 @@ export async function verifyStateEvidenceHistory({ base, osRoot, prisma, hub, fi
     const catalogEvent = store.getSyncOutbox().events.filter(event => event.type === 'control.catalog.upsert').at(-1);
     assert.ok(catalogEvent, 'actual recorder must publish the actual bridge control catalog');
     const catalog = catalogEvent.payload;
+    const selectedSignal = catalog.controls.find(control => control.semanticRole === 'power' && control.observable === true);
+    assert.ok(selectedSignal, 'synthetic light must expose a genuine observable power signal');
     device = await prisma.nativeDevice.create({ data: { homeId, hubInstallationId: installationId,
       osDeviceId: checked.deviceId, originalName: 'Synthetic checked light', technicalLabel: 'Synthetic',
       managementClass: 'PROPERTY_DEVICE', analyticsCategory: 'LIGHT', lifecycle: 'INSTALLED', deviceType: 'light', protocol: 'zigbee',
@@ -32,7 +34,7 @@ export async function verifyStateEvidenceHistory({ base, osRoot, prisma, hub, fi
       validFrom: new Date(start - 3600000), source: 'OS_SYNC' } });
     await prisma.hubInstallation.update({ where: { id: installationId }, data: { analyticsWriterEnabled: true } });
     const interval = await prisma.$transaction(tx => changeAnalyticsInterval(tx, { homeId, hubInstallationId: installationId,
-      deviceId: device.id, category: 'LIGHT', selectedControlId: 'power', generation: fixture.identityOneGeneration,
+      deviceId: device.id, category: 'LIGHT', selectedControlId: selectedSignal.controlId, generation: fixture.identityOneGeneration,
       analyticsPolicyVersion: 3, at: new Date(start) }));
     const platform = store.getPlatform();
     await store.savePlatform({ ...platform, devicePolicies: { ...platform.devicePolicies, [checked.deviceId]: {
