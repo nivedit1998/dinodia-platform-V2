@@ -4079,6 +4079,7 @@ async function nativeAlexaOAuthChecks(deliveryEnv) {
   // heartbeat race the same authority rows during the OAuth/delivery checks.
   // Restore the normal scheduler after this isolated fixture finishes.
   const scheduledPairingWasRunning = Boolean(hub.pairing.timer);
+  const pairingWasStopped = hub.pairing.stopped;
   hub.pairing.stop();
   const pairingDrainDeadline = Date.now() + 8000;
   while ((hub.pairing.syncing || hub.pairing.queuedImmediateSync || hub.pairing.recoveryEndpointInFlight)
@@ -5247,6 +5248,7 @@ async function nativeAlexaOAuthChecks(deliveryEnv) {
       await stopPlatform();
       await startPlatform(deliveryEnv);
       if (scheduledPairingWasRunning) hub.pairing.start();
+      else hub.pairing.stopped = pairingWasStopped;
     }
   }
 }
