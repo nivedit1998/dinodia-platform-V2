@@ -16,7 +16,8 @@ export async function GET() {
     const modelCount = await prisma.$queryRaw<Array<{ count: bigint }>>`SELECT COUNT(*)::bigint AS count FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE' AND table_name <> '_prisma_migrations'`;
     const ready = isSchemaReady(migration, Number(modelCount[0]?.count ?? 0), expectedMigrationChecksum);
     return Response.json({ ok: ready, ready, service: 'dinodia-platform-v2', build: safeBuildId(),
-      analyticsUsagePolicyVersion: ready && migration.some(row => row.migration_name === '20261023110000_category_analytics_intervals') ? 2 : null,
+      analyticsUsagePolicyVersion: ready && migration.some(row => row.migration_name === '20261024103000_state_evidence_policy') ? 3
+        : ready && migration.some(row => row.migration_name === '20261023110000_category_analytics_intervals') ? 2 : null,
     }, { status: ready ? 200 : 503, headers: { 'Cache-Control': 'no-store' } });
   } catch {
     return Response.json({ ok: false, ready: false, service: 'dinodia-platform-v2' }, { status: 503, headers: { 'Cache-Control': 'no-store' } });

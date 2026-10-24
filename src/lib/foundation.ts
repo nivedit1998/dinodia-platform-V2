@@ -12,6 +12,7 @@ export const STAGE1_MODEL_COUNT = 40;
 export const REQUIRED_MIGRATION = '20261003000000_native_v2_stage3_domain_schema';
 export const REQUIRED_MODEL_COUNT = 65;
 export const COMPATIBLE_ADDITIVE_MIGRATIONS: Readonly<Record<string, string>> = Object.freeze({
+  '20261024103000_state_evidence_policy': '925e1ee46f079a2cbde1704961493d71aaaecdb9a2e6f5f2fdbb2a3f276fa740',
   '20261023210000_room_qr_plaques': 'be22f4084ab317f1dae158427e866172105c2c45a5b7272662b6aa326c53da67',
   '20261023110000_category_analytics_intervals': 'b6a25359b7bfeb9a453ccc8ecc45fc4f32de63050ac85bd31821cae58e910d05',
   '20261006120000_stage6_invited_tenant_username_setup': '9b01d403fac2d37a59fc53be24c3f6296d3f0eaced2485530123b9e09946581c',
@@ -60,5 +61,6 @@ export function isSchemaReady(migrations: readonly CompletedMigration[], modelCo
   const hasStage12Alexa = newer.some((migration) => migration.migration_name === '20261009110000_stage12_alexa_oauth_scope');
   const hasAnalyticsIntervals = newer.some(migration => migration.migration_name === '20261023110000_category_analytics_intervals');
   const hasRoomPlaques = newer.some(migration => migration.migration_name === '20261023210000_room_qr_plaques');
+  if (newer.some(migration => migration.migration_name === '20261024103000_state_evidence_policy') && !hasAnalyticsIntervals) return false;
   return modelCount === REQUIRED_MODEL_COUNT + (hasStage5 ? 1 : 0) + (hasProspectiveRoomAccess ? 1 : 0) + (hasStage12Alexa ? 8 : 0) + (hasAnalyticsIntervals ? 2 : 0) + (hasRoomPlaques ? 2 : 0);
 }

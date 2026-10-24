@@ -9,10 +9,11 @@ export type NativeUsageRow = {
 
 export type NativeTemperatureRow = {
   deviceId: string; areaId: string; sourceObservedAt: Date | string;
-  validUntil: Date | string; temperature: number | string;
+  validUntil: Date | string; temperature: number | string; analyticsPolicyVersion?: number;
 };
 
 export const NATIVE_TEMPERATURE_MAX_VALIDITY_MS = 30 * 60 * 1000;
+export const NATIVE_EVIDENCE_TEMPERATURE_MAX_VALIDITY_MS = 65595 * 1000;
 
 export function validAnalyticsTimezone(value: string): boolean {
   try { new Intl.DateTimeFormat('en', { timeZone: value }).format(0); return true; } catch { return false; }
@@ -156,7 +157,8 @@ export function aggregateNativeTemperature(rows: readonly NativeTemperatureRow[]
   for (const row of rows) {
     const source = new Date(row.sourceObservedAt); const validUntil = new Date(row.validUntil); const value = Number(row.temperature);
     if (!Number.isFinite(source.getTime()) || !Number.isFinite(validUntil.getTime()) || !Number.isFinite(value) || value < -50 || value > 80
-      || validUntil <= source || validUntil.getTime() - source.getTime() > NATIVE_TEMPERATURE_MAX_VALIDITY_MS) continue;
+      || validUntil <= source || validUntil.getTime() - source.getTime() > (row.analyticsPolicyVersion === 3
+        ? NATIVE_EVIDENCE_TEMPERATURE_MAX_VALIDITY_MS : NATIVE_TEMPERATURE_MAX_VALIDITY_MS)) continue;
     const requestedStart = window?.from.getTime() ?? Number.NEGATIVE_INFINITY;
     const requestedEnd = Math.min(window?.to.getTime() ?? now.getTime(), now.getTime());
     const retentionStart = window?.retentionStart?.getTime() ?? Number.NEGATIVE_INFINITY;

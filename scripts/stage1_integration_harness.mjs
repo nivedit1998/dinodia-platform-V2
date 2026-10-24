@@ -11,6 +11,8 @@ import { isDeepStrictEqual } from 'node:util';
 import { Prisma, PrismaClient } from '@prisma/client';
 import { stage1RouteInventory } from '../test/stage1_route_inventory.mjs';
 import { roomPlaqueIntegration } from './room_plaque_integration.mjs';
+import { verifyStateEvidenceIOS } from './state_evidence_ios_integration.mjs';
+import { verifyStateEvidenceHistory } from './state_evidence_history_integration.mjs';
 
 const root = process.cwd();
 const osRoot = process.env.DINODIA_OS_ROOT || path.resolve(root, '../Dinodia OS');
@@ -118,7 +120,7 @@ async function universalCategoryIngestionCheck({ base, homeId, installationId, a
       intervals.push(await prisma.$transaction(async tx => {
         await tx.nativeDevice.update({ where: { id: device.id }, data: { analyticsCategory: category } });
         return changeAnalyticsInterval(tx, { homeId, hubInstallationId: installationId, deviceId: device.id, category, selectedControlId: selected,
-          generation: customerFixture.identityOneGeneration, at: new Date(start + index * 600000) });
+          generation: customerFixture.identityOneGeneration, analyticsPolicyVersion: 2, at: new Date(start + index * 600000) });
       }));
     }
     const payloadFor = (interval, index) => ({ osDeviceId, osAreaId, analyticsCategory: interval.analyticsCategory, controlId: interval.selectedControlId,
@@ -184,7 +186,7 @@ async function universalCategoryIngestionCheck({ base, homeId, installationId, a
       purgeAt: new Date('2027-10-08T08:00:00Z') } });
     const overlapInterval = await prisma.$transaction(tx => changeAnalyticsInterval(tx, { homeId, hubInstallationId: installationId,
       deviceId: overlapDevice.id, category: 'RADIATOR', selectedControlId: heat.controlId,
-      generation: customerFixture.identityOneGeneration, at: new Date(start) }));
+      generation: customerFixture.identityOneGeneration, analyticsPolicyVersion: 2, at: new Date(start) }));
     const overlapPayload = { ...payloadFor(overlapInterval, 0), osDeviceId: overlapDeviceId };
     await hub.store.queueSyncEvent('usage.bucket', aggregate(overlapPayload), overlapPayload);
     const markerId = `post-unallocated-${crypto.randomUUID()}`;
@@ -4096,6 +4098,7 @@ async function nativeAlexaOAuthChecks(deliveryEnv) {
   const formHeaders = { 'content-type': 'application/x-www-form-urlencoded' };
   const form = (fields) => new URLSearchParams(fields).toString();
   let originalOsAlexaFixtureDevice = null;
+  const originalMqttCommand = hub.mqtt.command;
   const requestParameters = (state, verifier) => ({
     client_id: clientId,
     redirect_uri: redirectUri,
@@ -4531,16 +4534,16 @@ async function nativeAlexaOAuthChecks(deliveryEnv) {
     const adjustPositionRetry = await fetchJsonLoopback(`${base}/api/v2/alexa/directives`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(adjustPositionDirective) });
     const adjustPositionChangedReplay = await fetchJsonLoopback(`${base}/api/v2/alexa/directives`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ ...adjustPositionDirective, directive: { ...adjustPositionDirective.directive, payload: { rangeValueDelta: -5, rangeValueDeltaDefault: false } } }) });
     const adjustPositionEffects = hub.store.listEvents(1000).filter((event) => event.type === 'device_command' && event.deviceId === osFixtureDeviceId).length;
-    if (adjustPosition.response.status !== 200 || adjustPosition.body.event?.header?.name !== 'Response'
-      || hub.store.getDevice(osFixtureDeviceId)?.entities?.[osPositionEntity.id]?.state !== 55
+    if (adjustPosition.response.status !== 200 || adjustPosition.body.event?.header?.name !== 'ErrorResponse'
+      || hub.store.getDevice(osFixtureDeviceId)?.entities?.[osPositionEntity.id]?.state !== 50
       || adjustPositionRetry.response.status !== 200 || adjustPositionChangedReplay.body.event?.header?.name !== 'ErrorResponse'
-      || adjustPositionEffects !== rangeEffectsBefore + 2) {
-      fail(`Actual Alexa AdjustRangeValue did not apply once from the fresh position or reconcile its retry (${JSON.stringify({ status: adjustPosition.response.status, name: adjustPosition.body.event?.header?.name, error: adjustPosition.body.event?.payload?.type, diagnostic: adjustPosition.body.event?.payload?.testDiagnostic, retryStatus: adjustPositionRetry.response.status, retryName: adjustPositionRetry.body.event?.header?.name, retryDiagnostic: adjustPositionRetry.body.event?.payload?.testDiagnostic, state: hub.store.getDevice(osFixtureDeviceId)?.entities?.[osPositionEntity.id]?.state, effects: adjustPositionEffects - rangeEffectsBefore, osControl: actualPositionDescriptor, platformControl: ownPrivateProjection.controls.find((control) => control.controlId === actualPositionDescriptor.controlId) })})`);
+      || adjustPositionEffects !== rangeEffectsBefore + 1) {
+      fail('An unverified private virtual source must not authorize a relative Alexa adjustment or duplicate an absolute effect');
     }
     const negativePosition = await fetchJsonLoopback(`${base}/api/v2/alexa/directives`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ ...adjustPositionDirective, directive: { ...adjustPositionDirective.directive, header: { ...adjustPositionDirective.directive.header, messageId: `stage12-position-adjust-negative-${crypto.randomUUID()}` }, payload: { rangeValueDelta: -5, rangeValueDeltaDefault: false } } }) });
     const afterNegativePosition = hub.store.listEvents(1000).filter((event) => event.type === 'device_command' && event.deviceId === osFixtureDeviceId).length;
-    if (negativePosition.response.status !== 200 || negativePosition.body.event?.header?.name !== 'Response'
-      || hub.store.getDevice(osFixtureDeviceId)?.entities?.[osPositionEntity.id]?.state !== 50 || afterNegativePosition !== adjustPositionEffects + 1) fail('Actual Alexa negative relative adjustment did not apply from current finite state exactly once');
+    if (negativePosition.response.status !== 200 || negativePosition.body.event?.header?.name !== 'ErrorResponse'
+      || hub.store.getDevice(osFixtureDeviceId)?.entities?.[osPositionEntity.id]?.state !== 50 || afterNegativePosition !== adjustPositionEffects) fail('A negative relative adjustment used an unverified private baseline');
     const openingSet = await fetchJsonLoopback(`${base}/api/v2/alexa/directives`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(rangeDirective('Dinodia.OpeningPercentage', 65, `stage12-opening-${crypto.randomUUID()}`)) });
     const rangeEffectsAfterAllowed = hub.store.listEvents(1000).filter((event) => event.type === 'device_command' && event.deviceId === osFixtureDeviceId).length;
     const missingInstance = await fetchJsonLoopback(`${base}/api/v2/alexa/directives`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(rangeDirective(undefined, 50, `stage12-range-missing-${crypto.randomUUID()}`, { instance: 'Dinodia.Position' })) });
@@ -4551,13 +4554,13 @@ async function nativeAlexaOAuthChecks(deliveryEnv) {
     const rangeEffectsAfterDenials = hub.store.listEvents(1000).filter((event) => event.type === 'device_command' && event.deviceId === osFixtureDeviceId).length;
     if (exactPositionRetry.response.status !== 200 || changedInstanceReplay.body.event?.payload?.type !== 'INVALID_DIRECTIVE'
       || openingSet.response.status !== 200 || hub.store.getDevice(osFixtureDeviceId)?.entities?.[osOpeningEntity.id]?.state !== 65
-      || rangeEffectsAfterAllowed !== rangeEffectsBefore + 4 || missingInstance.body.event?.header?.name !== 'ErrorResponse'
+      || rangeEffectsAfterAllowed !== rangeEffectsBefore + 2 || missingInstance.body.event?.header?.name !== 'ErrorResponse'
       || wrongInstance.body.event?.payload?.type !== 'NO_SUCH_ENDPOINT' || mismatchedPayloadInstance.body.event?.payload?.type !== 'INVALID_DIRECTIVE'
       || outOfRangeValue.body.event?.payload?.type !== 'INVALID_DIRECTIVE' || invalidStepValue.body.event?.payload?.type !== 'INVALID_DIRECTIVE'
       || rangeEffectsAfterDenials !== rangeEffectsAfterAllowed) {
       fail('Alexa range header identity, exact control routing, replay separation, constraints or zero-effect denial failed');
     }
-    console.log('[stage12:integration] PASS: actual Alexa RangeController absolute and positive/negative relative directives route through fresh state and exact header.instance; exact retry is one effect and changed-body/missing/wrong/payload-only/mismatched/invalid values have zero effects');
+    console.log('[state-evidence:integration] PASS: private Alexa absolute ranges remain authorized and idempotent; unverified relative baselines, wrong instances and invalid values have zero effects');
     const adjustmentDirective = (namespace, name, messageId, payload) => ({ directive: {
       header: { namespace, name, messageId, payloadVersion: '3', correlationToken: `corr-${messageId}` },
       endpoint: { endpointId: ownPrivateProjection.endpointId, scope: { type: 'BearerToken', token: tokenBody.access_token } }, payload,
@@ -4568,10 +4571,10 @@ async function nativeAlexaOAuthChecks(deliveryEnv) {
     const brightnessAdjustment = await fetchJsonLoopback(`${base}/api/v2/alexa/directives`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(brightnessDirective) });
     const brightnessRetry = await fetchJsonLoopback(`${base}/api/v2/alexa/directives`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(brightnessDirective) });
     const afterBrightness = hub.store.listEvents(1000).filter((event) => event.type === 'device_command' && event.deviceId === osFixtureDeviceId).length;
-    if (brightnessAdjustment.response.status !== 200 || brightnessAdjustment.body.event?.header?.name !== 'Response'
-      || brightnessRetry.response.status !== 200 || brightnessRetry.body.event?.header?.name !== 'Response'
-      || hub.store.getDevice(osFixtureDeviceId)?.entities?.[osBrightnessEntity.id]?.state !== 35 || afterBrightness !== beforeBrightness + 1) {
-      fail('Actual Alexa AdjustBrightness did not apply from the current observation exactly once across an exact retry');
+    if (brightnessAdjustment.response.status !== 200 || brightnessAdjustment.body.event?.header?.name !== 'ErrorResponse'
+      || brightnessRetry.response.status !== 200 || brightnessRetry.body.event?.header?.name !== 'ErrorResponse'
+      || hub.store.getDevice(osFixtureDeviceId)?.entities?.[osBrightnessEntity.id]?.state !== 25 || afterBrightness !== beforeBrightness) {
+      fail('Actual Alexa AdjustBrightness used an unverified private baseline');
     }
     const beforeTemperature = afterBrightness;
     const temperatureMessageId = `stage12-temperature-adjust-${crypto.randomUUID()}`;
@@ -4580,12 +4583,12 @@ async function nativeAlexaOAuthChecks(deliveryEnv) {
     const temperatureAdjustment = await fetchJsonLoopback(`${base}/api/v2/alexa/directives`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(temperatureDirective) });
     const temperatureRetry = await fetchJsonLoopback(`${base}/api/v2/alexa/directives`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(temperatureDirective) });
     const afterTemperature = hub.store.listEvents(1000).filter((event) => event.type === 'device_command' && event.deviceId === osFixtureDeviceId).length;
-    if (temperatureAdjustment.response.status !== 200 || temperatureAdjustment.body.event?.header?.name !== 'Response'
-      || temperatureRetry.response.status !== 200 || temperatureRetry.body.event?.header?.name !== 'Response'
-      || hub.store.getDevice(osFixtureDeviceId)?.entities?.[osTargetTemperatureEntity.id]?.state !== 25 || afterTemperature !== beforeTemperature + 1) {
+    if (temperatureAdjustment.response.status !== 200 || temperatureAdjustment.body.event?.header?.name !== 'ErrorResponse'
+      || temperatureRetry.response.status !== 200 || temperatureRetry.body.event?.header?.name !== 'ErrorResponse'
+      || hub.store.getDevice(osFixtureDeviceId)?.entities?.[osTargetTemperatureEntity.id]?.state !== 20 || afterTemperature !== beforeTemperature) {
       fail(`Actual Alexa AdjustTargetTemperature did not convert a Fahrenheit delta without offset or apply it once (${JSON.stringify({status: temperatureAdjustment.response.status, name: temperatureAdjustment.body.event?.header?.name, diagnostic: temperatureAdjustment.body.event?.payload?.testDiagnostic, state: hub.store.getDevice(osFixtureDeviceId)?.entities?.[osTargetTemperatureEntity.id]?.state, effects: afterTemperature - beforeTemperature})})`);
     }
-    console.log('[stage12:integration] PASS: actual AdjustBrightness and AdjustTargetTemperature apply from fresh exact controls, Fahrenheit delta conversion has no absolute offset, and retries do not duplicate effects');
+    console.log('[state-evidence:integration] PASS: relative brightness and target changes cannot use an unverified private source, including exact retries');
     const nativeCommandEventsBefore = hub.store.listEvents(1000).filter((event) => event.type === 'device_command' && event.deviceId === osFixtureDeviceId).length;
     const commandResult = await fetchJsonLoopback(`${base}/api/v2/alexa/directives`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(powerDirective('TurnOn')) });
     const postCommandDevice = hub.store.getDevice(osFixtureDeviceId);
@@ -4612,12 +4615,11 @@ async function nativeAlexaOAuthChecks(deliveryEnv) {
     const reportedPower = reportState.body.context?.properties?.find((property) => property.namespace === 'Alexa.PowerController' && property.name === 'powerState');
     const reportedPosition = reportState.body.context?.properties?.find((property) => property.namespace === 'Alexa.RangeController' && property.name === 'rangeValue' && property.instance === 'Dinodia.Position');
     const reportedOpening = reportState.body.context?.properties?.find((property) => property.namespace === 'Alexa.RangeController' && property.name === 'rangeValue' && property.instance === 'Dinodia.OpeningPercentage');
-    if (reportState.response.status !== 200 || reportState.body.event?.header?.name !== 'StateReport'
+    if (reportState.response.status !== 200 || reportState.body.event?.header?.name !== 'ErrorResponse'
       || reportState.body.event?.header?.namespace !== 'Alexa' || reportState.body.event?.header?.payloadVersion !== '3'
       || reportState.body.event?.header?.correlationToken !== `corr-${reportStateMessageId}`
-      || reportState.body.event?.endpoint?.endpointId !== ownPrivateProjection.endpointId || Object.keys(reportState.body.event?.payload ?? {}).length !== 0
-      || reportedPower?.value !== 'ON' || typeof reportedPower?.timeOfSample !== 'string'
-      || reportedPosition?.value !== 50 || reportedOpening?.value !== 65) fail(`Alexa ReportState did not return a canonical StateReport with actual source states and matching range instances (${JSON.stringify({status:reportState.response.status,event:reportState.body.event,properties:reportState.body.context?.properties})})`);
+      || reportState.body.event?.endpoint?.endpointId !== ownPrivateProjection.endpointId || reportState.body.event?.payload?.type !== 'ENDPOINT_UNREACHABLE'
+      || reportedPower || reportedPosition || reportedOpening) fail('Unverified private virtual state was advertised as current by Alexa ReportState');
 
     // Keep every advertised retrievable property stale for this endpoint-wide
     // unknown case. Other tests separately assert the exact per-range sample
@@ -4646,6 +4648,33 @@ async function nativeAlexaOAuthChecks(deliveryEnv) {
     const propertyDeviceRow = await prisma.nativeDevice.findUniqueOrThrow({ where: { id: permanentDeviceId }, select: {
       id: true, osDeviceId: true, descriptorRevision: true, descriptorDigest: true,
     } });
+    const requireOs = createRequire(path.join(osRoot, 'package.json'));
+    const { checkedStateFixture } = requireOs(path.join(osRoot, 'test/helpers/checked-state-fixture.js'));
+    // The synthetic cadence spans 25 minutes of controlled time. Its canonical
+    // assignment must cover that same period; never bypass ingestion's boundary check.
+    await prisma.deviceAreaAssignment.updateMany({ where: { deviceId: permanentDeviceId, validUntil: null },
+      data: { validFrom: new Date(osHarnessClock() - 1501000) } });
+    let syntheticCause = null;
+    const checkedProperty = await checkedStateFixture({ store: hub.store, directory: tempRoot,
+      registryDeviceId: propertyDeviceRow.osDeviceId, areaId: fixture.areaOneOsId, controlId: 'power',
+      generation: fixture.identityOneGeneration, now: osHarnessClock(),
+      onDeviceChanged: async device => {
+        if (!syntheticCause) return;
+        for (const item of hub.model.entities().filter(item => item.device.id === device.id)) {
+          const state = hub.model.stateFor(item);
+          hub.eventBus.emit('state_changed', { entity_id: state.entity_id, new_state: state, causeType: syntheticCause });
+        }
+      } });
+    hub.mqtt.command = async (deviceId, payload) => {
+      if (deviceId !== checkedProperty.deviceId) return originalMqttCommand.call(hub.mqtt, deviceId, payload);
+      await checkedProperty.bridge.command(deviceId, payload);
+      syntheticCause = 'APP_INTERACTION'; // known causal response in this synthetic transport only
+      try {
+        await checkedProperty.report(payload.state, { advance: Math.max(1, Date.now() - checkedProperty.clock()) });
+        setOsHarnessClock(checkedProperty.clock(), { frozen: false });
+      } finally { syntheticCause = null; }
+      return hub.store.getDevice(deviceId);
+    };
     const priorOsPlatform = hub.store.getPlatform();
     const propertyPolicy = {
       ...(priorOsPlatform.devicePolicies?.[propertyDeviceRow.osDeviceId] ?? {}),
@@ -4659,7 +4688,7 @@ async function nativeAlexaOAuthChecks(deliveryEnv) {
       ? priorAreaBindings : [...priorAreaBindings, { hubAreaId: fixture.areaOneOsId, areaId: fixture.areaOneId }];
     await hub.store.savePlatform({ ...priorOsPlatform, homeId: fixture.homeOneId,
       devicePolicies: nextPolicies, areaBindings: nextAreaBindings });
-    const propertyOsFixture = structuredClone(osFixtureDevice);
+    const propertyOsFixture = structuredClone(hub.store.getDevice(checkedProperty.deviceId));
     // Keep this unrelated permanent-device sync fixture on its original
     // single PowerController so its established order/receipt assertions do
     // not inherit the separate range-control test channels above.
@@ -4691,11 +4720,11 @@ async function nativeAlexaOAuthChecks(deliveryEnv) {
       if (entity.logicalKey === 'state' || entity.stateKey === 'state') {
         entity.capability = { ...(entity.capability ?? {}), controlId: 'power' };
       }
-      entity.state = 'OFF'; entity.lastChanged = new Date().toISOString(); entity.stateRevision = Date.now();
+      // Preserve the genuine sample and its revision; the next bridge report changes it.
     }
     const propertyStateEntity = Object.values(propertyOsFixture.entities ?? {}).find((entity) => entity.logicalKey === 'state' || entity.stateKey === 'state');
     if (!propertyStateEntity) fail('The disposable permanent-device OS fixture has no top-level state binding');
-    propertyOsFixture.state = { ...(propertyOsFixture.state ?? {}), [String(propertyStateEntity.stateKey || 'state')]: 'OFF' };
+    propertyOsFixture.state = { ...(propertyOsFixture.state ?? {}), [String(propertyStateEntity.stateKey || 'state')]: propertyStateEntity.state };
     const rewriteEntityReferences = (value) => {
       if (typeof value === 'string') return propertyEntityIds.get(value) ?? value;
       if (Array.isArray(value)) return value.map(rewriteEntityReferences);
@@ -4704,6 +4733,8 @@ async function nativeAlexaOAuthChecks(deliveryEnv) {
     };
     propertyOsFixture.presentation = rewriteEntityReferences(propertyOsFixture.presentation);
     await hub.store.upsertDevice(propertyOsFixture);
+    await checkedProperty.report('OFF', { advance: Math.max(1, Date.now() - checkedProperty.clock()) });
+    setOsHarnessClock(checkedProperty.clock(), { frozen: false });
     const propertyPowerEntity = Object.values(propertyOsFixture.entities ?? {}).find((entity) => entity.logicalKey === 'state' || entity.stateKey === 'state');
     if (!propertyPowerEntity) fail('The disposable permanent-device OS fixture has no state control');
     const propertyOsInventory = await fetchJson(`${loopbackOsOrigin}/api/dinodia/v1/devices`, {
@@ -4733,6 +4764,10 @@ async function nativeAlexaOAuthChecks(deliveryEnv) {
       capabilitySummary: capabilitySummary(permanentDeviceId, propertyCatalogEvent.payload.controls,
         String(propertyCatalogEvent.payload.descriptorDigest), Number(propertyCatalogEvent.payload.catalogRevision)),
     } });
+    const checkedDiscovery = await fetchJsonLoopback(`${base}/api/v2/alexa/discovery`, {
+      headers: { authorization: `Bearer ${tokenBody.access_token}` } });
+    if (checkedDiscovery.response.status !== 200) fail('Checked Zigbee catalog must be rediscovered before proactive reporting');
+    await verifyStateEvidenceIOS({ base, hubBase: loopbackOsOrigin, fixture, deviceId: propertyDeviceRow.osDeviceId });
     const unclassifiedEventCount = hub.store.getSyncOutbox().events.filter((event) => event.type === 'device.state'
       && event.payload?.osDeviceId === propertyDeviceRow.osDeviceId).length;
     hub.eventBus.emit('state_changed', { entity_id: propertyPowerEntity.id });
@@ -4859,14 +4894,11 @@ async function nativeAlexaOAuthChecks(deliveryEnv) {
         } : null,
       })})`);
     }
-    const privateReportsBeforeDispatch = await prisma.nativeDomainOutbox.findMany({ where: {
+    let privateReportsBeforeDispatch = await prisma.nativeDomainOutbox.findMany({ where: {
       aggregateType: 'AlexaChangeReport', eventType: 'ALEXA_CHANGE_REPORT', homeId: fixture.homeOneId, state: 'PENDING',
       payload: { path: ['deviceId'], equals: fixture.tenantDeviceId },
     }, orderBy: { createdAt: 'asc' }, select: { id: true, payload: true, expiresAt: true } });
-    if (privateReportsBeforeDispatch.length < 2 || privateReportsBeforeDispatch.some((report) => report.payload?.membershipId !== fixture.tenantMembershipId
-      || report.payload?.ownerMembershipId !== fixture.tenantMembershipId || report.payload?.tenantOwned !== true)) {
-      fail(`The actual OS command observations did not enqueue bounded owner-only events for the selected tenant (${JSON.stringify({ count: privateReportsBeforeDispatch.length, ownerBound: privateReportsBeforeDispatch.every((row) => row.payload?.membershipId === fixture.tenantMembershipId) })})`);
-    }
+    if (privateReportsBeforeDispatch.length !== 0) fail('Unverified private observations must not create current proactive state');
     const privateSummaryBeforeState = await prisma.nativeDevice.findUniqueOrThrow({ where: { id: fixture.tenantDeviceId }, select: { capabilitySummary: true } });
     await prisma.nativeDomainOutbox.updateMany({ where: { id: { in: privateReportsBeforeDispatch.map((report) => report.id) } }, data: { nextAttemptAt: new Date(Date.now() + 60_000) } });
     await prisma.nativeDomainOutbox.update({ where: { id: queuedChangeReport[0].id }, data: { nextAttemptAt: new Date(Date.now() - 1000) } });
@@ -4880,6 +4912,31 @@ async function nativeAlexaOAuthChecks(deliveryEnv) {
     const currentPropertyEndpointId = currentPropertyEndpoint?.endpointId;
     const currentPrivateEndpointId = currentPrivateEndpoint?.endpointId;
     if (!currentPropertyEndpointId || !currentPrivateEndpointId) fail('The explicit current Alexa scope did not create both permitted tenant/property endpoint identities');
+    // Isolate the existing private dispatcher/privacy contract with bounded
+    // database fixtures. These are NOT proof that the virtual device acquired
+    // a reporting guarantee; its real runtime above correctly queues no state.
+    const privateDescriptor = await prisma.nativeDevice.findUniqueOrThrow({ where: { id: fixture.tenantDeviceId }, select: { descriptorRevision: true } });
+    for (const [controlId, value] of [[actualPowerDescriptor.controlId, false], ['position-control', 35]]) {
+      const observedAt = new Date(Date.now() - 1000).toISOString();
+      const expiresAt = new Date(Date.now() + 120000);
+      const tenantOwnedState = { deviceId: osFixtureDeviceId, homeId: fixture.homeOneId, controlId,
+        descriptorRevision: privateDescriptor.descriptorRevision, sourceGeneration: fixture.identityOneGeneration,
+        revision: 9000, observedAt, receivedAt: new Date().toISOString(), validUntil: expiresAt.toISOString(),
+        quality: 'fresh', value, deviceAvailability: 'online', causeType: 'APP_INTERACTION' };
+      await prisma.nativeDomainOutbox.create({ data: { homeId: fixture.homeOneId, hubInstallationId: fixture.hubOneId,
+        aggregateType: 'AlexaChangeReport', aggregateId: currentPrivateEndpointId, eventType: 'ALEXA_CHANGE_REPORT',
+        idempotencyKey: `state-evidence-private-dispatch-${crypto.randomUUID()}`,
+        payload: { endpointProjectionId: currentPrivateEndpoint.id, linkId: link.id, homeId: fixture.homeOneId,
+          membershipId: fixture.tenantMembershipId, ownerMembershipId: fixture.tenantMembershipId,
+          tenantOwned: true, tenantOwnedState, areaId: fixture.areaOneId, deviceId: fixture.tenantDeviceId,
+          controlId, descriptorRevision: privateDescriptor.descriptorRevision, sourceGeneration: fixture.identityOneGeneration,
+          stateRevision: 9000, observedAt, causeType: 'APP_INTERACTION' },
+        state: 'PENDING', attempts: 0, nextAttemptAt: new Date(Date.now() + 60000), expiresAt } });
+    }
+    privateReportsBeforeDispatch = await prisma.nativeDomainOutbox.findMany({ where: {
+      aggregateType: 'AlexaChangeReport', eventType: 'ALEXA_CHANGE_REPORT', homeId: fixture.homeOneId, state: 'PENDING',
+      payload: { path: ['deviceId'], equals: fixture.tenantDeviceId },
+    }, select: { id: true, payload: true, expiresAt: true } });
     const firstEventDispatch = await fetchJson(`${base}/api/cron/native-operations`, { method: 'POST',
       headers: { authorization: `Bearer ${deliveryEnv.CRON_SECRET}` } });
     const firstReport = await prisma.nativeDomainOutbox.findUniqueOrThrow({ where: { id: queuedChangeReport[0].id }, select: { state: true, attempts: true, payload: true, nextAttemptAt: true, expiresAt: true } });
@@ -4911,7 +4968,7 @@ async function nativeAlexaOAuthChecks(deliveryEnv) {
     }
     const privateSummaryAfterState = await prisma.nativeDevice.findUniqueOrThrow({ where: { id: fixture.tenantDeviceId }, select: { capabilitySummary: true } });
     if (!isDeepStrictEqual(privateSummaryBeforeState.capabilitySummary, privateSummaryAfterState.capabilitySummary)) fail('Tenant-owned state was written into the Home-wide property state projection');
-    console.log('[stage12:integration] PASS: OS virtual-device changes crossed signed sync into owner-only private outbox rows; one current owner endpoint received a controlled ChangeReport, with no Home-wide private state projection');
+    console.log('[state-evidence:integration] PASS: unverified private runtime queues no current state; separate bounded dispatcher fixtures preserve owner-only delivery and no Home-wide private projection');
 
     const queuedForRevocation = currentPrivateReports.filter((item) => item.id !== allowedPrivateReport.id);
     const grant = await prisma.tenantAreaGrant.findFirst({ where: { membershipId: fixture.tenantMembershipId, areaId: fixture.areaOneId, revokedAt: null }, select: { id: true } });
@@ -5128,6 +5185,7 @@ async function nativeAlexaOAuthChecks(deliveryEnv) {
 
     console.log('[stage12:integration] PASS: actual OAuth routes enforce tenant-only account linking, explicit one-time scope consent, exact callback/state, PKCE, hashed tokens, single-use code, refresh rotation/reuse revocation and full unlink');
   } finally {
+    hub.mqtt.command = originalMqttCommand;
     try {
       if (originalOsAlexaFixtureDevice) {
         const current = hub.store.getDevice(originalOsAlexaFixtureDevice.id);
@@ -7286,6 +7344,9 @@ async function pendingInvitationRouteChecks(deliveryEnv) {
   });
   console.log('[stage10:integration] PASS: actual Store/route moved an exact 10:30–10:45 partial bucket across Areas, the assigned old-Area projection retained 900 seconds, maintenance accepted it, and source identity was preserved');
   await universalCategoryIngestionCheck({ base, homeId: telemetryHomeId, installationId: telemetryHubId, areaId: telemetryAreaId, osAreaId: telemetryOsAreaId, catalog: movedInitialCatalog.controls });
+  await verifyStateEvidenceHistory({ base, osRoot, prisma, hub, fixture: customerFixture, homeId: telemetryHomeId,
+    installationId: telemetryHubId, areaId: telemetryAreaId, osAreaId: telemetryOsAreaId, headers: telemetryHeaders,
+    changeAnalyticsInterval: analyticsIntervalDomain().changeAnalyticsInterval, machineRequest, fetchJson });
 
   // F10-G: query a real, retained Radiator validity interval that starts ten
   // minutes before UTC midnight. The row is disposable test data; the owner

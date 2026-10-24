@@ -297,6 +297,15 @@ test('temperature samples retain source freshness and automation outcomes are ag
   const carriedForward = structuredClone(temperature);
   carriedForward.events[0].payload.validUntil = '2026-10-04T12:30:00.001Z';
   assert.equal(validateHubSyncEnvelope(carriedForward), false);
+  const limited = structuredClone(temperature);
+  limited.events[0].payload.analyticsPolicyVersion = 3;
+  limited.events[0].payload.quality = 'unknown';
+  limited.events[0].payload.validUntil = limited.events[0].payload.sourceObservedAt;
+  assert.equal(validateHubSyncEnvelope(limited), true, 'a real point value is retained without duration coverage');
+  limited.events[0].payload.quality = 'fresh';
+  assert.equal(validateHubSyncEnvelope(limited), false, 'zero coverage cannot claim fresh');
+  limited.events[0].payload.validUntil = '2026-10-04T13:00:00.000Z';
+  assert.equal(validateHubSyncEnvelope(limited), true, 'policy3 admits bounded checked hourly coverage');
 
   const outcome = envelope();
   outcome.events[0] = {

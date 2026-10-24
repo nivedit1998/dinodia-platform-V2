@@ -1,7 +1,7 @@
 import { prisma } from './prisma';
 import type { Prisma } from '@prisma/client';
 import { currentNativeDisplayName } from './nativeDisplayNames';
-import { aggregateNativeTemperature, aggregateNativeUsage, reconcileNativeUsageCoverage, NATIVE_TEMPERATURE_MAX_VALIDITY_MS, parseAnalyticsWindow, retentionStart, type NativeAnalyticsLevel, type NativeUsageRow } from './nativeAnalytics';
+import { aggregateNativeTemperature, aggregateNativeUsage, reconcileNativeUsageCoverage, NATIVE_EVIDENCE_TEMPERATURE_MAX_VALIDITY_MS, parseAnalyticsWindow, retentionStart, type NativeAnalyticsLevel, type NativeUsageRow } from './nativeAnalytics';
 import { ANALYTICS_MAX_AREAS, ANALYTICS_MAX_DEVICES, ANALYTICS_MAX_ROWS, currentAnalyticsGroups, metricCategory, parseUuidList, type AnalyticsArea } from './nativeAnalyticsAccess';
 import { Stage1AuthError } from './stage1Auth';
 
@@ -51,9 +51,9 @@ export async function readNativeAnalyticsBootstrap(homeId: string, timezone: str
       orderBy: { bucketStart: 'asc' }, select: { bucketStart: true } }),
     prisma.nativeTemperatureSample.findFirst({ where: { homeId, sourceObservedAt: { gte: cutoff, lte: now }, purgeAt: { gt: now },
       device: { is: { homeId, managementClass: 'PROPERTY_DEVICE', analyticsCategory: 'RADIATOR' } } }, orderBy: { sourceObservedAt: 'asc' }, select: { sourceObservedAt: true } }),
-    prisma.nativeTemperatureSample.findMany({ where: { homeId, sourceObservedAt: { gte: new Date(Math.max(cutoff.getTime(), now.getTime() - NATIVE_TEMPERATURE_MAX_VALIDITY_MS)), lte: now }, purgeAt: { gt: now },
+    prisma.nativeTemperatureSample.findMany({ where: { homeId, sourceObservedAt: { gte: new Date(Math.max(cutoff.getTime(), now.getTime() - NATIVE_EVIDENCE_TEMPERATURE_MAX_VALIDITY_MS)), lte: now }, purgeAt: { gt: now },
       device: { is: { homeId, managementClass: 'PROPERTY_DEVICE', analyticsCategory: 'RADIATOR' } } }, orderBy: { sourceObservedAt: 'desc' }, take: ANALYTICS_MAX_ROWS + 1,
-      select: { deviceId: true, areaId: true, temperature: true, sourceObservedAt: true, validUntil: true } }),
+      select: { deviceId: true, areaId: true, temperature: true, sourceObservedAt: true, validUntil: true, analyticsPolicyVersion: true } }),
     prisma.nativeDevice.findMany({ where: { homeId, managementClass: 'PROPERTY_DEVICE', lifecycle: 'RETIRED',
       usageBuckets: { some: { homeId, bucketStart: { gte: cutoff, lte: now }, purgeAt: { gt: now } } } },
       orderBy: [{ retiredAt: 'desc' }, { id: 'asc' }], take: 100,
@@ -61,7 +61,7 @@ export async function readNativeAnalyticsBootstrap(homeId: string, timezone: str
   ]);
   if (areaRows.length > ANALYTICS_MAX_AREAS || devices.length > ANALYTICS_MAX_DEVICES || latestTemperatureRows.length > ANALYTICS_MAX_ROWS) throw boundedQueryError();
   const latestTemperature = latestTemperatureRows[0] ?? null;
-  const currentTemperatureCandidates = latestTemperatureRows.filter((sample) => sample.validUntil > now);
+  const currentTemperatureCandidates = latestTemperatureRows.filter((sample) => sample.analyticsPolicyVersion === 3 && sample.validUntil > now);
   const temperatureAssignmentDeviceIds = [...new Set(currentTemperatureCandidates.map((sample) => sample.deviceId))];
   const temperatureAssignmentAreaIds = [...new Set(currentTemperatureCandidates.map((sample) => sample.areaId))];
   const currentTemperatureAssignments = temperatureAssignmentDeviceIds.length ? await prisma.deviceAreaAssignment.findMany({ where: {
@@ -192,13 +192,13 @@ export async function readNativeTemperatureDetail(homeId: string, timezone: stri
   // when their signed validity overlaps the requested window; this lets a
   // pre-midnight observation contribute to the next-day chart without
   // scanning unbounded history or extending its original deadline.
-  const overlapStart = new Date(Math.max(window.retentionStart.getTime(), window.from.getTime() - NATIVE_TEMPERATURE_MAX_VALIDITY_MS));
+  const overlapStart = new Date(Math.max(window.retentionStart.getTime(), window.from.getTime() - NATIVE_EVIDENCE_TEMPERATURE_MAX_VALIDITY_MS));
   const rows = await prisma.nativeTemperatureSample.findMany({ where: { homeId,
     sourceObservedAt: { gte: overlapStart, lt: window.to }, validUntil: { gt: window.from }, purgeAt: { gt: now },
     device: { is: { homeId, managementClass: 'PROPERTY_DEVICE', analyticsCategory: 'RADIATOR' } }, area: { is: { homeId } },
     ...(filters.areaIds ? { areaId: { in: filters.areaIds } } : {}), ...(filters.deviceIds ? { deviceId: { in: filters.deviceIds } } : {}) },
     orderBy: [{ sourceObservedAt: 'asc' }, { deviceId: 'asc' }], take: ANALYTICS_MAX_ROWS + 1,
-    select: { deviceId: true, areaId: true, sourceObservedAt: true, validUntil: true, temperature: true } });
+    select: { deviceId: true, areaId: true, sourceObservedAt: true, validUntil: true, temperature: true, analyticsPolicyVersion: true } });
   if (rows.length > ANALYTICS_MAX_ROWS) throw boundedQueryError();
   const candidateDeviceIds = [...new Set(rows.map((row) => row.deviceId))];
   const areaIds = [...new Set(rows.map((row) => row.areaId))];

@@ -208,7 +208,7 @@ function validEvent(event: unknown): event is HubSyncEvent {
       const legacyKeys = ['osDeviceId', 'osAreaId', 'analyticsCategory', 'controlId', 'sourceGeneration', 'bucketStart', 'revision', 'onSeconds', 'offSeconds', 'unknownSeconds', 'closedAt', 'purgeAt'];
       const coveredKeys = [...legacyKeys.slice(0, 6), 'coverageStartAt', 'coverageEndAt', ...legacyKeys.slice(6)];
       const versionTwo = exactKeys(payload, [...coveredKeys, 'analyticsIntervalId', 'bindingRevision', 'analyticsPolicyVersion']);
-      if (versionTwo && (payload.analyticsPolicyVersion !== 2 || !Number.isSafeInteger(payload.bindingRevision) || Number(payload.bindingRevision) < 1
+      if (versionTwo && ((payload.analyticsPolicyVersion !== 2 && payload.analyticsPolicyVersion !== 3) || !Number.isSafeInteger(payload.bindingRevision) || Number(payload.bindingRevision) < 1
         || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(String(payload.analyticsIntervalId)))) return false;
       const hasCoverage = versionTwo || exactKeys(payload, coveredKeys);
       if ((!hasCoverage && !exactKeys(payload, legacyKeys))
@@ -247,15 +247,19 @@ function validEvent(event: unknown): event is HubSyncEvent {
       return true;
     }
     case 'temperature.sample':
-      return exactKeys(payload, ['osDeviceId', 'osAreaId', 'controlId', 'sourceGeneration', 'sourceEventKey', 'temperature', 'sourceObservedAt', 'validUntil', 'quality'])
+      return exactKeys(payload, ['osDeviceId', 'osAreaId', 'controlId', 'sourceGeneration', 'sourceEventKey', 'temperature', 'sourceObservedAt', 'validUntil', 'quality', ...(payload.analyticsPolicyVersion === 3 ? ['analyticsPolicyVersion'] : [])])
         && boundedText(payload.osDeviceId, 160) && boundedText(payload.osAreaId, 160) && boundedText(payload.controlId, 160)
         && Number.isSafeInteger(payload.sourceGeneration) && Number(payload.sourceGeneration) >= 1
         && /^[a-f0-9]{64}$/i.test(String(payload.sourceEventKey))
         && typeof payload.temperature === 'number' && Number.isFinite(payload.temperature) && payload.temperature >= -50 && payload.temperature <= 80
         && validUtc(payload.sourceObservedAt) && validUtc(payload.validUntil)
-        && Date.parse(String(payload.validUntil)) > Date.parse(String(payload.sourceObservedAt))
-        && Date.parse(String(payload.validUntil)) <= Date.parse(String(payload.sourceObservedAt)) + 30 * 60 * 1000
-        && payload.quality === 'fresh' && !event.critical && event.aggregateId === payload.sourceEventKey;
+        && (payload.analyticsPolicyVersion === 3
+          ? (payload.quality === 'unknown' && payload.validUntil === payload.sourceObservedAt
+            || payload.quality === 'fresh' && Date.parse(String(payload.validUntil)) > Date.parse(String(payload.sourceObservedAt))
+              && Date.parse(String(payload.validUntil)) <= Date.parse(String(payload.sourceObservedAt)) + 65595 * 1000)
+          : payload.quality === 'fresh' && Date.parse(String(payload.validUntil)) > Date.parse(String(payload.sourceObservedAt))
+            && Date.parse(String(payload.validUntil)) <= Date.parse(String(payload.sourceObservedAt)) + 30 * 60 * 1000)
+        && !event.critical && event.aggregateId === payload.sourceEventKey;
     case 'automation.outcome':
       return exactKeys(payload, ['occurrenceId', 'automationId', 'automationRevision', 'status', 'startedAt', 'completedAt', 'actionCount', 'actionStatuses'])
         // OS occurrence IDs include the signed local UTC offset (for example

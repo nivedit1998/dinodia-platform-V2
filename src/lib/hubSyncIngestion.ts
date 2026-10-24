@@ -535,7 +535,7 @@ async function applyHubSyncEventInner(tx: Prisma.TransactionClient, input: SyncE
     const newWriterFrom = intervals.map(row => row.newWriterFrom).filter((value): value is Date => value !== null).sort((a, b) => a.getTime() - b.getTime())[0];
     const authority = classifyUsageAuthority({ intervals, start: coverageStartAt, end: coverageEndAt, category: String(payload.analyticsCategory),
       controlId: String(payload.controlId), generation: Number(payload.sourceGeneration), intervalId: payload.analyticsIntervalId ? String(payload.analyticsIntervalId) : undefined,
-      bindingRevision: Number(payload.bindingRevision || 0), newWriterFrom });
+      bindingRevision: Number(payload.bindingRevision || 0), newWriterFrom, analyticsPolicyVersion: Number(payload.analyticsPolicyVersion || 1) });
     if (authority.status === 'denied') invalid('hub_sync_analytics_interval_invalid', 'The usage interval does not authorize these measurements');
     const installationWriter = payload.analyticsIntervalId ? await tx.hubInstallation.findUnique({ where: { id: hubInstallationId }, select: { analyticsWriterEnabled: true } }) : null;
     const writerDisabled = Boolean(payload.analyticsIntervalId) && installationWriter?.analyticsWriterEnabled !== true;
@@ -607,9 +607,11 @@ async function applyHubSyncEventInner(tx: Prisma.TransactionClient, input: SyncE
     const observedAt = strictDate(payload.sourceObservedAt, now);
     const validUntil = new Date(String(payload.validUntil));
     if (!Number.isFinite(validUntil.getTime())) invalid('hub_sync_temperature_validity_invalid', 'The temperature validity deadline is invalid');
-    const maximumValidityMs = Math.min(30 * 60 * 1000, Number(control.maxStateValiditySeconds) * 1000);
+    const evidencePolicy = payload.analyticsPolicyVersion === 3;
+    const maximumValidityMs = evidencePolicy ? Math.min(65595 * 1000, Number(control.maxStateValiditySeconds) * 1000)
+      : Math.min(30 * 60 * 1000, Number(control.maxStateValiditySeconds) * 1000);
     if (!Number.isSafeInteger(control.maxStateValiditySeconds) || maximumValidityMs <= 0
-      || validUntil <= observedAt || validUntil.getTime() > observedAt.getTime() + maximumValidityMs
+      || (evidencePolicy ? validUntil < observedAt : validUntil <= observedAt) || validUntil.getTime() > observedAt.getTime() + maximumValidityMs
       || observedAt > now || observedAt < oneCalendarYearBefore(now) || now >= oneCalendarYearAfter(observedAt)) return;
     const existing = await tx.nativeTemperatureSample.findUnique({ where: { sourceEventKey: String(payload.sourceEventKey) }, select: { id: true, homeId: true, deviceId: true, temperature: true, sourceObservedAt: true, validUntil: true } });
     const expectedSourceEventKey = createHash('sha256').update([
@@ -632,7 +634,7 @@ async function applyHubSyncEventInner(tx: Prisma.TransactionClient, input: SyncE
     await tx.nativeTemperatureSample.create({ data: {
       homeId, deviceId: device.id, areaId: area.id, sourceEventKey: String(payload.sourceEventKey),
       temperature: Number(payload.temperature), sourceObservedAt: observedAt, validUntil,
-      sourceGeneration: Number(payload.sourceGeneration), purgeAt: oneCalendarYearAfter(observedAt),
+      sourceGeneration: Number(payload.sourceGeneration), analyticsPolicyVersion: evidencePolicy ? 3 : 2, purgeAt: oneCalendarYearAfter(observedAt),
     } });
     if (!recent && now < validUntil) await tx.nativeDevice.update({ where: { id: device.id }, data: { radiatorTemperature: Number(payload.temperature), radiatorReadingAt: observedAt } });
     return;
