@@ -13,6 +13,7 @@ import { stage1RouteInventory } from '../test/stage1_route_inventory.mjs';
 import { roomPlaqueIntegration } from './room_plaque_integration.mjs';
 import { verifyStateEvidenceIOS } from './state_evidence_ios_integration.mjs';
 import { verifyStateEvidenceHistory } from './state_evidence_history_integration.mjs';
+import { logicalDevicesDatabaseChecks } from './logical_devices_integration.mjs';
 
 const root = process.cwd();
 const osRoot = process.env.DINODIA_OS_ROOT || path.resolve(root, '../Dinodia OS');
@@ -12569,6 +12570,10 @@ try {
   await bootstrapDeliveryChecks(deliveryEnv);
   await customerAuthenticationLifecycleChecks(deliveryEnv);
   await customerAuthorizationChecks(deliveryEnv);
+  if (process.env.LOGICAL_DEVICES_ONLY === '1') {
+    await logicalDevicesDatabaseChecks({ prisma, fixture: customerFixture, osRoot, databaseUrl });
+    verifyChildOutboundTargets();
+  } else {
   const plaqueOwner = await fetchJson(`http://127.0.0.1:${appPort}/api/v2/mobile/session`, { method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify({
     email:customerFixture.propertyEmail,password:customerFixture.propertyPassword,deviceInstallationId:customerFixture.propertyInstallationId,
     publicKey:customerFixture.propertyPublicKey,deviceName:'Disposable plaque owner phone',model:'integration-test',osFamily:'test',osVersion:'test' }) });
@@ -12640,6 +12645,7 @@ try {
   else if (stage5SyncRecoveryOnly) console.log(`[stage5:integration] PASS: focused signed Native V2 configuration-recovery route checks completed against disposable PostgreSQL; parent=${[...outboundTargets].sort().join(',')}; children=${childTargets.join(',')}`);
   else if (stage12AlexaOnly) console.log(`[stage12:integration] PASS: focused Alexa OAuth route checks completed against disposable PostgreSQL; parent=${[...outboundTargets].sort().join(',')}; children=${childTargets.join(',')}`);
   else console.log(`[stage1:integration] PASS: live Platform routes, locked Dinodia OS HTTP, browser isolation, authenticated native WebSocket command authorization and denial exercised against disposable PostgreSQL; parent=${[...outboundTargets].sort().join(',')}; children=${childTargets.join(',')}`);
+  }
 } finally {
   await cleanup();
 }

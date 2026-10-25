@@ -86,6 +86,15 @@ export async function buildHubCloudConfiguration(db: Prisma.TransactionClient, i
       };
     }),
   } : undefined;
+  const logicalRows = capabilitySummary.nativeLogicalDevicesV1 === true
+    ? await db.$queryRaw<Array<{ osDeviceId: string; sourceBinding: Record<string, unknown> }>>`
+      SELECT d."osDeviceId", d."sourceBinding" FROM "NativeDevice" d
+      JOIN "NativePhysicalDevice" p ON p."id" = d."physicalParentId"
+      WHERE d."homeId" = ${input.homeId}::uuid AND d."hubInstallationId" = ${input.hubInstallationId}::uuid
+      AND p."homeId" = d."homeId" AND p."hubInstallationId" = d."hubInstallationId"
+      AND p."lifecycle" = 'ACTIVE' LIMIT 2000`
+    : [];
+  const logicalBindings = new Map(logicalRows.map(row => [row.osDeviceId, row.sourceBinding]));
   const unsigned = {
     revision: home.managementRevision,
     policyRevision: hub?.accessPolicyRevision ?? 0,
@@ -98,6 +107,7 @@ export async function buildHubCloudConfiguration(db: Prisma.TransactionClient, i
       inventoryRevision: device.inventoryRevision,
       descriptorRevision: device.descriptorRevision, descriptorDigest: device.descriptorDigest,
       osAreaIds: device.assignments.map((assignment) => assignment.area.osAreaId),
+      ...(logicalBindings.has(device.osDeviceId) ? { logicalBinding: logicalBindings.get(device.osDeviceId) } : {}),
       ...(() => { const interval = analyticsIntervals.find(row => row.deviceId === device.id); return interval ? { analyticsInterval: {
         id: interval.id, revision: interval.revision, validFrom: interval.validFrom.toISOString(), sourceGeneration: interval.sourceGeneration,
         selectedControlId: interval.selectedControlId, writerEnabled: hub?.analyticsWriterEnabled === true

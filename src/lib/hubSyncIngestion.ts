@@ -8,6 +8,7 @@ import { suspendAutomationsForDeviceChange } from './nativeAutomations/revalidat
 import { retireNativeAutomations } from './nativeAutomations/lifecycle';
 import { currentCustomerPolicy } from './customerPolicyConfig';
 import { allowedAnalyticsControls, classifyUsageAuthority } from './analyticsIntervals';
+import { suppressedSyncEvents } from './deletionReferences';
 
 function invalid(code: string, message: string): never {
   throw new Stage1AuthError(409, code, message);
@@ -114,12 +115,17 @@ function oneCalendarYearBefore(source: Date): Date {
 
 type SyncEventInput = {
   event: HubSyncEvent; homeId: string; hubInstallationId: string; identityGeneration?: number; now: Date;
+  suppressedEventIds?: Set<string>;
 };
 
 // Only validated, authenticated usage events enter this boundary. A savepoint is
 // essential: PostgreSQL constraint errors otherwise poison the outer batch even
 // if JavaScript catches them. Never consume malformed envelopes or database outages.
 export async function applyHubSyncEvent(tx: Prisma.TransactionClient, input: SyncEventInput) {
+  const suppressed = input.suppressedEventIds ?? await suppressedSyncEvents(tx, input.hubInstallationId, [input.event]);
+  // The envelope and stream identity have already been authenticated/validated. Acknowledge
+  // erased targets without storing their payloads or blocking an immutable signed batch.
+  if (suppressed.has(input.event.id)) return;
   if (input.event.type !== 'usage.bucket') return applyHubSyncEventInner(tx, input);
   await tx.$executeRawUnsafe('SAVEPOINT analytics_usage_event');
   try {
