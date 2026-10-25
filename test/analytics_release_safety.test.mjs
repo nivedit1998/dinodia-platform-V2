@@ -11,6 +11,7 @@ function load(name) {
   const local = id => id === './stage1Auth' ? { Stage1AuthError: AuthError } : id === './hubSyncEnvelope'
     ? { canonicalSyncJson: JSON.stringify } : id === './analyticsIntervals' ? load('analyticsIntervals')
     : id === './deletionReferences' ? load('deletionReferences')
+    : ['./dailyAnalyticsIngestion', './dailyAnalyticsSchema', './analyticsHistoryCalendar'].includes(id) ? load(id.slice(2))
     : id === './stage1Crypto' ? { sha256: value => require('node:crypto').createHash('sha256').update(value).digest('hex') }
     : id === './hubCloudConfiguration' ? { buildHubCloudConfiguration: async () => ({ checksum: 'fixture' }),
       finalizeHubCloudConfiguration: (candidate, revision) => ({ ...candidate, revision }) }

@@ -9,7 +9,8 @@ export async function GET(request: Request, context: { params: Promise<{ homeId:
   try {
     const { homeId } = await context.params;
     const scope = await requireNativeAnalyticsScope(request, homeId);
-    const result = await readNativeTemperatureDetail(homeId, scope.timezone, new URL(request.url).searchParams);
+    const result = await readNativeTemperatureDetail(homeId, scope.timezone, new URL(request.url).searchParams, undefined,
+      { historyVersion: request.headers.get('X-Dinodia-Analytics-History-Version') });
     await assertNativeAnalyticsScopeCurrent(scope);
     return NextResponse.json(result, { headers: { 'Cache-Control': 'no-store', Pragma: 'no-cache', Vary: 'Authorization, Cookie, X-Dinodia-Home-Id' } });
   } catch (error) { return nativeV1ErrorResponse(error); }

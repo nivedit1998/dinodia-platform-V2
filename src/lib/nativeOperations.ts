@@ -223,8 +223,10 @@ export async function runNativeMaintenance(now = new Date()) {
       prisma.nativeAnalyticsUnallocated.findFirst({ where: { purgeAt: { lte: now } }, select: { id: true } }),
     ]);
     const ephemeral = await cleanEphemeralRecords(prisma, now);
+    const calendarAnalytics = process.env.DINODIA_CALENDAR_ANALYTICS_ENABLED === 'true'
+      ? await (await import('./dailyAnalyticsMaintenance')).maintainDailyAnalytics(prisma, now) : { enabled: false };
     const checkpoint = { through: now.toISOString(), usageDeleted, temperatureDeleted, automationTombstonesDeleted, unallocatedDeleted,
-      ephemeral, backlogRemains: Boolean(usageRemainder || temperatureRemainder || unallocatedRemainder
+      ephemeral, calendarAnalytics, backlogRemains: Boolean(usageRemainder || temperatureRemainder || unallocatedRemainder
         || ephemeral.replayBacklogRemains || ephemeral.cronBacklogRemains), batchLimitPerTable: batchSize * maxBatchesPerTable };
     result.retentionCleanup = checkpoint;
     (result as { taskCursors?: Record<string, unknown> }).taskCursors = {

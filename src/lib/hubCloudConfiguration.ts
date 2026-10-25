@@ -1,6 +1,7 @@
 import type { Prisma } from '@prisma/client';
 import { canonicalSyncJson, hashSyncConfiguration } from './hubSyncEnvelope';
 import { deletionReferencePrefix } from './deletionReferences';
+import { calendarSchemaPresent } from './dailyAnalyticsSchema';
 
 const MAX_CONFIGURATION_BYTES = 1024 * 1024;
 
@@ -17,7 +18,7 @@ export async function buildHubCloudConfiguration(db: Prisma.TransactionClient, i
       select: { id: true, role: true, accessRevision: true, tenantAreaGrants: { where: { revokedAt: null, area: { status: 'ACTIVE' } }, orderBy: { areaId: 'asc' }, select: { areaId: true, policyRevision: true } } },
     }),
     db.nativeDevice.findMany({ where: { homeId: input.homeId, hubInstallationId: input.hubInstallationId }, orderBy: { id: 'asc' }, take: 2000,
-      select: { id: true, osDeviceId: true, managementClass: true, ownerMembershipId: true, analyticsCategory: true, inventoryRevision: true, lifecycle: true, customerLabel: true, overrideName: true, descriptorRevision: true, descriptorDigest: true, assignments: { where: { validUntil: null, area: { status: 'ACTIVE' } }, orderBy: { areaId: 'asc' }, take: 8, select: { areaId: true, area: { select: { osAreaId: true } } } } } }),
+      select: { id: true, osDeviceId: true, managementClass: true, ownerMembershipId: true, analyticsCategory: true, inventoryRevision: true, lifecycle: true, customerLabel: true, overrideName: true, descriptorRevision: true, descriptorDigest: true, assignments: { where: { validUntil: null, area: { status: 'ACTIVE' } }, orderBy: { areaId: 'asc' }, take: 8, select: { areaId: true, validFrom: true, area: { select: { osAreaId: true } } } } } }),
     db.nativeAutomation.findMany({ where: { homeId: input.homeId }, orderBy: { id: 'asc' }, take: 100,
       select: { id: true, createdByMembershipId: true, name: true, status: true, revision: true, definitionChecksum: true, timezone: true, retiredAt: true, createdAt: true, updatedAt: true,
         triggers: { orderBy: { id: 'asc' }, take: 16, select: { id: true, kind: true, configuration: true, revision: true } },
@@ -35,6 +36,9 @@ export async function buildHubCloudConfiguration(db: Prisma.TransactionClient, i
   const capabilitySummary = hub?.capabilitySummary && typeof hub.capabilitySummary === 'object' && !Array.isArray(hub.capabilitySummary)
     ? hub.capabilitySummary as Record<string, unknown> : {};
   const supportsTenantAutomationProjection = capabilitySummary.nativeTenantAutomationProjectionV1 === true;
+  const history = capabilitySummary.nativeDailyAnalyticsV1 === true && await calendarSchemaPresent(db)
+    ? await db.nativeAnalyticsRetention.findUnique({where:{hubInstallationId:input.hubInstallationId}}):null;
+  if(history && (history.homeId!==input.homeId||history.timezone!==home.timezone)) throw new Error('Analytics timezone requires prospective reconciliation');
   const analyticsIntervals = capabilitySummary.nativeUniversalAnalyticsV2 === true ? await db.nativeAnalyticsInterval.findMany({
     where: { homeId: input.homeId, hubInstallationId: input.hubInstallationId, validUntil: null,
       sourceGeneration: hub?.manufacturingIdentity?.identityGeneration ?? -1 }, take: 2000,
@@ -102,6 +106,8 @@ export async function buildHubCloudConfiguration(db: Prisma.TransactionClient, i
       select: { anonymousReference: true }, orderBy: { anonymousReference: 'asc' }, take: 8193 }) : null;
   if (logicalSecurity && logicalSecurity.length > 8192) throw new Error('Deletion security ledger requires bounded recovery maintenance');
   const unsigned = {
+    ...(history?.writerEnabled && hub?.analyticsWriterEnabled ? {analyticsHistory:{version:1,enabled:true,timezone:history.timezone,writerFrom:history.writerFrom.toISOString(),
+      ...(history.prunedThrough ? {detailPruneBefore:history.prunedThrough.toISOString()}: {})}}:{}),
     revision: home.managementRevision,
     policyRevision: hub?.accessPolicyRevision ?? 0,
     areas: areas.map((area) => ({ id: area.id, osAreaId: area.osAreaId, originalName: area.originalName, overrideName: area.overrideName, revision: area.revision })),
@@ -113,6 +119,8 @@ export async function buildHubCloudConfiguration(db: Prisma.TransactionClient, i
       inventoryRevision: device.inventoryRevision,
       descriptorRevision: device.descriptorRevision, descriptorDigest: device.descriptorDigest,
       osAreaIds: device.assignments.map((assignment) => assignment.area.osAreaId),
+      ...(history?.writerEnabled && device.managementClass === 'PROPERTY_DEVICE' && device.assignments.length === 1
+        ? { analyticsAssignmentStartedAt: device.assignments[0].validFrom.toISOString() } : {}),
       ...(logicalBindings.has(device.osDeviceId) ? { logicalBinding: logicalBindings.get(device.osDeviceId) } : {}),
       ...(() => { const interval = analyticsIntervals.find(row => row.deviceId === device.id); return interval ? { analyticsInterval: {
         id: interval.id, revision: interval.revision, validFrom: interval.validFrom.toISOString(), sourceGeneration: interval.sourceGeneration,

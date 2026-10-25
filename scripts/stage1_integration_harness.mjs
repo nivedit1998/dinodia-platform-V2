@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -14,6 +15,7 @@ import { roomPlaqueIntegration } from './room_plaque_integration.mjs';
 import { verifyStateEvidenceIOS } from './state_evidence_ios_integration.mjs';
 import { verifyStateEvidenceHistory } from './state_evidence_history_integration.mjs';
 import { logicalDevicesDatabaseChecks } from './logical_devices_integration.mjs';
+import { calendarAnalyticsDatabaseChecks } from './calendar_analytics_integration.mjs';
 
 const root = process.cwd();
 const osRoot = process.env.DINODIA_OS_ROOT || path.resolve(root, '../Dinodia OS');
@@ -312,11 +314,14 @@ const nativeV1Contract = loadNativeV1Contract();
 function loadHubSyncEnvelopeValidator() {
   const require = createRequire(import.meta.url);
   const ts = require('typescript');
-  const source = fs.readFileSync(path.join(root, 'src/lib/hubSyncEnvelope.ts'), 'utf8');
-  const compiled = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, esModuleInterop: true } }).outputText;
-  const loaded = { exports: {} };
-  new Function('require', 'module', 'exports', compiled)(require, loaded, loaded.exports);
-  return loaded.exports.validateHubSyncEnvelope;
+  function load(file) {
+    const compiled = ts.transpileModule(fs.readFileSync(file, 'utf8'), { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, esModuleInterop: true } }).outputText;
+    const loaded = { exports: {} };
+    new Function('require', 'module', 'exports', compiled)(id => id.startsWith('.')
+      ? load(path.resolve(path.dirname(file), id + '.ts')) : require(id), loaded, loaded.exports);
+    return loaded.exports;
+  }
+  return load(path.join(root, 'src/lib/hubSyncEnvelope.ts')).validateHubSyncEnvelope;
 }
 const validateHubSyncEnvelope = loadHubSyncEnvelopeValidator();
 function usageBucketContractFacts(event) {
@@ -443,7 +448,8 @@ function loadHubCloudConfigurationBuilder() {
     const source = fs.readFileSync(path.join(root, file), 'utf8');
     const compiled = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, esModuleInterop: true } }).outputText;
     const loaded = { exports: {} };
-    new Function('require', 'module', 'exports', compiled)(require, loaded, loaded.exports);
+    new Function('require', 'module', 'exports', compiled)(id => id.startsWith('.')
+      ? compile(path.relative(root, path.resolve(root, path.dirname(file), id + '.ts'))) : require(id), loaded, loaded.exports);
     return loaded.exports;
   };
   const envelope = compile('src/lib/hubSyncEnvelope.ts');
@@ -452,6 +458,7 @@ function loadHubCloudConfigurationBuilder() {
   const loaded = { exports: {} };
   const localRequire = (specifier) => specifier === './hubSyncEnvelope' ? envelope
     : specifier === './deletionReferences' ? compile('src/lib/deletionReferences.ts')
+    : specifier === './dailyAnalyticsSchema' ? compile('src/lib/dailyAnalyticsSchema.ts')
     : specifier === './analyticsIntervals' ? analyticsIntervalDomain() : require(specifier);
   new Function('require', 'module', 'exports', compiled)(localRequire, loaded, loaded.exports);
   return loaded.exports.buildHubCloudConfiguration;
@@ -724,6 +731,7 @@ function baseEnv() {
     DINODIA_NATIVE_ZIGBEE_COMMISSIONING_ENABLED: 'true',
     DINODIA_NATIVE_MATTER_COMMISSIONING_ENABLED: 'true',
     DINODIA_LOGICAL_DEVICES_ENABLED: process.env.LOGICAL_DEVICES_ONLY === '1' ? 'true' : 'false',
+    DINODIA_CALENDAR_ANALYTICS_ENABLED: process.env.CALENDAR_ANALYTICS_ONLY === '1' ? 'true' : 'false',
     DINODIA_NATIVE_POLICY_TITLE: 'Disposable Stage 6 policy fixture',
     DINODIA_NATIVE_POLICY_TEXT: disposablePolicyText,
     DINODIA_NATIVE_POLICY_CONTENT_SHA256: sha256(disposablePolicyText),
@@ -12575,7 +12583,34 @@ try {
   await bootstrapDeliveryChecks(deliveryEnv);
   await customerAuthenticationLifecycleChecks(deliveryEnv);
   await customerAuthorizationChecks(deliveryEnv);
-  if (process.env.LOGICAL_DEVICES_ONLY === '1') {
+  if (process.env.CALENDAR_ANALYTICS_ONLY === '1') {
+    await calendarAnalyticsDatabaseChecks({ prisma, fixture: customerFixture, osRoot, databaseUrl,
+      base: `http://127.0.0.1:${appPort}`, machineRequest, fetchJson,
+      setEngine: async enabled => { await stopPlatform(); await startPlatform({ ...deliveryEnv,
+        DINODIA_CALENDAR_ANALYTICS_ENABLED: enabled ? 'true' : 'false' }); } });
+    // Prove the migration bridge on this disposable loopback database only.
+    // Candidate feature-OFF must function against the exact predecessor schema.
+    await stopPlatform();
+    if (!['127.0.0.1', 'localhost'].includes(new URL(databaseUrl).hostname)) fail('Calendar bridge requires disposable loopback database');
+    await prisma.$executeRawUnsafe('DROP TABLE "NativeAnalyticsDay", "NativeAnalyticsRetention"');
+    await prisma.$executeRawUnsafe('DROP FUNCTION "guard_native_analytics_day"(), "guard_native_analytics_retention"()');
+    await prisma.$executeRawUnsafe('DROP FUNCTION "native_analytics_day_start"(date,text)');
+    await prisma.$executeRaw`DELETE FROM "_prisma_migrations" WHERE migration_name='20261025140000_calendar_daily_analytics'`;
+    await startPlatform({ ...deliveryEnv, DINODIA_CALENDAR_ANALYTICS_ENABLED: 'false' });
+    const bridgeBase = `http://127.0.0.1:${appPort}`;
+    const bridgeOwner = await fetchJson(`${bridgeBase}/api/v2/mobile/session`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({
+      email: customerFixture.propertyEmail, password: customerFixture.propertyPassword, deviceInstallationId: customerFixture.propertyInstallationId,
+      publicKey: customerFixture.propertyPublicKey, deviceName: 'Disposable migration bridge', model: 'test', osFamily: 'test', osVersion: 'test' }) });
+    assert.equal(bridgeOwner.response.status, 200);
+    const bridgeBootstrap = await fetchJson(`${bridgeBase}/api/v2/homes/${customerFixture.homeOneId}/analytics/bootstrap`, {
+      headers: { authorization: `Bearer ${bridgeOwner.body.accessToken}`, 'x-dinodia-home-id': customerFixture.homeOneId } });
+    assert.equal(bridgeBootstrap.response.status, 200, JSON.stringify(bridgeBootstrap.body));
+    const bridgeReadiness = await fetchJson(`${bridgeBase}/api/readiness`);
+    assert.equal(bridgeReadiness.response.status, 200, JSON.stringify(bridgeReadiness.body));
+    assert.equal(bridgeReadiness.body.ready, true);
+    console.log('[calendar:integration] PASS feature-OFF candidate authenticates, serves existing analytics and passes readiness on the actual predecessor schema before migration');
+    verifyChildOutboundTargets();
+  } else if (process.env.LOGICAL_DEVICES_ONLY === '1') {
     const logicalEnv = { ...deliveryEnv, DINODIA_NATIVE_ALEXA_ENABLED: 'true' };
     await stopPlatform();
     await startPlatform(logicalEnv);

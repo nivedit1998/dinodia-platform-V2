@@ -78,6 +78,7 @@ function loadAreaDeletion() {
     './nativeAutomations/delivery': { refreshNativeAutomationCloudRevision: async () => {} },
     './deletionReferences': load('deletionReferences') };
   stubs['./areaDeletionPayloadPurge'] = { purgeAreaPayloads: async () => {} };
+  stubs['./dailyAnalyticsErasure'] = load('dailyAnalyticsErasure');
   new Function('require', 'module', 'exports', js)(id => stubs[id] ?? require(id), module, module.exports);
   return module.exports;
 }

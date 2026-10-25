@@ -10,6 +10,7 @@ test('historical contributors do not hide missing currently eligible devices or 
   const now = new Date('2026-10-23T11:00:00Z');
   const row = { deviceId: 'retired', areaId: 'a', bucketStart: new Date('2026-10-23T10:00:00Z'), coverageStartAt: new Date('2026-10-23T10:00:00Z'), coverageEndAt: new Date('2026-10-23T10:10:00Z'), closedAt: null, onSeconds: 600, offSeconds: 0, unknownSeconds: 0 };
   const prisma = {
+    $queryRaw: async () => [{ available: false }],
     nativeDeviceUsageBucket: { findMany: async () => [row] },
     deviceAreaAssignment: { findMany: async () => [{ deviceId: 'retired', areaId: 'a', validFrom: row.bucketStart, validUntil: null }] },
     nativeDevice: { findMany: async () => [{ id: 'retired', originalName: 'old', overrideName: null, customerLabel: null, lifecycle: 'RETIRED' }],

@@ -9,6 +9,7 @@ import { retireNativeAutomations } from './nativeAutomations/lifecycle';
 import { currentCustomerPolicy } from './customerPolicyConfig';
 import { allowedAnalyticsControls, classifyUsageAuthority } from './analyticsIntervals';
 import { suppressedSyncEvents } from './deletionReferences';
+import { ingestDailyAnalytics, quarantineDailyAnalytics, sealedLegacyEvent } from './dailyAnalyticsIngestion';
 
 function invalid(code: string, message: string): never {
   throw new Stage1AuthError(409, code, message);
@@ -115,7 +116,7 @@ function oneCalendarYearBefore(source: Date): Date {
 
 type SyncEventInput = {
   event: HubSyncEvent; homeId: string; hubInstallationId: string; identityGeneration?: number; now: Date;
-  suppressedEventIds?: Set<string>;
+  suppressedEventIds?: Set<string>; streamId?: string;
 };
 
 // Only validated, authenticated usage events enter this boundary. A savepoint is
@@ -126,6 +127,21 @@ export async function applyHubSyncEvent(tx: Prisma.TransactionClient, input: Syn
   // The envelope and stream identity have already been authenticated/validated. Acknowledge
   // erased targets without storing their payloads or blocking an immutable signed batch.
   if (suppressed.has(input.event.id)) return;
+  if (input.event.type === 'analytics.day') {
+    await tx.$executeRawUnsafe('SAVEPOINT analytics_daily_event');
+    try {
+      await applyHubSyncEventInner(tx, input);
+      await tx.$executeRawUnsafe('RELEASE SAVEPOINT analytics_daily_event');
+    } catch (error) {
+      await tx.$executeRawUnsafe('ROLLBACK TO SAVEPOINT analytics_daily_event');
+      const code = error instanceof Stage1AuthError ? error.code : '';
+      if (!['hub_sync_daily_authority_invalid', 'hub_sync_daily_assignment_invalid', 'hub_sync_daily_coverage_regression',
+        'hub_sync_daily_overlap', 'hub_sync_daily_writer_invalid', 'hub_sync_daily_disabled'].includes(code)) throw error;
+      await quarantineDailyAnalytics(tx, input, code);
+      await tx.$executeRawUnsafe('RELEASE SAVEPOINT analytics_daily_event');
+    }
+    return;
+  }
   if (input.event.type !== 'usage.bucket') return applyHubSyncEventInner(tx, input);
   await tx.$executeRawUnsafe('SAVEPOINT analytics_usage_event');
   try {
@@ -173,6 +189,8 @@ async function applyHubSyncEventInner(tx: Prisma.TransactionClient, input: SyncE
   const { event, homeId, hubInstallationId, now } = input;
   const payload = event.payload;
   if (event.type === 'sync.compacted') return;
+  if (await sealedLegacyEvent(tx, input)) return;
+  if (event.type === 'analytics.day' || event.type === 'analytics.daily.barrier') return ingestDailyAnalytics(tx, input);
 
   if (event.type === 'area.upsert') {
     const osAreaId = String(payload.osAreaId);

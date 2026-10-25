@@ -52,7 +52,7 @@ function localWeekStart(p: ReturnType<typeof parts>) {
   return { year: date.getUTCFullYear(), month: date.getUTCMonth() + 1, day: date.getUTCDate() };
 }
 
-function usagePeriod(row: NativeUsageRow, level: NativeAnalyticsLevel, timezone: string) {
+export function usagePeriod(row: NativeUsageRow, level: NativeAnalyticsLevel, timezone: string) {
   const start = new Date(row.bucketStart);
   const p = parts(start, timezone);
   if (level === 'hour') {
