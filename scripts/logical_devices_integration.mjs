@@ -7,7 +7,7 @@ const require = createRequire(import.meta.url), ts = require('typescript');
 
 // This domain/constraint check is called ONLY by the maintained disposable Docker harness.
 // It deliberately does not claim to prove the HTTP actor/session boundary.
-export async function logicalDevicesDatabaseChecks({ prisma, fixture, osRoot, databaseUrl, base, machineRequest }) {
+export async function logicalDevicesDatabaseChecks({ prisma, fixture, osRoot, databaseUrl, base, machineRequest, environment = {} }) {
   const url = new URL(databaseUrl);
   assert.ok(['localhost', '127.0.0.1', '::1', '[::1]'].includes(url.hostname), 'Disposable local DB only');
   const cache = new Map();
@@ -15,17 +15,39 @@ export async function logicalDevicesDatabaseChecks({ prisma, fixture, osRoot, da
     const file = path.resolve('src/lib', `${name}.ts`);
     if (cache.has(file)) return cache.get(file);
     const module = { exports: {} }; cache.set(file, module.exports);
-    const js = ts.transpileModule(fs.readFileSync(file, 'utf8'), { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText;
+    const js = ts.transpileModule(fs.readFileSync(file, 'utf8'), { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText
+      + (name === 'nativeAlexaExecution' ? '\nmodule.exports.testAuthorizeEndpoint = lockAndAuthorizeEndpoint;' : '');
     new Function('require', 'module', 'exports', js)(id => id === './stage1Auth'
       ? { Stage1AuthError: class extends Error { constructor(status, code, message) { super(message); this.status = status; this.code = code; } } }
+      : id === '@/lib/prisma' ? { prisma }
+      : id.startsWith('@/lib/') ? load(id.slice('@/lib/'.length))
       : id.startsWith('.') ? load(path.relative(path.resolve('src/lib'), path.resolve(path.dirname(file), id))) : require(id), module, module.exports);
     cache.set(file, module.exports); return module.exports;
   }
   const { commissionLogicalChildren } = load('commissioningLogicalDevices');
+  const signedEvents = async events => {
+    const cursor = await prisma.hubInstallation.findUniqueOrThrow({ where: { id: fixture.hubOneId } });
+    const from = Number(cursor.syncAcceptedSequence) + 1;
+    const envelope = { schemaVersion: 1, hubInstallationId: fixture.hubOneId, streamId: String(cursor.syncStreamId),
+      fromSequence: from, toSequence: from + events.length - 1,
+      events: events.map((event, index) => ({ id: randomUUID(), sequence: from + index,
+        occurredAt: new Date().toISOString(), critical: false, ...event })), queueDepth: events.length,
+      acknowledgedCloudRevision: Number(cursor.acknowledgedCloudRevision),
+      runtime: { kind: 'dinodia_os', version: 'logical-integration', capabilities: { nativeLogicalDevicesV1: true } },
+      sentAt: new Date().toISOString() };
+    const submit = () => machineRequest({ base, path: '/api/hub-agent/v2/sync', machineSecret: fixture.machineSecret,
+      body: { serial: fixture.identityOneSerial, identityGeneration: fixture.identityOneGeneration, ...envelope } });
+    const response = await submit();
+    assert.equal(response.response.status, 200, JSON.stringify(response.body));
+    assert.equal(Number(response.body.acceptedThroughSequence), envelope.toSequence);
+    const repeat = await submit();
+    assert.equal(repeat.response.status, 200, 'exact signed retry is acknowledged');
+    return envelope.events;
+  };
   const { normalizeZigbeeDevice } = require(path.join(osRoot, 'src/integrations/zigbee/exposeNormalizer'));
   const { buildLogicalCommissioningProposal } = require(path.join(osRoot, 'src/commissioning/logicalDeviceCatalogue'));
   const adapterFixture = JSON.parse(fs.readFileSync(path.join(osRoot, 'test/fixtures/zigbee/two-gang-light.json')));
-  const physical = normalizeZigbeeDevice(adapterFixture);
+  let physical = normalizeZigbeeDevice(adapterFixture);
   const original = await prisma.nativeDevice.create({ data: {
     id: randomUUID(), homeId: fixture.homeOneId, hubInstallationId: fixture.hubOneId,
     osDeviceId: physical.id, originalName: 'Synthetic two-channel switch', technicalLabel: 'tenant_device',
@@ -98,6 +120,9 @@ export async function logicalDevicesDatabaseChecks({ prisma, fixture, osRoot, da
     assert.equal(store.getArea(room.osAreaId), null);
     assert.equal(await prisma.deletionSecurityReceipt.count({ where: { actionType: 'AREA_DEVICE_ERASURE' } }) > 0, true);
     console.log('[logical-devices:integration] PASS real Hub coordinator -> machine-signed HTTP -> disposable PostgreSQL preview/reserve/commit/finish, wrong-session denial and exact duplicate retry');
+    physical = normalizeZigbeeDevice({ ...adapterFixture, definition: { ...adapterFixture.definition,
+      exposes: [...adapterFixture.definition.exposes, { type: 'switch', endpoint: 'l3',
+        features: [{ type: 'binary', property: 'state_l3', access: 7 }] }] } });
     const conversionArea = await prisma.area.create({ data: { homeId: fixture.homeOneId,
       osAreaId: `ld-convert-${randomUUID()}`, originalName: 'Conversion fixture room' } });
     await store.saveArea({ name: conversionArea.originalName }, conversionArea.osAreaId);
@@ -110,7 +135,8 @@ export async function logicalDevicesDatabaseChecks({ prisma, fixture, osRoot, da
       assignments: { create: { homeId: fixture.homeOneId, areaId: conversionArea.id, source: 'LD_CONVERSION_TEST', validFrom: new Date(Date.now() - 3600000) } } } });
     const epoch = await prisma.nativeAnalyticsInterval.create({ data: { homeId: fixture.homeOneId, hubInstallationId: fixture.hubOneId,
       deviceId: retained.id, analyticsCategory: 'LIGHT', revision: 1, sourceGeneration: fixture.identityOneGeneration,
-      validFrom: new Date(Date.now() - 3600000), authorizedControls: [] } });
+      validFrom: new Date(Date.now() - 3600000), authorizedControls: [{ controlId: 'control:legacy-power',
+        semanticRole: 'power', observable: true }] } });
     await store.savePlatform({ areaBindings: [{ areaId: conversionArea.id, hubAreaId: conversionArea.osAreaId }],
       devicePolicies: { [physical.id]: { managementClass: 'PROPERTY_DEVICE', ownerMembershipId: null,
         lifecycle: 'INSTALLED', analyticsCategory: 'LIGHT', customerLabel: 'Light', osAreaIds: [conversionArea.osAreaId],
@@ -128,13 +154,43 @@ export async function logicalDevicesDatabaseChecks({ prisma, fixture, osRoot, da
     const converted = await conversion.confirm(principal, proposed);
     assert.equal(converted.state, 'COMPLETE');
     assert.equal((await conversion.confirm(principal, proposed)).state, 'COMPLETE');
-    assert.equal(store.listManagedDevices().length, 2);
+    assert.equal(store.listManagedDevices().length, 3);
     assert.equal(store.getManagedDevice(physical.id), null);
     const priorDevice = await prisma.nativeDevice.findUniqueOrThrow({ where: { id: retained.id } });
     assert.equal(priorDevice.lifecycle, 'RETIRED');
     assert.ok((await prisma.nativeAnalyticsInterval.findUniqueOrThrow({ where: { id: epoch.id } })).validUntil);
     assert.equal(await prisma.nativeAnalyticsInterval.count({ where: { deviceId: retained.id } }), 1, 'No copied or invented historical epoch');
     console.log('[logical-devices:integration] PASS real existing-device conversion HTTP, durable local fence, original epoch closure, two prospective child identities and duplicate retry');
+    const cutover = new Date((await prisma.nativeAnalyticsInterval.findUniqueOrThrow({ where: { id: epoch.id } })).validUntil);
+    const usageEvent = (start, end, revision = 1) => {
+      const bucket = new Date(start); bucket.setUTCMinutes(0, 0, 0);
+      const purge = new Date(bucket); purge.setUTCFullYear(purge.getUTCFullYear() + 1);
+      const payload = { osDeviceId: physical.id, osAreaId: conversionArea.osAreaId, analyticsCategory: 'LIGHT',
+        controlId: 'control:legacy-power', sourceGeneration: fixture.identityOneGeneration,
+        bucketStart: bucket.toISOString(), coverageStartAt: new Date(start).toISOString(),
+        coverageEndAt: new Date(end).toISOString(), revision, onSeconds: (end-start)/1000,
+        offSeconds: 0, unknownSeconds: 0, closedAt: null, purgeAt: purge.toISOString() };
+      return { type: 'usage.bucket', aggregateId: createHash('sha256').update([
+        physical.id, conversionArea.osAreaId, 'LIGHT', payload.controlId,
+        String(fixture.identityOneGeneration), String(bucket.getTime())].join('|')).digest('hex'), payload };
+    };
+    const historicEnd = Math.floor(cutover.getTime()/1000)*1000 - 1000;
+    const historicStart = historicEnd - 1000;
+    await signedEvents([usageEvent(historicStart, historicEnd)]);
+    const originalHour = new Date(historicStart); originalHour.setUTCMinutes(0,0,0);
+    const historicalBucket = await prisma.nativeDeviceUsageBucket.findFirstOrThrow({ where: {
+      deviceId: retained.id, bucketStart: originalHour } });
+    assert.equal(historicalBucket.onSeconds, 1);
+    const cutoverHour = new Date(cutover); cutoverHour.setUTCMinutes(0,0,0);
+    const boundaryStart = Math.max(cutoverHour.getTime(), Math.floor(cutover.getTime()/1000)*1000 - 1000);
+    await signedEvents([usageEvent(boundaryStart, boundaryStart + 2000, 2)]);
+    assert.equal(await prisma.nativeAnalyticsUnallocated.count({ where: { deviceId: retained.id } }), 1,
+      'a delayed aggregate crossing cutover is unallocated, never split among children');
+    const logicalRows = await prisma.nativeDevice.findMany({ where: { hubInstallationId: fixture.hubOneId,
+      osDeviceId: { in: store.listManagedDevices().map(row => row.id) } }, select: { id: true } });
+    assert.equal(logicalRows.length, 3);
+    assert.equal(await prisma.nativeDeviceUsageBucket.count({ where: { deviceId: { in: logicalRows.map(row => row.id) } } }), 0);
+    console.log('[logical-devices:integration] PASS signed delayed pre-conversion history retains original hour; straddling aggregate becomes unallocated and exact retry advances once');
     const secondRoom = await prisma.area.create({ data: { homeId: fixture.homeOneId,
       osAreaId: `ld-sibling-${randomUUID()}`, originalName: 'Surviving sibling room' } });
     await store.saveArea({ name: secondRoom.originalName }, secondRoom.osAreaId);
@@ -144,6 +200,9 @@ export async function logicalDevicesDatabaseChecks({ prisma, fixture, osRoot, da
     const channels = store.listManagedDevices();
     const moving = channels[1], erased = channels[0];
     await conversion.assign(principal, moving.id, { operationId: randomUUID(), name: 'Surviving channel',
+      areaId: secondRoom.osAreaId, labelId: 'light' });
+    const alternate = channels[2];
+    await conversion.assign(principal, alternate.id, { operationId: randomUUID(), name: 'Another surviving channel',
       areaId: secondRoom.osAreaId, labelId: 'light' });
     assert.equal(store.getManagedDevice(moving.id).areaId, secondRoom.osAreaId);
     const canonicalErased = await prisma.nativeDevice.findFirstOrThrow({ where: {
@@ -181,6 +240,42 @@ export async function logicalDevicesDatabaseChecks({ prisma, fixture, osRoot, da
       homeId: fixture.homeOneId, eventType: 'ALEXA_CHANGE_REPORT' } });
     assert.ok(retainedPayloads.every(row => !JSON.stringify(row.payload).includes(erased.id)));
     console.log('[logical-devices:integration] PASS independent assignment and shared-room deletion via real machine HTTP; sibling survives, zero unpair attempts, attributable Alexa payload removed');
+    await signedEvents([usageEvent(historicStart, historicEnd, 3), { type: 'device.upsert', aggregateId: erased.id,
+      payload: { osDeviceId: erased.id, name: 'Erased channel must not return', areaId: conversionArea.osAreaId,
+        protocol: 'zigbee', deviceType: 'switch', technicalLabel: 'light', descriptorRevision: 1,
+        descriptorDigest: 'a'.repeat(64), available: true, observedAt: new Date().toISOString() } }]);
+    assert.equal(await prisma.nativeDevice.count({ where: { id: { in: [retained.id, canonicalErased.id] } } }), 0);
+    assert.equal(await prisma.nativeDeviceUsageBucket.count({ where: { deviceId: retained.id } }), 0);
+    console.log('[logical-devices:integration] PASS signed late erased-target batches acknowledged and exact retry consumed without rows, readings or stream stalls');
+    const survivorBefore = await prisma.nativeDevice.findFirstOrThrow({ where: { osDeviceId: moving.id,
+      hubInstallationId: fixture.hubOneId } });
+    const retiredKey = erased.channelKey;
+    await assert.rejects(conversion.preview({ ...principal, scope: ['os:support'] }, moving.id, { channelKey: retiredKey }));
+    const restorePreview = await conversion.preview(principal, moving.id, { channelKey: retiredKey });
+    const competingPreview = await conversion.preview(principal, alternate.id, { channelKey: retiredKey });
+    assert.equal(restorePreview.recommission, true);
+    await request('/api/hub-agent/v2/logical-conversion', { action: 'reserve', osDeviceId: moving.id,
+      operationId: restorePreview.operationId, digest: restorePreview.digest,
+      confirmationName: restorePreview.confirmationName, ...principal });
+    await assert.rejects(request('/api/hub-agent/v2/logical-conversion', { action: 'reserve', osDeviceId: alternate.id,
+      operationId: competingPreview.operationId, digest: competingPreview.digest,
+      confirmationName: competingPreview.confirmationName, ...principal }), /Logical HTTP 409/,
+      'different anchors cannot reserve the same physical parent lifecycle and strand a permanent reservation');
+    assert.equal((await conversion.confirm(principal, restorePreview)).state, 'COMPLETE');
+    assert.equal((await conversion.confirm(principal, restorePreview)).state, 'COMPLETE');
+    const restored = store.listManagedDevices().find(row => row.channelKey === retiredKey);
+    assert.ok(restored);
+    assert.equal(restored.channelGeneration, 2);
+    assert.notEqual(restored.id, erased.id);
+    const restoredCloud = await prisma.nativeDevice.findFirstOrThrow({ where: {
+      osDeviceId: restored.id, hubInstallationId: fixture.hubOneId } });
+    assert.equal(restoredCloud.analyticsCategory, 'NONE', 'a restored lifecycle does not inherit its sibling analytics selection');
+    assert.equal(restoredCloud.physicalParentId, survivorBefore.physicalParentId);
+    const survivorAfter = await prisma.nativeDevice.findUniqueOrThrow({ where: { id: survivorBefore.id } });
+    assert.equal(survivorAfter.lifecycle, survivorBefore.lifecycle);
+    assert.equal(survivorAfter.descriptorDigest, survivorBefore.descriptorDigest);
+    assert.equal(physicalRemovals, 0);
+    console.log('[logical-devices:integration] PASS authorized partial-channel recommission preview/reserve/commit, generation2, exact retry and cross-anchor reservation exclusion; paired siblings unchanged');
     const membership = await prisma.homeMembership.findUniqueOrThrow({ where: { id: fixture.tenantMembershipId },
       include: { customerAccount: true } });
     const trustedTemplate = await prisma.trustedDevice.findFirstOrThrow({ where: { customerAccountId: membership.customerAccountId } });
@@ -242,6 +337,64 @@ export async function logicalDevicesDatabaseChecks({ prisma, fixture, osRoot, da
     assert.ok(completedPrivate.logicalDevices.every(row => row.ownerMembershipId === membership.id && row.managementClass === 'TENANT_DEVICE'));
     assert.equal(await prisma.nativeAnalyticsInterval.count({ where: {
       deviceId: { in: completedPrivate.logicalDevices.map(row => row.id) } } }), 0);
+    const privateRow = await prisma.nativeDevice.findUniqueOrThrow({ where: { id: completedPrivate.logicalDevices[0].id } });
+    const privateCatalog = privateRow.capabilitySummary.controlCatalog;
+    assert.equal(privateCatalog.descriptorDigest, privateRow.descriptorDigest);
+    const power = privateCatalog.controls.find(control => control.semanticRole === 'power');
+    assert.ok(power?.observable);
+    await prisma.home.update({ where: { id: fixture.homeOneId }, data: {
+      lifecycle: 'ACTIVE', installationStatus: 'COMPLETE', activeHubInstallationId: fixture.hubOneId } });
+    await prisma.hubInstallation.update({ where: { id: fixture.hubOneId }, data: { lifecycleStatus: 'ACTIVE', state: 'ACTIVE',
+      cloudUrl: 'https://dinodia-logical-fixture.dinodiasmartliving.com', reservedHostname: 'dinodia-logical-fixture.dinodiasmartliving.com',
+      cloudUrlVerifiedAt: new Date(Date.now()-1000), remoteVerificationAt: new Date(Date.now()-1000) } });
+    const link = await prisma.alexaNativeLink.create({ data: { customerAccountId: membership.customerAccountId,
+      providerSubjectHash: createHash('sha256').update(randomUUID()).digest('hex'), encryptionKeyVersion: 1,
+      accessTokenCiphertext: 'disposable-not-delivered', refreshTokenCiphertext: 'disposable-not-delivered' } });
+    const family = await prisma.alexaOAuthTokenFamily.create({ data: { linkId: link.id,
+      absoluteExpiresAt: new Date(Date.now()+3600000), inactivityExpiresAt: new Date(Date.now()+3600000) } });
+    const tokenHash = createHash('sha256').update(randomUUID()).digest('hex');
+    await prisma.alexaOAuthAccessToken.create({ data: { familyId: family.id, tokenHash, expiresAt: new Date(Date.now()+600000) } });
+    await prisma.alexaNativeHomeScope.create({ data: { linkId: link.id, homeId: fixture.homeOneId,
+      membershipId: membership.id, areaIds: [secondRoom.id], areaSelections: { create: { areaId: secondRoom.id } } } });
+    const endpointId = `dos_${randomUUID().replaceAll('-','')}`;
+    await prisma.alexaNativeEndpointProjection.create({ data: { linkId: link.id, homeId: fixture.homeOneId,
+      membershipId: membership.id, deviceId: privateRow.id, areaId: secondRoom.id, endpointId,
+      descriptorRevision: privateRow.descriptorRevision, exposureGeneration: 1, displayName: 'Disposable private channel', capabilities: {} } });
+    const observedAt = new Date().toISOString();
+    await signedEvents([{ type: 'device.state', aggregateId: createHash('sha256')
+      .update(`${privateRow.osDeviceId}\n${power.controlId}`).digest('hex'), payload: {
+        osDeviceId: privateRow.osDeviceId, osAreaId: secondRoom.osAreaId, controlId: power.controlId,
+        sourceGeneration: fixture.identityOneGeneration, descriptorRevision: privateRow.descriptorRevision, revision: 1,
+        observedAt, receivedAt: observedAt, validUntil: new Date(Date.parse(observedAt) + 30000).toISOString(),
+        quality: 'fresh', value: true, deviceAvailability: 'online', causeType: 'PHYSICAL_INTERACTION' } }]);
+    const reportedPrivate = await prisma.nativeDevice.findUniqueOrThrow({ where: { id: privateRow.id } });
+    assert.equal(reportedPrivate.capabilitySummary.alexaStateByControl, undefined, 'private telemetry never enters the shared property cache');
+    const privateReport = await prisma.nativeDomainOutbox.findFirstOrThrow({ where: {
+      eventType: 'ALEXA_CHANGE_REPORT', aggregateId: endpointId } });
+    assert.equal(privateReport.payload.tenantOwnedState.value, true);
+    assert.equal(privateReport.payload.ownerMembershipId, membership.id);
+    const keys = ['DINODIA_NATIVE_POLICY_VERSION','DINODIA_NATIVE_POLICY_TITLE','DINODIA_NATIVE_POLICY_TEXT',
+      'DINODIA_NATIVE_POLICY_CONTENT_SHA256','DINODIA_NATIVE_ALEXA_ENABLED'];
+    const oldEnv = Object.fromEntries(keys.map(key => [key, process.env[key]]));
+    try {
+      for (const key of keys) if (environment[key] !== undefined) process.env[key] = environment[key];
+      process.env.DINODIA_NATIVE_ALEXA_ENABLED = 'true';
+      const { testAuthorizeEndpoint } = load('nativeAlexaExecution');
+      const authorized = await testAuthorizeEndpoint(tokenHash, endpointId);
+      assert.equal(authorized.osDeviceId, privateRow.osDeviceId);
+      assert.equal(authorized.membershipId, membership.id);
+      assert.ok(authorized.controls.some(control => control.controlId === power.controlId));
+      const { descriptorDigest: _digest, ...missingDigest } = privateCatalog;
+      await prisma.nativeDevice.update({ where: { id: privateRow.id }, data: { capabilitySummary: {
+        ...reportedPrivate.capabilitySummary, controlCatalog: missingDigest } } });
+      await assert.rejects(testAuthorizeEndpoint(tokenHash, endpointId), error => error.code === 'alexa_descriptor_changed');
+      await prisma.nativeDevice.update({ where: { id: privateRow.id }, data: { capabilitySummary: reportedPrivate.capabilitySummary } });
+      await prisma.tenantAreaGrant.update({ where: { membershipId_areaId: { membershipId: membership.id, areaId: secondRoom.id } }, data: { revokedAt: new Date() } });
+      await assert.rejects(testAuthorizeEndpoint(tokenHash, endpointId), error => error.code === 'alexa_endpoint_unavailable');
+    } finally {
+      for (const key of keys) if (oldEnv[key] === undefined) delete process.env[key]; else process.env[key] = oldEnv[key];
+    }
+    console.log('[logical-devices:integration] PASS newly commissioned private child state via signed sync and actual DB-backed Alexa command/state authorization; missing digest and revoked grant deny');
     console.log('[logical-devices:integration] PASS actual new tenant commissioning HTTP create/advertise/review/finalize, two private siblings, exact retry, no analytics and no radio commands');
   } finally {
     await store.flushPersist();

@@ -12,7 +12,7 @@ export async function POST(request: Request) {
     const hub = await authenticateHub(request, raw, { maxBodyBytes: 256 * 1024 });
     const body = hub.body;
     const allowed = new Set(['serial', 'identityGeneration', 'action', 'operationId', 'osDeviceId', 'channels',
-      'protocolIdentityHash', 'digest', 'confirmationName', 'handoffId', 'jti', 'credentialVersion', 'assignment']);
+      'protocolIdentityHash', 'digest', 'confirmationName', 'handoffId', 'jti', 'credentialVersion', 'assignment', 'recommissionChannelKey']);
     if (Object.keys(body).some(key => !allowed.has(key)) || !['preview', 'reserve', 'commit', 'assign'].includes(String(body.action))
       || !/^[0-9a-f-]{36}$/i.test(String(body.operationId)) || !/^[A-Za-z0-9:_-]{1,160}$/.test(String(body.osDeviceId)))
       throw new Stage1AuthError(400, 'logical_conversion_invalid', 'Review an exact existing device');
@@ -30,7 +30,7 @@ export async function POST(request: Request) {
       return logicalDeviceConversion(tx, scope, { action: String(body.action), operationId: String(body.operationId),
         osDeviceId: String(body.osDeviceId), channels: body.channels, protocolIdentityHash: String(body.protocolIdentityHash || ''),
         digest: String(body.digest || ''), confirmationName: String(body.confirmationName || ''), generation: hub.identity.identityGeneration,
-        assignment: body.assignment });
+        assignment: body.assignment, recommissionChannelKey: typeof body.recommissionChannelKey === 'string' ? body.recommissionChannelKey : undefined });
     }, { isolationLevel: 'Serializable', maxWait: 5000, timeout: 12000 });
     return NextResponse.json(result, { headers: { 'Cache-Control': 'no-store' } });
   } catch (error) { return authErrorResponse(error); }

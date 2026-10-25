@@ -12576,8 +12576,11 @@ try {
   await customerAuthenticationLifecycleChecks(deliveryEnv);
   await customerAuthorizationChecks(deliveryEnv);
   if (process.env.LOGICAL_DEVICES_ONLY === '1') {
+    const logicalEnv = { ...deliveryEnv, DINODIA_NATIVE_ALEXA_ENABLED: 'true' };
+    await stopPlatform();
+    await startPlatform(logicalEnv);
     await logicalDevicesDatabaseChecks({ prisma, fixture: customerFixture, osRoot, databaseUrl,
-      base: `http://127.0.0.1:${appPort}`, machineRequest });
+      base: `http://127.0.0.1:${appPort}`, machineRequest, environment: logicalEnv });
     verifyChildOutboundTargets();
   } else {
   const plaqueOwner = await fetchJson(`http://127.0.0.1:${appPort}/api/v2/mobile/session`, { method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify({
