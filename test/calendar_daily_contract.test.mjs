@@ -103,3 +103,32 @@ test('connected ingestion replaces newer absolute counters, rejects private uplo
     else process.env.DINODIA_CALENDAR_ANALYTICS_ENABLED = oldFlag;
   }
 });
+
+test('daily usage fragments retain the distinct device-day divisor for larger periods', () => {
+  const { aggregateDailyUsage } = load('src/lib/dailyAnalyticsAggregation.ts');
+  const day = calendar.historyDay(Date.parse('2026-10-25T12:00:00Z'), 'Europe/London');
+  const base = { deviceId: 'a', areaId: 'room', timezone: 'Europe/London', dayStartAt: new Date(day.start), dayEndAt: new Date(day.end),
+    onSeconds: 3600, offSeconds: 0, unknownSeconds: 0, coverageStartAt: new Date(day.start), coverageEndAt: new Date(day.start + 3600000) };
+  const rows = [base, { ...base, onSeconds: 0, offSeconds: 3600, coverageStartAt: new Date(day.start + 3600000), coverageEndAt: new Date(day.start + 7200000) },
+    { ...base, deviceId: 'b', onSeconds: 0, offSeconds: 1800, coverageEndAt: new Date(day.start + 1800000) }];
+  const [bucket] = aggregateDailyUsage(rows, 'week', 'Europe/London', new Date('2026-10-25T12:00:00Z'));
+  assert.equal(bucket.contributingDeviceDays, 2);
+  assert.equal(bucket.onMinutes, 30); assert.equal(bucket.offMinutes, 45);
+  assert.equal(bucket.coverageSeconds, 9000);
+  assert.throws(() => aggregateDailyUsage(rows, 'hour', 'Europe/London', new Date()), /cannot reconstruct hourly/);
+});
+
+test('approved temperature mean weights genuine device-duration, without inventing continuous segments', () => {
+  const { aggregateDailyTemperature } = load('src/lib/dailyAnalyticsAggregation.ts');
+  const day = calendar.historyDay(Date.parse('2026-10-25T12:00:00Z'), 'Europe/London');
+  const base = { deviceId: 'a', areaId: 'room', timezone: 'Europe/London', dayStartAt: new Date(day.start), dayEndAt: new Date(day.end),
+    knownMilliseconds: 600000n, celsiusMilliseconds: 12000000, minimumCelsius: 20, maximumCelsius: 20, sampleCount: 1,
+    lastCelsius: 20, lastObservedAt: new Date(day.start), lastValidUntil: new Date(day.start + 600000) };
+  const [point] = aggregateDailyTemperature([base, { ...base, deviceId: 'b', knownMilliseconds: 300000n,
+    celsiusMilliseconds: 9000000, minimumCelsius: 30, maximumCelsius: 30, lastCelsius: 30 }], 'month', 'Europe/London');
+  assert.equal(point.celsius, 23.33);
+  assert.equal(point.knownDeviceSeconds, 900);
+  assert.equal(point.coverageBasis, 'device_time');
+  assert.equal(point.currentFresh, false);
+  assert.deepEqual(point.segments, []);
+});
