@@ -7,6 +7,7 @@ import { createPropertySupportNotifications } from './supportNotifications';
 import { dispatchInstallationRequestNotifications } from './installationRequestDelivery';
 import { resumeHomeDeregistrationAccountCleanup, type HomeDeregistrationCleanupResult } from './homeDeregistrationCleanup';
 import { dispatchNativeAlexaChangeReports } from './nativeAlexaEvents';
+import { cleanEphemeralRecords } from './nativeEphemeralRetention';
 
 export const NATIVE_OPERATION_BATCH_LIMIT = 100;
 export const NATIVE_DISPATCH_LEASE_MS = 120_000;
@@ -221,8 +222,10 @@ export async function runNativeMaintenance(now = new Date()) {
       prisma.nativeTemperatureSample.findFirst({ where: { purgeAt: { lte: now } }, select: { id: true } }),
       prisma.nativeAnalyticsUnallocated.findFirst({ where: { purgeAt: { lte: now } }, select: { id: true } }),
     ]);
+    const ephemeral = await cleanEphemeralRecords(prisma, now);
     const checkpoint = { through: now.toISOString(), usageDeleted, temperatureDeleted, automationTombstonesDeleted, unallocatedDeleted,
-      backlogRemains: Boolean(usageRemainder || temperatureRemainder || unallocatedRemainder), batchLimitPerTable: batchSize * maxBatchesPerTable };
+      ephemeral, backlogRemains: Boolean(usageRemainder || temperatureRemainder || unallocatedRemainder
+        || ephemeral.replayBacklogRemains || ephemeral.cronBacklogRemains), batchLimitPerTable: batchSize * maxBatchesPerTable };
     result.retentionCleanup = checkpoint;
     (result as { taskCursors?: Record<string, unknown> }).taskCursors = {
       ...((result as { taskCursors?: Record<string, unknown> }).taskCursors ?? {}), retentionCleanup: checkpoint,
