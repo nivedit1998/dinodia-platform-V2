@@ -223,3 +223,15 @@ test('annual expiry still runs when legacy conversion cannot proceed', async () 
   } finally { if (prior === undefined) delete process.env.DINODIA_CALENDAR_ANALYTICS_ENABLED;
     else process.env.DINODIA_CALENDAR_ANALYTICS_ENABLED = prior; }
 });
+
+test('daily usage minutes are whole integers so strict iOS Int decoders accept them', () => {
+  const { aggregateDailyUsage } = load('src/lib/dailyAnalyticsAggregation.ts');
+  const day = calendar.historyDay(Date.parse('2026-10-25T12:00:00Z'), 'Europe/London');
+  const row = (deviceId, on, off) => ({ deviceId, areaId: 'room', timezone: 'Europe/London', dayStartAt: new Date(day.start), dayEndAt: new Date(day.end),
+    onSeconds: on, offSeconds: off, unknownSeconds: 0, coverageStartAt: new Date(day.start), coverageEndAt: new Date(day.start + (on + off) * 1000) });
+  // 741s on / 59s off averaged over 3 device-days → fractional minutes before rounding.
+  const buckets = aggregateDailyUsage([row('a', 741, 59), row('b', 100, 0), row('c', 0, 7)], 'day', 'Europe/London', new Date('2026-10-25T12:00:00Z'));
+  for (const bucket of buckets) for (const key of ['onMinutes', 'offMinutes', 'unknownMinutes'])
+    assert.ok(Number.isInteger(bucket[key]), `${key}=${bucket[key]} must be an integer`);
+  assert.equal(buckets[0].onMinutes, 5); // 841s / 60 / 3 = 4.67 → 5
+});

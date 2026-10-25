@@ -11,6 +11,7 @@ export type DailyRow = {
 };
 type Period = ReturnType<typeof usagePeriod>;
 const round = (value: number) => Math.round(value * 100) / 100;
+const wholeMinutes = (value: number) => Math.floor(value + 0.5);
 function periodFor(row: DailyRow, level: NativeAnalyticsLevel, timezone: string) {
   if (level === 'hour') throw new TypeError('Daily summaries cannot reconstruct hourly history');
   if (row.timezone !== timezone) throw new TypeError('Compacted history cannot be reinterpreted in another timezone');
@@ -46,7 +47,8 @@ export function aggregateDailyUsage(rows: readonly DailyRow[], level: NativeAnal
     const count = entry.samples.size;
     const incomplete = [...entry.coverageByDay].some(([identity, covered]) => covered < entry.expectedByDay.get(identity)!);
     return { id: entry.period.key, start: entry.period.start, end: entry.period.end, label: entry.period.label,
-      onMinutes: round(entry.on / 60 / count), offMinutes: round(entry.off / 60 / count), unknownMinutes: round(entry.unknown / 60 / count),
+      // Clients decode minutes as integers; match the hourly path rounding exactly.
+      onMinutes: wholeMinutes(entry.on / 60 / count), offMinutes: wholeMinutes(entry.off / 60 / count), unknownMinutes: wholeMinutes(entry.unknown / 60 / count),
       coverageSeconds: entry.on + entry.off + entry.unknown, contributingDeviceDays: count, isPartial: entry.partial || incomplete };
   });
 }
