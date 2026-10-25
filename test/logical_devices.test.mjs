@@ -58,3 +58,70 @@ test('one indexed deletion-fence lookup suppresses only the exact Hub targets', 
   assert.ok(erased.length <= 80);
   await assert.rejects(suppressedSyncEvents({ deletionSecurityReceipt: { findMany: async () => { throw new Error('database unavailable'); } } }, 'hub', events), /database unavailable/);
 });
+
+function loadAreaDeletion() {
+  const module = { exports: {} };
+  const js = ts.transpileModule(fs.readFileSync('src/lib/areaDeletion.ts', 'utf8'), { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText;
+  const stubs = { './stage1Auth': { Stage1AuthError: AuthError }, '@prisma/client': { Prisma: { JsonNull: null } },
+    './nativeAutomations/lifecycle': { retireNativeAutomations: async () => {} },
+    './nativeAutomations/delivery': { refreshNativeAutomationCloudRevision: async () => {} },
+    './deletionReferences': load('deletionReferences') };
+  new Function('require', 'module', 'exports', js)(id => stubs[id] ?? require(id), module, module.exports);
+  return module.exports;
+}
+function fakeTx(state) {
+  const calls = [];
+  const outbox = new Map();
+  const generic = model => new Proxy({}, { get: (_, op) => async args => { calls.push(`${model}.${op}`); state.mutations?.(model, op, args);
+    return op === 'count' ? 0 : op.startsWith('find') ? [] : { count: 0 }; } });
+  const tx = new Proxy({
+    $queryRaw: async () => [],
+    area: { findFirst: async () => state.area, findUniqueOrThrow: async () => ({ originalName: 'Room 1' }),
+      update: async () => { calls.push('area.update'); }, deleteMany: async () => { calls.push('area.deleteMany'); } },
+    home: { findFirst: async () => ({ managementRevision: 4 }), update: async () => { calls.push('home.update'); } },
+    nativeDevice: { findMany: async () => state.devices, updateMany: async () => { calls.push('nativeDevice.updateMany'); },
+      deleteMany: async () => { calls.push('nativeDevice.deleteMany'); } },
+    tenantAreaGrant: { findMany: async () => [{ membershipId: 'm1' }], updateMany: async a => { calls.push('tenantAreaGrant.updateMany'); state.revoked = a; } },
+    nativeDomainOutbox: {
+      findUnique: async ({ where }) => outbox.get(where.idempotencyKey) ?? null,
+      create: async ({ data }) => outbox.set(data.idempotencyKey, { id: data.idempotencyKey, ...data }),
+      update: async ({ where, data }) => Object.assign(outbox.get(where.id), data) },
+  }, { get: (target, key) => target[key] ?? generic(key) });
+  return { tx, calls };
+}
+
+test('LD09 Area deletion contract: preview, exact reserve, commit revokes, finish purges once', async () => {
+  const { previewAreaDeletion, reserveAreaDeletion, commitAreaDeletion, finishAreaDeletion } = loadAreaDeletion();
+  const state = { area: { id: 'a1', osAreaId: 'r1', revision: 2 }, devices: [{ id: 'd1', osDeviceId: 'logical:v1:x', assignments: [{ areaId: 'a1' }] }] };
+  const { tx, calls } = fakeTx(state);
+  const scope = { homeId: 'h', hubInstallationId: 'hub', employeeId: 'e' };
+  const operationId = '00000000-0000-4000-8000-000000000001';
+  const preview = await previewAreaDeletion(tx, scope, { operationId, areaId: 'a1' });
+  assert.equal(preview.deviceCount, 1);
+  assert.deepEqual(preview.osDeviceIds, ['logical:v1:x']);
+  await assert.rejects(commitAreaDeletion(tx, scope, { operationId, digest: preview.digest, localFenceDigest: 'f'.repeat(64), confirmationName: 'Room 1' }), /Reserve/);
+  await assert.rejects(reserveAreaDeletion(tx, scope, { operationId, digest: preview.digest, confirmationName: 'room 1' }), /changed/);
+  await assert.rejects(reserveAreaDeletion(tx, { ...scope, employeeId: 'other' }, { operationId, digest: preview.digest, confirmationName: 'Room 1' }), /does not match/);
+  assert.equal((await reserveAreaDeletion(tx, scope, { operationId, digest: preview.digest, confirmationName: 'Room 1' })).state, 'RESERVED');
+  assert.ok(!calls.includes('tenantAreaGrant.updateMany'), 'reservation changes no grant or data');
+  await assert.rejects(finishAreaDeletion(tx, scope, { operationId, localFenceDigest: 'f'.repeat(64) }), /does not match/);
+  assert.equal((await commitAreaDeletion(tx, scope, { operationId, digest: preview.digest, localFenceDigest: 'f'.repeat(64), confirmationName: 'Room 1' })).state, 'WAITING_HUB');
+  assert.equal(state.revoked.data.revokeReason, 'area_deleted');
+  assert.ok(calls.includes('deletionSecurityReceipt.upsert') && calls.includes('alexaNativeAreaSelection.updateMany'));
+  await assert.rejects(finishAreaDeletion(tx, scope, { operationId, localFenceDigest: 'a'.repeat(64) }), /does not match/);
+  assert.equal((await finishAreaDeletion(tx, scope, { operationId, localFenceDigest: 'f'.repeat(64) })).state, 'COMPLETE');
+  for (const purge of ['nativeDeviceUsageBucket.deleteMany', 'nativeTemperatureSample.deleteMany', 'nativeAnalyticsInterval.deleteMany',
+    'alexaNativeEndpointProjection.deleteMany', 'nativeDevice.deleteMany', 'area.deleteMany', 'auditEvent.create'])
+    assert.ok(calls.includes(purge), purge);
+  assert.ok(calls.indexOf('nativeDeviceUsageBucket.deleteMany') < calls.indexOf('nativeDevice.deleteMany'), 'Restrict-FK rows purge before devices');
+  const before = calls.length;
+  assert.equal((await finishAreaDeletion(tx, scope, { operationId, localFenceDigest: 'f'.repeat(64) })).state, 'COMPLETE');
+  assert.equal(calls.length, before, 'exact retry is idempotent');
+});
+
+test('LD09 shared legacy assignment blocks deletion preview', async () => {
+  const { previewAreaDeletion } = loadAreaDeletion();
+  const { tx } = fakeTx({ area: { id: 'a1', osAreaId: 'r1', revision: 1 }, devices: [{ id: 'd1', osDeviceId: 'x', assignments: [{ areaId: 'a1' }, { areaId: 'a2' }] }] });
+  await assert.rejects(previewAreaDeletion(tx, { homeId: 'h', hubInstallationId: 'hub', employeeId: 'e' },
+    { operationId: '00000000-0000-4000-8000-000000000002', areaId: 'a1' }), /shared/);
+});
