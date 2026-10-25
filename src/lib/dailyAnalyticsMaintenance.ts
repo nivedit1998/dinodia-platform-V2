@@ -68,6 +68,15 @@ export async function maintainDailyAnalytics(db: PrismaClient, now: Date, clock 
   for (const state of states) {
     if (clock() - started > 15000) break;
     try {
+      // Annual expiry is independent of conversion/compaction: an unconvertible
+      // retained day must not keep expired summaries forever.
+      const year = new Date(historyYearCutoff(now.getTime(), state.timezone));
+      const expiredDailyDeleted = await db.$executeRaw`
+        WITH doomed AS (SELECT summary.id FROM "NativeAnalyticsDay" summary
+          JOIN "NativeDevice" device ON device.id=summary."deviceId"
+          WHERE summary."homeId"=${state.homeId}::uuid AND device."hubInstallationId"=${state.hubInstallationId}::uuid
+            AND summary."dayEndAt"<=${year} ORDER BY summary."dayEndAt",summary.id LIMIT 1000 FOR UPDATE OF summary SKIP LOCKED)
+        DELETE FROM "NativeAnalyticsDay" summary USING doomed WHERE summary.id=doomed.id`;
       let result;
       for (let i = 0; i < 8 && clock() - started < 15000; i++) {
         result = await db.$transaction(tx => backfillLegacyDay(tx, state.hubInstallationId, now), { timeout: 20000 });
@@ -78,13 +87,6 @@ export async function maintainDailyAnalytics(db: PrismaClient, now: Date, clock 
         compaction = await db.$transaction(tx => compactDailyHistory(tx, state.hubInstallationId, now, { retryRetained: i === 0 }), { timeout: 20000 });
         if (compaction.completed) break;
       }
-      const year = new Date(historyYearCutoff(now.getTime(), state.timezone));
-      const expiredDailyDeleted = await db.$executeRaw`
-        WITH doomed AS (SELECT summary.id FROM "NativeAnalyticsDay" summary
-          JOIN "NativeDevice" device ON device.id=summary."deviceId"
-          WHERE summary."homeId"=${state.homeId}::uuid AND device."hubInstallationId"=${state.hubInstallationId}::uuid
-            AND summary."dayEndAt"<=${year} ORDER BY summary."dayEndAt",summary.id LIMIT 1000 FOR UPDATE OF summary SKIP LOCKED)
-        DELETE FROM "NativeAnalyticsDay" summary USING doomed WHERE summary.id=doomed.id`;
       results.push({ hubId: state.hubInstallationId, backfill: result, compaction, expiredDailyDeleted: Number(expiredDailyDeleted) });
       // Rotate bounded work fairly, including already complete installations.
       await db.nativeAnalyticsRetention.update({ where: { hubInstallationId: state.hubInstallationId }, data: { updatedAt: now } });

@@ -208,3 +208,18 @@ test('bounded scheduled maintenance rotates past the first twenty installations'
     if (previous === undefined) delete process.env.DINODIA_CALENDAR_ANALYTICS_ENABLED; else process.env.DINODIA_CALENDAR_ANALYTICS_ENABLED = previous;
   }
 });
+
+test('annual expiry still runs when legacy conversion cannot proceed', async () => {
+  const { maintainDailyAnalytics } = load('src/lib/dailyAnalyticsMaintenance.ts');
+  let expired = false, recorded = null;
+  const db = { $executeRaw: async () => { expired = true; return 1; },
+    $transaction: async () => { assert.equal(expired, true); throw new Error('legacy_usage_boundary_requires_detail'); },
+    nativeAnalyticsRetention: { findMany: async () => [{ hubInstallationId: 'hub', homeId: 'home', timezone: 'UTC' }],
+      update: async ({ data }) => { recorded = data.backlogReason; } } };
+  const prior = process.env.DINODIA_CALENDAR_ANALYTICS_ENABLED;
+  process.env.DINODIA_CALENDAR_ANALYTICS_ENABLED = 'true';
+  try { await maintainDailyAnalytics(db, new Date('2026-10-25T12:00:00Z'));
+    assert.equal(expired, true); assert.equal(recorded, 'legacy_usage_boundary_requires_detail');
+  } finally { if (prior === undefined) delete process.env.DINODIA_CALENDAR_ANALYTICS_ENABLED;
+    else process.env.DINODIA_CALENDAR_ANALYTICS_ENABLED = prior; }
+});

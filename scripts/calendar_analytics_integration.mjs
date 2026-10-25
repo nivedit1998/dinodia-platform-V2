@@ -176,7 +176,13 @@ export async function calendarAnalyticsDatabaseChecks({ prisma, fixture: f, osRo
     dayStartAt: new Date(expiredDay.start), dayEndAt: new Date(expiredDay.end), assignmentEpochAt: new Date(expiredDay.start),
     coverageStartAt: new Date(expiredDay.start), coverageEndAt: new Date(expiredDay.start + 3600000),
     closedAt: new Date(expiredDay.end), purgeAt: new Date(expiredDay.end) } });
-  const maintenance = await maintainDailyAnalytics(prisma, now);
+  const priorFlag = process.env.DINODIA_CALENDAR_ANALYTICS_ENABLED;
+  process.env.DINODIA_CALENDAR_ANALYTICS_ENABLED = 'true';
+  let maintenance;
+  try { maintenance = await maintainDailyAnalytics(prisma, now); } finally {
+    if (priorFlag === undefined) delete process.env.DINODIA_CALENDAR_ANALYTICS_ENABLED;
+    else process.env.DINODIA_CALENDAR_ANALYTICS_ENABLED = priorFlag;
+  }
   assert.equal(maintenance.enabled, true);
   assert.equal(await prisma.nativeAnalyticsDay.count({ where: { id: expired.id } }), 0, 'the existing bounded scheduler also expires daily summaries after twelve calendar months');
   console.log('[calendar:integration] PASS authenticated Hub usage/temperature uploads/retry/replacement/zero correction, SQL guards, resumable verified backfill, guarded compaction, late evidence quarantine, authorized daily APIs and old-client/hourly boundaries');
