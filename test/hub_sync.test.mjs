@@ -12,7 +12,9 @@ function loadTypeScript(relative) {
   const ts = require('typescript');
   const output = ts.transpileModule(read(relative), { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText;
   const module = { exports: {} };
-  new Function('require', 'module', 'exports', output)(require, module, module.exports);
+  new Function('require', 'module', 'exports', output)(name => name.startsWith('.')
+    ? loadTypeScript(path.relative(root, path.resolve(root, path.dirname(relative), name + '.ts')))
+    : require(name), module, module.exports);
   return module.exports;
 }
 

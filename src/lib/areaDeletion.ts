@@ -179,6 +179,7 @@ export async function finishAreaDeletion(tx: Tx, scope: Pick<AreaDeleteScope, 'h
   await purgeAreaPayloads(tx, { ...scope, areaId, osAreaId: payload.snapshot.osAreaId, deviceIds,
     osDeviceIds: [...payload.snapshot.osDeviceIds, ...(payload.snapshot.legacyOsDeviceIds || [])], operationRowId: row.id });
   const target = { homeId: scope.homeId, OR: [{ areaId }, { deviceId: { in: deviceIds } }] };
+  await purgeDailyAnalytics(tx, { homeId: scope.homeId, areaId, deviceIds });
   await tx.nativeDeviceUsageBucket.deleteMany({ where: target });
   await tx.nativeTemperatureSample.deleteMany({ where: target });
   await tx.nativeAnalyticsUnallocated.deleteMany({ where: target });
@@ -208,3 +209,4 @@ export async function finishAreaDeletion(tx: Tx, scope: Pick<AreaDeleteScope, 'h
     expiresAt: new Date(Date.now() + 29 * 24 * 60 * 60_000) } });
   return { operationId: input.operationId, state: 'COMPLETE' };
 }
+import { purgeDailyAnalytics } from './dailyAnalyticsErasure';

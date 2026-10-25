@@ -272,6 +272,7 @@ export async function POST(request: Request) {
               try {
                 await applyHubSyncEvent(tx, {
                   event, homeId: current.homeId, hubInstallationId: current.id,
+                  streamId: envelope.streamId,
                   identityGeneration: hub.identity.identityGeneration, now, suppressedEventIds,
                 });
               } catch (error) {

@@ -620,6 +620,8 @@ model Home {
   commissioningSessions      NativeCommissioningSession[]
   usageBuckets               NativeDeviceUsageBucket[]
   temperatureSamples         NativeTemperatureSample[]
+  analyticsDays              NativeAnalyticsDay[]
+  analyticsRetention         NativeAnalyticsRetention[]
   automations                NativeAutomation[]
   alexaHomeScopes            AlexaNativeHomeScope[]
   alexaConnectIntents        AlexaNativeConnectIntent[]
@@ -702,6 +704,7 @@ model Area {
   commissioningSessions     NativeCommissioningSession[]
   usageBuckets              NativeDeviceUsageBucket[]
   temperatureSamples        NativeTemperatureSample[]
+  analyticsDays             NativeAnalyticsDay[]
   automationActions         NativeAutomationAction[]
   alexaEndpoints            AlexaNativeEndpointProjection[]
   alexaAreaSelections       AlexaNativeAreaSelection[]
@@ -803,6 +806,7 @@ model NativeDevice {
   commissioningResults NativeCommissioningSession[]        @relation("CommissionedDevice")
   usageBuckets         NativeDeviceUsageBucket[]
   temperatureSamples   NativeTemperatureSample[]
+  analyticsDays        NativeAnalyticsDay[]
   automationActions    NativeAutomationAction[]
   alexaEndpoints       AlexaNativeEndpointProjection[]
   outageIncidents      NativeDeviceOutageIncident[]
@@ -998,6 +1002,7 @@ model HubInstallation {
   tenantDeviceRecoveries  NativeTenantDeviceRecovery[]
   outageIncidents         NativeDeviceOutageIncident[]
   syncReceipts            HubSyncReceipt[]
+  analyticsRetention      NativeAnalyticsRetention?
 
   @@unique([id, homeId])
   @@unique([id, manufacturingIdentityId])
@@ -2042,6 +2047,70 @@ model NativeTemperatureSample {
 
   @@index([homeId, sourceObservedAt])
   @@index([deviceId, sourceObservedAt])
+  @@index([purgeAt])
+}
+
+model NativeAnalyticsRetention {
+  hubInstallationId String @id @db.Uuid
+  homeId String @db.Uuid
+  timezone String @db.VarChar(64)
+  writerFrom DateTime
+  writerEnabled Boolean @default(false)
+  readsEnabled Boolean @default(false)
+  pruningEnabled Boolean @default(false)
+  barrierStreamId String? @db.VarChar(80)
+  barrierSequence BigInt?
+  legacySealedThrough DateTime?
+  backfillVerifiedAt DateTime?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  home Home @relation(fields:[homeId], references:[id], onDelete:Cascade)
+  hubInstallation HubInstallation @relation(fields:[hubInstallationId], references:[id], onDelete:Cascade)
+  @@index([homeId])
+}
+
+model NativeAnalyticsDay {
+  id String @id @default(uuid()) @db.Uuid
+  homeId String @db.Uuid
+  deviceId String @db.Uuid
+  areaId String @db.Uuid
+  kind String @db.VarChar(16)
+  analyticsCategory DeviceAnalyticsCategory
+  controlId String @db.VarChar(160)
+  sourceGeneration Int
+  bindingRevision Int @default(0)
+  analyticsIntervalId String? @db.Uuid
+  analyticsPolicyVersion Int
+  timezone String @db.VarChar(64)
+  dayStartAt DateTime
+  dayEndAt DateTime
+  writerFrom DateTime
+  assignmentEpochAt DateTime
+  origin String @db.VarChar(16)
+  revision Int
+  onSeconds Int @default(0)
+  offSeconds Int @default(0)
+  unknownSeconds Int @default(0)
+  knownMilliseconds BigInt @default(0)
+  celsiusMilliseconds Decimal @default(0) @db.Decimal(24,2)
+  minimumCelsius Decimal? @db.Decimal(6,2)
+  maximumCelsius Decimal? @db.Decimal(6,2)
+  sampleCount Int @default(0)
+  lastCelsius Decimal? @db.Decimal(6,2)
+  lastObservedAt DateTime?
+  lastValidUntil DateTime?
+  coverageStartAt DateTime
+  coverageEndAt DateTime
+  payloadDigest String @db.VarChar(64)
+  verifiedAt DateTime?
+  purgeAt DateTime
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  home Home @relation(fields:[homeId], references:[id], onDelete:Cascade)
+  device NativeDevice @relation(fields:[deviceId], references:[id], onDelete:Restrict)
+  area Area @relation(fields:[areaId], references:[id], onDelete:Restrict)
+  @@unique([deviceId, areaId, kind, analyticsCategory, controlId, sourceGeneration, bindingRevision, dayStartAt, writerFrom, assignmentEpochAt, origin], map:"NativeAnalyticsDay_source_key")
+  @@index([homeId, kind, dayStartAt])
   @@index([purgeAt])
 }
 

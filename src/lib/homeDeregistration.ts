@@ -242,6 +242,7 @@ export async function deregisterFullHome(input: {
     if (homeTicketIds.length) await tx.nativeSupportTicketTimeline.deleteMany({ where: { ticketId: { in: homeTicketIds } } });
 
     await tx.nativeAutomation.deleteMany({ where: { homeId } });
+    await purgeDailyAnalytics(tx, { homeId, wholeHome: true });
     await tx.nativeDeviceUsageBucket.deleteMany({ where: { homeId } });
     await tx.nativeTemperatureSample.deleteMany({ where: { homeId } });
     await tx.nativeDeviceOutageIncident.updateMany({ where: { homeId, causedByHubIncidentId: { not: null } }, data: { causedByHubIncidentId: null } });
@@ -306,3 +307,4 @@ export async function deregisterFullHome(input: {
   }
   return { ...receipt, accountCleanupState, accountCleanupProcessed };
 }
+import { purgeDailyAnalytics } from './dailyAnalyticsErasure';

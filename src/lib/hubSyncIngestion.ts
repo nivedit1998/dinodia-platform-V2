@@ -9,6 +9,7 @@ import { retireNativeAutomations } from './nativeAutomations/lifecycle';
 import { currentCustomerPolicy } from './customerPolicyConfig';
 import { allowedAnalyticsControls, classifyUsageAuthority } from './analyticsIntervals';
 import { suppressedSyncEvents } from './deletionReferences';
+import { ingestDailyAnalytics } from './dailyAnalyticsIngestion';
 
 function invalid(code: string, message: string): never {
   throw new Stage1AuthError(409, code, message);
@@ -115,7 +116,7 @@ function oneCalendarYearBefore(source: Date): Date {
 
 type SyncEventInput = {
   event: HubSyncEvent; homeId: string; hubInstallationId: string; identityGeneration?: number; now: Date;
-  suppressedEventIds?: Set<string>;
+  suppressedEventIds?: Set<string>; streamId?: string;
 };
 
 // Only validated, authenticated usage events enter this boundary. A savepoint is
@@ -173,6 +174,7 @@ async function applyHubSyncEventInner(tx: Prisma.TransactionClient, input: SyncE
   const { event, homeId, hubInstallationId, now } = input;
   const payload = event.payload;
   if (event.type === 'sync.compacted') return;
+  if (event.type === 'analytics.day' || event.type === 'analytics.daily.barrier') return ingestDailyAnalytics(tx, input);
 
   if (event.type === 'area.upsert') {
     const osAreaId = String(payload.osAreaId);

@@ -35,6 +35,9 @@ export async function buildHubCloudConfiguration(db: Prisma.TransactionClient, i
   const capabilitySummary = hub?.capabilitySummary && typeof hub.capabilitySummary === 'object' && !Array.isArray(hub.capabilitySummary)
     ? hub.capabilitySummary as Record<string, unknown> : {};
   const supportsTenantAutomationProjection = capabilitySummary.nativeTenantAutomationProjectionV1 === true;
+  const history = process.env.DINODIA_CALENDAR_ANALYTICS_ENABLED === 'true' && capabilitySummary.nativeDailyAnalyticsV1 === true
+    ? await db.nativeAnalyticsRetention.findUnique({where:{hubInstallationId:input.hubInstallationId}}):null;
+  if(history && (history.homeId!==input.homeId||history.timezone!==home.timezone)) throw new Error('Analytics timezone requires prospective reconciliation');
   const analyticsIntervals = capabilitySummary.nativeUniversalAnalyticsV2 === true ? await db.nativeAnalyticsInterval.findMany({
     where: { homeId: input.homeId, hubInstallationId: input.hubInstallationId, validUntil: null,
       sourceGeneration: hub?.manufacturingIdentity?.identityGeneration ?? -1 }, take: 2000,
@@ -102,6 +105,7 @@ export async function buildHubCloudConfiguration(db: Prisma.TransactionClient, i
       select: { anonymousReference: true }, orderBy: { anonymousReference: 'asc' }, take: 8193 }) : null;
   if (logicalSecurity && logicalSecurity.length > 8192) throw new Error('Deletion security ledger requires bounded recovery maintenance');
   const unsigned = {
+    ...(history?.writerEnabled && hub?.analyticsWriterEnabled ? {analyticsHistory:{version:1,enabled:true,timezone:history.timezone,writerFrom:history.writerFrom.toISOString()}}:{}),
     revision: home.managementRevision,
     policyRevision: hub?.accessPolicyRevision ?? 0,
     areas: areas.map((area) => ({ id: area.id, osAreaId: area.osAreaId, originalName: area.originalName, overrideName: area.overrideName, revision: area.revision })),
