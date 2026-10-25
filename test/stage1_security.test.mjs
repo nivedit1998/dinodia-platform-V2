@@ -152,7 +152,8 @@ function loadTypeScriptModule(relativePath, overrides = {}) {
   const localRequire = (specifier) => overrides[specifier] ?? require(specifier);
   const taskRequire = (specifier) => overrides[specifier] ?? (specifier === './installationRequestDelivery'
     ? isolatedInstallationDelivery : specifier === './homeDeregistrationCleanup' ? isolatedHomeDeregistrationCleanup
-      : specifier === './nativeAlexaEvents' ? isolatedNativeAlexaEvents : require(specifier));
+      : specifier === './nativeAlexaEvents' ? isolatedNativeAlexaEvents
+        : specifier === './nativeEphemeralRetention' ? loadTypeScriptModule('src/lib/nativeEphemeralRetention.ts') : require(specifier));
   new Function('require', 'module', 'exports', compiled)(relativePath === 'src/lib/nativeOperations.ts' ? taskRequire : localRequire, module, module.exports);
   return module.exports;
 }
@@ -218,6 +219,8 @@ test('native task registry dispatches business operations and daily lease cleanu
   assert.deepEqual(maintenance.tasks, ['expired_dispatch_lease_cleanup', 'retentionCleanup', 'analyticsAndStorageMaintenance']);
   assert.deepEqual(maintenance.failedTasks, []);
   assert.equal(maintenance.retentionCleanup.backlogRemains, false);
+  assert.equal(maintenance.retentionCleanup.ephemeral.expiredReplayNonces, 0);
+  assert.equal(maintenance.retentionCleanup.ephemeral.cronHistoryAvailable, false);
   assert.equal(maintenance.analyticsAndStorageMaintenance.status, 'OK');
   assert.equal(maintenance.expiredDispatcherLeases, 3);
   assert.equal(maintenance.expiredSyncReceipts, 2);
