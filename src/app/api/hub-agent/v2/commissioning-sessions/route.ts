@@ -363,7 +363,8 @@ export async function POST(request: Request) {
       const safeSummary = safeControlSummary(device.capabilitySummary) as Record<string, unknown>;
       const created = await tx.nativeDevice.create({ data: {
         homeId: authority.home.id, hubInstallationId: hub.installation.id, osDeviceId: String(device.osDeviceId), originalName: String(device.originalName),
-        overrideName: device.name == null || !String(device.name).trim() ? null : String(device.name), technicalLabel: String(device.technicalLabel), customerLabel: String(device.customerLabel),
+        overrideName: device.name == null || !String(device.name).trim() ? null : String(device.name),
+        technicalLabel: isStaff ? String(device.technicalLabel) : 'tenant_device', customerLabel: String(device.customerLabel),
         analyticsCategory: analyticsCategory as never,
         managementClass: authority.managementClass, ownerMembershipId: authority.ownerMembershipId, deviceType: String(device.deviceType),
         manufacturer: device.manufacturer == null ? null : String(device.manufacturer), model: device.model == null ? null : String(device.model), protocol,

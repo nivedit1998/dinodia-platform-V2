@@ -42,7 +42,8 @@ export async function commissionLogicalChildren(tx: Prisma.TransactionClient, in
     const controls = cat.controls as Array<Record<string, unknown>>;
     const row = await tx.nativeDevice.create({ data: {
       id: randomUUID(), homeId: original.homeId, hubInstallationId: original.hubInstallationId,
-      osDeviceId, originalName: cat.name, overrideName: cat.name, technicalLabel: String(cat.technicalLabel),
+      osDeviceId, originalName: cat.name, overrideName: cat.name,
+      technicalLabel: original.managementClass === 'TENANT_DEVICE' ? 'tenant_device' : String(cat.technicalLabel),
       customerLabel: original.customerLabel, analyticsCategory: original.analyticsCategory,
       managementClass: original.managementClass, ownerMembershipId: original.ownerMembershipId,
       installationRequestId: original.installationRequestId, deviceType: original.deviceType,
