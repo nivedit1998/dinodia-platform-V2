@@ -208,6 +208,8 @@ async function applyHubSyncEventInner(tx: Prisma.TransactionClient, input: SyncE
     // belongs to the property or a tenant. Commissioning must create the
     // platform-owned classification before its inventory is accepted.
     if (!device || device.homeId !== homeId || device.managementClass !== 'PROPERTY_DEVICE') invalid('hub_sync_device_uncommissioned', 'The device is not bound to a current permanent property record');
+    if (device.lifecycle === 'RETIRED'
+      && (device.capabilitySummary as Record<string, unknown> | null)?.logicalConversion) return;
     if (['RETIRED', 'REMOVED', 'REMOVAL_PENDING'].includes(device.lifecycle)) invalid('hub_sync_device_retired', 'A removed device cannot be restored by inventory sync');
     const descriptorRevision = Number(payload.descriptorRevision);
     const descriptorDigest = String(payload.descriptorDigest);
@@ -278,8 +280,10 @@ async function applyHubSyncEventInner(tx: Prisma.TransactionClient, input: SyncE
   }
 
   if (event.type === 'device.tombstone') {
-    const device = await tx.nativeDevice.findUnique({ where: { hubInstallationId_osDeviceId: { hubInstallationId, osDeviceId: String(payload.osDeviceId) } }, select: { id: true, homeId: true, lifecycle: true } });
+    const device = await tx.nativeDevice.findUnique({ where: { hubInstallationId_osDeviceId: { hubInstallationId, osDeviceId: String(payload.osDeviceId) } }, select: { id: true, homeId: true, lifecycle: true, capabilitySummary: true } });
     if (!device || device.homeId !== homeId) return;
+    if (device.lifecycle === 'RETIRED'
+      && (device.capabilitySummary as Record<string, unknown> | null)?.logicalConversion) return;
     if (device.lifecycle === 'REMOVED') return;
     await suspendAutomationsForDeviceChange(tx, { homeId, deviceId: device.id, now, reason: 'device_removed' });
     await tx.nativeDevice.update({ where: { id: device.id }, data: { lifecycle: 'REMOVED', retiredAt: strictDate(payload.removedAt, now), cleanupDeadlineAt: now } });
@@ -293,6 +297,8 @@ async function applyHubSyncEventInner(tx: Prisma.TransactionClient, input: SyncE
       id: true, homeId: true, lifecycle: true, managementClass: true, descriptorRevision: true, descriptorDigest: true, capabilitySummary: true,
     } });
     if (!device || device.homeId !== homeId || device.managementClass !== 'PROPERTY_DEVICE') invalid('hub_sync_catalog_device_invalid', 'The control catalogue does not belong to a current permanent property device');
+    if (device.lifecycle === 'RETIRED'
+      && (device.capabilitySummary as Record<string, unknown> | null)?.logicalConversion) return;
     if (['RETIRED', 'REMOVED', 'REMOVAL_PENDING'].includes(device.lifecycle)) invalid('hub_sync_catalog_device_retired', 'A retired device catalogue cannot be restored');
     const revision = Number(payload.catalogRevision);
     if (revision !== device.descriptorRevision || payload.descriptorDigest !== device.descriptorDigest) invalid('hub_sync_catalog_revision_mismatch', 'The control catalogue does not match the current device descriptor');
@@ -335,6 +341,8 @@ async function applyHubSyncEventInner(tx: Prisma.TransactionClient, input: SyncE
     const device = await tx.nativeDevice.findUnique({ where: { hubInstallationId_osDeviceId: { hubInstallationId, osDeviceId } }, select: {
       id: true, homeId: true, lifecycle: true, managementClass: true, descriptorRevision: true, descriptorDigest: true, capabilitySummary: true,
     } });
+    if (device?.homeId === homeId && device.lifecycle === 'RETIRED'
+      && (device.capabilitySummary as Record<string, unknown> | null)?.logicalConversion) return;
     if (!device || device.homeId !== homeId || device.managementClass !== 'PROPERTY_DEVICE'
       || ['RETIRED', 'REMOVED', 'REMOVAL_PENDING'].includes(device.lifecycle)) invalid('hub_sync_catalog_device_invalid', 'The control catalogue tombstone is not for a current permanent device');
     const revision = Number(payload.catalogRevision);
@@ -510,8 +518,12 @@ async function applyHubSyncEventInner(tx: Prisma.TransactionClient, input: SyncE
     // A newer staff policy may have revoked analytics or changed classification
     // while an old bounded event was in flight. Consume that stale event without
     // restoring the former projection.
+    const retainedSummary = device.capabilitySummary as Record<string, unknown> | null;
+    const conversion = retainedSummary?.logicalConversion as Record<string, unknown> | undefined;
+    const convertedHistory = device.lifecycle === 'RETIRED' && conversion?.version === 1
+      && Number.isFinite(Date.parse(String(conversion.cutoverAt)));
     if (device.managementClass !== 'PROPERTY_DEVICE'
-      || ['RETIRED', 'REMOVED', 'REMOVAL_PENDING'].includes(device.lifecycle)) return;
+      || ['RETIRED', 'REMOVED', 'REMOVAL_PENDING'].includes(device.lifecycle) && !convertedHistory) return;
     if (Number(payload.sourceGeneration) !== Number(input.identityGeneration)) {
       if (payload.analyticsIntervalId) invalid('hub_sync_usage_generation_invalid', 'The analytics writer generation is not current');
       return;
@@ -547,6 +559,10 @@ async function applyHubSyncEventInner(tx: Prisma.TransactionClient, input: SyncE
     const coverageStartAt = Object.hasOwn(payload, 'coverageStartAt') ? strictDate(payload.coverageStartAt, now)
       : new Date(legacyEnd.getTime() - totalSeconds * 1000);
     const coverageEndAt = Object.hasOwn(payload, 'coverageEndAt') ? strictDate(payload.coverageEndAt, now) : legacyEnd;
+    // A converted parent is historical only: no post-cutover activity may be
+    // accepted as measured. A boundary-straddling signed aggregate remains
+    // unallocated under the original identity, never copied into its children.
+    if (convertedHistory && coverageStartAt >= new Date(String(conversion!.cutoverAt))) return;
     const coveredMilliseconds = coverageEndAt.getTime() - coverageStartAt.getTime();
     if (coverageStartAt < bucketStart || coverageEndAt > new Date(bucketStart.getTime() + 3600000)
       || coverageEndAt <= coverageStartAt || coveredMilliseconds !== totalSeconds * 1000
@@ -619,8 +635,12 @@ async function applyHubSyncEventInner(tx: Prisma.TransactionClient, input: SyncE
       radiatorReadingAt: true,
     } });
     if (!device || device.homeId !== homeId) invalid('hub_sync_temperature_device_invalid', 'The temperature projection device does not belong to this enrolled home');
+    const historicalConversion = (device.capabilitySummary as Record<string, unknown> | null)?.logicalConversion as Record<string, unknown> | undefined;
+    const conversionBoundary = historicalConversion?.version === 1 ? Date.parse(String(historicalConversion.cutoverAt)) : NaN;
+    const historicalSample = device.lifecycle === 'RETIRED' && Number.isFinite(conversionBoundary)
+      && Date.parse(String(payload.sourceObservedAt)) < conversionBoundary;
     if (device.managementClass !== 'PROPERTY_DEVICE' || device.analyticsCategory !== 'RADIATOR'
-      || ['RETIRED', 'REMOVED', 'REMOVAL_PENDING'].includes(device.lifecycle)
+      || ['RETIRED', 'REMOVED', 'REMOVAL_PENDING'].includes(device.lifecycle) && !historicalSample
       || Number(payload.sourceGeneration) !== Number(input.identityGeneration)) return;
     const summary = device.capabilitySummary && typeof device.capabilitySummary === 'object' && !Array.isArray(device.capabilitySummary)
       ? device.capabilitySummary as Record<string, unknown> : {};
@@ -655,11 +675,13 @@ async function applyHubSyncEventInner(tx: Prisma.TransactionClient, input: SyncE
     const area = await tx.area.findUnique({ where: { homeId_osAreaId: { homeId, osAreaId: String(payload.osAreaId) } }, select: { id: true } });
     if (!area) invalid('hub_sync_temperature_area_invalid', 'The temperature observation area is not part of this home');
     await requireAreaAssignmentAt(tx, { homeId, deviceId: device.id, areaId: area.id, at: observedAt });
-    const recent = device.radiatorReadingAt && device.radiatorReadingAt.getTime() >= observedAt.getTime();
+    const recent = historicalSample || device.radiatorReadingAt && device.radiatorReadingAt.getTime() >= observedAt.getTime();
     await tx.nativeTemperatureSample.create({ data: {
       homeId, deviceId: device.id, areaId: area.id, sourceEventKey: String(payload.sourceEventKey),
       temperature: Number(payload.temperature), sourceObservedAt: observedAt, validUntil,
       sourceGeneration: Number(payload.sourceGeneration), analyticsPolicyVersion: evidencePolicy ? 3 : 2, purgeAt: oneCalendarYearAfter(observedAt),
+      ...(historicalSample && evidencePolicy && validUntil.getTime() > conversionBoundary
+        ? { currentnessEndedAt: new Date(conversionBoundary) } : {}),
     } });
     if (!recent && now < validUntil) await tx.nativeDevice.update({ where: { id: device.id }, data: { radiatorTemperature: Number(payload.temperature), radiatorReadingAt: observedAt } });
     return;

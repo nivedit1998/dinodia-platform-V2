@@ -12,7 +12,7 @@ export const STAGE1_MODEL_COUNT = 40;
 export const REQUIRED_MIGRATION = '20261003000000_native_v2_stage3_domain_schema';
 export const REQUIRED_MODEL_COUNT = 65;
 export const COMPATIBLE_ADDITIVE_MIGRATIONS: Readonly<Record<string, string>> = Object.freeze({
-  '20261025010000_logical_device_parents': '57527e1c9921d5150c22dcf348141bf6591d4b7771b8b14a22d33ae1d92a01df',
+  '20261025010000_logical_device_parents': '92b87695dda9389b48ad6e5ed4c1e0f524705cf486b63680678e632b8db4d128',
   '20261024103000_state_evidence_policy': '905d3c72ea537e6e015743e8ba7bcc85e7353c5868053244f58ff4b272ed40da',
   '20261023210000_room_qr_plaques': 'be22f4084ab317f1dae158427e866172105c2c45a5b7272662b6aa326c53da67',
   '20261023110000_category_analytics_intervals': 'b6a25359b7bfeb9a453ccc8ecc45fc4f32de63050ac85bd31821cae58e910d05',

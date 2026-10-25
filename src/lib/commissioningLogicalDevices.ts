@@ -10,10 +10,23 @@ type Channel = { binding: LogicalBinding; catalogue: Record<string, unknown> };
 /** The caller has rechecked the actual commissioning actor/session and exact reviewed parent. */
 export async function commissionLogicalChildren(tx: Prisma.TransactionClient, input: {
   original: NativeDevice; channels: unknown; protocolIdentityHash: string; generation: number; now: Date;
+  historicalCutover?: { expectedInventoryRevision: number };
+  initialAreaId?: string;
 }) {
   const original = input.original;
-  if (await tx.nativeAnalyticsInterval.count({ where: { deviceId: original.id } }) > 0)
+  if (!input.historicalCutover && await tx.nativeAnalyticsInterval.count({ where: { deviceId: original.id } }) > 0)
     throw new Stage1AuthError(409, 'logical_conversion_review_required', 'Existing history requires an explicit channel conversion review');
+  if (input.historicalCutover) {
+    const current = await tx.nativeDevice.findFirst({ where: { id: original.id, homeId: original.homeId,
+      hubInstallationId: original.hubInstallationId, inventoryRevision: input.historicalCutover.expectedInventoryRevision,
+      lifecycle: { in: ['INSTALLED', 'VIEW_ONLY'] }, physicalParentId: null } });
+    if (!current) throw new Stage1AuthError(409, 'logical_conversion_changed', 'The reviewed existing device changed');
+    const last = await tx.nativeAnalyticsInterval.findFirst({ where: { deviceId: original.id }, orderBy: { revision: 'desc' } });
+    if (last && input.now <= last.validFrom) throw new Stage1AuthError(409, 'logical_conversion_time_invalid', 'Wait for a later trusted cutover time');
+    // Never split or copy old counters. The original identity and closed epochs
+    // remain the sole authority for historical uploads.
+    await tx.nativeAnalyticsInterval.updateMany({ where: { deviceId: original.id, validUntil: null }, data: { validUntil: input.now } });
+  }
   if (!Array.isArray(input.channels) || input.channels.length < 2 || input.channels.length > 32) {
     throw new Stage1AuthError(400, 'logical_channels_invalid', 'A bounded independent channel manifest is required');
   }
@@ -21,7 +34,12 @@ export async function commissionLogicalChildren(tx: Prisma.TransactionClient, in
   if (!validateLogicalBindings(original.osDeviceId, channels.map(channel => channel.binding))) {
     throw new Stage1AuthError(409, 'logical_binding_invalid', 'The independent channel bindings are invalid');
   }
-  const originalAreas = await tx.deviceAreaAssignment.findMany({ where: { deviceId: original.id, homeId: original.homeId, validUntil: null }, select: { areaId: true } });
+  const initialArea = input.initialAreaId && !input.historicalCutover
+    ? await tx.area.findFirst({ where: { id: input.initialAreaId, homeId: original.homeId, status: 'ACTIVE' }, select: { id: true } })
+    : null;
+  if (input.initialAreaId && !initialArea) throw new Stage1AuthError(409, 'logical_assignment_ambiguous', 'The initial channel Area changed');
+  const originalAreas = initialArea ? [{ areaId: initialArea.id }]
+    : await tx.deviceAreaAssignment.findMany({ where: { deviceId: original.id, homeId: original.homeId, validUntil: null }, select: { areaId: true } });
   if (originalAreas.length !== 1) throw new Stage1AuthError(409, 'logical_assignment_ambiguous', 'The physical device needs one reviewed initial Area');
   const areaId = originalAreas[0].areaId;
   const created = [];
@@ -63,9 +81,13 @@ export async function commissionLogicalChildren(tx: Prisma.TransactionClient, in
     physicalId: original.osDeviceId, protocol: String(original.protocol), protocolIdentityHash: input.protocolIdentityHash,
     managementClass: original.managementClass, ownerMembershipId: original.ownerMembershipId,
     children: created.map(child => ({ deviceId: child.row.id, osDeviceId: child.row.osDeviceId, binding: child.binding })) });
-  // This record was created in the SAME finalization transaction; it has no pre-existing history.
-  await tx.deviceAreaAssignment.updateMany({ where: { deviceId: original.id, validUntil: null }, data: { validUntil: input.now } });
-  await tx.nativeDevice.update({ where: { id: original.id }, data: { lifecycle: 'RETIRED', retiredAt: input.now, inventoryRevision: { increment: 1 } } });
+  // Keep the historical assignment for conversion: interval authority bounds
+  // admission, while a straddling legacy aggregate is retained as unallocated.
+  if (!input.historicalCutover && !input.initialAreaId)
+    await tx.deviceAreaAssignment.updateMany({ where: { deviceId: original.id, validUntil: null }, data: { validUntil: input.now } });
+  await tx.nativeDevice.update({ where: { id: original.id }, data: { lifecycle: 'RETIRED', retiredAt: input.now, inventoryRevision: { increment: 1 },
+    ...(input.historicalCutover ? { capabilitySummary: { ...(original.capabilitySummary as Record<string, unknown> || {}),
+      logicalConversion: { version: 1, cutoverAt: input.now.toISOString(), children: created.map(child => child.row.id) } } as Prisma.InputJsonValue } : {}) } });
   await tx.nativeDeviceSourceAlias.updateMany({ where: { deviceId: original.id, retiredAt: null }, data: { retiredAt: input.now } });
   for (const child of created) {
     if (original.managementClass === 'PROPERTY_DEVICE') await changeAnalyticsInterval(tx, { homeId: original.homeId,

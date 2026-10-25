@@ -372,7 +372,8 @@ export async function POST(request: Request) {
         descriptorRevision: Number(device.descriptorRevision), descriptorDigest: String(device.descriptorDigest),
         lifecycle: body.disposition === 'view_only' ? 'VIEW_ONLY' : 'INSTALLED', onlineState: 'UNKNOWN', installedAt: now,
         ...(isStaff ? { installationRequestId: authority.request!.id } : {}),
-        assignments: { create: { areaId, homeId: authority.home.id, source: isStaff ? (registerExisting ? 'NATIVE_STAFF_EXISTING_DEVICE_ADOPTION' : 'NATIVE_STAFF_COMMISSIONING') : 'NATIVE_TENANT_COMMISSIONING' } },
+        ...(device.channels === undefined ? { assignments: { create: { areaId, homeId: authority.home.id,
+          source: isStaff ? (registerExisting ? 'NATIVE_STAFF_EXISTING_DEVICE_ADOPTION' : 'NATIVE_STAFF_COMMISSIONING') : 'NATIVE_TENANT_COMMISSIONING' } } } : {}),
       }, select: { id: true, homeId: true, osDeviceId: true, ownerMembershipId: true, managementClass: true, lifecycle: true, customerLabel: true, descriptorRevision: true, analyticsCategory: true, inventoryRevision: true } });
       await observeDeviceSourceAlias(tx, { homeId: authority.home.id, deviceId: created.id, hubInstallationId: hub.installation.id,
         protocol: sourceProtocol, sourceDeviceId: String(device.osDeviceId),
@@ -381,7 +382,7 @@ export async function POST(request: Request) {
         category: analyticsCategory as 'NONE' | 'LIGHT' | 'RADIATOR' | 'BOILER', selectedControlId: null, generation: hub.identity.identityGeneration, at: now });
       const logicalDevices = device.channels === undefined ? null : await commissionLogicalChildren(tx, {
         original: await tx.nativeDevice.findUniqueOrThrow({ where: { id: created.id } }), channels: device.channels,
-        protocolIdentityHash: String(device.protocolIdentityHash), generation: hub.identity.identityGeneration, now });
+        protocolIdentityHash: String(device.protocolIdentityHash), generation: hub.identity.identityGeneration, now, initialAreaId: areaId });
       const primaryDevice = logicalDevices?.[0] || created;
       const updated = await tx.nativeCommissioningSession.updateMany({ where: { id: row.id, state: 'READY', revision: row.revision, expiresAt: { gt: now } }, data: { state: 'COMPLETED', closedAt: now, finalDeviceId: primaryDevice.id, revision: { increment: 1 } } });
       if (updated.count !== 1) fail(409, 'commissioning_revision_conflict', 'The commissioning session changed before ownership could be recorded');
@@ -398,6 +399,16 @@ export async function POST(request: Request) {
       return NextResponse.json(response, { headers: { 'Cache-Control': 'no-store' } });
     }, { isolationLevel: 'Serializable', maxWait: 5000, timeout: 12000 });
   } catch (error) {
+    if (!(error instanceof Stage1AuthError)) {
+      const failure = error as { name?: string; message?: string; code?: string; meta?: { code?: string; message?: string; database_error?: string } };
+      const prismaCode = /^P\d{4}$/.test(String(failure.code)) ? failure.code : 'UNKNOWN';
+      const sqlState = /^[A-Z0-9]{5}$/.test(String(failure.meta?.code)) ? failure.meta?.code : 'NONE';
+      const diagnostic = String(failure.meta?.database_error || failure.meta?.message || failure.message || '');
+      const constraint = diagnostic.match(/\b([A-Za-z_][A-Za-z0-9_]{1,110}_(?:check|guard|fkey))\b/)?.[1] || 'NONE';
+      const errorName = /^[A-Za-z]{1,64}$/.test(String(failure.name)) ? failure.name : 'UnknownError';
+      // Never include request data, SQL values, exception text or credentials.
+      console.warn(`[commissioning-failure] code=${prismaCode} sqlState=${sqlState} constraint=${constraint} errorName=${errorName}`);
+    }
     const status = error instanceof Stage1AuthError ? error.status : 503;
     const code = error instanceof Stage1AuthError ? error.code : 'commissioning_unavailable';
     return NextResponse.json({ error: { code, message: error instanceof Stage1AuthError ? error.message : 'The commissioning service is temporarily unavailable' } }, { status, headers: { 'Cache-Control': 'no-store' } });

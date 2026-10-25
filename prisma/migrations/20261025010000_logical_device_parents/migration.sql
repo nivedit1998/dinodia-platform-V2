@@ -83,3 +83,66 @@ BEGIN
 END $$;
 CREATE TRIGGER "NativeDevice_remove_empty_parent" AFTER DELETE ON "NativeDevice"
   FOR EACH ROW EXECUTE FUNCTION "remove_empty_logical_parent"();
+
+-- Lifecycle intents are not expiring delivery messages. Keep the original
+-- bounds for ALL other outboxes; allow only the two reviewed state machines
+-- their durable reservation/acknowledgement phases and bounded manifests.
+ALTER TABLE "NativeDomainOutbox" DROP CONSTRAINT "NativeOutbox_bounds_check";
+ALTER TABLE "NativeDomainOutbox" ADD CONSTRAINT "NativeOutbox_bounds_check" CHECK (
+  "attempts" BETWEEN 0 AND 12 AND "expiresAt" > "createdAt"
+  AND ("hubInstallationId" IS NULL OR "homeId" IS NOT NULL)
+  AND (
+    ("state" IN ('PENDING','PROCESSING','DELIVERED','FAILED','CANCELLED')
+      AND "expiresAt" <= "createdAt" + INTERVAL '30 days' AND octet_length("payload"::text) <= 16384)
+    OR ("aggregateType" = 'AreaDeletion' AND "eventType" = 'AREA_DELETE_V1'
+      AND "state" IN ('PREVIEW','RESERVED','WAITING_HUB','COMPLETE')
+      AND octet_length("payload"::text) <= 262144)
+    OR ("aggregateType" = 'LogicalDeviceConversion' AND "eventType" = 'LOGICAL_CONVERSION_V1'
+      AND "state" IN ('PREVIEW','RESERVED','COMPLETE') AND octet_length("payload"::text) <= 262144)
+  )
+);
+
+-- A confirmed reservation freezes only its destructive scope. New assignments,
+-- identity changes or room edits cannot race the Hub's irreversible fence.
+-- Telemetry and unrelated rooms remain writable; authority revocation remains
+-- immediate. Only the scoped lifecycle transaction may advance its own intent.
+CREATE FUNCTION "guard_reserved_area_deletion"() RETURNS trigger LANGUAGE plpgsql AS $$
+DECLARE area_ids text[] := ARRAY[]::text[]; device_ids text[] := ARRAY[]::text[];
+BEGIN
+  IF TG_TABLE_NAME = 'Area' THEN
+    IF TG_OP <> 'INSERT' THEN area_ids := array_append(area_ids, OLD."id"::text); END IF;
+    IF TG_OP <> 'DELETE' THEN area_ids := array_append(area_ids, NEW."id"::text); END IF;
+  ELSIF TG_TABLE_NAME = 'DeviceAreaAssignment' THEN
+    IF TG_OP <> 'INSERT' THEN area_ids := array_append(area_ids, OLD."areaId"::text); device_ids := array_append(device_ids, OLD."deviceId"::text); END IF;
+    IF TG_OP <> 'DELETE' THEN area_ids := array_append(area_ids, NEW."areaId"::text); device_ids := array_append(device_ids, NEW."deviceId"::text); END IF;
+  ELSIF TG_TABLE_NAME = 'NativeDevice' THEN
+    IF TG_OP = 'UPDATE' AND ROW(OLD."lifecycle", OLD."managementClass", OLD."ownerMembershipId",
+      OLD."descriptorRevision", OLD."descriptorDigest", OLD."sourceBinding", OLD."inventoryRevision",
+      OLD."analyticsCategory", OLD."overrideName", OLD."customerLabel")
+      IS NOT DISTINCT FROM ROW(NEW."lifecycle", NEW."managementClass", NEW."ownerMembershipId",
+      NEW."descriptorRevision", NEW."descriptorDigest", NEW."sourceBinding", NEW."inventoryRevision",
+      NEW."analyticsCategory", NEW."overrideName", NEW."customerLabel") THEN RETURN NEW; END IF;
+    IF TG_OP <> 'INSERT' THEN device_ids := array_append(device_ids, OLD."id"::text); END IF;
+    IF TG_OP <> 'DELETE' THEN device_ids := array_append(device_ids, NEW."id"::text); END IF;
+  END IF;
+  IF EXISTS (SELECT 1 FROM "NativeDomainOutbox" o WHERE o."eventType" = 'AREA_DELETE_V1'
+    AND o."aggregateType" = 'AreaDeletion' AND o."state" IN ('RESERVED','WAITING_HUB')
+    AND o."id"::text IS DISTINCT FROM current_setting('dinodia.area_deletion_operation', true)
+    AND (o."payload" #>> '{snapshot,areaId}' = ANY(area_ids)
+      OR EXISTS (SELECT 1 FROM jsonb_array_elements_text(
+        COALESCE(o."payload" #> '{snapshot,deviceIds}', '[]'::jsonb)
+        || COALESCE(o."payload" #> '{snapshot,legacyDeviceIds}', '[]'::jsonb)) d(value) WHERE d.value = ANY(device_ids))))
+  THEN RAISE EXCEPTION 'area deletion scope is reserved; finish cleanup before changing its assignments'; END IF;
+  IF EXISTS (SELECT 1 FROM "NativeDomainOutbox" o WHERE o."eventType" = 'LOGICAL_CONVERSION_V1'
+    AND o."aggregateType" = 'LogicalDeviceConversion' AND o."state" = 'RESERVED'
+    AND o."id"::text IS DISTINCT FROM current_setting('dinodia.logical_conversion_operation', true)
+    AND o."payload" ->> 'deviceId' = ANY(device_ids))
+  THEN RAISE EXCEPTION 'logical conversion scope is reserved; finish conversion before changing its assignments'; END IF;
+  IF TG_OP = 'DELETE' THEN RETURN OLD; ELSE RETURN NEW; END IF;
+END $$;
+CREATE TRIGGER "Area_reserved_deletion_guard" BEFORE UPDATE OR DELETE ON "Area"
+  FOR EACH ROW EXECUTE FUNCTION "guard_reserved_area_deletion"();
+CREATE TRIGGER "Assignment_reserved_deletion_guard" BEFORE INSERT OR UPDATE OR DELETE ON "DeviceAreaAssignment"
+  FOR EACH ROW EXECUTE FUNCTION "guard_reserved_area_deletion"();
+CREATE TRIGGER "Device_reserved_deletion_guard" BEFORE UPDATE OR DELETE ON "NativeDevice"
+  FOR EACH ROW EXECUTE FUNCTION "guard_reserved_area_deletion"();

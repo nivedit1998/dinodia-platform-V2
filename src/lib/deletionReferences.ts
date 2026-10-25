@@ -2,9 +2,12 @@ import { createHash } from 'node:crypto';
 import type { Prisma } from '@prisma/client';
 import type { HubSyncEvent } from './hubSyncEnvelope';
 
+export function deletionReferencePrefix(hubInstallationId: string) {
+  return `ld:${createHash('sha256').update(hubInstallationId).digest('hex').slice(0, 10)}:`;
+}
 export function deletedTargetReference(hubInstallationId: string, kind: 'area' | 'device', osId: string) {
   const digest = createHash('sha256').update(JSON.stringify([hubInstallationId, kind, osId])).digest('hex');
-  return `deleted-${kind}:${digest}`;
+  return `${deletionReferencePrefix(hubInstallationId)}${kind[0]}:${digest}`;
 }
 function references(hubId: string, event: HubSyncEvent) {
   const result = [];
@@ -18,7 +21,7 @@ export async function suppressedSyncEvents(tx: Prisma.TransactionClient, hubId: 
   const candidates = [...new Set(events.flatMap(event => references(hubId, event)))];
   if (!candidates.length) return new Set<string>();
   const fences = await tx.deletionSecurityReceipt.findMany({ where: {
-    anonymousReference: { in: candidates }, actionType: 'AREA_DEVICE_ERASURE',
+    anonymousReference: { in: candidates }, actionType: { in: ['AREA_DEVICE_ERASURE', 'AREA_LEGACY_ERASURE'] },
   }, select: { anonymousReference: true } });
   const retained = new Set(fences.map(row => row.anonymousReference));
   return new Set(events.filter(event => references(hubId, event).some(reference => retained.has(reference))).map(event => event.id));

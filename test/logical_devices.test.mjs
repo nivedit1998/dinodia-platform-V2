@@ -14,6 +14,17 @@ const { logicalOsId, validateLogicalBindings, bindLogicalChildren } = load('logi
 const binding = key => ({ physicalDeviceId: 'zigbee:abc', channelKey: key, channelGeneration: 1,
   mappingRevision: 1, manifestDigest: 'a'.repeat(64), sourceDigest: 'b'.repeat(64), sourceEntityIds: [`zigbee:abc:${key}:state`] });
 
+test('erasure removes attributable payload records without discarding unrelated Home preferences', () => {
+  const { pruneDeletedReferences } = load('areaDeletionPayloadPurge');
+  const input = { selectedAreaId: 'deleted-room', theme: 'dark', tiles: [
+    { deviceId: 'deleted-device', reading: 21, name: 'Private erased name' },
+    { deviceId: 'surviving-device', reading: 19 }], rooms: { 'deleted-room': { name: 'Erased room' },
+      'surviving-room': { name: 'Kept room' } } };
+  assert.deepEqual(pruneDeletedReferences(input, new Set(['deleted-room', 'deleted-device'])), {
+    theme: 'dark', tiles: [{ deviceId: 'surviving-device', reading: 19 }],
+    rooms: { 'surviving-room': { name: 'Kept room' } } });
+});
+
 test('logical identity is stable and exact source overlaps/forged fields are rejected', () => {
   const first = binding('l1'), second = binding('l2');
   assert.equal(validateLogicalBindings('zigbee:abc', [first, second]), true);
@@ -62,10 +73,11 @@ test('one indexed deletion-fence lookup suppresses only the exact Hub targets', 
 function loadAreaDeletion() {
   const module = { exports: {} };
   const js = ts.transpileModule(fs.readFileSync('src/lib/areaDeletion.ts', 'utf8'), { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText;
-  const stubs = { './stage1Auth': { Stage1AuthError: AuthError }, '@prisma/client': { Prisma: { JsonNull: null } },
+  const stubs = { './stage1Auth': { Stage1AuthError: AuthError }, '@prisma/client': { Prisma: { JsonNull: null, join: values => values } },
     './nativeAutomations/lifecycle': { retireNativeAutomations: async () => {} },
     './nativeAutomations/delivery': { refreshNativeAutomationCloudRevision: async () => {} },
     './deletionReferences': load('deletionReferences') };
+  stubs['./areaDeletionPayloadPurge'] = { purgeAreaPayloads: async () => {} };
   new Function('require', 'module', 'exports', js)(id => stubs[id] ?? require(id), module, module.exports);
   return module.exports;
 }
@@ -79,7 +91,7 @@ function fakeTx(state) {
     area: { findFirst: async () => state.area, findUniqueOrThrow: async () => ({ originalName: 'Room 1' }),
       update: async () => { calls.push('area.update'); }, deleteMany: async () => { calls.push('area.deleteMany'); } },
     home: { findFirst: async () => ({ managementRevision: 4 }), update: async () => { calls.push('home.update'); } },
-    nativeDevice: { findMany: async () => state.devices, updateMany: async () => { calls.push('nativeDevice.updateMany'); },
+    nativeDevice: { findMany: async ({ where }) => where.lifecycle === 'RETIRED' ? (state.legacyDevices || []) : state.devices, updateMany: async () => { calls.push('nativeDevice.updateMany'); },
       deleteMany: async () => { calls.push('nativeDevice.deleteMany'); } },
     tenantAreaGrant: { findMany: async () => [{ membershipId: 'm1' }], updateMany: async a => { calls.push('tenantAreaGrant.updateMany'); state.revoked = a; } },
     nativeDomainOutbox: {
