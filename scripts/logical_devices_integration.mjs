@@ -256,10 +256,10 @@ export async function logicalDevicesDatabaseChecks({ prisma, fixture, osRoot, da
     assert.equal(restorePreview.recommission, true);
     await request('/api/hub-agent/v2/logical-conversion', { action: 'reserve', osDeviceId: moving.id,
       operationId: restorePreview.operationId, digest: restorePreview.digest,
-      confirmationName: restorePreview.confirmationName, ...principal });
+      confirmationName: restorePreview.confirmationName, handoffId: principal.handoffId, jti: principal.jti, credentialVersion: 0 });
     await assert.rejects(request('/api/hub-agent/v2/logical-conversion', { action: 'reserve', osDeviceId: alternate.id,
       operationId: competingPreview.operationId, digest: competingPreview.digest,
-      confirmationName: competingPreview.confirmationName, ...principal }), /Logical HTTP 409/,
+      confirmationName: competingPreview.confirmationName, handoffId: principal.handoffId, jti: principal.jti, credentialVersion: 0 }), /Logical HTTP 409/,
       'different anchors cannot reserve the same physical parent lifecycle and strand a permanent reservation');
     assert.equal((await conversion.confirm(principal, restorePreview)).state, 'COMPLETE');
     assert.equal((await conversion.confirm(principal, restorePreview)).state, 'COMPLETE');
