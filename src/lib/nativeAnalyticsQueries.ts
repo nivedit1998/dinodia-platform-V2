@@ -15,6 +15,16 @@ function level(value: string | null): NativeAnalyticsLevel {
 
 function boundedQueryError() { return new Stage1AuthError(413, 'VALIDATION_FAILED', 'This history window is too large; choose a shorter period or fewer devices'); }
 
+async function activeDailyReader(homeId: string, timezone: string, now: Date) {
+  if (process.env.DINODIA_CALENDAR_ANALYTICS_ENABLED !== 'true') {
+    const [schema] = await prisma.$queryRaw<Array<{ available: boolean }>>`SELECT to_regclass('public."NativeAnalyticsRetention"') IS NOT NULL AS available`;
+    if (!schema?.available || !await prisma.nativeAnalyticsRetention.findFirst({ where: { homeId, OR: [{ prunedThrough: { not: null } }, { compactionCursor: { not: null } }] }, select: { hubInstallationId: true } })) return null;
+  }
+  const reader = await import('./dailyAnalyticsReads');
+  const active = await reader.dailyReadState(homeId, timezone, now);
+  return active ? { ...reader, active } : null;
+}
+
 function assignmentForTemperatureSource(row: { deviceId: string; areaId: string; sourceObservedAt: Date },
   assignments: Array<{ deviceId: string; areaId: string; validFrom: Date; validUntil: Date | null }>) {
   const source = row.sourceObservedAt.getTime();
@@ -37,7 +47,8 @@ function inCoverageAssignment(row: NativeUsageRow, assignments: Array<{ deviceId
 }
 
 export async function readNativeAnalyticsBootstrap(homeId: string, timezone: string, now = new Date()) {
-  const cutoff = retentionStart(now);
+  const daily = await activeDailyReader(homeId, timezone, now);
+  const cutoff = daily ? new Date(daily.active.metadata.dailyAvailableFrom) : retentionStart(now);
   const [areaRows, devices, earliestUsage, earliestTemperature, latestTemperatureRows, retiredDevices] = await Promise.all([
     prisma.area.findMany({ where: { homeId, status: 'ACTIVE' }, orderBy: [{ createdAt: 'asc' }, { id: 'asc' }], take: ANALYTICS_MAX_AREAS + 1,
       select: { id: true, originalName: true, overrideName: true, status: true, revision: true } }),
@@ -55,7 +66,8 @@ export async function readNativeAnalyticsBootstrap(homeId: string, timezone: str
       device: { is: { homeId, managementClass: 'PROPERTY_DEVICE', analyticsCategory: 'RADIATOR' } } }, orderBy: { sourceObservedAt: 'desc' }, take: ANALYTICS_MAX_ROWS + 1,
       select: { deviceId: true, areaId: true, temperature: true, sourceObservedAt: true, validUntil: true, currentnessEndedAt: true, analyticsPolicyVersion: true } }),
     prisma.nativeDevice.findMany({ where: { homeId, managementClass: 'PROPERTY_DEVICE', lifecycle: 'RETIRED',
-      usageBuckets: { some: { homeId, bucketStart: { gte: cutoff, lte: now }, purgeAt: { gt: now } } } },
+      OR: [{ usageBuckets: { some: { homeId, bucketStart: { gte: cutoff, lte: now }, purgeAt: { gt: now } } } },
+        ...(daily ? [{ analyticsDays: { some: { homeId, dayStartAt: { gte: cutoff, lte: now } } } }] : [])] },
       orderBy: [{ retiredAt: 'desc' }, { id: 'asc' }], take: 100,
       select: { id: true, originalName: true, overrideName: true, analyticsCategory: true, retiredAt: true } }),
   ]);
@@ -97,6 +109,13 @@ export async function readNativeAnalyticsBootstrap(homeId: string, timezone: str
   const groups = currentAnalyticsGroups(homeId, areas);
   const sevenDays = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
   const summaries = await Promise.all((['LIGHT', 'RADIATOR', 'BOILER'] as const).map(async (category) => {
+    if (daily) {
+      const start = daily.active.metadata.hourlyAvailableFrom;
+      if (Date.parse(start) >= now.getTime()) return { metric: category.toLowerCase(), buckets: [] };
+      const result = await daily.readDailyDetail({ homeId, timezone, metric: category, interval: 'day',
+        search: new URLSearchParams({ from: start, to: now.toISOString() }), filters: {}, active: daily.active, now });
+      return { metric: category.toLowerCase(), buckets: 'buckets' in result ? result.buckets : [] };
+    }
     const rows = await prisma.nativeDeviceUsageBucket.findMany({ where: { homeId, analyticsCategory: category,
       bucketStart: { gte: sevenDays, lte: now }, purgeAt: { gt: now },
       device: { is: { homeId, managementClass: 'PROPERTY_DEVICE' } }, area: { is: { homeId } } },
@@ -105,10 +124,13 @@ export async function readNativeAnalyticsBootstrap(homeId: string, timezone: str
     if (rows.length > ANALYTICS_MAX_ROWS) throw boundedQueryError();
     return { metric: category.toLowerCase(), buckets: aggregateNativeUsage(rows, 'day', timezone) };
   }));
-  const first = [earliestUsage?.bucketStart, earliestTemperature?.sourceObservedAt].filter((item): item is Date => Boolean(item)).sort((a, b) => a.getTime() - b.getTime())[0] ?? null;
+  const earliestDaily = daily ? await prisma.nativeAnalyticsDay.findFirst({ where: { homeId, dayStartAt: { gte: cutoff, lte: now },
+    device: { is: { homeId, managementClass: 'PROPERTY_DEVICE', ownerMembershipId: null } } }, orderBy: { dayStartAt: 'asc' }, select: { dayStartAt: true } }) : null;
+  const first = [earliestUsage?.bucketStart, earliestTemperature?.sourceObservedAt, earliestDaily?.dayStartAt].filter((item): item is Date => Boolean(item)).sort((a, b) => a.getTime() - b.getTime())[0] ?? null;
   return {
     schemaVersion: 'dinodia.v1', ok: true, homeId, timezone, generatedAt: now.toISOString(), retentionStartAt: cutoff.toISOString(),
     earliestAvailableAt: first?.toISOString() ?? null,
+    ...(daily ? { historyResolution: daily.active.metadata } : {}),
     areas: areas.filter((area) => area.status === 'ACTIVE').map((area) => ({ id: area.id, name: displayName(area), revision: area.revision })),
     displayGroups: groups,
     devices: devices.map((device) => ({ id: device.id, label: device.customerLabel ?? displayName(device), category: device.analyticsCategory.toLowerCase(), deviceType: device.deviceType,
@@ -139,7 +161,10 @@ async function resolveFilters(homeId: string, search: URLSearchParams, metric: '
   }
   if (deviceIds?.length) {
     const matches = await prisma.nativeDevice.findMany({ where: { id: { in: deviceIds }, homeId, managementClass: 'PROPERTY_DEVICE',
-      ...(metric === 'TEMPERATURE' ? { analyticsCategory: 'RADIATOR' as const } : { OR: [{ analyticsCategory: metric }, { usageBuckets: { some: { homeId, analyticsCategory: metric } } }] }) }, select: { id: true } });
+      ...(metric === 'TEMPERATURE' ? { OR: [{ analyticsCategory: 'RADIATOR' as const },
+        ...(process.env.DINODIA_CALENDAR_ANALYTICS_ENABLED === 'true' ? [{ analyticsDays: { some: { homeId, kind: 'TEMPERATURE' } } }] : [])] }
+        : { OR: [{ analyticsCategory: metric }, { usageBuckets: { some: { homeId, analyticsCategory: metric } } },
+          ...(process.env.DINODIA_CALENDAR_ANALYTICS_ENABLED === 'true' ? [{ analyticsDays: { some: { homeId, analyticsCategory: metric } } }] : [])] }) }, select: { id: true } });
     if (matches.length !== deviceIds.length) throw new Stage1AuthError(404, 'RESOURCE_NOT_FOUND', 'Analytics is not available for this selected Home');
   }
   return { areaIds: resolvedAreaIds, deviceIds };
@@ -149,8 +174,11 @@ export async function readNativeUsageDetail(homeId: string, timezone: string, se
   const metric = metricCategory(search.get('metric') ?? '');
   if (metric === 'TEMPERATURE') throw new Stage1AuthError(400, 'VALIDATION_FAILED', 'Use the temperature history endpoint for Home Temperature');
   const interval = level(search.get('level'));
-  const window = parseAnalyticsWindow({ from: search.get('from'), to: search.get('to') }, now);
   const filters = await resolveFilters(homeId, search, metric);
+  const daily = await activeDailyReader(homeId, timezone, now);
+  if (daily && interval !== 'hour') return daily.readDailyDetail({ homeId, timezone, metric, interval, filters, search, active: daily.active, now });
+  const window = parseAnalyticsWindow({ from: search.get('from'), to: search.get('to') }, now);
+  if (daily) daily.assertHourlyWindow(window.from, daily.active);
   const rows = await prisma.nativeDeviceUsageBucket.findMany({ where: { homeId, analyticsCategory: metric,
     bucketStart: { gte: window.from, lt: window.to }, purgeAt: { gt: now },
     ...(filters.areaIds ? { areaId: { in: filters.areaIds } } : {}), ...(filters.deviceIds ? { deviceId: { in: filters.deviceIds } } : {}),
@@ -188,9 +216,15 @@ export async function readNativeUsageDetail(homeId: string, timezone: string, se
       historicalOnly: ['RETIRED', 'REMOVED'].includes(device.lifecycle) })), buckets };
 }
 
-export async function readNativeTemperatureDetail(homeId: string, timezone: string, search: URLSearchParams, now = new Date()) {
-  const interval = level(search.get('level')); const window = parseAnalyticsWindow({ from: search.get('from'), to: search.get('to') }, now);
+export async function readNativeTemperatureDetail(homeId: string, timezone: string, search: URLSearchParams, now = new Date(), options: { historyVersion?: string | null } = {}) {
+  const interval = level(search.get('level'));
   const filters = await resolveFilters(homeId, search, 'TEMPERATURE');
+  const daily = await activeDailyReader(homeId, timezone, now);
+  if (daily && interval !== 'hour' && options.historyVersion !== '1') throw new Stage1AuthError(409,
+    'APP_UPDATE_REQUIRED', 'Update Dinodia to view daily temperature history with its recorded coverage.');
+  if (daily && interval !== 'hour') return daily.readDailyDetail({ homeId, timezone, metric: 'TEMPERATURE', interval, filters, search, active: daily.active, now });
+  const window = parseAnalyticsWindow({ from: search.get('from'), to: search.get('to') }, now);
+  if (daily) daily.assertHourlyWindow(window.from, daily.active);
   // Samples last at most 30 minutes. Include only this bounded look-behind
   // when their signed validity overlaps the requested window; this lets a
   // pre-midnight observation contribute to the next-day chart without

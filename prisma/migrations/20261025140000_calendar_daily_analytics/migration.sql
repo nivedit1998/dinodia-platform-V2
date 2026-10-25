@@ -11,6 +11,11 @@ CREATE TABLE "NativeAnalyticsRetention" (
     "barrierSequence" BIGINT,
     "legacySealedThrough" TIMESTAMP(3),
     "backfillVerifiedAt" TIMESTAMP(3),
+    "backfillThrough" TIMESTAMP(3),
+    "prunedThrough" TIMESTAMP(3),
+    "compactionCursor" TIMESTAMP(3),
+    "retainedDetailDays" JSONB NOT NULL DEFAULT '[]',
+    "backlogReason" VARCHAR(120),
     "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "updatedAt" TIMESTAMP(3) NOT NULL,
 
@@ -35,6 +40,7 @@ CREATE TABLE "NativeAnalyticsDay" (
     "dayEndAt" TIMESTAMP(3) NOT NULL,
     "writerFrom" TIMESTAMP(3) NOT NULL,
     "assignmentEpochAt" TIMESTAMP(3) NOT NULL,
+    "closedAt" TIMESTAMP(3),
     "origin" VARCHAR(16) NOT NULL,
     "revision" INTEGER NOT NULL,
     "onSeconds" INTEGER NOT NULL DEFAULT 0,
@@ -100,6 +106,8 @@ ALTER TABLE "NativeAnalyticsDay" ADD CONSTRAINT "NativeAnalyticsDay_coverage_che
   AND "analyticsPolicyVersion" IN (1, 2, 3)
   AND "coverageStartAt" >= "dayStartAt" AND "coverageEndAt" <= "dayEndAt"
   AND "coverageEndAt" > "coverageStartAt" AND "dayEndAt" > "dayStartAt"
+  AND ("closedAt" IS NULL OR ("closedAt" >= "coverageEndAt" AND "closedAt" <= "dayEndAt"))
+  AND ("origin" <> 'HUB' OR "closedAt" IS NULL OR "closedAt" = "dayEndAt")
   AND ("origin" <> 'HUB' OR "coverageStartAt" >= GREATEST("writerFrom", "assignmentEpochAt"))
   AND ("origin" <> 'LEGACY' OR "coverageEndAt" <= "writerFrom")
   AND "onSeconds" >= 0 AND "offSeconds" >= 0 AND "unknownSeconds" >= 0
@@ -118,7 +126,12 @@ ALTER TABLE "NativeAnalyticsDay" ADD CONSTRAINT "NativeAnalyticsDay_coverage_che
       AND "lastCelsius" BETWEEN -50 AND 80
       AND "lastObservedAt" IS NOT NULL AND "lastValidUntil" IS NOT NULL AND "lastValidUntil" >= "lastObservedAt"
       AND "celsiusMilliseconds" BETWEEN "minimumCelsius" * "knownMilliseconds" - 0.1
-        AND "maximumCelsius" * "knownMilliseconds" + 0.1))
+        AND "maximumCelsius" * "knownMilliseconds" + 0.1)
+    OR ("kind" = 'TEMPERATURE' AND "analyticsCategory" = 'RADIATOR'
+      AND "onSeconds" = 0 AND "offSeconds" = 0 AND "unknownSeconds" = 0
+      AND "knownMilliseconds" = 0 AND "celsiusMilliseconds" = 0
+      AND "minimumCelsius" IS NULL AND "maximumCelsius" IS NULL AND "lastCelsius" IS NULL
+      AND "lastObservedAt" IS NULL AND "lastValidUntil" IS NULL))
 );
 
 CREATE FUNCTION "guard_native_analytics_day"() RETURNS trigger LANGUAGE plpgsql AS $$
@@ -134,8 +147,8 @@ BEGIN
     OR NEW."dayEndAt" <> ((date_trunc('day', NEW."dayStartAt" AT TIME ZONE 'UTC' AT TIME ZONE NEW.timezone) + interval '1 day') AT TIME ZONE NEW.timezone AT TIME ZONE 'UTC') THEN
     RAISE EXCEPTION 'Daily analytics requires exact local-calendar boundaries' USING ERRCODE = '23514';
   END IF;
-  IF NEW.origin = 'HUB' AND EXISTS (SELECT 1 FROM "NativeAnalyticsDay" d
-      WHERE d."deviceId" = NEW."deviceId" AND d.kind = NEW.kind AND d.origin = 'HUB' AND d.id <> NEW.id
+  IF EXISTS (SELECT 1 FROM "NativeAnalyticsDay" d
+      WHERE d."deviceId" = NEW."deviceId" AND d.kind = NEW.kind AND d.id <> NEW.id
       AND d."coverageStartAt" < NEW."coverageEndAt" AND d."coverageEndAt" > NEW."coverageStartAt") THEN
     RAISE EXCEPTION 'Daily analytics coverage cannot overlap' USING ERRCODE = '23514';
   END IF;
@@ -143,4 +156,25 @@ BEGIN
 END $$;
 CREATE TRIGGER "NativeAnalyticsDay_authority_guard" BEFORE INSERT OR UPDATE ON "NativeAnalyticsDay"
 FOR EACH ROW EXECUTE FUNCTION "guard_native_analytics_day"();
+
+CREATE FUNCTION "guard_native_analytics_retention"() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM "HubInstallation" h WHERE h.id=NEW."hubInstallationId" AND h."homeId"=NEW."homeId") THEN
+    RAISE EXCEPTION 'Daily retention requires its enrolled Home' USING ERRCODE = '23514';
+  END IF;
+  RETURN NEW;
+END $$;
+CREATE TRIGGER "NativeAnalyticsRetention_home_guard" BEFORE INSERT OR UPDATE ON "NativeAnalyticsRetention"
+FOR EACH ROW EXECUTE FUNCTION "guard_native_analytics_retention"();
+
+REVOKE ALL ON "NativeAnalyticsRetention", "NativeAnalyticsDay" FROM PUBLIC;
+REVOKE ALL ON FUNCTION "guard_native_analytics_day"(), "guard_native_analytics_retention"() FROM PUBLIC;
+DO $$ DECLARE role_name text; BEGIN
+  FOREACH role_name IN ARRAY ARRAY['anon','authenticated'] LOOP
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname=role_name) THEN
+      EXECUTE format('REVOKE ALL ON "NativeAnalyticsRetention", "NativeAnalyticsDay" FROM %I', role_name);
+      EXECUTE format('REVOKE ALL ON FUNCTION "guard_native_analytics_day"(), "guard_native_analytics_retention"() FROM %I', role_name);
+    END IF;
+  END LOOP;
+END $$;
 

@@ -4,7 +4,7 @@ export const DAILY_ANALYTICS_VERSION=1;
 export const DAILY_PAYLOAD_KEYS=['osDeviceId','osAreaId','kind','analyticsCategory','controlId','sourceGeneration',
   'bindingRevision','analyticsIntervalId','analyticsPolicyVersion','timezone','writerFrom','dayStartAt','dayEndAt','assignmentEpochAt',
   'revision','onSeconds','offSeconds','unknownSeconds','knownMilliseconds','celsiusMilliseconds','minimumCelsius','maximumCelsius',
-  'sampleCount','lastCelsius','lastObservedAt','lastValidUntil','coverageStartAt','coverageEndAt'];
+  'sampleCount','lastCelsius','lastObservedAt','lastValidUntil','coverageStartAt','coverageEndAt','closedAt'];
 const integer=(v:unknown)=>Number.isSafeInteger(v)&&Number(v)>=0;
 const date=(v:unknown)=>typeof v==='string'&&Number.isFinite(Date.parse(v))&&new Date(v).toISOString()===v;
 const number=(v:unknown)=>typeof v==='number'&&Number.isFinite(v);
@@ -22,6 +22,7 @@ export function validDailyPayload(p:Record<string,unknown>){
     ||!['writerFrom','dayStartAt','dayEndAt','assignmentEpochAt','coverageStartAt','coverageEndAt'].every(k=>date(p[k]))
     ||!['onSeconds','offSeconds','unknownSeconds','knownMilliseconds','sampleCount'].every(k=>integer(p[k]))
     ||!number(p.celsiusMilliseconds)||Math.abs(Number(p.celsiusMilliseconds))>1e13)return false;
+  if (p.closedAt !== null && (!date(p.closedAt) || p.closedAt !== p.dayEndAt)) return false;
   try{const d=historyDay(Date.parse(String(p.dayStartAt)),String(p.timezone));
     if(d.start!==Date.parse(String(p.dayStartAt))||d.end!==Date.parse(String(p.dayEndAt)))return false;}catch{return false;}
   const start=Date.parse(String(p.coverageStartAt)),end=Date.parse(String(p.coverageEndAt));
@@ -30,6 +31,8 @@ export function validDailyPayload(p:Record<string,unknown>){
   if(p.kind==='USAGE')return Number(p.onSeconds)+Number(p.offSeconds)+Number(p.unknownSeconds)===(end-start)/1000
     &&p.knownMilliseconds===0&&p.celsiusMilliseconds===0&&p.minimumCelsius===null&&p.maximumCelsius===null
     &&p.lastCelsius===null&&p.lastObservedAt===null&&p.lastValidUntil===null&&p.sampleCount===0;
+  if (p.knownMilliseconds===0) return p.onSeconds===0&&p.offSeconds===0&&p.unknownSeconds===0&&p.celsiusMilliseconds===0
+    &&p.minimumCelsius===null&&p.maximumCelsius===null&&p.lastCelsius===null&&p.lastObservedAt===null&&p.lastValidUntil===null;
   return p.onSeconds===0&&p.offSeconds===0&&p.unknownSeconds===0&&Number(p.knownMilliseconds)>0&&Number(p.knownMilliseconds)<=end-start
     &&[p.minimumCelsius,p.maximumCelsius,p.lastCelsius].every(v=>number(v)&&Number(v)>=-50&&Number(v)<=80)
     &&Number(p.minimumCelsius)<=Number(p.maximumCelsius)&&date(p.lastObservedAt)&&date(p.lastValidUntil)

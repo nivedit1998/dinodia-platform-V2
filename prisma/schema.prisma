@@ -2062,6 +2062,11 @@ model NativeAnalyticsRetention {
   barrierSequence BigInt?
   legacySealedThrough DateTime?
   backfillVerifiedAt DateTime?
+  backfillThrough DateTime?
+  prunedThrough DateTime?
+  compactionCursor DateTime?
+  retainedDetailDays Json @default("[]")
+  backlogReason String? @db.VarChar(120)
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
   home Home @relation(fields:[homeId], references:[id], onDelete:Cascade)
@@ -2086,6 +2091,7 @@ model NativeAnalyticsDay {
   dayEndAt DateTime
   writerFrom DateTime
   assignmentEpochAt DateTime
+  closedAt DateTime?
   origin String @db.VarChar(16)
   revision Int
   onSeconds Int @default(0)

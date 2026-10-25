@@ -132,3 +132,79 @@ test('approved temperature mean weights genuine device-duration, without inventi
   assert.equal(point.currentFresh, false);
   assert.deepEqual(point.segments, []);
 });
+
+test('legacy backfill keeps exact counters and replaces overlapping temperature validity with the later genuine report', () => {
+  const { buildLegacyDays } = load('src/lib/dailyAnalyticsBackfill.ts');
+  const start = Date.parse('2026-10-24T10:00:00Z'), day = calendar.historyDay(start, 'Europe/London');
+  const input = { homeId: 'home', timezone: 'Europe/London', writerFrom: new Date('2026-10-25T00:00:00Z'), day,
+    usage: [{ id: 'hour', deviceId: 'a', areaId: 'room', bucketStart: new Date(start), closedAt: new Date(start + 3600000),
+      onSeconds: 1800, offSeconds: 1800, unknownSeconds: 0, controlId: 'power', analyticsCategory: 'LIGHT',
+      sourceGeneration: 1, bindingRevision: 0, analyticsIntervalId: null, analyticsPolicyVersion: 1 }],
+    temperature: [0, 300000].map((delta, i) => ({ id: `sample-${i}`, deviceId: 'a', areaId: 'room', sourceGeneration: 1,
+      temperature: i ? 24 : 20, sourceObservedAt: new Date(start + delta), validUntil: new Date(start + delta + 600000),
+      currentnessEndedAt: null, analyticsPolicyVersion: 2 })),
+    assignments: [{ deviceId: 'a', areaId: 'room', validFrom: new Date(day.start), validUntil: null }], intervals: [] };
+  const rows = buildLegacyDays(input);
+  const usage = rows.find(r => r.kind === 'USAGE'), temp = rows.find(r => r.kind === 'TEMPERATURE');
+  assert.equal(usage.onSeconds, 1800); assert.equal(usage.offSeconds, 1800);
+  assert.equal(temp.knownMilliseconds, 900000n);
+  assert.equal(temp.celsiusMilliseconds, 20400000);
+  assert.equal(temp.minimumCelsius, 20); assert.equal(temp.maximumCelsius, 24);
+  assert.equal(temp.payloadDigest, buildLegacyDays(input).find(r => r.kind === 'TEMPERATURE').payloadDigest);
+});
+
+test('mixed legacy UTC hour crossing fractional-offset midnight is retained, never prorated as a measurement', () => {
+  const { buildLegacyDays } = load('src/lib/dailyAnalyticsBackfill.ts');
+  const start = Date.parse('2026-10-24T18:00:00Z'), day = calendar.historyDay(start, 'Asia/Kolkata');
+  assert.throws(() => buildLegacyDays({ homeId: 'home', timezone: 'Asia/Kolkata', writerFrom: new Date('2026-10-25T00:00:00Z'), day,
+    usage: [{ id: 'hour', deviceId: 'a', areaId: 'room', bucketStart: new Date(start), closedAt: new Date(start + 3600000),
+      onSeconds: 1800, offSeconds: 1800, unknownSeconds: 0, analyticsCategory: 'LIGHT', controlId: 'power', sourceGeneration: 1,
+      bindingRevision: 0, analyticsIntervalId: null, analyticsPolicyVersion: 1 }], temperature: [], assignments: [], intervals: [] }),
+  /legacy_usage_boundary_requires_detail/);
+});
+
+test('daily expiry uses local calendar years and safely clamps leap days', () => {
+  assert.equal(new Date(calendar.historyDayExpiry(Date.parse('2028-02-29T12:00:00Z'), 'UTC')).toISOString(), '2029-03-01T00:00:00.000Z');
+  assert.equal(new Date(calendar.historyDayExpiry(Date.parse('2028-02-28T12:00:00Z'), 'UTC')).toISOString(), '2029-03-01T00:00:00.000Z');
+});
+
+test('both writers resolve a skipped midnight to the first actual instant of that local date', () => {
+  const time = Date.parse('2026-09-06T16:00:00Z');
+  const day = calendar.historyDay(time, 'America/Santiago');
+  assert.deepEqual(day, hubCalendar.calendarDay(time, 'America/Santiago'));
+  assert.equal(new Date(day.start).toISOString(), '2026-09-06T04:00:00.000Z');
+  assert.equal(day.end - day.start, 23 * 3600000);
+});
+
+test('compaction verifies temporal attribution, extrema and latest evidence as well as integral totals', () => {
+  const { buildLegacyDays } = load('src/lib/dailyAnalyticsBackfill.ts');
+  const { dailyStatisticsAgree } = load('src/lib/dailyAnalyticsMaintenance.ts');
+  const start = Date.parse('2026-10-24T10:00:00Z'), day = calendar.historyDay(start, 'Europe/London');
+  const assignments = [{ deviceId: 'a', areaId: 'room', validFrom: new Date(day.start), validUntil: null }];
+  const rows = buildLegacyDays({ homeId: 'home', timezone: 'Europe/London', writerFrom: new Date(day.end), day,
+    usage: [], assignments, intervals: [], temperature: [{ id: 'sample', deviceId: 'a', areaId: 'room', sourceGeneration: 1,
+      temperature: 20, sourceObservedAt: new Date(start), validUntil: new Date(start + 600000), currentnessEndedAt: null, analyticsPolicyVersion: 2 }] });
+  assert.equal(dailyStatisticsAgree(rows, rows, assignments), true);
+  for (const mutation of [ { minimumCelsius: 19 }, { maximumCelsius: 21 }, { lastCelsius: 21 },
+    { sampleCount: 2 }, { lastObservedAt: new Date(start + 1) }, { lastValidUntil: new Date(start + 600001) },
+    { coverageEndAt: new Date(start + 600001) }, { assignmentEpochAt: new Date(start + 1) } ])
+    assert.equal(dailyStatisticsAgree(rows, [{ ...rows[0], ...mutation }], assignments), false, JSON.stringify(mutation));
+});
+
+test('bounded scheduled maintenance rotates past the first twenty installations', async () => {
+  const { maintainDailyAnalytics } = load('src/lib/dailyAnalyticsMaintenance.ts');
+  const states = Array.from({ length: 21 }, (_, i) => ({ hubInstallationId: String(i).padStart(3, '0'), updatedAt: new Date(i),
+    writerEnabled: true, legacySealedThrough: null, timezone: 'UTC' }));
+  const visited = new Set();
+  const tx = { $queryRaw: async () => [], nativeAnalyticsRetention: {
+    findUniqueOrThrow: async ({ where }) => { visited.add(where.hubInstallationId); return states.find(s => s.hubInstallationId === where.hubInstallationId); } } };
+  const db = { $transaction: async callback => callback(tx), $executeRaw: async () => 0, nativeAnalyticsRetention: {
+    findMany: async ({ orderBy, take }) => { assert.deepEqual(orderBy, [{ updatedAt: 'asc' }, { hubInstallationId: 'asc' }]);
+      return [...states].sort((a, b) => a.updatedAt - b.updatedAt).slice(0, take); },
+    update: async ({ where, data }) => Object.assign(states.find(s => s.hubInstallationId === where.hubInstallationId), data) } };
+  const previous = process.env.DINODIA_CALENDAR_ANALYTICS_ENABLED; process.env.DINODIA_CALENDAR_ANALYTICS_ENABLED = 'true';
+  try { await maintainDailyAnalytics(db, new Date(100000)); await maintainDailyAnalytics(db, new Date(200000));
+    assert.equal(visited.size, 21); } finally {
+    if (previous === undefined) delete process.env.DINODIA_CALENDAR_ANALYTICS_ENABLED; else process.env.DINODIA_CALENDAR_ANALYTICS_ENABLED = previous;
+  }
+});
