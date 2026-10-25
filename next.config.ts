@@ -2,6 +2,7 @@
 import type { NextConfig } from 'next';
 
 const nextConfig: NextConfig = {
+  agentRules: false,
   reactStrictMode: true,
   reactCompiler: true,
   typedRoutes: true,
@@ -41,8 +42,41 @@ const nextConfig: NextConfig = {
 
     return [
       {
+        source: '/.well-known/apple-app-site-association',
+        headers: [
+          { key: 'Content-Type', value: 'application/json' },
+          { key: 'Cache-Control', value: 'public, max-age=300' },
+        ],
+      },
+      {
+        // Company Portal intentionally opens the paired hub on a separate
+        // origin. Keep that popup in the opener's browsing-context group so
+        // the existing origin-checked, browser-bound postMessage handshake
+        // works in browsers enforcing COOP isolation. This exception is only
+        // on the installer document, not on APIs or customer pages.
+        source: '/installer',
+        headers: [
+          {
+            key: 'Cross-Origin-Opener-Policy',
+            value: 'same-origin-allow-popups',
+          },
+        ],
+      },
+      {
         source: '/:path*',
         headers,
+      },
+      {
+        // The OAuth consent document is deliberately static and has no
+        // scripts. Next's catch-all header above would otherwise replace the
+        // stricter Response CSP with the site's general inline-script policy.
+        source: '/api/v2/alexa/oauth/authorize',
+        headers: [
+          {
+            key: 'Content-Security-Policy',
+            value: "default-src 'none'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
+          },
+        ],
       },
     ];
   },

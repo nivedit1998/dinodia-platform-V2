@@ -1,0 +1,202 @@
+-- CreateTable
+CREATE TABLE "NativeAnalyticsRetention" (
+    "hubInstallationId" UUID NOT NULL,
+    "homeId" UUID NOT NULL,
+    "timezone" VARCHAR(64) NOT NULL,
+    "writerFrom" TIMESTAMP(3) NOT NULL,
+    "writerEnabled" BOOLEAN NOT NULL DEFAULT false,
+    "readsEnabled" BOOLEAN NOT NULL DEFAULT false,
+    "pruningEnabled" BOOLEAN NOT NULL DEFAULT false,
+    "barrierStreamId" VARCHAR(80),
+    "barrierSequence" BIGINT,
+    "legacySealedThrough" TIMESTAMP(3),
+    "backfillVerifiedAt" TIMESTAMP(3),
+    "backfillThrough" TIMESTAMP(3),
+    "prunedThrough" TIMESTAMP(3),
+    "compactionCursor" TIMESTAMP(3),
+    "retainedDetailDays" JSONB NOT NULL DEFAULT '[]',
+    "backlogReason" VARCHAR(120),
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "updatedAt" TIMESTAMP(3) NOT NULL,
+
+    CONSTRAINT "NativeAnalyticsRetention_pkey" PRIMARY KEY ("hubInstallationId")
+);
+
+-- CreateTable
+CREATE TABLE "NativeAnalyticsDay" (
+    "id" UUID NOT NULL,
+    "homeId" UUID NOT NULL,
+    "deviceId" UUID NOT NULL,
+    "areaId" UUID NOT NULL,
+    "kind" VARCHAR(16) NOT NULL,
+    "analyticsCategory" "DeviceAnalyticsCategory" NOT NULL,
+    "controlId" VARCHAR(160) NOT NULL,
+    "sourceGeneration" INTEGER NOT NULL,
+    "bindingRevision" INTEGER NOT NULL DEFAULT 0,
+    "analyticsIntervalId" UUID,
+    "analyticsPolicyVersion" INTEGER NOT NULL,
+    "timezone" VARCHAR(64) NOT NULL,
+    "dayStartAt" TIMESTAMP(3) NOT NULL,
+    "dayEndAt" TIMESTAMP(3) NOT NULL,
+    "writerFrom" TIMESTAMP(3) NOT NULL,
+    "assignmentEpochAt" TIMESTAMP(3) NOT NULL,
+    "closedAt" TIMESTAMP(3),
+    "origin" VARCHAR(16) NOT NULL,
+    "revision" INTEGER NOT NULL,
+    "onSeconds" INTEGER NOT NULL DEFAULT 0,
+    "offSeconds" INTEGER NOT NULL DEFAULT 0,
+    "unknownSeconds" INTEGER NOT NULL DEFAULT 0,
+    "knownMilliseconds" BIGINT NOT NULL DEFAULT 0,
+    "celsiusMilliseconds" DECIMAL(24,2) NOT NULL DEFAULT 0,
+    "minimumCelsius" DECIMAL(6,2),
+    "maximumCelsius" DECIMAL(6,2),
+    "sampleCount" INTEGER NOT NULL DEFAULT 0,
+    "lastCelsius" DECIMAL(6,2),
+    "lastObservedAt" TIMESTAMP(3),
+    "lastValidUntil" TIMESTAMP(3),
+    "coverageStartAt" TIMESTAMP(3) NOT NULL,
+    "coverageEndAt" TIMESTAMP(3) NOT NULL,
+    "payloadDigest" VARCHAR(64) NOT NULL,
+    "verifiedAt" TIMESTAMP(3),
+    "purgeAt" TIMESTAMP(3) NOT NULL,
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "updatedAt" TIMESTAMP(3) NOT NULL,
+
+    CONSTRAINT "NativeAnalyticsDay_pkey" PRIMARY KEY ("id")
+);
+
+-- CreateIndex
+CREATE INDEX "NativeAnalyticsRetention_homeId_idx" ON "NativeAnalyticsRetention"("homeId");
+
+-- CreateIndex
+CREATE INDEX "NativeAnalyticsDay_homeId_kind_dayStartAt_idx" ON "NativeAnalyticsDay"("homeId", "kind", "dayStartAt");
+
+-- CreateIndex
+CREATE INDEX "NativeAnalyticsDay_purgeAt_idx" ON "NativeAnalyticsDay"("purgeAt");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "NativeAnalyticsDay_source_key" ON "NativeAnalyticsDay"("deviceId", "areaId", "kind", "analyticsCategory", "controlId", "sourceGeneration", "bindingRevision", "dayStartAt", "writerFrom", "assignmentEpochAt", "origin");
+
+-- AddForeignKey
+ALTER TABLE "NativeAnalyticsRetention" ADD CONSTRAINT "NativeAnalyticsRetention_homeId_fkey" FOREIGN KEY ("homeId") REFERENCES "Home"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "NativeAnalyticsRetention" ADD CONSTRAINT "NativeAnalyticsRetention_hubInstallationId_fkey" FOREIGN KEY ("hubInstallationId") REFERENCES "HubInstallation"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "NativeAnalyticsDay" ADD CONSTRAINT "NativeAnalyticsDay_homeId_fkey" FOREIGN KEY ("homeId") REFERENCES "Home"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "NativeAnalyticsDay" ADD CONSTRAINT "NativeAnalyticsDay_deviceId_fkey" FOREIGN KEY ("deviceId") REFERENCES "NativeDevice"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "NativeAnalyticsDay" ADD CONSTRAINT "NativeAnalyticsDay_areaId_fkey" FOREIGN KEY ("areaId") REFERENCES "Area"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+
+-- Counters describe disjoint genuine coverage, not a rounded chart bar. All new
+-- rows remain shadow-only until their complete source prefix is verified.
+ALTER TABLE "NativeAnalyticsRetention" ADD CONSTRAINT "NativeAnalyticsRetention_flags_check" CHECK (
+  (NOT "pruningEnabled" OR ("readsEnabled" AND "backfillVerifiedAt" IS NOT NULL AND "legacySealedThrough" = "writerFrom"))
+  AND ("barrierStreamId" IS NULL) = ("barrierSequence" IS NULL)
+  AND ("barrierStreamId" IS NULL) = ("legacySealedThrough" IS NULL)
+);
+ALTER TABLE "NativeAnalyticsDay" ADD CONSTRAINT "NativeAnalyticsDay_coverage_check" CHECK (
+  "kind" IN ('USAGE', 'TEMPERATURE') AND "origin" IN ('HUB', 'LEGACY')
+  AND "analyticsCategory" IN ('LIGHT', 'RADIATOR', 'BOILER')
+  AND "sourceGeneration" > 0 AND "bindingRevision" >= 0 AND "revision" > 0
+  AND "analyticsPolicyVersion" IN (1, 2, 3)
+  AND "coverageStartAt" >= "dayStartAt" AND "coverageEndAt" <= "dayEndAt"
+  AND "coverageEndAt" > "coverageStartAt" AND "dayEndAt" > "dayStartAt"
+  AND ("closedAt" IS NULL OR ("closedAt" >= "coverageEndAt" AND "closedAt" <= "dayEndAt"))
+  AND ("origin" <> 'HUB' OR "closedAt" IS NULL OR "closedAt" = "dayEndAt")
+  AND ("origin" <> 'HUB' OR "coverageStartAt" >= GREATEST("writerFrom", "assignmentEpochAt"))
+  AND ("origin" <> 'LEGACY' OR "coverageEndAt" <= "writerFrom")
+  AND "onSeconds" >= 0 AND "offSeconds" >= 0 AND "unknownSeconds" >= 0
+  AND "knownMilliseconds" >= 0 AND "sampleCount" >= 0
+  AND (("kind" = 'USAGE' AND ("onSeconds"::bigint + "offSeconds" + "unknownSeconds") * 1000
+      = EXTRACT(EPOCH FROM ("coverageEndAt" - "coverageStartAt")) * 1000
+      AND "knownMilliseconds" = 0 AND "celsiusMilliseconds" = 0 AND "minimumCelsius" IS NULL
+      AND "maximumCelsius" IS NULL AND "lastCelsius" IS NULL AND "sampleCount" = 0
+      AND "lastObservedAt" IS NULL AND "lastValidUntil" IS NULL)
+    OR ("kind" = 'TEMPERATURE' AND "analyticsCategory" = 'RADIATOR'
+      AND "onSeconds" = 0 AND "offSeconds" = 0 AND "unknownSeconds" = 0
+      AND "knownMilliseconds" > 0
+      AND "knownMilliseconds" <= EXTRACT(EPOCH FROM ("coverageEndAt" - "coverageStartAt")) * 1000
+      AND "minimumCelsius" IS NOT NULL AND "maximumCelsius" IS NOT NULL AND "lastCelsius" IS NOT NULL
+      AND "minimumCelsius" >= -50 AND "maximumCelsius" <= 80 AND "minimumCelsius" <= "maximumCelsius"
+      AND "lastCelsius" BETWEEN -50 AND 80
+      AND "lastObservedAt" IS NOT NULL AND "lastValidUntil" IS NOT NULL AND "lastValidUntil" >= "lastObservedAt"
+      AND "celsiusMilliseconds" BETWEEN "minimumCelsius" * "knownMilliseconds" - 0.1
+        AND "maximumCelsius" * "knownMilliseconds" + 0.1)
+    OR ("kind" = 'TEMPERATURE' AND "analyticsCategory" = 'RADIATOR'
+      AND "onSeconds" = 0 AND "offSeconds" = 0 AND "unknownSeconds" = 0
+      AND "knownMilliseconds" = 0 AND "celsiusMilliseconds" = 0
+      AND "minimumCelsius" IS NULL AND "maximumCelsius" IS NULL AND "lastCelsius" IS NULL
+      AND "lastObservedAt" IS NULL AND "lastValidUntil" IS NULL))
+);
+
+-- Resolve the first real instant of a local date, including skipped/repeated
+-- midnight. PostgreSQL's default ambiguous-time cast chooses the later midnight.
+CREATE FUNCTION "native_analytics_day_start"(local_day date, zone_name text)
+RETURNS timestamp(3) LANGUAGE plpgsql STABLE AS $$
+DECLARE
+  target_ms bigint := EXTRACT(EPOCH FROM local_day::timestamp)::bigint * 1000;
+  low_ms bigint := target_ms - 129600000;
+  high_ms bigint := target_ms + 129600000;
+  mid_ms bigint;
+BEGIN
+  WHILE low_ms < high_ms LOOP
+    mid_ms := (low_ms + high_ms) / 2;
+    IF (to_timestamp(mid_ms / 1000.0) AT TIME ZONE zone_name)::date < local_day THEN
+      low_ms := mid_ms + 1;
+    ELSE high_ms := mid_ms;
+    END IF;
+  END LOOP;
+  RETURN to_timestamp(low_ms / 1000.0) AT TIME ZONE 'UTC';
+END $$;
+
+CREATE FUNCTION "guard_native_analytics_day"() RETURNS trigger LANGUAGE plpgsql AS $$
+DECLARE device_row "NativeDevice"%ROWTYPE;
+BEGIN
+  SELECT * INTO device_row FROM "NativeDevice" WHERE id = NEW."deviceId" FOR UPDATE;
+  IF NOT FOUND OR device_row."homeId" <> NEW."homeId" OR device_row."managementClass" <> 'PROPERTY_DEVICE'
+    OR device_row."ownerMembershipId" IS NOT NULL
+    OR NOT EXISTS (SELECT 1 FROM "Area" a WHERE a.id = NEW."areaId" AND a."homeId" = NEW."homeId") THEN
+    RAISE EXCEPTION 'Daily analytics requires same-home permanent-device authority' USING ERRCODE = '23514';
+  END IF;
+  IF NEW."dayStartAt" <> "native_analytics_day_start"((NEW."dayStartAt" AT TIME ZONE 'UTC' AT TIME ZONE NEW.timezone)::date, NEW.timezone)
+    OR NEW."dayEndAt" <> "native_analytics_day_start"((NEW."dayStartAt" AT TIME ZONE 'UTC' AT TIME ZONE NEW.timezone)::date + 1, NEW.timezone) THEN
+    RAISE EXCEPTION 'Daily analytics requires exact local-calendar boundaries' USING ERRCODE = '23514';
+  END IF;
+  IF EXISTS (SELECT 1 FROM "NativeAnalyticsDay" d
+      WHERE d."deviceId" = NEW."deviceId" AND d.kind = NEW.kind AND d.id <> NEW.id
+      AND d."coverageStartAt" < NEW."coverageEndAt" AND d."coverageEndAt" > NEW."coverageStartAt") THEN
+    RAISE EXCEPTION 'Daily analytics coverage cannot overlap' USING ERRCODE = '23514';
+  END IF;
+  RETURN NEW;
+END $$;
+CREATE TRIGGER "NativeAnalyticsDay_authority_guard" BEFORE INSERT OR UPDATE ON "NativeAnalyticsDay"
+FOR EACH ROW EXECUTE FUNCTION "guard_native_analytics_day"();
+
+CREATE FUNCTION "guard_native_analytics_retention"() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM "HubInstallation" h WHERE h.id=NEW."hubInstallationId" AND h."homeId"=NEW."homeId") THEN
+    RAISE EXCEPTION 'Daily retention requires its enrolled Home' USING ERRCODE = '23514';
+  END IF;
+  RETURN NEW;
+END $$;
+CREATE TRIGGER "NativeAnalyticsRetention_home_guard" BEFORE INSERT OR UPDATE ON "NativeAnalyticsRetention"
+FOR EACH ROW EXECUTE FUNCTION "guard_native_analytics_retention"();
+
+REVOKE ALL ON "NativeAnalyticsRetention", "NativeAnalyticsDay" FROM PUBLIC;
+REVOKE ALL ON FUNCTION "guard_native_analytics_day"(), "guard_native_analytics_retention"() FROM PUBLIC;
+REVOKE ALL ON FUNCTION "native_analytics_day_start"(date,text) FROM PUBLIC;
+DO $$ DECLARE role_name text; BEGIN
+  FOREACH role_name IN ARRAY ARRAY['anon','authenticated'] LOOP
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname=role_name) THEN
+      EXECUTE format('REVOKE ALL ON "NativeAnalyticsRetention", "NativeAnalyticsDay" FROM %I', role_name);
+      EXECUTE format('REVOKE ALL ON FUNCTION "guard_native_analytics_day"(), "guard_native_analytics_retention"() FROM %I', role_name);
+      EXECUTE format('REVOKE ALL ON FUNCTION "native_analytics_day_start"(date,text) FROM %I', role_name);
+    END IF;
+  END LOOP;
+END $$;
+

@@ -1,0 +1,72 @@
+import { NextResponse } from 'next/server';
+import { authErrorResponse, Stage1AuthError } from '@/lib/stage1Auth';
+import { authenticateHub } from '@/lib/stage1HubAuth';
+import { randomSecret, sha256 } from '@/lib/stage1Crypto';
+import { supportProofRequestDigest, verifySupportProofSignature } from '@/lib/stage1Operator';
+import { createPropertySupportNotifications } from '@/lib/supportNotifications';
+import { serializableTransaction } from '@/lib/serializableTransaction';
+
+export const dynamic = 'force-dynamic';
+
+export async function POST(request: Request) {
+  try {
+    const raw = await request.text();
+    const hub = await authenticateHub(request, raw);
+    const allowedFields = new Set(['serial', 'identityGeneration', 'ticketId', 'requestId', 'code', 'employeeId', 'homeId', 'nonce', 'proofExpiresAt', 'requestBodyDigest', 'employeeProofSignature']);
+    if (Object.keys(hub.body).length !== allowedFields.size || Object.keys(hub.body).some((key) => !allowedFields.has(key))) throw new Stage1AuthError(400, 'support_proof_body_invalid', 'The support proof request fields are invalid');
+    const serial = String(hub.body.serial ?? '').trim();
+    const ticketId = String(hub.body.ticketId ?? '').trim();
+    const requestId = String(hub.body.requestId ?? '').trim();
+    const identityGeneration = Number(hub.body.identityGeneration);
+    const code = String(hub.body.code ?? '').trim();
+    const employeeId = String(hub.body.employeeId ?? '').trim();
+    const homeId = String(hub.body.homeId ?? '').trim();
+    const nonce = String(hub.body.nonce ?? '').trim();
+    const proofExpiresAt = Number(hub.body.proofExpiresAt);
+    const requestBodyDigest = String(hub.body.requestBodyDigest ?? '').trim().toLowerCase();
+    const employeeProofSignature = String(hub.body.employeeProofSignature ?? '').trim();
+    if (!ticketId || !/^[0-9a-f-]{36}$/i.test(requestId) || !Number.isInteger(identityGeneration) || identityGeneration < 1 || !code || !employeeId || !homeId || !/^[A-Za-z0-9_-]{32,128}$/.test(nonce) || !Number.isSafeInteger(proofExpiresAt) || !/^[a-f0-9]{64}$/.test(requestBodyDigest) || !/^[A-Za-z0-9_-]{80,256}$/.test(employeeProofSignature)) throw new Stage1AuthError(401, 'support_credentials_required', 'A support ticket, request, one-use support code and hub employee proof are required');
+    if (serial !== hub.installation.serialNumberSnapshot || identityGeneration !== Number(hub.identity.identityGeneration)) throw new Stage1AuthError(401, 'support_identity_generation_mismatch', 'The support proof is bound to a different hub identity or generation');
+    const result = await serializableTransaction(async (tx) => {
+      // Serialize redemption with customer ticket closure using the same lock
+      // order (ticket, then request). Without these locks, the two serializable
+      // transactions can both pass their initial reads and exhaust retries on
+      // the one-session-per-request constraint, surfacing an internal 500.
+      await tx.$queryRaw`SELECT "id" FROM "SupportTicket" WHERE "id" = ${ticketId}::uuid FOR UPDATE`;
+      await tx.$queryRaw`SELECT "id" FROM "SupportAccessRequest" WHERE "id" = ${requestId}::uuid AND "ticketId" = ${ticketId}::uuid FOR UPDATE`;
+      // Request start time is not authority: a legitimate request may have
+      // waited on either lock across code, handoff or hard-stop expiry.
+      const now = new Date();
+      const row = await tx.supportAccessRequest.findFirst({ where: { id: requestId, ticketId, hubInstallationId: hub.installation.id, status: 'ISSUED', codeHash: sha256(code), employeeHandoffEnvelope: { not: null } }, select: { id: true, ticketId: true, requestedByEmployeeId: true, homeId: true, hubInstallationId: true, requestedScope: true, targetMembershipId: true, targetUserId: true, canonicalAreaIds: true, codeExpiresAt: true, employeeHandoffExpiresAt: true, employeeHandoffConsumedAt: true, sessionHardStopAt: true, codeConsumedAt: true, employeeProofPublicKey: true } });
+      if (!row || row.codeConsumedAt || row.employeeHandoffConsumedAt || !row.codeExpiresAt || row.codeExpiresAt <= now || !row.employeeHandoffExpiresAt || row.employeeHandoffExpiresAt <= now || !row.sessionHardStopAt || row.sessionHardStopAt <= now) throw new Stage1AuthError(401, 'support_code_invalid', 'The support code and Company Portal handoff are invalid or expired');
+      if (employeeId !== row.requestedByEmployeeId || homeId !== row.homeId || proofExpiresAt <= Math.floor(now.getTime() / 1000) || proofExpiresAt > Math.floor(row.employeeHandoffExpiresAt.getTime() / 1000)) throw new Stage1AuthError(401, 'support_proof_context_invalid', 'The employee proof is invalid, expired or bound to another request');
+      const ticket = await tx.supportTicket.findUnique({ where: { id: row.ticketId }, select: { status: true, assignedEmployeeId: true } });
+      if (!ticket || ticket.status !== 'OPEN' || ticket.assignedEmployeeId !== row.requestedByEmployeeId) throw new Stage1AuthError(403, 'support_ticket_closed', 'The support ticket is not open for the assigned employee');
+      const proofContext = { serial: hub.installation.serialNumberSnapshot, ticketId: row.ticketId, requestId: row.id, employeeId, homeId, codeHash: sha256(code), identityGeneration, nonce, proofExpiresAt };
+      if (!row.employeeProofPublicKey || !verifySupportProofSignature({ ...proofContext, requestBodyDigest, signature: employeeProofSignature, publicKey: row.employeeProofPublicKey }) || requestBodyDigest !== supportProofRequestDigest(proofContext)) throw new Stage1AuthError(401, 'support_proof_invalid', 'The Company Portal proof is invalid, expired or not bound to this request');
+      let targetUserId = row.targetUserId;
+      let areaIds = Array.isArray(row.canonicalAreaIds) ? row.canonicalAreaIds.map(String) : [];
+      if (row.requestedScope === 'TENANT_SCOPE') {
+        if (!row.targetMembershipId) throw new Stage1AuthError(403, 'support_target_missing', 'The tenant support target is missing');
+        const membership = await tx.homeMembership.findUnique({ where: { id: row.targetMembershipId }, select: { id: true, homeId: true, role: true, status: true, customerAccountId: true } });
+        if (!membership || membership.homeId !== row.homeId || membership.role !== 'TENANT' || membership.status !== 'ACTIVE') throw new Stage1AuthError(403, 'support_target_invalid', 'The tenant support target is no longer active');
+        targetUserId = membership.customerAccountId;
+        if (!areaIds.length) {
+          const grants = await tx.tenantAreaGrant.findMany({ where: { membershipId: membership.id, revokedAt: null }, select: { areaId: true } });
+          areaIds = grants.map((grant) => grant.areaId);
+        }
+      } else {
+        targetUserId = null;
+        areaIds = [];
+      }
+      const consumed = await tx.supportAccessRequest.updateMany({ where: { id: row.id, status: 'ISSUED', codeConsumedAt: null, employeeHandoffConsumedAt: null }, data: { status: 'REDEEMED', codeConsumedAt: now, employeeHandoffConsumedAt: now } });
+      if (consumed.count !== 1) throw new Stage1AuthError(401, 'support_code_replayed', 'The support code has already been consumed');
+      const lease = randomSecret(32);
+      const session = await tx.supportSession.create({ data: { accessRequestId: row.id, ticketId: row.ticketId, employeeId: row.requestedByEmployeeId, homeId: row.homeId, hubInstallationId: row.hubInstallationId, scope: row.requestedScope, areaIds, targetMembershipId: row.targetMembershipId, targetUserId, leaseHash: sha256(lease), approvedAt: now, expiresAt: row.sessionHardStopAt }, select: { id: true, expiresAt: true } });
+      await createPropertySupportNotifications(tx, { homeId: row.homeId, ticketId: row.ticketId, accessRequestId: row.id, sessionId: session.id, eventType: 'STARTED' });
+      await tx.auditEvent.create({ data: { homeId: row.homeId, actorType: 'EMPLOYEE', actorId: row.requestedByEmployeeId, category: 'SECURITY', action: 'support_access_redeemed', targetType: 'SupportSession', targetId: session.id, metadata: { ticketId: row.ticketId, scope: row.requestedScope, targetMembershipId: row.targetMembershipId, outcome: 'redeemed' }, purgeAt: new Date(now.getTime() + 365 * 24 * 60 * 60 * 1000) } });
+      return { sessionId: session.id, lease, expiresAt: session.expiresAt, scope: row.requestedScope, areaIds, targetMembershipId: row.targetMembershipId, targetUserId, includesTenantDevices: row.requestedScope === 'TENANT_SCOPE' };
+    });
+    return NextResponse.json({ ok: true, ...result }, { headers: { 'Cache-Control': 'no-store', Pragma: 'no-cache' } });
+  } catch (error) { return authErrorResponse(error); }
+}

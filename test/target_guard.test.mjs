@@ -1,8 +1,21 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 
-const cwd = process.cwd();
+// Exercise the unchanged guard with an explicit synthetic link. No developer
+// checkout link or production credentials are required by this unit test.
+const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'dinodia-target-guard-'));
+fs.mkdirSync(path.join(cwd, 'scripts'));
+fs.mkdirSync(path.join(cwd, '.vercel'));
+for (const name of ['assert_v2_target.mjs', 'v2-target.json']) {
+  fs.copyFileSync(new URL(`../scripts/${name}`, import.meta.url), path.join(cwd, 'scripts', name));
+}
+const target = JSON.parse(fs.readFileSync(path.join(cwd, 'scripts/v2-target.json'), 'utf8'));
+fs.writeFileSync(path.join(cwd, '.vercel/project.json'), JSON.stringify({ projectId: target.vercelProjectId, orgId: target.vercelOrgId }));
+test.after(() => fs.rmSync(cwd, { recursive: true, force: true }));
 const script = 'scripts/assert_v2_target.mjs';
 const base = {
   ...process.env,

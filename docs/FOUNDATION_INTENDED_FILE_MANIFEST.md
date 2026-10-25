@@ -11,12 +11,14 @@ This manifest is reviewed before staging. It is not permission to commit or push
 - `src/app/api/health/route.ts`.
 - `src/app/api/readiness/route.ts`.
 - `src/lib/foundation.ts`.
+- `src/lib/buildIdentity.mjs` — safe runtime identity from validated Vercel commit/deployment system variables, without stale source-pin fallback.
 - `src/lib/foundationContracts.mjs`.
 - `src/lib/runtimeDatabaseUrl.ts`.
 - `src/lib/runtimeTarget.mjs`.
 - Foundation tests under `test/`.
 - Foundation guard/verification scripts under `scripts/`.
 - `vercel.json`.
+- `public/.well-known/apple-app-site-association` — V2-only universal-link association for the canonical Vercel origin; App Store registration and signed-device verification remain external.
 - `README.md`.
 - `docs/V2_ENVIRONMENT_INVENTORY.md`.
 - `docs/V2_FOUNDATION_STATUS.md`.

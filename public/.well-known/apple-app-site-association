@@ -1,0 +1,13 @@
+{
+  "applinks": {
+    "apps": [],
+    "details": [
+      {
+        "appIDs": ["P759CSZK34.com.dinodia.DinodiaV2"],
+        "components": [
+          { "/": "/app/*" }
+        ]
+      }
+    ]
+  }
+}

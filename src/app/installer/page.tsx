@@ -1,0 +1,299 @@
+"use client";
+
+import { useEffect, useRef, useState } from "react";
+import { useRouter } from "next/navigation";
+
+type Workflow = {
+  id: string;
+  publicReference: string;
+  kind: string;
+  state: string;
+  homeId: string | null;
+  hubInstallationId: string | null;
+  certifiedSerialNumber: string | null;
+  reason: string | null;
+  updatedAt: string;
+  hubInstallation?: { secureUrl: string | null; secureVerified: boolean; reachability: "RECENT" | "STALE"; lastSeenAt: string | null; localUrl: string | null; localState: "CURRENT" | "STALE"; localReportedAt: string | null; localRevision: number; remoteAccess: { state: "READY" | "RECONNECTING" | "RECONNECT_REQUIRED" | "HELD" | "UNCONFIGURED" | "UNAVAILABLE" | "UNKNOWN"; reportedAt: string | null; retryAvailableLocally: boolean } } | null;
+};
+
+type Employee = { id: string; displayName: string; role: string };
+type OperatorCredential = {
+  version: number;
+  state: string;
+  issuedAt: string;
+  deliveredAt: string | null;
+  acknowledgedAt: string | null;
+  activatedAt: string | null;
+  graceUntil: string | null;
+  revokedAt: string | null;
+};
+type HubSyncStatus = {
+  installation: { lifecycle: string; status: string; activeAreaCount: number; canComplete: boolean; blockReason: string | null };
+  heartbeat: { state: "ONLINE" | "OFFLINE"; lastSeenAt: string | null };
+  sync: { lastSuccessfulSyncAt: string | null; acceptedSequence: number; statusState: "UNKNOWN" | "FRESH" | "STALE"; statusReportedAt: string | null; queueDepth: number | null; errorCode: string | null; gapDetected: boolean | null; criticalBacklog: boolean | null; telemetryPaused: boolean | null; droppedTelemetryCount: number | null; cloudConfigurationRevision: number; acknowledgedCloudRevision: number };
+  incidents: { openCount: number };
+  replacement: { workflowHubIsCurrent: boolean; currentHubLifecycle: string; installationGeneration: number | null; liveDeviceCount: number; replacementCandidates: Array<{ id: string; generation: number; addedAt: string }>; disposition: string; activationState: string };
+  update: { mode: "MANUAL"; automaticInstallEnabled: false; trustState: string; phase: string; attemptId: string | null; releaseId: string | null; activeReleaseVersion: string | null; resultCode: string | null; updatedAt: string | null; busy: boolean };
+};
+
+function formatOptionalStatusTime(value: string | null, emptyLabel = "Not yet recorded"): string {
+  return value ? new Date(value).toLocaleString() : emptyLabel;
+}
+
+export default function InstallerPage() {
+  const router = useRouter();
+  const [workflows, setWorkflows] = useState<Workflow[]>([]);
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [opening, setOpening] = useState<string | null>(null);
+  const [reservingCloudflare, setReservingCloudflare] = useState<string | null>(null);
+  const [actionMessage, setActionMessage] = useState("");
+  const [employeeRole, setEmployeeRole] = useState("");
+  const [employees, setEmployees] = useState<Employee[]>([]);
+  const [pairingCode, setPairingCode] = useState("");
+  const [assignedEmployeeId, setAssignedEmployeeId] = useState("");
+  const [workReason, setWorkReason] = useState("");
+  const [assigning, setAssigning] = useState(false);
+  const [operatorCredentials, setOperatorCredentials] = useState<Record<string, OperatorCredential[]>>({});
+  const [operatorStatusMessages, setOperatorStatusMessages] = useState<Record<string, string>>({});
+  const [hubSyncStatus, setHubSyncStatus] = useState<Record<string, HubSyncStatus>>({});
+  const [operatorAction, setOperatorAction] = useState<string | null>(null);
+  const [installationCompleting, setInstallationCompleting] = useState<string | null>(null);
+  const completionIdempotencyKeys = useRef<Record<string, string>>({});
+  const [sessionExpiresAt, setSessionExpiresAt] = useState<string | null>(null);
+
+  useEffect(() => {
+    let stopped = false;
+    let active: AbortController | null = null;
+    const refresh = async () => {
+      if (stopped || document.visibilityState !== "visible" || active) return;
+      active = new AbortController();
+      try {
+        const response = await fetch("/api/installer/workflows", { credentials: "same-origin", cache: "no-store", signal: active.signal });
+        const body = await response.json();
+        if (!response.ok) throw new Error(body.error || "Portal session required");
+        if (stopped) return;
+        setWorkflows(body.workflows || []); setEmployeeRole(body.employee?.role || ""); setEmployees(body.employees || []); setSessionExpiresAt(body.sessionExpiresAt || null); setError("");
+      } catch (caught) {
+        if (!stopped && !(caught instanceof DOMException && caught.name === "AbortError")) setError(caught instanceof Error ? caught.message : "Portal session required");
+      } finally { active = null; setLoading(false); }
+    };
+    const onVisibility = () => { if (document.visibilityState === "visible") void refresh(); };
+    void refresh();
+    const timer = window.setInterval(() => { if (document.visibilityState === "visible") void refresh(); }, 60_000);
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => { stopped = true; active?.abort(); window.clearInterval(timer); document.removeEventListener("visibilitychange", onVisibility); };
+  }, []);
+
+  useEffect(() => {
+    const clearWhenHidden = () => { if (document.visibilityState !== "visible") setPairingCode(""); };
+    document.addEventListener("visibilitychange", clearWhenHidden);
+    return () => document.removeEventListener("visibilitychange", clearWhenHidden);
+  }, []);
+
+  async function openHub(work: Workflow, accessMode: "secure" | "local", fullDashboard = false) {
+    if (!work.homeId || !work.hubInstallationId) return;
+    setOpening(work.id); setActionMessage("");
+    const operatorOriginUrl = String(accessMode === "secure" ? work.hubInstallation?.secureUrl || "" : work.hubInstallation?.localUrl || "").replace(/\/$/, "");
+    const operatorUrl = operatorOriginUrl ? `${operatorOriginUrl}/support-access` : "";
+    if (!operatorUrl) { setActionMessage(accessMode === "secure" ? "The hub has no verified secure endpoint yet" : "The hub has no fresh local endpoint. Refresh its signed heartbeat while it is on your LAN, then refresh this page."); setOpening(null); return; }
+    const operatorOrigin = new URL(operatorUrl).origin;
+    let popup: Window | null = null;
+    let messageHandler: ((event: MessageEvent) => void) | null = null;
+    try {
+      const setupAttemptId = await new Promise<string>((resolve, reject) => {
+        const timeout = window.setTimeout(() => { if (messageHandler) window.removeEventListener("message", messageHandler); reject(new Error("The locked Dinodia OS browser did not register in time.")); }, 30_000);
+        messageHandler = (event: MessageEvent) => {
+          if (event.source !== popup || event.origin !== operatorOrigin) return;
+          if (event.data?.type === "dinodia-operator-handoff-failed") {
+            window.clearTimeout(timeout); window.removeEventListener("message", messageHandler!);
+            const code = typeof event.data.errorCode === "string" && /^[a-z0-9_]{1,64}$/.test(event.data.errorCode) ? event.data.errorCode : "operator_browser_registration_failed";
+            reject(new Error(`Dinodia OS could not register the originating browser (${code}). Close the OS window and relaunch from the same assigned work.`));
+            return;
+          }
+          if (event.data?.type !== "dinodia-operator-attempt" || typeof event.data.setupAttemptId !== "string") return;
+          window.clearTimeout(timeout); window.removeEventListener("message", messageHandler!); resolve(event.data.setupAttemptId);
+        };
+        window.addEventListener("message", messageHandler);
+        // Each handoff has a single-use browser attempt. Reusing a named
+        // popup can retain an already-consumed setup page after End session,
+        // leaving the Portal waiting for a new attempt that the stale page
+        // will never register. A fresh top-level context keeps every launch
+        // bound to a newly loaded locked OS page.
+        popup = window.open(operatorUrl, "_blank", "popup,width=860,height=760");
+        if (!popup) { window.clearTimeout(timeout); window.removeEventListener("message", messageHandler); reject(new Error("The browser blocked the secure Dinodia OS window. Allow pop-ups and try again.")); }
+      });
+      const response = await fetch(`/api/installer/home-support/homes/${encodeURIComponent(work.homeId)}/os-access/launch`, { method: "POST", credentials: "same-origin", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ workflowId: work.id, setupAttemptId, accessMode, ...(fullDashboard ? { fullDashboard: true } : {}) }) });
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(body.error || "The secure Dinodia OS session could not be started");
+      if (typeof body.operatorUrl !== "string" || new URL(body.operatorUrl).origin !== operatorOrigin) throw new Error("The hub endpoint changed while this browser was registering. Close it and launch again.");
+      if (!popup) throw new Error("The secure Dinodia OS window is unavailable");
+      const sessionEstablished = new Promise<void>((resolve, reject) => {
+        const timeout = window.setTimeout(() => {
+          if (messageHandler) window.removeEventListener("message", messageHandler);
+          reject(new Error("The hub did not confirm an authenticated operator session. Check the Dinodia OS window before retrying."));
+        }, 55_000);
+        messageHandler = (event: MessageEvent) => {
+          if (event.source !== popup || event.origin !== operatorOrigin) return;
+          if (event.data?.type === "dinodia-operator-handoff-failed") {
+            window.clearTimeout(timeout);
+            window.removeEventListener("message", messageHandler!);
+            const phase = ["prepare", "consume", "hub"].includes(event.data.phase) ? event.data.phase : "unknown";
+            const code = typeof event.data.errorCode === "string" && /^[a-z0-9_]{1,64}$/.test(event.data.errorCode) ? event.data.errorCode : "operator_handoff_rejected";
+            const correlationId = typeof event.data.correlationId === "string" && /^[0-9a-f-]{36}$/i.test(event.data.correlationId) ? event.data.correlationId : "";
+            const reference = correlationId ? ` Reference ${correlationId.slice(0, 8)}.` : "";
+            reject(new Error(`Dinodia OS could not complete the operator handoff during ${phase} (${code}).${reference} Check the OS window and relaunch if needed.`));
+            return;
+          }
+          if (event.data?.type !== "dinodia-operator-session-established") return;
+          window.clearTimeout(timeout);
+          window.removeEventListener("message", messageHandler!);
+          resolve();
+        };
+        window.addEventListener("message", messageHandler);
+      });
+      const deliver = () => { try { popup?.postMessage({ type: "dinodia-operator-handoff", handoffId: body.handoffId }, operatorOrigin); } catch {} };
+      // The popup has already registered its hub-created attempt and is now
+      // waiting for this message. Do not race its one-use consume with periodic
+      // duplicate deliveries.
+      deliver();
+      await sessionEstablished;
+      setActionMessage(`${accessMode === "secure" ? "The secure CloudURL" : "The current private-LAN BaseURL"} ${fullDashboard ? "full Home dashboard" : "assigned-work Dinodia OS"} session was verified by the hub.`);
+    } catch (caught) { setActionMessage(caught instanceof Error ? caught.message : "The secure Dinodia OS session could not be verified"); }
+    finally { setOpening(null); }
+  }
+
+  async function reserveCloudflare(work: Workflow) {
+    if (!work.homeId || !work.hubInstallationId) return;
+    setReservingCloudflare(work.id); setActionMessage("");
+    try {
+      const response = await fetch(`/api/installer/hubs/${encodeURIComponent(work.hubInstallationId)}/cloudflare/reserve`, {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "Content-Type": "application/json", "Idempotency-Key": crypto.randomUUID() },
+        body: JSON.stringify({ workflowId: work.id, reason: "Reserve the installation-specific secure Dinodia OS endpoint" }),
+      });
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(body.error || "The secure endpoint could not be reserved");
+      const refreshed = await fetch("/api/installer/workflows", { credentials: "same-origin", cache: "no-store" });
+      const refreshedBody = await refreshed.json().catch(() => ({}));
+      if (!refreshed.ok) throw new Error(refreshedBody.error || "Assigned work could not be refreshed");
+      setWorkflows(refreshedBody.workflows || []);
+      setActionMessage("The installation-specific secure endpoint is reserved. Open the local Dinodia OS dashboard and complete its Cloudflare setup, then return here.");
+    } catch (caught) {
+      setActionMessage(caught instanceof Error ? caught.message : "The secure endpoint could not be reserved");
+    } finally { setReservingCloudflare(null); }
+  }
+
+  async function assignWork(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault(); setAssigning(true); setActionMessage("");
+    try {
+      const response = await fetch("/api/installer/workflows", { method: "POST", credentials: "same-origin", headers: { "Content-Type": "application/json", "Idempotency-Key": crypto.randomUUID() }, body: JSON.stringify({ pairingCode, assignedEmployeeId, reason: workReason }) });
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(body.error || "Installation work could not be assigned");
+      setActionMessage("Installation work assigned from the persisted hub pairing."); setPairingCode(""); setWorkReason("");
+      const refreshed = await fetch("/api/installer/workflows", { credentials: "same-origin", cache: "no-store" });
+      const refreshedBody = await refreshed.json().catch(() => ({})); setWorkflows(refreshedBody.workflows || []);
+    } catch (caught) { setActionMessage(caught instanceof Error ? caught.message : "Installation work could not be assigned"); }
+    finally { setAssigning(false); }
+  }
+
+  async function refreshOperatorCredentials(work: Workflow) {
+    if (!work.homeId) return;
+    setOperatorAction(`status:${work.id}`);
+    setOperatorStatusMessages((current) => ({ ...current, [work.id]: "Checking the durable hub credential state…" }));
+    try {
+      const query = new URLSearchParams({ workflowId: work.id });
+      const response = await fetch(`/api/installer/home-support/homes/${encodeURIComponent(work.homeId)}/os-access/status?${query}`, { credentials: "same-origin", cache: "no-store" });
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(body.error || "Operator credential status is unavailable");
+      const credentials = Array.isArray(body.credentials) ? body.credentials as OperatorCredential[] : [];
+      setOperatorCredentials((current) => ({ ...current, [work.id]: credentials }));
+      if (body.heartbeat && body.sync && body.update) setHubSyncStatus((current) => ({ ...current, [work.id]: body as HubSyncStatus }));
+      setOperatorStatusMessages((current) => ({ ...current, [work.id]: credentials.length ? "Credential status refreshed from the Platform record." : "No operator credential has been issued for this hub yet." }));
+    } catch (caught) {
+      setOperatorStatusMessages((current) => ({ ...current, [work.id]: caught instanceof Error ? caught.message : "Operator credential status is unavailable" }));
+    } finally { setOperatorAction(null); }
+  }
+
+  async function rotateOperatorCredential(work: Workflow) {
+    if (!work.homeId) return;
+    setOperatorAction(`rotate:${work.id}`);
+    setOperatorStatusMessages((current) => ({ ...current, [work.id]: "Submitting a protected rotation request…" }));
+    try {
+      const response = await fetch(`/api/installer/home-support/homes/${encodeURIComponent(work.homeId)}/os-access/rotate`, {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "Content-Type": "application/json", "Idempotency-Key": crypto.randomUUID() },
+        body: JSON.stringify({ workflowId: work.id }),
+      });
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(body.error || "Operator credential rotation was not accepted");
+      setOperatorStatusMessages((current) => ({ ...current, [work.id]: `Credential version ${body.version} is pending secure hub delivery. The credential itself is never shown in Company Portal.` }));
+      await refreshOperatorCredentials(work);
+    } catch (caught) {
+      setOperatorStatusMessages((current) => ({ ...current, [work.id]: caught instanceof Error ? caught.message : "Operator credential rotation was not accepted" }));
+    } finally { setOperatorAction(null); }
+  }
+
+  async function completeInstallation(work: Workflow) {
+    if (!work.homeId || !hubSyncStatus[work.id]?.installation.canComplete) return;
+    setInstallationCompleting(work.id); setActionMessage("");
+    const key = completionIdempotencyKeys.current[work.id] || (completionIdempotencyKeys.current[work.id] = crypto.randomUUID());
+    try {
+      const response = await fetch(`/api/installer/home-support/homes/${encodeURIComponent(work.homeId)}/installation/complete`, {
+        method: "POST", credentials: "same-origin",
+        headers: { "Content-Type": "application/json", "Idempotency-Key": key },
+        body: JSON.stringify({ workflowId: work.id }),
+      });
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(body.error || "Installation could not be completed");
+      delete completionIdempotencyKeys.current[work.id];
+      setActionMessage("Installation completion was recorded. The Home is ready for its first homeowner claim; the paired hub remains active and syncing continues under the same installation identity.");
+      await refreshOperatorCredentials(work);
+      const refreshed = await fetch("/api/installer/workflows", { credentials: "same-origin", cache: "no-store" });
+      const refreshedBody = await refreshed.json().catch(() => ({}));
+      if (refreshed.ok) setWorkflows(refreshedBody.workflows || []);
+    } catch (caught) {
+      setActionMessage(caught instanceof Error ? caught.message : "Installation could not be completed");
+    } finally { setInstallationCompleting(null); }
+  }
+
+  return <main className="mx-auto min-h-screen w-full max-w-5xl px-6 py-12">
+    {["CXO", "SENIOR_OPERATIONS_MANAGER"].includes(employeeRole) && <a className="mb-5 inline-block rounded-xl border border-[var(--border)] px-4 py-3 font-semibold" href="/installer/room-plaque-requests">Room plaque requests</a>}
+    <header className="flex flex-wrap items-start justify-between gap-4"><div><p className="text-sm font-semibold uppercase tracking-[0.24em] text-[var(--muted)]">Dinodia Smart Living</p><h1 className="mt-3 text-4xl font-semibold tracking-tight">Assigned work</h1><p className="mt-3 text-[var(--muted)]">Only work assigned to the signed-in employee appears here.</p>{sessionExpiresAt && <p className="mt-2 text-sm text-[var(--muted)]">This sign-in expires at {new Date(sessionExpiresAt).toLocaleString()} and will not extend automatically.</p>}</div><div className="flex flex-wrap gap-3"><a className="rounded-xl border border-[var(--border)] px-4 py-3 text-sm font-semibold" href="/installer/installation-requests">Permanent installation requests</a>{["CXO", "SENIOR_OPERATIONS_MANAGER", "INSTALLER"].includes(employeeRole) && <a className="rounded-xl border border-[var(--border)] px-4 py-3 text-sm font-semibold" href="/installer/claim-recovery">Recover a lost Home claim QR</a>}<a className="rounded-xl border border-[var(--border)] px-4 py-3 text-sm font-semibold" href="/installer/home-support">Support access</a><button className="rounded-xl border border-[var(--border)] px-4 py-3 text-sm font-semibold" onClick={async () => { await fetch("/api/company/auth/session", { method: "DELETE", credentials: "same-origin" }); router.replace("/company/login" as never); }}>Sign out</button></div></header>
+    {error && <p role="alert" className="mt-8 rounded-xl border border-red-200 bg-red-50 p-4 text-sm text-red-800">{error}</p>}
+    {actionMessage && <p role="status" aria-live="polite" className="mt-6 rounded-xl border border-[var(--border)] p-4 text-sm">{actionMessage}</p>}
+    {(employeeRole === "CXO" || employeeRole === "SENIOR_OPERATIONS_MANAGER") && <form onSubmit={assignWork} className="mt-8 rounded-2xl border border-[var(--border)] bg-[var(--surface)] p-6 shadow-[var(--shadow)]"><h2 className="text-xl font-semibold">Create assigned installation work</h2><p className="mt-2 text-sm text-[var(--muted)]">Enter the pairing code shown by the locked Dinodia OS setup page or scan its QR value. Serial, identity, work type and later home/hub bindings are loaded from the server.</p><label className="mt-5 block text-sm font-semibold" htmlFor="pairing-code">Pairing code or QR value</label><input id="pairing-code" required autoComplete="one-time-code" inputMode="text" value={pairingCode} onChange={(event) => setPairingCode(event.target.value)} className="mt-2 w-full rounded-xl border border-[var(--border)] bg-transparent px-4 py-3" /><label className="mt-5 block text-sm font-semibold" htmlFor="assignee">Assign to</label><select id="assignee" required value={assignedEmployeeId} onChange={(event) => setAssignedEmployeeId(event.target.value)} className="mt-2 w-full rounded-xl border border-[var(--border)] bg-transparent px-4 py-3"><option value="">Select an installation employee</option>{employees.map((candidate) => <option key={candidate.id} value={candidate.id}>{candidate.displayName} — {candidate.role}</option>)}</select><label className="mt-5 block text-sm font-semibold" htmlFor="work-reason">Reason</label><input id="work-reason" required maxLength={500} value={workReason} onChange={(event) => setWorkReason(event.target.value)} className="mt-2 w-full rounded-xl border border-[var(--border)] bg-transparent px-4 py-3" /><button disabled={assigning} className="mt-5 rounded-xl bg-[var(--accent)] px-5 py-3 font-semibold text-white disabled:opacity-50">{assigning ? "Assigning…" : "Assign installation work"}</button></form>}
+    {loading ? <p className="mt-10 text-[var(--muted)]" aria-live="polite">Loading assigned work…</p> : <section className="mt-10 grid gap-4">{workflows.length === 0 ? <p className="rounded-2xl border border-[var(--border)] p-6 text-[var(--muted)]">No active work is assigned to this employee.</p> : workflows.map((work) => {
+      const credentials = operatorCredentials[work.id] || [];
+      const latestCredential = credentials[0];
+      const rotationPending = latestCredential && ["PENDING", "DELIVERED", "ACKNOWLEDGED"].includes(latestCredential.state);
+      const operatorBusy = operatorAction === `status:${work.id}` || operatorAction === `rotate:${work.id}`;
+      const installation = hubSyncStatus[work.id]?.installation;
+      const remoteAccess = work.hubInstallation?.remoteAccess;
+      const canRetryLocally = Boolean(remoteAccess && ["RECONNECTING", "RECONNECT_REQUIRED"].includes(remoteAccess.state) && remoteAccess.retryAvailableLocally && work.hubInstallation?.localUrl);
+      return <article key={work.id} className="rounded-2xl border border-[var(--border)] bg-[var(--surface)] p-6 shadow-[var(--shadow)]">
+        <div className="flex flex-wrap items-start justify-between gap-4"><div>
+          <p className="text-xs font-semibold uppercase tracking-[0.16em] text-[var(--muted)]">{work.publicReference}</p><h2 className="mt-2 text-xl font-semibold">{work.kind}</h2><p className="mt-2 text-[var(--muted)]">{work.reason || "Installation or property work"}</p>
+          {work.hubInstallation?.secureVerified && <p className="mt-2 text-sm text-[var(--muted)]" role="status">Secure hub identity verified; {work.hubInstallation.reachability === "RECENT" ? "the hub heartbeat is recent." : "the hub is currently unreachable by its signed heartbeat."}</p>}
+          {remoteAccess && <p className="mt-2 text-sm text-[var(--muted)]" role="status">{remoteAccess.state === "RECONNECTING" ? "Remote access is reconnecting; recovery progress comes from the current signed hub report." : remoteAccess.state === "RECONNECT_REQUIRED" ? "The existing tunnel needs an assigned staff member to verify its installation identity before reconnecting." : remoteAccess.state === "HELD" ? "Remote access is deliberately paused for maintenance. Automatic recovery will not override this hold." : remoteAccess.state === "READY" ? "Remote access is ready." : "Remote-access status is not current or is not configured; no recovery success is assumed."}{remoteAccess.reportedAt ? ` · status ${formatOptionalStatusTime(remoteAccess.reportedAt)}` : ""}</p>}
+        </div><span className="rounded-full bg-[var(--surface-2)] px-3 py-1 text-sm font-semibold">{work.state}</span></div>
+        <div className="mt-5 flex flex-wrap gap-3">
+          <a className="rounded-xl bg-[var(--accent)] px-4 py-3 text-sm font-semibold text-white" href={`/installer/provision?workflowId=${encodeURIComponent(work.id)}`}>Open provisioning</a>
+          {canRetryLocally && <button type="button" onClick={() => openHub(work, "local", true)} disabled={opening === work.id} className="rounded-xl border border-[var(--border)] px-4 py-3 text-sm font-semibold disabled:opacity-50">{opening === work.id ? "Opening local OS…" : "Retry recovery"}</button>}
+          {remoteAccess && ["RECONNECTING", "RECONNECT_REQUIRED"].includes(remoteAccess.state) && !canRetryLocally && <span className="self-center text-sm text-[var(--muted)]">Retry needs the existing trusted home LAN and an assigned-staff OS session; no remote cloud command is queued.</span>}
+          {work.hubInstallationId && work.homeId && !work.hubInstallation?.secureVerified && <button type="button" onClick={() => reserveCloudflare(work)} disabled={reservingCloudflare === work.id} className="rounded-xl border border-[var(--border)] px-4 py-3 text-sm font-semibold disabled:opacity-50">{reservingCloudflare === work.id ? "Reserving secure endpoint…" : "Reserve secure endpoint"}</button>}
+          {work.hubInstallationId && work.homeId && work.hubInstallation?.secureVerified && work.kind === "PERMANENT_DEVICE_INSTALLATION" && <><button type="button" onClick={() => openHub(work, "secure", true)} disabled={opening === work.id} className="rounded-xl border border-[var(--border)] px-4 py-3 text-sm font-semibold disabled:opacity-50">{opening === work.id ? "Opening secure OS…" : "Open full Home dashboard"}</button><button type="button" onClick={() => openHub(work, "secure")} disabled={opening === work.id} className="rounded-xl border border-[var(--border)] px-4 py-3 text-sm font-semibold disabled:opacity-50">{opening === work.id ? "Opening installation…" : "Open assigned device installation"}</button></>}
+          {work.hubInstallationId && work.homeId && work.hubInstallation?.secureVerified && work.kind !== "PERMANENT_DEVICE_INSTALLATION" && <button type="button" onClick={() => openHub(work, "secure")} disabled={opening === work.id} className="rounded-xl border border-[var(--border)] px-4 py-3 text-sm font-semibold disabled:opacity-50">{opening === work.id ? "Opening secure OS…" : "Open secure Dinodia OS"}</button>}
+          {work.hubInstallationId && work.homeId && work.hubInstallation?.localUrl && work.kind === "PERMANENT_DEVICE_INSTALLATION" && <><button type="button" onClick={() => openHub(work, "local", true)} disabled={opening === work.id} className="rounded-xl border border-[var(--border)] px-4 py-3 text-sm font-semibold disabled:opacity-50">{opening === work.id ? "Opening local OS…" : "Open full Home dashboard (local)"}</button><button type="button" onClick={() => openHub(work, "local")} disabled={opening === work.id} className="rounded-xl border border-[var(--border)] px-4 py-3 text-sm font-semibold disabled:opacity-50">{opening === work.id ? "Opening installation…" : "Open assigned device installation (local)"}</button></>}
+          {work.hubInstallationId && work.homeId && work.hubInstallation?.localUrl && work.kind !== "PERMANENT_DEVICE_INSTALLATION" && <button type="button" onClick={() => openHub(work, "local")} disabled={opening === work.id} className="rounded-xl border border-[var(--border)] px-4 py-3 text-sm font-semibold disabled:opacity-50">{opening === work.id ? "Opening local OS…" : "Open local Dinodia OS"}</button>}
+          {work.hubInstallationId && work.homeId && work.hubInstallation?.localState === "STALE" && <span className="self-center text-sm text-[var(--muted)]">Local access is unavailable until the Pi reports a fresh signed LAN endpoint.</span>}
+          {work.homeId && <a className="rounded-xl border border-[var(--border)] px-4 py-3 text-sm font-semibold" href={`/installer/home-support?homeId=${encodeURIComponent(work.homeId)}`}>Open home support</a>}
+        </div>
+        {work.homeId && work.hubInstallationId && <section className="mt-6 rounded-xl border border-[var(--border)] p-4" aria-label={`Hub synchronization and update status for ${work.publicReference}`}><h3 className="font-semibold">Hub health and synchronization</h3><p className="mt-1 text-sm text-[var(--muted)]">Heartbeat and successful sync are separate. Queue status is shown only when the hub has reported it; stale or missing reports are not treated as an empty queue. Update installation is manual; the Portal does not install releases automatically.</p><div className="mt-3 flex flex-wrap gap-3"><button type="button" onClick={() => refreshOperatorCredentials(work)} disabled={operatorBusy} className="rounded-lg border border-[var(--border)] px-3 py-2 text-sm font-semibold disabled:opacity-50">{operatorAction === `status:${work.id}` ? "Refreshing…" : "Refresh hub status"}</button>{(employeeRole === "CXO" || employeeRole === "SENIOR_OPERATIONS_MANAGER") && <button type="button" onClick={() => rotateOperatorCredential(work)} disabled={operatorBusy || Boolean(rotationPending)} className="rounded-lg bg-[var(--accent)] px-3 py-2 text-sm font-semibold text-white disabled:opacity-50">{operatorAction === `rotate:${work.id}` ? "Requesting…" : latestCredential ? "Rotate operator credential" : "Issue operator credential"}</button>}</div>{hubSyncStatus[work.id] && <dl className="mt-4 grid gap-2 rounded-lg bg-[var(--surface-2)] p-3 text-sm sm:grid-cols-2"><div><dt className="text-[var(--muted)]">Heartbeat</dt><dd className="font-semibold">{hubSyncStatus[work.id].heartbeat.state}{` · ${formatOptionalStatusTime(hubSyncStatus[work.id].heartbeat.lastSeenAt, "no accepted heartbeat")}`}</dd></div><div><dt className="text-[var(--muted)]">Last successful sync</dt><dd>{formatOptionalStatusTime(hubSyncStatus[work.id].sync.lastSuccessfulSyncAt)}</dd></div><div><dt className="text-[var(--muted)]">Backlog</dt><dd>{hubSyncStatus[work.id].sync.statusState === "UNKNOWN" ? "Not reported" : `${hubSyncStatus[work.id].sync.queueDepth} events${hubSyncStatus[work.id].sync.statusState === "STALE" ? " (stale)" : ""}`}{hubSyncStatus[work.id].sync.statusReportedAt ? ` · report ${formatOptionalStatusTime(hubSyncStatus[work.id].sync.statusReportedAt)}` : ""} · accepted sequence {hubSyncStatus[work.id].sync.acceptedSequence}</dd></div><div><dt className="text-[var(--muted)]">Recovery state</dt><dd>{hubSyncStatus[work.id].sync.statusState === "UNKNOWN" ? "Queue status not reported" : hubSyncStatus[work.id].sync.statusState === "STALE" ? "Queue report is stale" : hubSyncStatus[work.id].sync.gapDetected ? "Reconciliation required" : "No known gap"}{hubSyncStatus[work.id].sync.criticalBacklog ? " · critical backlog" : ""}{hubSyncStatus[work.id].sync.telemetryPaused ? ` · telemetry paused (${hubSyncStatus[work.id].sync.droppedTelemetryCount} deferred)` : ""}</dd></div><div><dt className="text-[var(--muted)]">Cloud policy</dt><dd>Revision {hubSyncStatus[work.id].sync.acknowledgedCloudRevision} acknowledged of {hubSyncStatus[work.id].sync.cloudConfigurationRevision}</dd></div><div><dt className="text-[var(--muted)]">Sync error</dt><dd>{hubSyncStatus[work.id].sync.statusState === "UNKNOWN" ? "Not reported" : hubSyncStatus[work.id].sync.errorCode || "None reported"}</dd></div><div><dt className="text-[var(--muted)]">Open incidents</dt><dd>{hubSyncStatus[work.id].incidents.openCount}</dd></div><div><dt className="text-[var(--muted)]">Replacement</dt><dd>{hubSyncStatus[work.id].replacement.disposition} · {hubSyncStatus[work.id].replacement.activationState}</dd></div><div><dt className="text-[var(--muted)]">Update</dt><dd>{hubSyncStatus[work.id].update.mode} · {hubSyncStatus[work.id].update.phase} · trust {hubSyncStatus[work.id].update.trustState}{hubSyncStatus[work.id].update.activeReleaseVersion ? ` · active ${hubSyncStatus[work.id].update.activeReleaseVersion}` : " · no updater release reported active"}</dd></div></dl>}{credentials.length > 0 && <ol className="mt-4 grid gap-2">{credentials.map((credential) => <li key={credential.version} className="rounded-lg bg-[var(--surface-2)] p-3 text-sm"><span className="font-semibold">Version {credential.version}: {credential.state}</span><span className="ml-2 text-[var(--muted)]">{credential.activatedAt ? `Active since ${new Date(credential.activatedAt).toLocaleString()}` : credential.acknowledgedAt ? `Acknowledged ${new Date(credential.acknowledgedAt).toLocaleString()}` : credential.deliveredAt ? `Delivered ${new Date(credential.deliveredAt).toLocaleString()}` : `Issued ${new Date(credential.issuedAt).toLocaleString()}`}</span></li>)}</ol>}{operatorStatusMessages[work.id] && <p className="mt-3 text-sm" aria-live="polite" role="status">{operatorStatusMessages[work.id]}</p>}</section>}
+        {installation && installation.status !== "COMPLETE" && <section className="mt-6 rounded-xl border border-[var(--border)] p-4" aria-label="Installation completion"><h3 className="font-semibold">Complete assigned installation</h3><p className="mt-2 text-sm text-[var(--muted)]">A real Area must first be created in Dinodia OS and acknowledged by Platform. No sample room or customer data will be created automatically.</p><p className="mt-2 text-sm">Current setup: {installation.status} · {installation.activeAreaCount} active {installation.activeAreaCount === 1 ? "Area" : "Areas"}.</p>{!installation.canComplete && <p className="mt-2 text-sm" role="status">{installation.blockReason === "NO_ACTIVE_AREAS" ? "Open secure Dinodia OS, add the actual room used by this home, then refresh hub status." : installation.blockReason === "REMOTE_VERIFICATION_REQUIRED" ? "The signed CloudURL verification must finish before completion." : installation.blockReason === "ALREADY_COMPLETE" ? "This installation is already complete." : "The assigned workflow or current paired-hub authority is not ready to complete."}</p>}<button type="button" onClick={() => completeInstallation(work)} disabled={!installation.canComplete || installationCompleting === work.id || operatorBusy} className="mt-3 rounded-lg bg-[var(--accent)] px-4 py-2 text-sm font-semibold text-white disabled:opacity-50">{installationCompleting === work.id ? "Completing installation…" : "Complete installation"}</button></section>}
+      </article>;
+    })}</section>}
+  </main>;
+}

@@ -1,0 +1,3046 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dinodiasmartliving.com/contracts/dinodia-v1/contract.json",
+  "contractVersion": "dinodia.v1",
+  "wireRules": {
+    "ids": "opaque non-empty strings; UUID format is not part of the public contract",
+    "timestamps": "RFC3339 UTC timestamps; all freshness comparisons use server time",
+    "unknownFields": "reject security/authority objects; ignore only documented extension maps",
+    "managementClass": ["property_device", "tenant_device"],
+    "freshness": {
+      "heartbeatExpectedSeconds": 120,
+      "onlineThroughSeconds": 420,
+      "stateValidity": "descriptor.expectedReportIntervalSeconds; then quality=unknown"
+    },
+    "customerAppName": "Dinodia Smart Living",
+    "authority": "homeId + homeMembershipId; role is membership-scoped; employee identity is never a household role"
+  },
+  "$defs": {
+    "id": { "type": "string", "minLength": 1, "maxLength": 160, "pattern": "\\S" },
+    "timestamp": { "type": "string", "format": "date-time" },
+    "role": { "enum": ["OWNER", "PROPERTY_MANAGER", "TENANT"] },
+    "managementClass": { "enum": ["property_device", "tenant_device"] },
+    "quality": { "enum": ["fresh", "stale", "unknown", "unavailable"] },
+    "envelope": {
+      "type": "object",
+      "required": [
+        "schemaVersion",
+        "homeId",
+        "streamId",
+        "sequence",
+        "generatedAt",
+        "revision",
+        "data"
+      ],
+      "properties": {
+        "schemaVersion": { "const": "dinodia.v1" },
+        "homeId": { "$ref": "#/$defs/id" },
+        "streamId": { "$ref": "#/$defs/id" },
+        "sequence": { "type": "integer", "minimum": 0 },
+        "generatedAt": { "$ref": "#/$defs/timestamp" },
+        "revision": { "type": "integer", "minimum": 0 },
+        "data": {}
+      },
+      "additionalProperties": false
+    },
+    "area": {
+      "type": "object",
+      "required": ["id", "homeId", "originalName", "revision", "lifecycle"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "homeId": { "$ref": "#/$defs/id" },
+        "originalName": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "overrideName": { "type": ["string", "null"], "maxLength": 80 },
+        "revision": { "type": "integer", "minimum": 0 },
+        "lifecycle": { "enum": ["active", "retired"] }
+      },
+      "additionalProperties": false
+    },
+    "control": {
+      "type": "object",
+      "required": [
+        "schemaVersion",
+        "deviceId",
+        "controlId",
+        "label",
+        "valueType",
+        "interactionKind",
+        "semanticRole",
+        "readable",
+        "writable",
+        "automatable",
+        "observable",
+        "idempotency",
+        "confirmationPolicy",
+        "riskLevel",
+        "stepUpPolicy",
+        "sortOrder",
+        "catalogRevision"
+      ],
+      "properties": {
+        "schemaVersion": { "const": 1 },
+        "deviceId": { "$ref": "#/$defs/id" },
+        "surfaceId": { "type": ["string", "null"] },
+        "controlId": { "$ref": "#/$defs/id" },
+        "label": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "group": { "type": ["string", "null"], "maxLength": 80 },
+        "sortOrder": { "type": "integer", "minimum": 0 },
+        "valueType": {
+          "enum": ["boolean", "number", "option", "text", "invoke"]
+        },
+        "interactionKind": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "semanticRole": {
+          "enum": [
+            "power",
+            "brightness",
+            "active_heat_demand",
+            "active_heat_production",
+            "target_temperature",
+            "ambient_temperature",
+            "opening_percentage",
+            "connectivity",
+            "security_lock",
+            "lock_state",
+            "operating_mode",
+            "position",
+            "volume",
+            "color",
+            "state",
+            "unknown"
+          ]
+        },
+        "readable": { "type": "boolean" },
+        "writable": { "type": "boolean" },
+        "automatable": { "type": "boolean" },
+        "observable": { "type": "boolean" },
+        "idempotency": { "enum": ["set_value", "invoke_once", "none"] },
+        "confirmationPolicy": {
+          "enum": ["none", "matching_observation", "explicit_user", "step_up"]
+        },
+        "riskLevel": { "enum": ["low", "normal", "sensitive", "critical"] },
+        "stepUpPolicy": { "enum": ["none", "required"] },
+        "constraints": {
+          "type": "object",
+          "properties": {
+            "minimum": { "type": "number" },
+            "maximum": { "type": "number" },
+            "step": { "type": "number", "exclusiveMinimum": 0 },
+            "precision": { "type": "integer", "minimum": 0, "maximum": 12 },
+            "unit": { "type": "string", "maxLength": 32 },
+            "options": {
+              "type": "array",
+              "maxItems": 128,
+              "items": {
+                "type": "object",
+                "required": ["value", "label"],
+                "properties": {
+                  "value": {},
+                  "label": { "type": "string", "maxLength": 80 }
+                },
+                "additionalProperties": false
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        "expectedReportingIntervalSeconds": { "type": "integer", "minimum": 1 },
+        "maxStateValiditySeconds": { "type": "integer", "minimum": 1 },
+        "unsupportedReason": { "type": ["string", "null"], "maxLength": 120 },
+        "catalogRevision": { "type": "integer", "minimum": 0 }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "writable": { "const": true } }, "required": ["writable"] },
+          "then": { "properties": { "readable": { "const": true } } }
+        },
+        {
+          "if": { "properties": { "interactionKind": { "not": { "enum": ["toggle", "slider", "thermostat", "picker", "text_input", "momentary_action", "read_only"] } } }, "required": ["interactionKind"] },
+          "then": { "properties": { "readable": { "const": true }, "writable": { "const": false }, "automatable": { "const": false }, "idempotency": { "const": "none" }, "confirmationPolicy": { "const": "none" }, "stepUpPolicy": { "const": "none" } } }
+        },
+        {
+          "if": { "properties": { "semanticRole": { "enum": ["security_lock", "lock_state"] } }, "required": ["semanticRole"] },
+          "then": { "properties": { "stepUpPolicy": { "const": "required" }, "automatable": { "const": false } } }
+        },
+        {
+          "if": { "properties": { "stepUpPolicy": { "const": "required" } }, "required": ["stepUpPolicy"] },
+          "then": { "properties": { "automatable": { "const": false } } }
+        },
+        {
+          "if": { "properties": { "valueType": { "const": "option" }, "writable": { "const": true } }, "required": ["valueType", "writable"] },
+          "then": { "required": ["constraints"], "properties": { "constraints": { "required": ["options"], "properties": { "options": { "minItems": 1 } } } } }
+        }
+      ],
+      "additionalProperties": false
+    },
+    "device": {
+      "type": "object",
+      "required": [
+        "id",
+        "homeId",
+        "managementClass",
+        "lifecycle",
+        "technicalLabel",
+        "controls",
+        "descriptorRevision"
+      ],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "homeId": { "$ref": "#/$defs/id" },
+        "managementClass": { "$ref": "#/$defs/managementClass" },
+        "ownerMembershipId": { "type": ["string", "null"] },
+        "lifecycle": {
+          "enum": ["commissioning", "installed", "view_only", "retired"]
+        },
+        "technicalLabel": { "type": "string", "maxLength": 80 },
+        "customerLabel": { "type": ["string", "null"], "maxLength": 40 },
+        "areaIds": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/id" },
+          "uniqueItems": true
+        },
+        "controls": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/control" },
+          "maxItems": 64
+        },
+        "descriptorRevision": { "type": "integer", "minimum": 0 }
+      },
+      "additionalProperties": false
+    },
+    "controlState": {
+      "type": "object",
+      "required": [
+        "deviceId",
+        "controlId",
+        "homeId",
+        "descriptorRevision",
+        "revision",
+        "observedAt",
+        "receivedAt",
+        "quality",
+        "value",
+        "validUntil",
+        "deviceAvailability",
+        "analyticsActivity"
+      ],
+      "properties": {
+        "deviceId": { "$ref": "#/$defs/id" },
+        "controlId": { "$ref": "#/$defs/id" },
+        "homeId": { "$ref": "#/$defs/id" },
+        "descriptorRevision": { "type": "integer", "minimum": 0 },
+        "revision": { "type": "integer", "minimum": 0 },
+        "observedAt": { "anyOf": [{ "$ref": "#/$defs/timestamp" }, { "type": "null" }] },
+        "receivedAt": { "anyOf": [{ "$ref": "#/$defs/timestamp" }, { "type": "null" }] },
+        "quality": { "$ref": "#/$defs/quality" },
+        "value": {},
+        "validUntil": { "anyOf": [{ "$ref": "#/$defs/timestamp" }, { "type": "null" }] },
+        "deviceAvailability": { "enum": ["online", "offline", "unknown"] },
+        "analyticsActivity": { "enum": ["on", "off", "unknown"] }
+      },
+      "additionalProperties": false
+    },
+    "controlStateEvidence2": {
+      "type": "object",
+      "required": ["stateEvidenceVersion", "deviceId", "controlId", "homeId", "descriptorRevision", "revision", "observedAt", "receivedAt", "quality", "value", "validUntil", "deviceAvailability", "analyticsActivity", "lastReported", "evidence"],
+      "properties": {
+        "stateEvidenceVersion": { "const": 2 },
+        "deviceId": { "$ref": "#/$defs/id" }, "controlId": { "$ref": "#/$defs/id" }, "homeId": { "$ref": "#/$defs/id" },
+        "descriptorRevision": { "type": "integer", "minimum": 0 }, "revision": { "type": "integer", "minimum": 0 },
+        "observedAt": { "anyOf": [{ "$ref": "#/$defs/timestamp" }, { "type": "null" }] },
+        "receivedAt": { "anyOf": [{ "$ref": "#/$defs/timestamp" }, { "type": "null" }] },
+        "validUntil": { "anyOf": [{ "$ref": "#/$defs/timestamp" }, { "type": "null" }] },
+        "quality": { "$ref": "#/$defs/quality" }, "value": {},
+        "deviceAvailability": { "enum": ["online", "offline", "unknown"] },
+        "analyticsActivity": { "enum": ["on", "off", "unknown"] },
+        "lastReported": { "anyOf": [{ "type": "null" }, {
+          "type": "object", "additionalProperties": false,
+          "required": ["value", "observedAt", "receivedAt", "observationId", "sourceKey", "sourceGeneration", "provenance"],
+          "properties": {
+            "value": {}, "observedAt": { "anyOf": [{ "$ref": "#/$defs/timestamp" }, { "type": "null" }] }, "receivedAt": { "anyOf": [{ "$ref": "#/$defs/timestamp" }, { "type": "null" }] },
+            "observationId": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+            "sourceKey": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+            "sourceGeneration": { "type": "integer", "minimum": 1 },
+            "provenance": { "enum": ["device_report", "device_read", "provider_read", "integration_snapshot"] }
+          }
+        }] },
+        "evidence": {
+          "type": "object", "additionalProperties": false, "required": ["status", "guaranteeId", "policyRevision"],
+          "properties": {
+            "status": { "enum": ["verified", "no_observation", "clock_untrusted", "device_offline", "no_verified_guarantee", "unsupported_guarantee", "expired", "descriptor_limit", "timestamp_unavailable"] },
+            "guaranteeId": { "anyOf": [{ "$ref": "#/$defs/id" }, { "type": "null" }] },
+            "policyRevision": { "const": 3 }
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "membership": {
+      "type": "object",
+      "required": [
+        "accountId",
+        "homeId",
+        "homeMembershipId",
+        "role",
+        "status",
+        "areaIds",
+        "revision"
+      ],
+      "properties": {
+        "accountId": { "$ref": "#/$defs/id" },
+        "homeId": { "$ref": "#/$defs/id" },
+        "homeMembershipId": { "$ref": "#/$defs/id" },
+        "role": { "$ref": "#/$defs/role" },
+        "status": { "enum": ["active", "suspended", "removed"] },
+        "areaIds": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/id" },
+          "uniqueItems": true
+        },
+        "revision": { "type": "integer", "minimum": 0 }
+      },
+      "additionalProperties": false
+    },
+    "accountSessionContext": {
+      "type": "object",
+      "required": ["schemaVersion", "accountId", "sessionId", "trustedDeviceId", "memberships", "expiresAt"],
+      "properties": {
+        "schemaVersion": { "const": "dinodia.v1" },
+        "accountId": { "$ref": "#/$defs/id" },
+        "sessionId": { "$ref": "#/$defs/id", "description": "Opaque identifier for the authenticated HttpOnly-cookie session; never a credential." },
+        "trustedDeviceId": { "$ref": "#/$defs/id", "description": "Opaque identifier for the trusted installation bound to this session; never a signing key or credential." },
+        "memberships": { "type": "array", "items": { "$ref": "#/$defs/membership" }, "uniqueItems": true },
+        "expiresAt": { "$ref": "#/$defs/timestamp" }
+      },
+      "additionalProperties": false
+    },
+    "customerSessionLoginRequest": {
+      "type": "object",
+      "required": ["email", "password", "deviceInstallationId", "publicKey", "deviceName"],
+      "properties": {
+        "email": { "type": "string", "format": "email", "minLength": 3, "maxLength": 320 },
+        "password": { "type": "string", "minLength": 1, "maxLength": 1024, "writeOnly": true },
+        "deviceInstallationId": { "$ref": "#/$defs/id" },
+        "publicKey": { "type": "string", "minLength": 1, "maxLength": 4096, "writeOnly": true },
+        "deviceName": { "type": "string", "minLength": 1, "maxLength": 160, "pattern": "\\S" },
+        "model": { "type": "string", "maxLength": 160 },
+        "osFamily": { "type": "string", "maxLength": 80 },
+        "osVersion": { "type": "string", "maxLength": 80 }
+      },
+      "additionalProperties": false
+    },
+    "customerSessionReceipt": {
+      "type": "object",
+      "required": ["ok", "accountId", "sessionId", "trustedDeviceId", "expiresAt"],
+      "properties": {
+        "ok": { "const": true },
+        "accountId": { "$ref": "#/$defs/id" },
+        "sessionId": { "$ref": "#/$defs/id" },
+        "trustedDeviceId": { "$ref": "#/$defs/id" },
+        "expiresAt": { "$ref": "#/$defs/timestamp" }
+      },
+      "additionalProperties": false
+    },
+    "mobileSessionMembership": {
+      "type": "object",
+      "required": ["accountId", "homeId", "homeMembershipId", "role", "status", "areaIds", "revision", "postcode"],
+      "properties": {
+        "accountId": { "$ref": "#/$defs/id" },
+        "homeId": { "$ref": "#/$defs/id" },
+        "homeMembershipId": { "$ref": "#/$defs/id" },
+        "role": { "$ref": "#/$defs/role" },
+        "status": { "const": "active" },
+        "areaIds": { "type": "array", "items": { "$ref": "#/$defs/id" }, "uniqueItems": true },
+        "revision": { "type": "integer", "minimum": 0 },
+        "postcode": { "type": ["string", "null"], "maxLength": 32 }
+      },
+      "additionalProperties": false
+    },
+    "mobileSessionUser": {
+      "type": "object",
+      "required": ["accountId", "displayName", "username", "email", "emailVerifiedAt"],
+      "properties": {
+        "accountId": { "$ref": "#/$defs/id" },
+        "displayName": { "type": "string", "minLength": 1, "maxLength": 160 },
+        "username": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "email": { "type": "string", "format": "email", "maxLength": 320 },
+        "emailVerifiedAt": { "$ref": "#/$defs/timestamp" }
+      },
+      "additionalProperties": false
+    },
+    "mobileSessionReceipt": {
+      "type": "object",
+      "required": ["schemaVersion", "ok", "accountId", "sessionId", "trustedDeviceId", "accessToken", "refreshToken", "accessTokenExpiresAt", "refreshTokenExpiresAt", "user", "memberships", "nextAction"],
+      "properties": {
+        "schemaVersion": { "const": "dinodia.v1" },
+        "ok": { "const": true },
+        "accountId": { "$ref": "#/$defs/id" },
+        "sessionId": { "$ref": "#/$defs/id" },
+        "trustedDeviceId": { "$ref": "#/$defs/id" },
+        "accessToken": { "type": "string", "pattern": "^dno-customer-access-[A-Za-z0-9_-]{32,160}$", "writeOnly": true },
+        "refreshToken": { "type": "string", "pattern": "^dno-customer-session-[A-Za-z0-9_-]{32,160}$", "writeOnly": true },
+        "accessTokenExpiresAt": { "$ref": "#/$defs/timestamp" },
+        "refreshTokenExpiresAt": { "$ref": "#/$defs/timestamp" },
+        "user": { "$ref": "#/$defs/mobileSessionUser" },
+        "memberships": { "type": "array", "items": { "$ref": "#/$defs/mobileSessionMembership" }, "uniqueItems": true },
+        "nextAction": { "enum": ["CHANGE_PASSWORD", "CHOOSE_USERNAME", "POLICY_UNAVAILABLE", "ACCEPT_POLICY", "PENDING_RELATIONSHIPS", "SELECT_HOME"] },
+        "offlineHubEnforcement": { "enum": ["PENDING", "NOT_REQUIRED"] }
+      },
+      "additionalProperties": false
+    },
+    "customerSessionLogoutReceipt": {
+      "type": "object",
+      "required": ["ok"],
+      "properties": { "ok": { "const": true } },
+      "additionalProperties": false
+    },
+    "customerProfileReceipt": {
+      "type": "object",
+      "required": ["schemaVersion", "ok", "accountId", "displayName", "username", "phoneNumber", "email", "emailVerified", "profileRevision"],
+      "properties": {
+        "schemaVersion": { "const": "dinodia.v1" },
+        "ok": { "const": true },
+        "accountId": { "$ref": "#/$defs/id" },
+        "displayName": { "type": "string", "minLength": 1, "maxLength": 160 },
+        "username": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "phoneNumber": { "type": ["string", "null"], "pattern": "^[+() .0-9-]{7,40}$" },
+        "email": { "type": "string", "format": "email", "maxLength": 320 },
+        "emailVerified": { "type": "boolean" },
+        "profileRevision": { "$ref": "#/$defs/timestamp" }
+      },
+      "additionalProperties": false
+    },
+    "customerProfileUpdateRequest": {
+      "type": "object",
+      "required": ["displayName", "username", "phoneNumber", "expectedProfileRevision", "proof"],
+      "properties": {
+        "displayName": { "type": "string", "minLength": 1, "maxLength": 160 },
+        "username": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "phoneNumber": { "type": ["string", "null"], "pattern": "^[+() .0-9-]{7,40}$" },
+        "expectedProfileRevision": { "$ref": "#/$defs/timestamp" },
+        "proof": { "type": "string", "minLength": 40, "maxLength": 8192, "writeOnly": true }
+      },
+      "additionalProperties": false
+    },
+    "tenantMembershipRemovalPreview": {
+      "type": "object",
+      "required": ["schemaVersion", "homeMembershipId", "homePostcode", "accessRevision", "homeManagementRevision", "willDeleteAccount", "otherRelationshipsRemain"],
+      "properties": {
+        "schemaVersion": { "const": "dinodia.v1" }, "homeMembershipId": { "$ref": "#/$defs/id" },
+        "homePostcode": { "type": ["string", "null"], "maxLength": 32 },
+        "accessRevision": { "type": "integer", "minimum": 1 }, "homeManagementRevision": { "type": "integer", "minimum": 1 },
+        "willDeleteAccount": { "type": "boolean" }, "otherRelationshipsRemain": { "type": "boolean" }
+      },
+      "oneOf": [
+        { "properties": { "willDeleteAccount": { "const": true }, "otherRelationshipsRemain": { "const": false } }, "required": ["willDeleteAccount", "otherRelationshipsRemain"] },
+        { "properties": { "willDeleteAccount": { "const": false }, "otherRelationshipsRemain": { "const": true } }, "required": ["willDeleteAccount", "otherRelationshipsRemain"] }
+      ],
+      "additionalProperties": false
+    },
+    "tenantMembershipRemovalRequest": {
+      "type": "object",
+      "required": ["expectedAccessRevision", "expectedManagementRevision", "confirmFinalAccountDeletion", "proof", "idempotencyKey"],
+      "properties": {
+        "expectedAccessRevision": { "type": "integer", "minimum": 1 }, "expectedManagementRevision": { "type": "integer", "minimum": 1 },
+        "confirmFinalAccountDeletion": { "type": "boolean" },
+        "proof": { "type": "string", "minLength": 40, "maxLength": 8192, "writeOnly": true },
+        "idempotencyKey": { "type": "string", "minLength": 16, "maxLength": 160, "pattern": "^[A-Za-z0-9._:-]{16,160}$" }
+      },
+      "additionalProperties": false
+    },
+    "tenantMembershipRemovalReceipt": {
+      "type": "object",
+      "required": ["schemaVersion", "ok", "state", "homeMembershipId", "accountDeleted", "otherRelationshipsRemain", "nextAction", "hubEnforcement", "anonymousReference", "idempotentReplay"],
+      "properties": {
+        "schemaVersion": { "const": "dinodia.v1" }, "ok": { "const": true }, "state": { "const": "REMOVED" },
+        "homeMembershipId": { "$ref": "#/$defs/id" }, "accountDeleted": { "type": "boolean" },
+        "otherRelationshipsRemain": { "type": "boolean" }, "nextAction": { "enum": ["SELECT_HOME", "PENDING_RELATIONSHIPS", "SIGN_IN"] },
+        "hubEnforcement": { "const": "PENDING" }, "anonymousReference": { "type": ["string", "null"], "pattern": "^del_[A-Za-z0-9_-]{32}$" },
+        "idempotentReplay": { "type": "boolean" }
+      },
+      "allOf": [
+        { "if": { "properties": { "accountDeleted": { "const": true } }, "required": ["accountDeleted"] }, "then": { "properties": { "otherRelationshipsRemain": { "const": false }, "nextAction": { "const": "SIGN_IN" }, "anonymousReference": { "type": "string", "pattern": "^del_[A-Za-z0-9_-]{32}$" } } } },
+        { "if": { "properties": { "accountDeleted": { "const": false } }, "required": ["accountDeleted"] }, "then": { "properties": { "otherRelationshipsRemain": { "const": true }, "nextAction": { "enum": ["SELECT_HOME", "PENDING_RELATIONSHIPS"] }, "anonymousReference": { "type": "null" } } } }
+      ],
+      "additionalProperties": false
+    },
+    "customerEmailChangeRequest": {
+      "type": "object",
+      "required": ["email", "expectedProfileRevision", "proof"],
+      "properties": {
+        "email": { "type": "string", "format": "email", "maxLength": 320 },
+        "expectedProfileRevision": { "$ref": "#/$defs/timestamp" },
+        "proof": { "type": "string", "minLength": 40, "maxLength": 8192, "writeOnly": true }
+      },
+      "additionalProperties": false
+    },
+    "customerEmailChangeReceipt": {
+      "type": "object",
+      "required": ["schemaVersion", "ok", "state", "challengeId", "expiresAt", "emailSubmission"],
+      "properties": {
+        "schemaVersion": { "const": "dinodia.v1" }, "ok": { "const": true }, "state": { "const": "PENDING" },
+        "challengeId": { "$ref": "#/$defs/id" }, "expiresAt": { "$ref": "#/$defs/timestamp" },
+        "emailSubmission": { "enum": ["ACCEPTED", "FAILED"] }
+      },
+      "additionalProperties": false
+    },
+    "customerPolicyProjection": {
+      "type": "object",
+      "required": ["version", "title", "text", "contentSha256"],
+      "properties": {
+        "version": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,79}$" },
+        "title": { "type": "string", "minLength": 1, "maxLength": 160 },
+        "text": { "type": "string", "minLength": 20, "maxLength": 40000 },
+        "contentSha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" }
+      },
+      "additionalProperties": false
+    },
+    "customerAuthRequirements": {
+      "type": "object",
+      "required": ["schemaVersion", "ok", "nextAction", "accepted", "policy"],
+      "properties": {
+        "schemaVersion": { "const": "dinodia.v1" },
+        "ok": { "const": true },
+        "nextAction": { "enum": ["CHANGE_PASSWORD", "CHOOSE_USERNAME", "POLICY_UNAVAILABLE", "ACCEPT_POLICY", "CONTINUE"] },
+        "accepted": { "type": "boolean" },
+        "policy": { "anyOf": [{ "$ref": "#/$defs/customerPolicyProjection" }, { "type": "null" }] }
+      },
+      "additionalProperties": false
+    },
+    "invitedTenantRegistrationRequest": {
+      "type": "object",
+      "required": ["invitationId", "email", "password"],
+      "properties": {
+        "invitationId": { "type": "string", "format": "uuid" },
+        "email": { "type": "string", "format": "email", "maxLength": 320 },
+        "password": { "type": "string", "minLength": 12, "maxLength": 1024 }
+      },
+      "additionalProperties": false
+    },
+    "invitedTenantUsernameRequest": {
+      "type": "object", "required": ["username"],
+      "properties": { "username": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{2,79}$" } },
+      "additionalProperties": false
+    },
+    "invitedTenantUsernameReceipt": {
+      "type": "object", "required": ["schemaVersion", "ok", "username", "usernameNormalized", "nextAction"],
+      "properties": {
+        "schemaVersion": { "const": "dinodia.v1" }, "ok": { "const": true },
+        "username": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{2,79}$" },
+        "usernameNormalized": { "type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{2,79}$" },
+        "nextAction": { "const": "CONTINUE" }
+      }, "additionalProperties": false
+    },
+    "customerPolicyAcceptanceRequest": {
+      "type": "object",
+      "required": ["version", "contentSha256", "accepted"],
+      "properties": {
+        "version": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,79}$" },
+        "contentSha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "accepted": { "const": true }
+      },
+      "additionalProperties": false
+    },
+    "customerPolicyAcceptanceReceipt": {
+      "type": "object",
+      "required": ["schemaVersion", "ok", "policyVersion", "contentSha256", "idempotentReplay"],
+      "properties": {
+        "schemaVersion": { "const": "dinodia.v1" },
+        "ok": { "const": true },
+        "policyVersion": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,79}$" },
+        "contentSha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "idempotentReplay": { "type": "boolean" }
+      },
+      "additionalProperties": false
+    },
+    "customerLanEndpoint": {
+      "type": "object",
+      "required": ["state", "origin", "publicHubId", "certificateGeneration", "currentSpkiPin", "currentNotBefore", "currentNotAfter", "reportedAt", "validUntil"],
+      "properties": {
+        "state": { "const": "verified_lan" },
+        "origin": { "type": "string", "pattern": "^https://dinodia-[a-f0-9]{20}\\.local:8123$" },
+        "publicHubId": { "type": "string", "pattern": "^[a-f0-9]{20}$" },
+        "certificateGeneration": { "type": "integer", "minimum": 1 },
+        "currentSpkiPin": { "type": "string", "pattern": "^sha256/[A-Za-z0-9+/]{43}=$" },
+        "currentNotBefore": { "$ref": "#/$defs/timestamp" },
+        "currentNotAfter": { "$ref": "#/$defs/timestamp" },
+        "nextCertificateGeneration": { "type": "integer", "minimum": 2 },
+        "nextSpkiPin": { "type": "string", "pattern": "^sha256/[A-Za-z0-9+/]{43}=$" },
+        "nextNotBefore": { "$ref": "#/$defs/timestamp" },
+        "nextNotAfter": { "$ref": "#/$defs/timestamp" },
+        "reportedAt": { "$ref": "#/$defs/timestamp" },
+        "validUntil": { "$ref": "#/$defs/timestamp" }
+      },
+      "allOf": [{
+        "if": { "required": ["nextCertificateGeneration", "nextSpkiPin", "nextNotBefore", "nextNotAfter"] },
+        "then": { "properties": { "nextCertificateGeneration": { "type": "integer", "minimum": 2 } } },
+        "else": { "not": { "anyOf": [{ "required": ["nextCertificateGeneration"] }, { "required": ["nextSpkiPin"] }, { "required": ["nextNotBefore"] }, { "required": ["nextNotAfter"] }] } }
+      }],
+      "additionalProperties": false
+    },
+    "customerHomeClaimLanEndpoint": {
+      "type": "object",
+      "required": ["state", "origin", "publicHubId", "certificateGeneration", "currentSpkiPin", "currentNotBefore", "currentNotAfter", "reportedAt", "validUntil", "lanAddress", "lanAddressReportedAt", "lanAddressValidUntil"],
+      "properties": {
+        "state": { "const": "verified_lan" },
+        "origin": { "type": "string", "pattern": "^https://dinodia-[a-f0-9]{20}\\.local:8123$" },
+        "publicHubId": { "type": "string", "pattern": "^[a-f0-9]{20}$" },
+        "certificateGeneration": { "type": "integer", "minimum": 1 },
+        "currentSpkiPin": { "type": "string", "pattern": "^sha256/[A-Za-z0-9+/]{43}=$" },
+        "currentNotBefore": { "$ref": "#/$defs/timestamp" },
+        "currentNotAfter": { "$ref": "#/$defs/timestamp" },
+        "nextCertificateGeneration": { "type": "integer", "minimum": 2 },
+        "nextSpkiPin": { "type": "string", "pattern": "^sha256/[A-Za-z0-9+/]{43}=$" },
+        "nextNotBefore": { "$ref": "#/$defs/timestamp" },
+        "nextNotAfter": { "$ref": "#/$defs/timestamp" },
+        "reportedAt": { "$ref": "#/$defs/timestamp" },
+        "validUntil": { "$ref": "#/$defs/timestamp" },
+        "lanAddress": { "type": "string", "pattern": "^(10|172|192)\\.(?:[0-9]{1,3}\\.){2}[0-9]{1,3}$" },
+        "lanAddressReportedAt": { "$ref": "#/$defs/timestamp" },
+        "lanAddressValidUntil": { "$ref": "#/$defs/timestamp" }
+      },
+      "allOf": [{
+        "if": { "required": ["nextCertificateGeneration", "nextSpkiPin", "nextNotBefore", "nextNotAfter"] },
+        "then": { "properties": { "nextCertificateGeneration": { "type": "integer", "minimum": 2 } } },
+        "else": { "not": { "anyOf": [{ "required": ["nextCertificateGeneration"] }, { "required": ["nextSpkiPin"] }, { "required": ["nextNotBefore"] }, { "required": ["nextNotAfter"] }] } }
+      }],
+      "additionalProperties": false
+    },
+    "customerHubSession": {
+      "type": "object",
+      "required": ["ok", "token", "expiresAt", "homeId", "membershipId", "hubEndpoint"],
+      "properties": {
+        "ok": { "const": true },
+        "token": { "type": "string", "minLength": 1, "maxLength": 8192, "description": "Short-lived bearer. Native client memory only; never persist, log, render or forward to an unverified hub origin." },
+        "expiresAt": { "$ref": "#/$defs/timestamp" },
+        "homeId": { "$ref": "#/$defs/id" },
+        "membershipId": { "$ref": "#/$defs/id" },
+        "hubEndpoint": {
+          "type": "object",
+          "oneOf": [
+            {
+              "required": ["state", "origin"],
+              "properties": {
+                "state": { "const": "verified_cloud" },
+                "origin": { "type": "string", "pattern": "^https://dinodia-[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\\.dinodiasmartliving\\.com$" },
+                "lan": { "$ref": "#/$defs/customerLanEndpoint" }
+              },
+              "additionalProperties": false
+            },
+            {
+              "required": ["state"],
+              "properties": { "state": { "const": "unavailable" }, "lan": { "$ref": "#/$defs/customerLanEndpoint" } },
+              "not": { "required": ["origin"] },
+              "additionalProperties": false
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "offlineHomeCandidate": {
+      "type": "object",
+      "required": ["schemaVersion", "grantId", "accountId", "homeId", "homeMembershipId", "trustedDeviceId", "role", "areaIds", "membershipRevision", "issuedAt", "expiresAt"],
+      "properties": {
+        "schemaVersion": { "const": "dinodia.v1" },
+        "grantId": { "$ref": "#/$defs/id" },
+        "accountId": { "$ref": "#/$defs/id" },
+        "homeId": { "$ref": "#/$defs/id" },
+        "homeMembershipId": { "$ref": "#/$defs/id" },
+        "trustedDeviceId": { "$ref": "#/$defs/id" },
+        "role": { "const": "TENANT" },
+        "areaIds": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/id" }, "uniqueItems": true },
+        "membershipRevision": { "type": "integer", "minimum": 0 },
+        "issuedAt": { "$ref": "#/$defs/timestamp" },
+        "expiresAt": { "anyOf": [{ "$ref": "#/$defs/timestamp" }, { "type": "null" }] }
+      },
+      "additionalProperties": false
+    },
+    "offlineHomeSelection": {
+      "type": "object",
+      "required": ["schemaVersion", "accountId", "generatedAt", "state", "candidates"],
+      "properties": {
+        "schemaVersion": { "const": "dinodia.v1" },
+        "accountId": { "$ref": "#/$defs/id" },
+        "generatedAt": { "$ref": "#/$defs/timestamp" },
+        "state": { "const": "offline" },
+        "candidates": { "type": "array", "items": { "$ref": "#/$defs/offlineHomeCandidate" } }
+      },
+      "additionalProperties": false
+    },
+    "accessPolicy": {
+      "type": "object",
+      "required": ["homeId", "homeMembershipId", "role", "scopes", "revision"],
+      "properties": {
+        "homeId": { "$ref": "#/$defs/id" },
+        "homeMembershipId": { "$ref": "#/$defs/id" },
+        "role": { "$ref": "#/$defs/role" },
+        "scopes": {
+          "type": "array",
+          "items": { "type": "string", "maxLength": 100 },
+          "uniqueItems": true
+        },
+        "areaIds": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/id" },
+          "uniqueItems": true
+        },
+        "revision": { "type": "integer", "minimum": 0 }
+      },
+      "additionalProperties": false
+    },
+    "command": {
+      "type": "object",
+      "required": [
+        "commandId",
+        "homeId",
+        "homeMembershipId",
+        "deviceId",
+        "controlId",
+        "descriptorRevision",
+        "value",
+        "issuedAt",
+        "idempotencyKey"
+      ],
+      "properties": {
+        "commandId": { "$ref": "#/$defs/id" },
+        "homeId": { "$ref": "#/$defs/id" },
+        "homeMembershipId": { "$ref": "#/$defs/id" },
+        "deviceId": { "$ref": "#/$defs/id" },
+        "controlId": { "$ref": "#/$defs/id" },
+        "descriptorRevision": { "type": "integer", "minimum": 0 },
+        "value": {},
+        "issuedAt": { "$ref": "#/$defs/timestamp" },
+        "idempotencyKey": {
+          "type": "string",
+          "minLength": 16,
+          "maxLength": 160
+        },
+        "stepUpOperationId": { "type": ["string", "null"] },
+        "expectedObservationRevision": { "type": "integer", "minimum": 0 }
+      },
+      "additionalProperties": false
+    },
+    "commandResult": {
+      "type": "object",
+      "required": ["commandId", "homeId", "status", "acceptedAt"],
+      "properties": {
+        "commandId": { "$ref": "#/$defs/id" },
+        "homeId": { "$ref": "#/$defs/id" },
+        "status": {
+          "enum": ["accepted", "applied", "failed", "timed_out", "uncertain"]
+        },
+        "acceptedAt": { "$ref": "#/$defs/timestamp" },
+        "completedAt": {
+          "anyOf": [{ "$ref": "#/$defs/timestamp" }, { "type": "null" }]
+        },
+        "errorCode": { "type": ["string", "null"] }
+      },
+      "additionalProperties": false
+    },
+    "analyticsIntervalUsage": {
+      "description": "Version-two signed Hub usage payload. Existing version-one envelopes remain supported. Interval identity authorizes historical coverage, never current control authority. Counters partition the explicit span; ambiguous spans are preserved separately, not split.",
+      "type": "object",
+      "required": [
+        "osDeviceId",
+        "osAreaId",
+        "analyticsCategory",
+        "controlId",
+        "bucketStart",
+        "onSeconds",
+        "offSeconds",
+        "unknownSeconds",
+        "sourceGeneration",
+        "revision",
+        "closedAt",
+        "purgeAt",
+        "coverageStartAt",
+        "coverageEndAt",
+        "analyticsIntervalId",
+        "bindingRevision",
+        "analyticsPolicyVersion"
+      ],
+      "properties": {
+        "osDeviceId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "osAreaId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "analyticsCategory": {
+          "enum": [
+            "LIGHT",
+            "RADIATOR",
+            "BOILER"
+          ]
+        },
+        "controlId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "bucketStart": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "onSeconds": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 3600
+        },
+        "offSeconds": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 3600
+        },
+        "unknownSeconds": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 3600
+        },
+        "sourceGeneration": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "revision": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "closedAt": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "purgeAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "coverageStartAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "coverageEndAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "analyticsIntervalId": {
+          "type": "string",
+          "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+        },
+        "bindingRevision": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "analyticsPolicyVersion": {
+          "const": 2
+        }
+      },
+      "additionalProperties": false
+    },
+    "analyticsObservation": {
+      "type": "object",
+      "required": [
+        "homeId",
+        "deviceId",
+        "category",
+        "observedAt",
+        "validUntil",
+        "activity",
+        "quality"
+      ],
+      "properties": {
+        "homeId": { "$ref": "#/$defs/id" },
+        "deviceId": { "$ref": "#/$defs/id" },
+        "category": { "enum": ["light", "radiator", "boiler", "none"] },
+        "observedAt": { "$ref": "#/$defs/timestamp" },
+        "validUntil": { "$ref": "#/$defs/timestamp" },
+        "activity": { "enum": ["on", "off", "unknown"] },
+        "quality": { "$ref": "#/$defs/quality" },
+        "temperatureCelsius": { "type": ["number", "null"] }
+      },
+      "additionalProperties": false
+    },
+    "analyticsUsageBucket": {
+      "type": "object",
+      "required": ["id", "start", "end", "label", "onMinutes", "offMinutes", "unknownMinutes", "coverageSeconds", "contributingDeviceDays", "isPartial"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 160 },
+        "start": { "$ref": "#/$defs/timestamp" },
+        "end": { "$ref": "#/$defs/timestamp" },
+        "label": { "type": "string", "maxLength": 120 },
+        "onMinutes": { "type": "integer", "minimum": 0 },
+        "offMinutes": { "type": "integer", "minimum": 0 },
+        "unknownMinutes": { "type": "integer", "minimum": 0 },
+        "coverageSeconds": { "type": "integer", "minimum": 0 },
+        "contributingDeviceDays": { "type": "integer", "minimum": 0 },
+        "isPartial": { "type": "boolean" }
+      },
+      "additionalProperties": false
+    },
+    "analyticsBootstrap": {
+      "type": "object",
+      "required": ["schemaVersion", "ok", "homeId", "timezone", "generatedAt", "retentionStartAt", "earliestAvailableAt", "areas", "displayGroups", "devices", "historicalDevices", "summaries", "temperature", "historyState"],
+      "properties": {
+        "schemaVersion": { "const": "dinodia.v1" },
+        "ok": { "const": true },
+        "homeId": { "$ref": "#/$defs/id" },
+        "timezone": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "generatedAt": { "$ref": "#/$defs/timestamp" },
+        "retentionStartAt": { "$ref": "#/$defs/timestamp" },
+        "earliestAvailableAt": { "anyOf": [{ "$ref": "#/$defs/timestamp" }, { "type": "null" }] },
+        "areas": { "type": "array", "maxItems": 64, "items": { "type": "object", "required": ["id", "name", "revision"], "properties": { "id": { "$ref": "#/$defs/id" }, "name": { "type": "string", "maxLength": 120 }, "revision": { "type": "integer", "minimum": 0 } }, "additionalProperties": false } },
+        "displayGroups": { "type": "array", "maxItems": 64, "items": { "type": "object", "required": ["id", "label", "areaIds"], "properties": { "id": { "type": "string", "pattern": "^analytics-group-[a-f0-9]{24}$" }, "label": { "type": "string", "maxLength": 120 }, "areaIds": { "type": "array", "minItems": 2, "maxItems": 64, "uniqueItems": true, "items": { "$ref": "#/$defs/id" } } }, "additionalProperties": false } },
+        "devices": { "type": "array", "maxItems": 100, "items": { "type": "object", "required": ["id", "label", "category", "deviceType", "areaIds"], "properties": { "id": { "$ref": "#/$defs/id" }, "label": { "type": "string", "maxLength": 120 }, "category": { "enum": ["light", "radiator", "boiler"] }, "deviceType": { "type": "string", "maxLength": 100 }, "areaIds": { "type": "array", "maxItems": 64, "uniqueItems": true, "items": { "$ref": "#/$defs/id" } } }, "additionalProperties": false } },
+        "historicalDevices": { "type": "array", "maxItems": 100, "items": { "type": "object", "required": ["id", "label", "category", "retiredAt"], "properties": { "id": { "$ref": "#/$defs/id" }, "label": { "const": "Retired device" }, "category": { "enum": ["light", "radiator", "boiler"] }, "retiredAt": { "anyOf": [{ "$ref": "#/$defs/timestamp" }, { "type": "null" }] } }, "additionalProperties": false } },
+        "summaries": { "type": "array", "maxItems": 3, "items": { "type": "object", "required": ["metric", "buckets"], "properties": { "metric": { "enum": ["light", "radiator", "boiler"] }, "buckets": { "type": "array", "maxItems": 366, "items": { "$ref": "#/$defs/analyticsUsageBucket" } } }, "additionalProperties": false } },
+        "temperature": { "type": "object", "required": ["latestCelsius", "quality", "sourceAt", "validUntil"], "properties": { "latestCelsius": { "type": ["number", "null"], "minimum": -50, "maximum": 80 }, "quality": { "enum": ["unknown", "fresh", "stale"] }, "sourceAt": { "anyOf": [{ "$ref": "#/$defs/timestamp" }, { "type": "null" }] }, "validUntil": { "anyOf": [{ "$ref": "#/$defs/timestamp" }, { "type": "null" }] } }, "additionalProperties": false },
+        "historyState": { "enum": ["available", "empty"] }
+      },
+      "additionalProperties": false
+    },
+    "analyticsCoverageStatus": {
+      "type": "object",
+      "required": ["eligibleDeviceCount", "reportingDeviceCount", "missingDeviceCount", "unallocatedEventCount"],
+      "properties": {
+        "eligibleDeviceCount": { "type": "integer", "minimum": 0 },
+        "reportingDeviceCount": { "type": "integer", "minimum": 0 },
+        "missingDeviceCount": { "type": "integer", "minimum": 0 },
+        "unallocatedEventCount": { "type": "integer", "minimum": 0 }
+      },
+      "additionalProperties": false
+    },
+    "analyticsUsageResponse": {
+      "type": "object",
+      "required": ["schemaVersion", "ok", "homeId", "metric", "level", "timezone", "from", "to", "retentionStartAt", "generatedAt", "selectedDeviceCount", "devices", "buckets"],
+      "properties": {
+        "schemaVersion": { "const": "dinodia.v1" }, "ok": { "const": true }, "homeId": { "$ref": "#/$defs/id" },
+        "metric": { "enum": ["light", "radiator", "boiler"] }, "level": { "enum": ["hour", "day", "week", "month", "year"] },
+        "timezone": { "type": "string", "minLength": 1, "maxLength": 80 }, "from": { "$ref": "#/$defs/timestamp" }, "to": { "$ref": "#/$defs/timestamp" },
+        "retentionStartAt": { "$ref": "#/$defs/timestamp" }, "generatedAt": { "$ref": "#/$defs/timestamp" },
+        "selectedDeviceCount": { "type": "integer", "minimum": 0, "maximum": 100 },
+        "coverageStatus": { "$ref": "#/$defs/analyticsCoverageStatus" },
+        "devices": { "type": "array", "maxItems": 100, "items": { "type": "object", "required": ["id", "label", "historicalOnly"], "properties": { "id": { "$ref": "#/$defs/id" }, "label": { "type": "string", "maxLength": 120 }, "historicalOnly": { "type": "boolean" } }, "additionalProperties": false } },
+        "buckets": { "type": "array", "maxItems": 50000, "items": { "$ref": "#/$defs/analyticsUsageBucket" } }
+      },
+      "additionalProperties": false
+    },
+    "analyticsTemperatureResponse": {
+      "type": "object",
+      "required": ["schemaVersion", "ok", "homeId", "metric", "level", "timezone", "from", "to", "retentionStartAt", "generatedAt", "selectedDeviceCount", "points"],
+      "properties": {
+        "schemaVersion": { "const": "dinodia.v1" }, "ok": { "const": true }, "homeId": { "$ref": "#/$defs/id" },
+        "metric": { "const": "temperature" }, "level": { "enum": ["hour", "day", "week", "month", "year"] },
+        "timezone": { "type": "string", "minLength": 1, "maxLength": 80 }, "from": { "$ref": "#/$defs/timestamp" }, "to": { "$ref": "#/$defs/timestamp" },
+        "retentionStartAt": { "$ref": "#/$defs/timestamp" }, "generatedAt": { "$ref": "#/$defs/timestamp" },
+        "selectedDeviceCount": { "type": "integer", "minimum": 0, "maximum": 100 },
+        "points": { "type": "array", "maxItems": 50000, "items": { "type": "object", "required": ["id", "start", "end", "label", "celsius", "sampleCount", "sourceAt", "validUntil", "currentFresh", "coverageSeconds", "segments"], "properties": { "id": { "type": "string", "minLength": 1, "maxLength": 160 }, "start": { "$ref": "#/$defs/timestamp" }, "end": { "$ref": "#/$defs/timestamp" }, "label": { "type": "string", "maxLength": 120 }, "celsius": { "type": "number", "minimum": -50, "maximum": 80 }, "sampleCount": { "type": "integer", "minimum": 1 }, "sourceAt": { "$ref": "#/$defs/timestamp" }, "validUntil": { "$ref": "#/$defs/timestamp" }, "currentFresh": { "type": "boolean" }, "coverageSeconds": { "type": "integer", "minimum": 0 }, "segments": { "type": "array", "maxItems": 1000, "items": { "type": "object", "required": ["id", "start", "end", "celsius"], "properties": { "id": { "type": "string", "maxLength": 200 }, "start": { "$ref": "#/$defs/timestamp" }, "end": { "$ref": "#/$defs/timestamp" }, "celsius": { "type": "number", "minimum": -50, "maximum": 80 } }, "additionalProperties": false } } }, "additionalProperties": false } }
+      },
+      "additionalProperties": false
+    },
+    "alexaDiscoveryProjection": {
+      "type": "object",
+      "required": ["schemaVersion", "properties"],
+      "properties": {
+        "schemaVersion": { "const": "dinodia.v1" },
+        "properties": {
+          "type": "array", "maxItems": 100,
+          "items": { "$ref": "#/$defs/alexaDiscoveryProperty" }
+        }
+      },
+      "additionalProperties": false
+    },
+    "alexaDiscoveryProperty": {
+      "type": "object",
+      "required": ["homeId", "membership", "selectedAreaIds", "exposureGeneration", "postcode", "data"],
+      "properties": {
+        "homeId": { "$ref": "#/$defs/id" },
+        "membership": {
+          "type": "object", "required": ["homeMembershipId", "role"],
+          "properties": { "homeMembershipId": { "$ref": "#/$defs/id" }, "role": { "const": "TENANT" } },
+          "additionalProperties": false
+        },
+        "selectedAreaIds": { "type": "array", "minItems": 1, "maxItems": 200, "uniqueItems": true, "items": { "$ref": "#/$defs/id" } },
+        "exposureGeneration": { "type": "integer", "minimum": 1 },
+        "postcode": { "type": "string", "maxLength": 24 },
+        "data": { "type": "array", "maxItems": 512, "items": { "$ref": "#/$defs/alexaDiscoveredDevice" } }
+      },
+      "additionalProperties": false
+    },
+    "alexaDiscoveredDevice": {
+      "type": "object",
+      "required": ["endpointId", "id", "homeId", "managementClass", "ownerMembershipId", "lifecycle", "technicalLabel", "customerLabel", "friendlyName", "propertyPostcode", "areaName", "areaIds", "controls", "descriptorRevision"],
+      "properties": {
+        "endpointId": { "type": "string", "pattern": "^dos_[A-Za-z0-9_-]{16,80}$" },
+        "id": { "$ref": "#/$defs/id" },
+        "homeId": { "$ref": "#/$defs/id" },
+        "managementClass": { "$ref": "#/$defs/managementClass" },
+        "ownerMembershipId": { "type": ["string", "null"], "maxLength": 160 },
+        "lifecycle": { "const": "installed" },
+        "technicalLabel": { "type": "string", "maxLength": 80 },
+        "customerLabel": { "type": ["string", "null"], "maxLength": 40 },
+        "friendlyName": { "type": "string", "minLength": 1, "maxLength": 160 },
+        "propertyPostcode": { "type": "string", "maxLength": 24 },
+        "areaName": { "type": "string", "maxLength": 160 },
+        "areaIds": { "type": "array", "minItems": 1, "maxItems": 200, "uniqueItems": true, "items": { "$ref": "#/$defs/id" } },
+        "controls": { "type": "array", "maxItems": 64, "items": { "$ref": "#/$defs/control" } },
+        "descriptorRevision": { "type": "integer", "minimum": 0 }
+      },
+      "additionalProperties": false
+    },
+    "alexaLinkStatusResponse": {
+      "type": "object",
+      "required": ["schemaVersion", "ok", "enabled", "disabledReason", "homes", "checkedAt"],
+      "properties": {
+        "schemaVersion": { "const": "dinodia.v1" },
+        "ok": { "const": true },
+        "enabled": { "type": "boolean" },
+        "disabledReason": { "anyOf": [{ "type": "string", "maxLength": 120 }, { "type": "null" }] },
+        "checkedAt": { "$ref": "#/$defs/timestamp" },
+        "homes": { "type": "array", "maxItems": 100, "items": { "$ref": "#/$defs/alexaLinkStatusHome" } }
+      },
+      "additionalProperties": false
+    },
+    "alexaLinkStatusHome": {
+      "type": "object",
+      "required": ["homeId", "homeMembershipId", "postcode", "address", "role", "membershipRevision", "connectionState", "connectionId", "linkUpdatedAt", "linkRevision", "scopeRevision", "areas", "areaGroups"],
+      "properties": {
+        "homeId": { "$ref": "#/$defs/id" },
+        "homeMembershipId": { "$ref": "#/$defs/id" },
+        "postcode": { "anyOf": [{ "type": "string", "maxLength": 24 }, { "type": "null" }] },
+        "address": { "type": "string", "maxLength": 512 },
+        "role": { "const": "TENANT" },
+        "membershipRevision": { "type": "integer", "minimum": 1 },
+        "connectionState": { "enum": ["LINKED", "AVAILABLE"] },
+        "connectionId": { "anyOf": [{ "$ref": "#/$defs/id" }, { "type": "null" }] },
+        "linkUpdatedAt": { "anyOf": [{ "$ref": "#/$defs/timestamp" }, { "type": "null" }] },
+        "linkRevision": { "anyOf": [{ "type": "integer", "minimum": 1 }, { "type": "null" }] },
+        "scopeRevision": { "anyOf": [{ "type": "integer", "minimum": 1 }, { "type": "null" }] },
+        "areas": { "type": "array", "maxItems": 200, "items": { "$ref": "#/$defs/alexaLinkStatusArea" } },
+        "areaGroups": { "type": "array", "maxItems": 100, "items": { "$ref": "#/$defs/alexaAreaDisplayGroup" } }
+      },
+      "additionalProperties": false
+    },
+    "alexaLinkStatusArea": {
+      "type": "object",
+      "required": ["areaId", "name", "state"],
+      "properties": {
+        "areaId": { "$ref": "#/$defs/id" },
+        "name": { "type": "string", "minLength": 1, "maxLength": 160 },
+        "state": { "enum": ["LINKED", "AVAILABLE"] },
+        "exposureGeneration": { "type": "integer", "minimum": 1 }
+      },
+      "additionalProperties": false
+    },
+    "alexaAreaDisplayGroup": {
+      "type": "object",
+      "required": ["id", "name", "areaIds"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^display-[a-f0-9]{20}$" },
+        "name": { "type": "string", "minLength": 1, "maxLength": 160 },
+        "areaIds": { "type": "array", "minItems": 2, "maxItems": 200, "uniqueItems": true, "items": { "$ref": "#/$defs/id" } }
+      },
+      "additionalProperties": false
+    },
+    "alexaConnectIntentReceipt": {
+      "type": "object",
+      "required": ["schemaVersion", "ok", "intentId", "intent", "expiresAt"],
+      "properties": {
+        "schemaVersion": { "const": "dinodia.v1" }, "ok": { "const": true },
+        "intentId": { "$ref": "#/$defs/id" }, "intent": { "type": "string", "minLength": 40, "maxLength": 128 },
+        "expiresAt": { "$ref": "#/$defs/timestamp" }
+      },
+      "additionalProperties": false
+    },
+    "alexaConnectIntentRequest": {
+      "type": "object",
+      "required": ["homeMembershipId", "areaIds"],
+      "properties": {
+        "homeMembershipId": { "$ref": "#/$defs/id" },
+        "areaIds": { "type": "array", "minItems": 1, "maxItems": 200, "uniqueItems": true, "items": { "$ref": "#/$defs/id" } }
+      },
+      "additionalProperties": false
+    },
+    "alexaHomeScopeSaveRequest": {
+      "type": "object",
+      "required": ["homeMembershipId", "areaIds", "expectedLinkRevision", "expectedScopeRevision"],
+      "properties": {
+        "homeMembershipId": { "$ref": "#/$defs/id" },
+        "areaIds": { "type": "array", "maxItems": 200, "uniqueItems": true, "items": { "$ref": "#/$defs/id" } },
+        "expectedLinkRevision": { "type": "integer", "minimum": 1 },
+        "expectedScopeRevision": { "type": "integer", "minimum": 1 }
+      },
+      "additionalProperties": false
+    },
+    "alexaUnlinkRequest": {
+      "type": "object",
+      "required": ["connectionId", "expectedLinkRevision", "expectedScopeRevision", "proof"],
+      "properties": {
+        "connectionId": { "$ref": "#/$defs/id" },
+        "expectedLinkRevision": { "type": "integer", "minimum": 1 },
+        "expectedScopeRevision": { "type": "integer", "minimum": 1 },
+        "proof": { "type": "string", "minLength": 20, "maxLength": 8192 }
+      },
+      "additionalProperties": false
+    },
+    "alexaHomeScopeSaveReceipt": {
+      "type": "object",
+      "required": ["schemaVersion", "ok", "homeId", "homeMembershipId", "linkRevision", "scopeRevision", "selectedAreaIds", "changed"],
+      "properties": {
+        "schemaVersion": { "const": "dinodia.v1" }, "ok": { "const": true },
+        "homeId": { "$ref": "#/$defs/id" }, "homeMembershipId": { "$ref": "#/$defs/id" },
+        "linkRevision": { "type": "integer", "minimum": 1 }, "scopeRevision": { "type": "integer", "minimum": 1 },
+        "selectedAreaIds": { "type": "array", "maxItems": 200, "uniqueItems": true, "items": { "$ref": "#/$defs/id" } },
+        "changed": { "type": "boolean" }
+      },
+      "additionalProperties": false
+    },
+    "alexaUnlinkReceipt": {
+      "type": "object",
+      "required": ["schemaVersion", "ok", "homeId", "homeMembershipId", "state", "remainingHomes", "accountLinkRevoked"],
+      "properties": {
+        "schemaVersion": { "const": "dinodia.v1" }, "ok": { "const": true },
+        "homeId": { "$ref": "#/$defs/id" }, "homeMembershipId": { "$ref": "#/$defs/id" },
+        "state": { "const": "UNLINKED" }, "remainingHomes": { "type": "integer", "minimum": 0, "maximum": 100 },
+        "accountLinkRevoked": { "type": "boolean" }
+      },
+      "additionalProperties": false
+    },
+    "alexaAcceptGrantRequest": {
+      "type": "object",
+      "required": ["messageId", "grantCode"],
+      "properties": {
+        "messageId": { "type": "string", "pattern": "^[A-Za-z0-9._:-]{1,180}$" },
+        "grantCode": { "type": "string", "minLength": 1, "maxLength": 4096 }
+      },
+      "additionalProperties": false
+    },
+    "alexaAcceptGrantReceipt": {
+      "type": "object",
+      "required": ["accepted"],
+      "properties": { "accepted": { "const": true } },
+      "additionalProperties": false
+    },
+    "alexaDirectiveRequest": {
+      "type": "object",
+      "required": ["directive"],
+      "properties": {
+        "directive": {
+          "type": "object",
+          "required": ["header", "endpoint"],
+          "properties": {
+            "header": {
+              "type": "object",
+              "required": ["namespace", "name", "messageId", "payloadVersion"],
+              "properties": {
+                "namespace": { "type": "string", "minLength": 1, "maxLength": 80 },
+                "name": { "type": "string", "minLength": 1, "maxLength": 80 },
+                "messageId": { "type": "string", "pattern": "^[A-Za-z0-9._:-]{1,180}$" },
+                "payloadVersion": { "const": "3" },
+                "correlationToken": { "type": "string", "maxLength": 2048 }
+              },
+              "additionalProperties": true
+            },
+            "endpoint": {
+              "type": "object",
+              "required": ["endpointId", "scope"],
+              "properties": {
+                "endpointId": { "type": "string", "pattern": "^dos_[A-Za-z0-9_-]{16,80}$" },
+                "scope": {
+                  "type": "object",
+                  "required": ["type", "token"],
+                  "properties": {
+                    "type": { "const": "BearerToken" },
+                    "token": { "type": "string", "pattern": "^dno-alexa-access-[A-Za-z0-9_-]{40,128}$" }
+                  },
+                  "additionalProperties": false
+                }
+              },
+              "additionalProperties": true
+            },
+            "payload": { "type": "object", "maxProperties": 32 }
+          },
+          "additionalProperties": true
+        }
+      },
+      "additionalProperties": false
+    },
+    "alexaOAuthTokenResponse": {
+      "type": "object",
+      "required": ["access_token", "token_type", "expires_in", "refresh_token", "scope"],
+      "properties": {
+        "access_token": { "type": "string", "pattern": "^dno-alexa-access-[A-Za-z0-9_-]{40,128}$" },
+        "token_type": { "const": "Bearer" },
+        "expires_in": { "type": "integer", "minimum": 1, "maximum": 3600 },
+        "refresh_token": { "type": "string", "pattern": "^dno-alexa-refresh-[A-Za-z0-9_-]{40,128}$" },
+        "scope": { "const": "alexa::skills:account_linking" }
+      },
+      "additionalProperties": false
+    },
+    "alexaOAuthRevokeReceipt": {
+      "type": "object",
+      "required": ["revoked"],
+      "properties": { "revoked": { "const": true } },
+      "additionalProperties": false
+    },
+    "controlCatalog": {
+      "type": "object",
+      "required": [
+        "schemaVersion",
+        "homeId",
+        "deviceId",
+        "catalogRevision",
+        "controls"
+      ],
+      "properties": {
+        "schemaVersion": { "const": "dinodia.v1" },
+        "homeId": { "$ref": "#/$defs/id" },
+        "deviceId": { "$ref": "#/$defs/id" },
+        "catalogRevision": { "type": "integer", "minimum": 0 },
+        "controls": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/control" },
+          "maxItems": 64
+        },
+        "deletedControlIds": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/id" },
+          "uniqueItems": true
+        }
+      },
+      "additionalProperties": false
+    },
+    "controlCatalogEvent": {
+      "type": "object",
+      "required": [
+        "schemaVersion",
+        "homeId",
+        "streamId",
+        "sequence",
+        "generatedAt",
+        "revision",
+        "data"
+      ],
+      "properties": {
+        "schemaVersion": { "const": "dinodia.v1" },
+        "homeId": { "$ref": "#/$defs/id" },
+        "streamId": { "$ref": "#/$defs/id" },
+        "sequence": { "type": "integer", "minimum": 0 },
+        "generatedAt": { "$ref": "#/$defs/timestamp" },
+        "revision": { "type": "integer", "minimum": 0 },
+        "data": { "$ref": "#/$defs/controlCatalog" }
+      },
+      "additionalProperties": false
+    },
+    "stateEvent": {
+      "type": "object",
+      "required": [
+        "schemaVersion",
+        "homeId",
+        "streamId",
+        "sequence",
+        "generatedAt",
+        "revision",
+        "data"
+      ],
+      "properties": {
+        "schemaVersion": { "const": "dinodia.v1" },
+        "homeId": { "$ref": "#/$defs/id" },
+        "streamId": { "$ref": "#/$defs/id" },
+        "sequence": { "type": "integer", "minimum": 0 },
+        "generatedAt": { "$ref": "#/$defs/timestamp" },
+        "revision": { "type": "integer", "minimum": 0 },
+        "data": { "$ref": "#/$defs/controlState" }
+      },
+      "additionalProperties": false
+    },
+    "override": {
+      "type": "object",
+      "required": [
+        "homeId",
+        "targetId",
+        "targetType",
+        "field",
+        "value",
+        "revision"
+      ],
+      "properties": {
+        "homeId": { "$ref": "#/$defs/id" },
+        "targetId": { "$ref": "#/$defs/id" },
+        "targetType": { "enum": ["area", "device"] },
+        "field": { "enum": ["overrideName", "customerLabel"] },
+        "value": { "type": ["string", "null"], "maxLength": 80 },
+        "revision": { "type": "integer", "minimum": 0 }
+      },
+      "additionalProperties": false
+    },
+    "automationTypedTargetValue": {
+      "oneOf": [
+        { "type": "object", "required": ["type", "boolean"], "properties": { "type": { "const": "boolean" }, "boolean": { "type": "boolean" } }, "additionalProperties": false },
+        { "type": "object", "required": ["type", "number"], "properties": { "type": { "const": "number" }, "number": { "type": "number" } }, "additionalProperties": false },
+        { "type": "object", "required": ["type", "option"], "properties": { "type": { "const": "option" }, "option": { "type": "string", "maxLength": 128 } }, "additionalProperties": false },
+        { "type": "object", "required": ["type", "text"], "properties": { "type": { "const": "text" }, "text": { "type": "string", "maxLength": 128 } }, "additionalProperties": false }
+      ]
+    },
+    "tenantAutomationDefinition": {
+      "type": "object", "required": ["name", "trigger", "actions"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1, "maxLength": 60 },
+        "trigger": { "type": "object", "required": ["minuteOfDay", "weekdays"], "properties": {
+          "minuteOfDay": { "type": "integer", "minimum": 0, "maximum": 1439 },
+          "weekdays": { "type": "array", "minItems": 1, "maxItems": 7, "uniqueItems": true, "items": { "type": "integer", "minimum": 1, "maximum": 7 } }
+        }, "additionalProperties": false },
+        "actions": { "type": "array", "minItems": 1, "maxItems": 32, "items": { "type": "object", "required": ["deviceId", "areaId", "controlId", "targetValue"], "properties": {
+          "deviceId": { "$ref": "#/$defs/id" }, "areaId": { "$ref": "#/$defs/id" },
+          "controlId": { "type": "string", "minLength": 1, "maxLength": 160 },
+          "targetValue": { "$ref": "#/$defs/automationTypedTargetValue" }
+        }, "additionalProperties": false } }
+      }, "additionalProperties": false
+    },
+    "tenantAutomationCreateDefinition": {
+      "type": "object", "required": ["name", "trigger", "actions"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1, "maxLength": 60 },
+        "enabled": { "type": "boolean", "description": "Optional create-time state; false creates a paused duplicate while omission preserves enabled-by-default behavior." },
+        "trigger": { "type": "object", "required": ["minuteOfDay", "weekdays"], "properties": {
+          "minuteOfDay": { "type": "integer", "minimum": 0, "maximum": 1439 },
+          "weekdays": { "type": "array", "minItems": 1, "maxItems": 7, "uniqueItems": true, "items": { "type": "integer", "minimum": 1, "maximum": 7 } }
+        }, "additionalProperties": false },
+        "actions": { "type": "array", "minItems": 1, "maxItems": 32, "items": { "type": "object", "required": ["deviceId", "areaId", "controlId", "targetValue"], "properties": {
+          "deviceId": { "$ref": "#/$defs/id" }, "areaId": { "$ref": "#/$defs/id" },
+          "controlId": { "type": "string", "minLength": 1, "maxLength": 160 },
+          "targetValue": { "$ref": "#/$defs/automationTypedTargetValue" }
+        }, "additionalProperties": false } }
+      }, "additionalProperties": false
+    },
+    "tenantAutomationCreateReceipt": {
+      "type": "object", "required": ["ok", "automationId", "revision", "managementRevision", "deliveryState"],
+      "properties": { "ok": { "const": true }, "automationId": { "$ref": "#/$defs/id" }, "revision": { "type": "integer", "minimum": 1 }, "managementRevision": { "type": "integer", "minimum": 0 }, "deliveryState": { "enum": ["pending_delivery", "waiting_for_activation"] } }, "additionalProperties": false
+    },
+    "tenantAutomationUpdateRequest": {
+      "type": "object", "required": ["expectedRevision", "definition"],
+      "properties": { "expectedRevision": { "type": "integer", "minimum": 1 }, "definition": { "$ref": "#/$defs/tenantAutomationDefinition" } }, "additionalProperties": false
+    },
+    "tenantAutomationDeleteRequest": {
+      "type": "object", "required": ["expectedRevision"],
+      "properties": { "expectedRevision": { "type": "integer", "minimum": 1 } }, "additionalProperties": false
+    },
+    "tenantAutomationEnableRequest": {
+      "type": "object", "required": ["enabled", "expectedRevision"],
+      "properties": { "enabled": { "type": "boolean" }, "expectedRevision": { "type": "integer", "minimum": 1 } }, "additionalProperties": false
+    },
+    "tenantAutomationMutationReceipt": {
+      "type": "object", "required": ["ok", "automationId", "revision"],
+      "properties": {
+        "ok": { "const": true }, "automationId": { "$ref": "#/$defs/id" }, "revision": { "type": "integer", "minimum": 1 },
+        "managementRevision": { "type": "integer", "minimum": 0 },
+        "deliveryState": { "enum": ["pending_delivery", "waiting_for_activation", "pending_hub_removal"] },
+        "status": { "enum": ["waiting_for_hub", "disabled_waiting_for_hub"] }
+      }, "additionalProperties": false
+    },
+    "tenantAutomationDelivery": {
+      "type": "object", "required": ["state", "cloudRevision", "appliedRevision", "lastSuccessfulSyncAt"],
+      "properties": {
+        "state": { "enum": ["activation_disabled", "applied", "pending_delivery"] },
+        "cloudRevision": { "type": "integer", "minimum": 0 }, "appliedRevision": { "type": "integer", "minimum": 0 },
+        "lastSuccessfulSyncAt": { "anyOf": [{ "$ref": "#/$defs/timestamp" }, { "type": "null" }] }
+      }, "additionalProperties": false
+    },
+    "tenantAutomationTriggerSummary": {
+      "type": "object", "required": ["id", "kind", "minuteOfDay", "weekdays", "revision"],
+      "properties": { "id": { "$ref": "#/$defs/id" }, "kind": { "const": "SCHEDULE" }, "minuteOfDay": { "type": "integer", "minimum": 0, "maximum": 1439 }, "weekdays": { "type": "array", "minItems": 1, "maxItems": 7, "uniqueItems": true, "items": { "type": "integer", "minimum": 1, "maximum": 7 } }, "revision": { "type": "integer", "minimum": 1 } }, "additionalProperties": false
+    },
+    "tenantAutomationActionSummary": {
+      "type": "object", "required": ["id", "deviceId", "areaId", "controlId", "sortOrder", "descriptorRevision", "targetValue", "needsAttention", "deviceName", "areaName"],
+      "properties": { "id": { "$ref": "#/$defs/id" }, "deviceId": { "$ref": "#/$defs/id" }, "areaId": { "$ref": "#/$defs/id" }, "controlId": { "type": "string", "minLength": 1, "maxLength": 160 }, "sortOrder": { "type": "integer", "minimum": 0, "maximum": 31 }, "descriptorRevision": { "type": "integer", "minimum": 0 }, "targetValue": { "$ref": "#/$defs/automationTypedTargetValue" }, "needsAttention": { "type": "boolean" }, "deviceName": { "type": "string", "maxLength": 120 }, "areaName": { "type": "string", "maxLength": 120 } }, "additionalProperties": false
+    },
+    "tenantAutomationSummary": {
+      "type": "object", "required": ["id", "name", "status", "revision", "definitionChecksum", "timeZone", "trigger", "actions", "lastOutcome", "createdAt", "updatedAt"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" }, "name": { "type": "string", "minLength": 1, "maxLength": 60 },
+        "status": { "enum": ["active", "waiting_for_activation", "waiting_for_hub", "disabled_waiting_for_hub", "disabled", "needs_attention", "removal_pending"] },
+        "revision": { "type": "integer", "minimum": 1 }, "definitionChecksum": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "timeZone": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "trigger": { "anyOf": [{ "$ref": "#/$defs/tenantAutomationTriggerSummary" }, { "type": "null" }] },
+        "actions": { "type": "array", "maxItems": 32, "items": { "$ref": "#/$defs/tenantAutomationActionSummary" } },
+        "lastOutcome": { "anyOf": [{ "type": "object", "required": ["status", "startedAt", "completedAt"], "properties": { "status": { "type": "string", "maxLength": 40 }, "startedAt": { "$ref": "#/$defs/timestamp" }, "completedAt": { "anyOf": [{ "$ref": "#/$defs/timestamp" }, { "type": "null" }] }, "actionCount": { "type": "integer", "minimum": 0, "maximum": 32 }, "actionStatuses": { "type": "object", "required": ["applied", "failed", "uncertain", "skipped"], "properties": { "applied": { "type": "integer", "minimum": 0, "maximum": 32 }, "failed": { "type": "integer", "minimum": 0, "maximum": 32 }, "uncertain": { "type": "integer", "minimum": 0, "maximum": 32 }, "skipped": { "type": "integer", "minimum": 0, "maximum": 32 } }, "additionalProperties": false } }, "additionalProperties": false }, { "type": "null" }] },
+        "createdAt": { "$ref": "#/$defs/timestamp" }, "updatedAt": { "$ref": "#/$defs/timestamp" }
+      }, "additionalProperties": false
+    },
+    "tenantAutomationDetailEnvelope": {
+      "type": "object", "required": ["ok", "automation"],
+      "properties": { "ok": { "const": true }, "automation": { "type": "object", "required": ["id", "name", "status", "revision", "definitionChecksum", "timezone", "triggers", "actions"], "properties": {
+        "id": { "$ref": "#/$defs/id" }, "name": { "type": "string", "minLength": 1, "maxLength": 60 },
+        "status": { "enum": ["ACTIVE", "PAUSED", "NEEDS_ATTENTION", "RETIRED"] }, "revision": { "type": "integer", "minimum": 1 },
+        "definitionChecksum": { "type": "string", "pattern": "^[a-f0-9]{64}$" }, "timezone": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "triggers": { "type": "array", "maxItems": 1, "items": { "type": "object", "required": ["id", "kind", "configuration", "revision"], "properties": { "id": { "$ref": "#/$defs/id" }, "kind": { "const": "SCHEDULE" }, "configuration": { "type": "object" }, "revision": { "type": "integer", "minimum": 1 } }, "additionalProperties": false } },
+        "actions": { "type": "array", "maxItems": 32, "items": { "type": "object", "required": ["id", "deviceId", "areaId", "controlId", "sortOrder", "descriptorRevision", "actionValue", "needsAttention"], "properties": { "id": { "$ref": "#/$defs/id" }, "deviceId": { "$ref": "#/$defs/id" }, "areaId": { "$ref": "#/$defs/id" }, "controlId": { "type": "string", "minLength": 1, "maxLength": 160 }, "sortOrder": { "type": "integer", "minimum": 0, "maximum": 31 }, "descriptorRevision": { "type": "integer", "minimum": 0 }, "actionValue": { "$ref": "#/$defs/automationTypedTargetValue" }, "needsAttention": { "type": "boolean" } }, "additionalProperties": false } }
+      }, "additionalProperties": false } }, "additionalProperties": false
+    },
+    "tenantAutomationProjection": {
+      "type": "object", "required": ["ok", "homeId", "membershipId", "membershipRevision", "managementRevision", "propertyTimeZone", "delivery", "automations"],
+      "properties": {
+        "ok": { "const": true }, "homeId": { "$ref": "#/$defs/id" }, "membershipId": { "$ref": "#/$defs/id" },
+        "membershipRevision": { "type": "integer", "minimum": 0 }, "managementRevision": { "type": "integer", "minimum": 0 },
+        "propertyTimeZone": { "type": ["string", "null"], "maxLength": 64 }, "delivery": { "$ref": "#/$defs/tenantAutomationDelivery" },
+        "automations": { "type": "array", "maxItems": 100, "items": { "$ref": "#/$defs/tenantAutomationSummary" } }
+      }, "additionalProperties": false
+    },
+    "propertyAutomationLiveProjection": {
+      "type": "object", "required": ["ok", "homeId", "membershipId", "managementRevision", "delivery", "automations"],
+      "properties": {
+        "ok": { "const": true }, "homeId": { "$ref": "#/$defs/id" }, "membershipId": { "$ref": "#/$defs/id" },
+        "managementRevision": { "type": "integer", "minimum": 0 }, "delivery": { "$ref": "#/$defs/tenantAutomationDelivery" },
+        "automations": { "type": "array", "maxItems": 100, "items": { "type": "object", "required": ["id", "tenantName", "name", "status", "revision", "timeZone", "trigger", "actions", "lastOutcome", "canDisable", "canDelete", "createdAt", "updatedAt"], "properties": {
+          "id": { "$ref": "#/$defs/id" }, "tenantName": { "type": "string", "minLength": 1, "maxLength": 120 }, "name": { "type": "string", "minLength": 1, "maxLength": 60 },
+          "status": { "enum": ["active", "waiting_for_activation", "waiting_for_hub", "disabled_waiting_for_hub", "disabled", "needs_attention", "removal_pending"] },
+          "revision": { "type": "integer", "minimum": 1 }, "timeZone": { "type": "string", "minLength": 1, "maxLength": 64 },
+          "trigger": { "anyOf": [{ "$ref": "#/$defs/tenantAutomationTriggerSummary" }, { "type": "null" }] },
+          "actions": { "type": "array", "maxItems": 32, "items": { "type": "object", "required": ["id", "deviceId", "areaId", "controlId", "sortOrder", "deviceName", "areaName", "needsAttention"], "properties": {
+            "id": { "$ref": "#/$defs/id" }, "deviceId": { "$ref": "#/$defs/id" }, "areaId": { "$ref": "#/$defs/id" }, "controlId": { "type": "string", "minLength": 1, "maxLength": 160 },
+            "sortOrder": { "type": "integer", "minimum": 0, "maximum": 31 }, "deviceName": { "type": "string", "maxLength": 120 }, "areaName": { "type": "string", "maxLength": 120 }, "needsAttention": { "type": "boolean" }
+          }, "additionalProperties": false } },
+        "lastOutcome": { "anyOf": [{ "type": "object", "required": ["status", "startedAt", "completedAt"], "properties": { "status": { "type": "string", "maxLength": 40 }, "startedAt": { "$ref": "#/$defs/timestamp" }, "completedAt": { "anyOf": [{ "$ref": "#/$defs/timestamp" }, { "type": "null" }] }, "actionCount": { "type": "integer", "minimum": 0, "maximum": 32 }, "actionStatuses": { "type": "object", "required": ["applied", "failed", "uncertain", "skipped"], "properties": { "applied": { "type": "integer", "minimum": 0, "maximum": 32 }, "failed": { "type": "integer", "minimum": 0, "maximum": 32 }, "uncertain": { "type": "integer", "minimum": 0, "maximum": 32 }, "skipped": { "type": "integer", "minimum": 0, "maximum": 32 } }, "additionalProperties": false } }, "additionalProperties": false }, { "type": "null" }] },
+          "canDisable": { "type": "boolean" }, "canDelete": { "type": "boolean" }, "createdAt": { "$ref": "#/$defs/timestamp" }, "updatedAt": { "$ref": "#/$defs/timestamp" }
+        }, "additionalProperties": false } }
+      }, "additionalProperties": false
+    },
+    "propertyAutomationInterventionRequest": {
+      "type": "object", "required": ["expectedAutomationRevision", "expectedManagementRevision", "proof", "reason"],
+      "properties": { "expectedAutomationRevision": { "type": "integer", "minimum": 1 }, "expectedManagementRevision": { "type": "integer", "minimum": 1 }, "proof": { "type": "string", "minLength": 20, "maxLength": 4096 }, "reason": { "enum": ["safety", "conflict", "access", "other"] } }, "additionalProperties": false
+    },
+    "propertyAutomationInterventionReceipt": {
+      "type": "object", "required": ["ok", "homeId", "automationId", "revision", "status", "managementRevision", "tenantNoticeQueued"],
+      "properties": { "ok": { "const": true }, "homeId": { "$ref": "#/$defs/id" }, "automationId": { "$ref": "#/$defs/id" }, "revision": { "type": "integer", "minimum": 1 }, "status": { "enum": ["disabled_waiting_for_hub", "disabled", "removal_pending", "removed"] }, "managementRevision": { "type": "integer", "minimum": 0 }, "tenantNoticeQueued": { "type": "boolean" } }, "additionalProperties": false
+    },
+    "automation": {
+      "type": "object",
+      "required": [
+        "id",
+        "homeId",
+        "revision",
+        "name",
+        "enabled",
+        "trigger",
+        "actions",
+        "status"
+      ],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "homeId": { "$ref": "#/$defs/id" },
+        "revision": { "type": "integer", "minimum": 0 },
+        "name": { "type": "string", "minLength": 1, "maxLength": 60 },
+        "enabled": { "type": "boolean" },
+        "trigger": {
+          "type": "object",
+          "required": ["kind", "schedule"],
+          "properties": {
+            "kind": { "const": "schedule" },
+            "schedule": { "type": "object" }
+          },
+          "additionalProperties": false
+        },
+        "actions": {
+          "type": "array",
+          "maxItems": 32,
+          "items": {
+            "type": "object",
+            "required": [
+              "deviceId",
+              "controlId",
+              "descriptorRevision",
+              "value"
+            ],
+            "properties": {
+              "deviceId": { "$ref": "#/$defs/id" },
+              "controlId": { "$ref": "#/$defs/id" },
+              "descriptorRevision": { "type": "integer", "minimum": 0 },
+              "value": {}
+            },
+            "additionalProperties": false
+          }
+        },
+        "status": {
+          "enum": ["active", "disabled", "needs_attention", "deleted"]
+        }
+      },
+      "additionalProperties": false
+    },
+    "automationPropertyImpactProjection": {
+      "type": "object",
+      "required": ["schemaVersion", "homeId", "membershipId", "role", "revision", "automations"],
+      "properties": {
+        "schemaVersion": { "const": "dinodia.v1" },
+        "homeId": { "$ref": "#/$defs/id" },
+        "membershipId": { "$ref": "#/$defs/id" },
+        "role": { "enum": ["OWNER", "PROPERTY_MANAGER"] },
+        "revision": { "type": "integer", "minimum": 0 },
+        "automations": {
+          "type": "array",
+          "maxItems": 100,
+          "items": {
+            "type": "object",
+            "required": ["automationId", "tenantName", "name", "schedule", "affectedPermanentDevices", "availableActions", "stepUpRequired"],
+            "properties": {
+              "automationId": { "$ref": "#/$defs/id" },
+              "tenantName": { "type": "string", "minLength": 1, "maxLength": 80 },
+              "name": { "type": "string", "minLength": 1, "maxLength": 60 },
+              "schedule": {
+                "type": "object",
+                "required": ["timezone", "daysOfWeek", "localTime"],
+                "properties": {
+                  "timezone": { "type": "string", "minLength": 1, "maxLength": 64 },
+                  "daysOfWeek": { "type": "array", "minItems": 1, "maxItems": 7, "uniqueItems": true, "items": { "type": "integer", "minimum": 1, "maximum": 7 } },
+                  "localTime": { "type": "string", "pattern": "^(?:[01]\\d|2[0-3]):[0-5]\\d$" }
+                },
+                "additionalProperties": false
+              },
+              "affectedPermanentDevices": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                  "type": "object",
+                  "required": ["deviceId", "displayName"],
+                  "properties": {
+                    "deviceId": { "$ref": "#/$defs/id" },
+                    "displayName": { "type": "string", "minLength": 1, "maxLength": 80 }
+                  },
+                  "additionalProperties": false
+                }
+              },
+              "availableActions": { "type": "array", "minItems": 1, "maxItems": 2, "uniqueItems": true, "items": { "enum": ["disable", "delete"] } },
+              "stepUpRequired": { "const": true }
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "commissioning": {
+      "type": "object",
+      "required": [
+        "sessionId",
+        "homeId",
+        "technology",
+        "state",
+        "createdAt",
+        "expiresAt"
+      ],
+      "properties": {
+        "sessionId": { "$ref": "#/$defs/id" },
+        "homeId": { "$ref": "#/$defs/id" },
+        "technology": { "enum": ["zigbee", "matter"] },
+        "state": {
+          "enum": [
+            "discovering",
+            "candidates_available",
+            "committing",
+            "completed",
+            "cancelled",
+            "expired",
+            "failed"
+          ]
+        },
+        "createdAt": { "$ref": "#/$defs/timestamp" },
+        "expiresAt": { "$ref": "#/$defs/timestamp" },
+        "candidateCount": { "type": "integer", "minimum": 0, "maximum": 32 }
+      },
+      "additionalProperties": false
+    },
+    "nativeCommissioningStartRequest": {
+      "type": "object",
+      "required": ["schemaVersion", "protocol"],
+      "properties": {
+        "schemaVersion": { "const": "dinodia.v1" },
+        "protocol": { "enum": ["zigbee", "matter"] }
+      },
+      "additionalProperties": false
+    },
+    "nativeCommissioningMatterPayload": {
+      "type": "object",
+      "required": ["schemaVersion", "setupPayload"],
+      "properties": {
+        "schemaVersion": { "const": "dinodia.v1" },
+        "setupPayload": { "type": "string", "minLength": 4, "maxLength": 512, "pattern": "^MT:" }
+      },
+      "additionalProperties": false
+    },
+    "nativeCommissioningSelectRequest": {
+      "type": "object",
+      "required": ["schemaVersion", "expectedRevision", "candidateRef", "areaId", "name", "customerLabel"],
+      "properties": {
+        "schemaVersion": { "const": "dinodia.v1" },
+        "expectedRevision": { "type": "integer", "minimum": 1 },
+        "candidateRef": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "areaId": { "$ref": "#/$defs/id" },
+        "name": { "type": "string", "maxLength": 80 },
+        "customerLabel": { "type": "string", "minLength": 1, "maxLength": 40 }
+      },
+      "additionalProperties": false
+    },
+    "nativeCommissioningCompletion": {
+      "type": "object",
+      "required": ["schemaVersion", "disposition"],
+      "properties": {
+        "schemaVersion": { "const": "dinodia.v1" },
+        "disposition": { "enum": ["install", "view_only", "remove"] }
+      },
+      "additionalProperties": false
+    },
+    "nativeCommissioningAction": {
+      "type": "object",
+      "required": ["schemaVersion"],
+      "properties": { "schemaVersion": { "const": "dinodia.v1" } },
+      "additionalProperties": false
+    },
+    "nativeCommissioningCandidate": {
+      "type": "object",
+      "required": ["candidateRef", "name", "stage", "observedAt"],
+      "properties": {
+        "candidateRef": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "name": { "type": "string", "maxLength": 80 },
+        "manufacturer": { "type": "string", "maxLength": 80 },
+        "model": { "type": "string", "maxLength": 80 },
+        "stage": { "type": "string", "maxLength": 40 },
+        "observedAt": { "$ref": "#/$defs/timestamp" }
+      },
+      "additionalProperties": false
+    },
+    "nativeCommissioningEvent": {
+      "type": "object",
+      "required": ["sequence", "type", "at"],
+      "properties": {
+        "sequence": { "type": "integer", "minimum": 1 },
+        "type": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "at": { "$ref": "#/$defs/timestamp" },
+        "count": { "type": "integer", "minimum": 0 },
+        "protocol": { "enum": ["zigbee", "matter"] },
+        "cleanupState": { "type": "string", "maxLength": 40 }
+      },
+      "additionalProperties": false
+    },
+    "nativeCommissioningSession": {
+      "type": "object",
+      "required": ["schemaVersion", "sessionId", "protocol", "status", "createdAt", "updatedAt", "expiresAt", "revision", "candidates", "nextCandidateCursor", "selectedCandidateRef", "selectedAreaId", "selectedName", "selectedCustomerLabel", "catalogueStatus", "catalogueUsefulReadings", "finalDeviceId", "finalDisposition", "cleanup", "events"],
+      "properties": {
+        "schemaVersion": { "const": "dinodia.v1" },
+        "sessionId": { "$ref": "#/$defs/id" },
+        "protocol": { "enum": ["zigbee", "matter"] },
+        "status": { "enum": ["requested", "advertising", "awaiting_payload", "commissioning", "searching", "interrupted", "selected", "completed", "completed_cleanup_pending", "cancelled", "expired", "failed", "cancelled_cleanup_pending", "expired_cleanup_pending", "failed_cleanup_pending"] },
+        "createdAt": { "$ref": "#/$defs/timestamp" },
+        "updatedAt": { "$ref": "#/$defs/timestamp" },
+        "expiresAt": { "$ref": "#/$defs/timestamp" },
+        "revision": { "type": "integer", "minimum": 1 },
+        "candidates": { "type": "array", "maxItems": 32, "items": { "$ref": "#/$defs/nativeCommissioningCandidate" } },
+        "nextCandidateCursor": { "anyOf": [{ "$ref": "#/$defs/id" }, { "type": "null" }] },
+        "selectedCandidateRef": { "anyOf": [{ "type": "string", "maxLength": 80 }, { "type": "null" }] },
+        "selectedAreaId": { "anyOf": [{ "$ref": "#/$defs/id" }, { "type": "null" }] },
+        "selectedName": { "anyOf": [{ "type": "string", "maxLength": 80 }, { "type": "null" }] },
+        "selectedCustomerLabel": { "anyOf": [{ "type": "string", "maxLength": 40 }, { "type": "null" }] },
+        "catalogueStatus": { "anyOf": [{ "type": "string", "maxLength": 40 }, { "type": "null" }] },
+        "catalogueUsefulReadings": { "type": "boolean" },
+        "finalDeviceId": { "anyOf": [{ "$ref": "#/$defs/id" }, { "type": "null" }] },
+        "finalDisposition": { "anyOf": [{ "enum": ["install", "view_only", "remove"] }, { "type": "null" }] },
+        "cleanup": { "type": "object", "required": ["state", "pendingCount"], "properties": { "state": { "type": "string", "maxLength": 40 }, "pendingCount": { "type": "integer", "minimum": 0 } }, "additionalProperties": false },
+        "events": { "type": "array", "maxItems": 40, "items": { "$ref": "#/$defs/nativeCommissioningEvent" } }
+      },
+      "additionalProperties": false
+    },
+    "installationRequestCreate": {
+      "type": "object",
+      "required": ["category", "notes", "areaId"],
+      "properties": {
+        "category": { "enum": ["LIGHTING", "HEATING", "SECURITY", "OTHER"] },
+        "notes": { "type": "string", "maxLength": 1000 },
+        "areaId": { "anyOf": [{ "$ref": "#/$defs/id" }, { "type": "null" }] }
+      },
+      "additionalProperties": false
+    },
+    "installationRequestCancel": {
+      "type": "object",
+      "required": ["expectedRevision"],
+      "properties": { "expectedRevision": { "type": "integer", "minimum": 1 } },
+      "additionalProperties": false
+    },
+    "installationRequestStart": {
+      "type": "object",
+      "required": ["expectedRevision"],
+      "properties": {
+        "expectedRevision": { "type": "integer", "minimum": 1 },
+        "assignedEmployeeId": { "$ref": "#/$defs/id" }
+      },
+      "additionalProperties": false
+    },
+    "installationRequestComplete": {
+      "type": "object",
+      "required": ["expectedRevision"],
+      "properties": { "expectedRevision": { "type": "integer", "minimum": 1 } },
+      "additionalProperties": false
+    },
+    "installationRequestSummary": {
+      "type": "object",
+      "required": ["id", "reference", "status", "revision", "createdAt", "canCancel"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "reference": { "type": "string", "minLength": 1, "maxLength": 32 },
+        "status": { "enum": ["SUBMITTED", "IN_PROGRESS", "CANCELLED", "COMPLETED"] },
+        "revision": { "type": "integer", "minimum": 1 },
+        "createdAt": { "$ref": "#/$defs/timestamp" },
+        "canCancel": { "type": "boolean" }
+      },
+      "additionalProperties": false
+    },
+    "installationRequestListReceipt": {
+      "type": "object",
+      "required": ["schemaVersion", "requests"],
+      "properties": { "schemaVersion": { "const": "dinodia.v1" }, "requests": { "type": "array", "maxItems": 25, "items": { "$ref": "#/$defs/installationRequestSummary" } } },
+      "additionalProperties": false
+    },
+    "installationRequestReceipt": {
+      "type": "object",
+      "required": ["schemaVersion", "request"],
+      "properties": { "schemaVersion": { "const": "dinodia.v1" }, "ok": { "const": true }, "request": { "$ref": "#/$defs/installationRequestSummary" } },
+      "additionalProperties": false
+    },
+    "supportTicketCreateRequest": {
+      "type": "object",
+      "required": ["category", "description"],
+      "properties": {
+        "category": { "enum": ["ACCOUNT_OR_SIGN_IN", "ACCESS_OR_PERMISSIONS", "DEVICE_PROBLEM", "HUB_OR_CONNECTION", "AUTOMATION", "ALEXA", "OTHER"] },
+        "description": { "type": "string", "minLength": 1, "maxLength": 4000 }
+      },
+      "additionalProperties": false
+    },
+    "supportTicketCreateReceipt": {
+      "type": "object",
+      "required": ["ok", "ticket"],
+      "properties": {
+        "ok": { "const": true },
+        "ticket": {
+          "type": "object",
+          "required": ["id", "publicReference", "status", "createdAt"],
+          "properties": {
+            "id": { "$ref": "#/$defs/id" },
+            "publicReference": { "type": "string", "minLength": 1, "maxLength": 20 },
+            "status": { "const": "OPEN" },
+            "createdAt": { "$ref": "#/$defs/timestamp" }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "publicSupportEmailChallengeRequest": {
+      "type": "object",
+      "required": ["replyEmail", "category", "description"],
+      "properties": {
+        "replyEmail": { "type": "string", "format": "email", "maxLength": 320 },
+        "category": { "enum": ["ACCOUNT_OR_SIGN_IN", "ACCESS_OR_PERMISSIONS", "DEVICE_PROBLEM", "HUB_OR_CONNECTION", "AUTOMATION", "ALEXA", "OTHER"] },
+        "description": { "type": "string", "minLength": 1, "maxLength": 4000 }
+      },
+      "additionalProperties": false
+    },
+    "publicSupportEmailChallengeReceipt": {
+      "type": "object",
+      "required": ["schemaVersion", "ok", "state", "challengeId", "expiresAt", "emailSubmission"],
+      "properties": {
+        "schemaVersion": { "const": "dinodia.v1" }, "ok": { "const": true }, "state": { "const": "PENDING" },
+        "challengeId": { "$ref": "#/$defs/id" }, "expiresAt": { "$ref": "#/$defs/timestamp" },
+        "emailSubmission": { "enum": ["ACCEPTED", "FAILED"] }
+      },
+      "additionalProperties": false
+    },
+    "publicSupportEmailVerificationRequest": {
+      "type": "object",
+      "required": ["challengeId", "code", "category", "description"],
+      "properties": {
+        "challengeId": { "$ref": "#/$defs/id" }, "code": { "type": "string", "pattern": "^\\d{6}$" },
+        "category": { "enum": ["ACCOUNT_OR_SIGN_IN", "ACCESS_OR_PERMISSIONS", "DEVICE_PROBLEM", "HUB_OR_CONNECTION", "AUTOMATION", "ALEXA", "OTHER"] },
+        "description": { "type": "string", "minLength": 1, "maxLength": 4000 }
+      },
+      "additionalProperties": false
+    },
+    "publicSupportTicketReceipt": {
+      "type": "object",
+      "required": ["schemaVersion", "ok", "state", "publicReference", "idempotentReplay"],
+      "properties": {
+        "schemaVersion": { "const": "dinodia.v1" }, "ok": { "const": true }, "state": { "const": "SUBMITTED" },
+        "publicReference": { "type": "string", "pattern": "^DNO-[A-Z0-9]{16}$" }, "idempotentReplay": { "type": "boolean" }
+      },
+      "additionalProperties": false
+    },
+    "supportTicketListReceipt": {
+      "type": "object",
+      "required": ["ok", "tickets"],
+      "properties": {
+        "ok": { "const": true },
+        "tickets": { "type": "array", "maxItems": 50, "items": { "$ref": "#/$defs/supportTicket" } }
+      },
+      "additionalProperties": false
+    },
+    "supportTicketDetailReceipt": {
+      "type": "object",
+      "required": ["ok", "ticket"],
+      "properties": { "ok": { "const": true }, "ticket": { "$ref": "#/$defs/supportTicket" } },
+      "additionalProperties": false
+    },
+    "homeInvitationAreasReceipt": {
+      "type": "object",
+      "required": ["schemaVersion", "ok", "homeId", "managementRevision", "areas"],
+      "properties": {
+        "schemaVersion": { "const": "dinodia.v1" },
+        "ok": { "const": true },
+        "homeId": { "$ref": "#/$defs/id" },
+        "managementRevision": { "type": "integer", "minimum": 0 },
+        "areas": {
+          "type": "array", "maxItems": 64,
+          "items": { "type": "object", "required": ["id", "name"], "properties": { "id": { "$ref": "#/$defs/id" }, "name": { "type": "string", "minLength": 1, "maxLength": 120 } }, "additionalProperties": false }
+        }
+      },
+      "additionalProperties": false
+    },
+    "homePendingInvitation": {
+      "type": "object",
+      "required": ["invitationId", "targetEmail", "role", "state", "createdAt", "expiresAt", "deliveryStatus", "areas"],
+      "properties": {
+        "invitationId": { "$ref": "#/$defs/id" },
+        "targetEmail": { "type": "string", "format": "email", "maxLength": 320 },
+        "role": { "enum": ["PROPERTY_MANAGER", "TENANT"] },
+        "state": { "const": "PENDING" },
+        "createdAt": { "$ref": "#/$defs/timestamp" },
+        "expiresAt": { "$ref": "#/$defs/timestamp" },
+        "deliveryStatus": { "enum": ["PENDING", "ACCEPTED", "NOT_SENT", "FAILED", "UNKNOWN"] },
+        "areas": { "type": "array", "maxItems": 64, "items": { "type": "object", "required": ["areaId", "name"], "properties": { "areaId": { "$ref": "#/$defs/id" }, "name": { "type": "string", "minLength": 1, "maxLength": 160 } }, "additionalProperties": false } }
+      },
+      "allOf": [
+        { "if": { "properties": { "role": { "const": "TENANT" } }, "required": ["role"] }, "then": { "properties": { "areas": { "minItems": 1 } } } },
+        { "if": { "properties": { "role": { "const": "PROPERTY_MANAGER" } }, "required": ["role"] }, "then": { "properties": { "areas": { "maxItems": 0 } } } }
+      ],
+      "additionalProperties": false
+    },
+    "homePendingInvitationsReceipt": {
+      "type": "object",
+      "required": ["schemaVersion", "ok", "homeId", "managementRevision", "generatedAt", "invitations", "nextCursor"],
+      "properties": {
+        "schemaVersion": { "const": "dinodia.v1" }, "ok": { "const": true }, "homeId": { "$ref": "#/$defs/id" },
+        "managementRevision": { "type": "integer", "minimum": 0 }, "generatedAt": { "$ref": "#/$defs/timestamp" },
+        "invitations": { "type": "array", "maxItems": 50, "items": { "$ref": "#/$defs/homePendingInvitation" } },
+        "nextCursor": { "type": ["string", "null"], "maxLength": 256 }
+      },
+      "additionalProperties": false
+    },
+    "supportAccessRequestCreateRequest": {
+      "type": "object",
+      "required": ["requestedScope", "areaIds", "targetIds"],
+      "properties": {
+        "requestedScope": { "enum": ["TENANT_SCOPE", "PROPERTY_SCOPE"] },
+        "targetMembershipId": { "anyOf": [{ "$ref": "#/$defs/id" }, { "type": "null" }] },
+        "areaIds": { "type": "array", "maxItems": 100, "uniqueItems": true, "items": { "$ref": "#/$defs/id" } },
+        "targetIds": { "type": "array", "maxItems": 100, "uniqueItems": true, "items": { "$ref": "#/$defs/id" } }
+      },
+      "additionalProperties": false
+    },
+    "supportAccessRequestCreateReceipt": {
+      "type": "object",
+      "required": ["ok", "accessRequest"],
+      "properties": {
+        "ok": { "const": true },
+        "accessRequest": {
+          "type": "object",
+          "required": ["id", "status", "requestedScope", "touchesPropertyInfrastructure", "createdAt"],
+          "properties": {
+            "id": { "$ref": "#/$defs/id" },
+            "status": { "const": "REQUESTED" },
+            "requestedScope": { "enum": ["TENANT_SCOPE", "PROPERTY_SCOPE"] },
+            "touchesPropertyInfrastructure": { "type": "boolean" },
+            "createdAt": { "$ref": "#/$defs/timestamp" }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "supportAccessDecisionRequest": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["approve", "confirmation", "proof"],
+          "properties": {
+            "approve": { "const": true },
+            "confirmation": { "enum": ["I approve this support access for my property", "I approve this support access for me"] },
+            "proof": { "type": "string", "minLength": 1, "maxLength": 8192 }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["approve"],
+          "properties": { "approve": { "const": false } },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "supportAccessDecisionReceipt": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["ok", "requestId", "status"],
+          "properties": {
+            "ok": { "const": true },
+            "requestId": { "$ref": "#/$defs/id" },
+            "status": { "const": "APPROVED" }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["ok", "requestId", "status"],
+          "properties": {
+            "ok": { "const": true },
+            "requestId": { "$ref": "#/$defs/id" },
+            "status": { "const": "DENIED" }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "supportAccessIssueReceipt": {
+      "type": "object",
+      "required": ["ok", "requestId", "status", "oneUseCode", "supportUrl", "codeExpiresAt"],
+      "properties": {
+        "ok": { "const": true },
+        "requestId": { "$ref": "#/$defs/id" },
+        "status": { "const": "ISSUED" },
+        "oneUseCode": { "type": "string", "pattern": "^DNO-S-[A-Za-z0-9_-]{20,}$", "maxLength": 128 },
+        "supportUrl": { "type": "string", "pattern": "^https://[^/?#]+/support-access$" },
+        "codeExpiresAt": { "$ref": "#/$defs/timestamp" }
+      },
+      "additionalProperties": false
+    },
+    "supportAccessRevokeRequest": {
+      "type": "object",
+      "required": ["confirmation"],
+      "properties": {
+        "confirmation": { "const": "I revoke this support access for my property" },
+        "proof": { "type": "string", "minLength": 1, "maxLength": 8192, "writeOnly": true }
+      },
+      "additionalProperties": false
+    },
+    "supportAccessRevokeReceipt": {
+      "type": "object",
+      "required": ["ok", "requestId", "status", "message"],
+      "properties": {
+        "ok": { "const": true },
+        "requestId": { "$ref": "#/$defs/id" },
+        "status": { "const": "REVOKED" },
+        "message": { "const": "Property support access revoked — waiting for hub confirmation" }
+      },
+      "additionalProperties": false
+    },
+    "trustedDeviceRemovalRequest": {
+      "type": "object",
+      "properties": { "proof": { "type": "string", "minLength": 1, "maxLength": 8192 } },
+      "additionalProperties": false
+    },
+    "trustedDeviceRemovalReceipt": {
+      "type": "object",
+      "required": ["ok", "trustedDeviceId", "accountWide"],
+      "properties": { "ok": { "const": true }, "trustedDeviceId": { "$ref": "#/$defs/id" }, "accountWide": { "const": true } },
+      "additionalProperties": false
+    },
+    "supportTicket": {
+      "type": "object",
+      "required": [
+        "ticketId",
+        "customerAccountId",
+        "homeId",
+        "homeMembershipId",
+        "category",
+        "status",
+        "revision",
+        "createdAt",
+        "updatedAt"
+      ],
+      "properties": {
+        "ticketId": { "$ref": "#/$defs/id" },
+        "publicReference": { "type": "string", "minLength": 1, "maxLength": 20 },
+        "customerAccountId": { "$ref": "#/$defs/id" },
+        "homeId": { "type": ["string", "null"] },
+        "homeMembershipId": { "type": ["string", "null"] },
+        "category": {
+          "enum": [
+            "ACCOUNT_OR_SIGN_IN",
+            "ACCESS_OR_PERMISSIONS",
+            "DEVICE_PROBLEM",
+            "HUB_OR_CONNECTION",
+            "AUTOMATION",
+            "ALEXA",
+            "OTHER"
+          ]
+        },
+        "status": {
+          "enum": [
+            "OPEN",
+            "NEW",
+            "REVIEWING",
+            "WAITING_FOR_CUSTOMER",
+            "ACCESS_REQUESTED",
+            "ACCESS_APPROVED",
+            "INVESTIGATING",
+            "WAITING_FOR_VISIT",
+            "RESOLVED",
+            "CLOSED"
+          ]
+        },
+        "revision": { "type": "integer", "minimum": 0 },
+        "description": { "type": "string", "maxLength": 4000 },
+        "createdAt": { "$ref": "#/$defs/timestamp" },
+        "updatedAt": { "$ref": "#/$defs/timestamp" },
+        "closedAt": { "type": ["string", "null"], "format": "date-time" },
+        "hubEnforcement": { "enum": ["PENDING", "ACKNOWLEDGED", "EXPIRED", "NOT_REQUIRED"] },
+        "customerVisibleUpdates": {
+          "type": "array",
+          "maxItems": 100,
+          "items": {
+            "type": "object",
+            "required": ["id", "code", "summary", "createdAt"],
+            "properties": {
+              "id": { "$ref": "#/$defs/id" },
+              "code": { "type": "string", "maxLength": 80 },
+              "summary": { "type": ["string", "null"], "maxLength": 500 },
+              "createdAt": { "$ref": "#/$defs/timestamp" }
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "allOf": [{
+        "oneOf": [
+          { "properties": { "homeId": { "type": "null" }, "homeMembershipId": { "type": "null" } } },
+          { "properties": { "homeId": { "$ref": "#/$defs/id" }, "homeMembershipId": { "$ref": "#/$defs/id" } } }
+        ]
+      }],
+      "additionalProperties": false
+    },
+    "supportAccessRequest": {
+      "type": "object",
+      "required": [
+        "requestId",
+        "ticketId",
+        "scope",
+        "status",
+        "expiresAt",
+        "revision"
+      ],
+      "properties": {
+        "requestId": { "$ref": "#/$defs/id" },
+        "ticketId": { "$ref": "#/$defs/id" },
+        "scope": { "enum": ["PROPERTY_SCOPE", "TENANT_SCOPE"] },
+        "status": {
+          "enum": [
+            "requested",
+            "approved",
+            "denied",
+            "revoked",
+            "expired",
+            "closed"
+          ]
+        },
+        "expiresAt": { "$ref": "#/$defs/timestamp" },
+        "revision": { "type": "integer", "minimum": 0 },
+        "touchesPropertyInfrastructure": { "type": "boolean" }
+      },
+      "additionalProperties": false
+    },
+    "supportSession": {
+      "type": "object",
+      "required": [
+        "sessionId",
+        "ticketId",
+        "requestId",
+        "scope",
+        "status",
+        "expiresAt"
+      ],
+      "properties": {
+        "sessionId": { "$ref": "#/$defs/id" },
+        "ticketId": { "$ref": "#/$defs/id" },
+        "requestId": { "$ref": "#/$defs/id" },
+        "scope": { "enum": ["PROPERTY_SCOPE", "TENANT_SCOPE"] },
+        "status": { "enum": ["active", "revoked", "expired", "closed"] },
+        "expiresAt": { "$ref": "#/$defs/timestamp" }
+      },
+      "additionalProperties": false
+    },
+    "supportCodeExchange": {
+      "type": "object",
+      "required": ["ticketId", "requestId", "code", "employeeSession"],
+      "properties": {
+        "ticketId": { "$ref": "#/$defs/id" },
+        "requestId": { "$ref": "#/$defs/id" },
+        "code": { "type": "string", "minLength": 6, "maxLength": 64 },
+        "employeeSession": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": false
+    },
+    "notification": {
+      "type": "object",
+      "required": ["notificationId", "homeId", "recipientMembershipId", "kind", "createdAt", "deduplicationKey", "deliveryState"],
+      "properties": {
+        "notificationId": { "$ref": "#/$defs/id" },
+        "homeId": { "$ref": "#/$defs/id" },
+        "recipientMembershipId": { "$ref": "#/$defs/id" },
+        "kind": { "enum": ["security", "access", "support", "device", "automation", "system"] },
+        "createdAt": { "$ref": "#/$defs/timestamp" },
+        "deduplicationKey": { "type": "string", "minLength": 16, "maxLength": 160 },
+        "deliveryState": { "enum": ["queued", "sent", "delivered", "failed", "suppressed_quiet_hours"] },
+        "mandatory": { "type": "boolean" }
+      },
+      "additionalProperties": false
+    },
+    "membershipInvitation": {
+      "type": "object",
+      "required": ["invitationId", "homeId", "invitedEmailHash", "role", "areaIds", "state", "expiresAt", "revision"],
+      "properties": {
+        "invitationId": { "$ref": "#/$defs/id" },
+        "homeId": { "$ref": "#/$defs/id" },
+        "invitedEmailHash": { "type": "string", "minLength": 32, "maxLength": 128 },
+        "role": { "enum": ["PROPERTY_MANAGER", "TENANT"] },
+        "areaIds": { "type": "array", "items": { "$ref": "#/$defs/id" }, "uniqueItems": true },
+        "state": { "enum": ["pending", "accepted", "expired", "revoked", "replaced"] },
+        "expiresAt": { "$ref": "#/$defs/timestamp" },
+        "revision": { "type": "integer", "minimum": 0 },
+        "membershipId": { "type": ["string", "null"] }
+      },
+      "additionalProperties": false
+    },
+    "claimReservation": {
+      "type": "object",
+      "required": ["claimId", "homeId", "state", "createdAt", "expiresAt", "revision"],
+      "properties": {
+        "claimId": { "$ref": "#/$defs/id" },
+        "homeId": { "$ref": "#/$defs/id" },
+        "state": { "enum": ["reserved", "completed", "expired", "released", "replaced"] },
+        "createdAt": { "$ref": "#/$defs/timestamp" },
+        "expiresAt": { "$ref": "#/$defs/timestamp" },
+        "revision": { "type": "integer", "minimum": 0 },
+        "firstWins": { "const": true }
+      },
+      "additionalProperties": false
+    },
+    "hubInstallation": {
+      "type": "object",
+      "required": ["hubInstallationId", "homeId", "serialNumber", "identityGeneration", "state", "provisioningRevision", "cloudUrlState", "lastHeartbeatAt"],
+      "properties": {
+        "hubInstallationId": { "$ref": "#/$defs/id" },
+        "homeId": { "$ref": "#/$defs/id" },
+        "serialNumber": { "$ref": "#/$defs/id" },
+        "identityGeneration": { "type": "integer", "minimum": 1 },
+        "state": { "enum": ["pairing", "provisioning", "active", "suspended", "replacement_pending", "deregistering", "deregistered"] },
+        "provisioningRevision": { "type": "integer", "minimum": 0 },
+        "cloudUrlState": { "enum": ["not_configured", "report_pending", "verified", "failed", "revoked"] },
+        "lastHeartbeatAt": { "anyOf": [{ "$ref": "#/$defs/timestamp" }, { "type": "null" }] },
+        "onlineState": { "enum": ["online", "stale", "offline", "unknown"] }
+      },
+      "additionalProperties": false
+    },
+    "stepUpOperationKind": {
+      "enum": ["trusted_device_remove", "customer_password_change", "customer_profile_change", "customer_email_change", "tenant_membership_remove", "home_tenant_remove", "home_property_manager_remove", "home.tenant_automation_disable", "home.tenant_automation_delete", "tenant_device_remove", "tenant_area_grants_replace", "home.transfer", "home.deregister", "home_room_access_decision", "support_ticket_close", "support_access_approve", "support_access_revoke", "alexa_unlink", "heating_sensitive_command", "device_sensitive_command"]
+    },
+    "stepUpDescriptorAttestation": {
+      "type": "object",
+      "required": ["version", "serial", "identityGeneration", "actorId", "customerSessionId", "trustedDeviceId", "homeId", "membershipId", "hubInstallId", "operationKind", "targetIds", "controlId", "descriptorRevision", "descriptorDigest", "operationDigest", "nonce", "issuedAt", "hubSignature"],
+      "properties": {
+        "version": { "const": 1 },
+        "serial": { "$ref": "#/$defs/id" },
+        "identityGeneration": { "type": "integer", "minimum": 1 },
+        "actorId": { "$ref": "#/$defs/id" },
+        "customerSessionId": { "$ref": "#/$defs/id" },
+        "trustedDeviceId": { "$ref": "#/$defs/id" },
+        "homeId": { "$ref": "#/$defs/id" },
+        "membershipId": { "$ref": "#/$defs/id" },
+        "hubInstallId": { "$ref": "#/$defs/id" },
+        "operationKind": { "$ref": "#/$defs/stepUpOperationKind" },
+        "targetIds": { "type": "array", "minItems": 1, "maxItems": 20, "uniqueItems": true, "items": { "$ref": "#/$defs/id" } },
+        "controlId": { "$ref": "#/$defs/id" },
+        "descriptorRevision": { "type": "integer", "minimum": 0 },
+        "descriptorDigest": { "anyOf": [{ "type": "string", "pattern": "^[0-9a-f]{64}$" }, { "type": "null" }] },
+        "operationDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "nonce": { "type": "string", "minLength": 20, "maxLength": 128, "pattern": "^[A-Za-z0-9_-]+$" },
+        "issuedAt": { "type": "integer", "minimum": 1 },
+        "hubSignature": { "type": "string", "minLength": 32, "maxLength": 2048, "pattern": "^[A-Za-z0-9_-]+$" }
+      },
+      "additionalProperties": false
+    },
+    "stepUpChallengeRequest": {
+      "type": "object",
+      "required": ["operationKind", "targetIds"],
+      "properties": {
+        "operationKind": { "$ref": "#/$defs/stepUpOperationKind" },
+        "targetIds": { "type": "array", "minItems": 1, "maxItems": 20, "uniqueItems": true, "items": { "$ref": "#/$defs/id" } },
+        "value": {},
+        "descriptorAttestation": { "$ref": "#/$defs/stepUpDescriptorAttestation" }
+      },
+      "additionalProperties": false
+    },
+    "stepUpChallengeReceipt": {
+      "type": "object",
+      "required": ["ok", "challengeId", "nonce", "operationDigest", "expiresAt"],
+      "properties": {
+        "ok": { "const": true },
+        "challengeId": { "$ref": "#/$defs/id" },
+        "nonce": { "type": "string", "minLength": 20, "maxLength": 128, "pattern": "^[A-Za-z0-9_-]+$" },
+        "operationDigest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "expiresAt": { "$ref": "#/$defs/timestamp" }
+      },
+      "additionalProperties": false
+    },
+    "stepUpCancellationRequest": {
+      "type": "object",
+      "required": ["challengeId"],
+      "properties": { "challengeId": { "$ref": "#/$defs/id" } },
+      "additionalProperties": false
+    },
+    "stepUpCancellationReceipt": {
+      "type": "object",
+      "required": ["ok", "cancelled"],
+      "properties": { "ok": { "const": true }, "cancelled": { "const": true } },
+      "additionalProperties": false
+    },
+    "stepUpIssueRequest": {
+      "type": "object",
+      "required": ["challengeId", "nonce", "deviceSignature"],
+      "properties": {
+        "challengeId": { "$ref": "#/$defs/id" },
+        "nonce": { "type": "string", "minLength": 20, "maxLength": 128, "pattern": "^[A-Za-z0-9_-]+$" },
+        "deviceSignature": { "type": "string", "minLength": 32, "maxLength": 2048, "pattern": "^[A-Za-z0-9_-]+$" }
+      },
+      "additionalProperties": false
+    },
+    "stepUpProofReceipt": {
+      "type": "object",
+      "required": ["ok", "proof", "proofId", "operationId", "expiresAt"],
+      "properties": {
+        "ok": { "const": true },
+        "proof": { "type": "string", "minLength": 1, "maxLength": 8192 },
+        "proofId": { "$ref": "#/$defs/id" },
+        "operationId": { "$ref": "#/$defs/id" },
+        "expiresAt": { "$ref": "#/$defs/timestamp" }
+      },
+      "additionalProperties": false
+    },
+    "stepUpConsumeRequest": {
+      "type": "object",
+      "required": ["operationKind", "targetIds"],
+      "properties": {
+        "operationKind": { "$ref": "#/$defs/stepUpOperationKind" },
+        "targetIds": { "type": "array", "minItems": 1, "maxItems": 20, "uniqueItems": true, "items": { "$ref": "#/$defs/id" } },
+        "proof": { "type": "string", "minLength": 1, "maxLength": 8192, "writeOnly": true },
+        "value": {},
+        "descriptorDigests": { "type": "object", "maxProperties": 20, "propertyNames": { "$ref": "#/$defs/id" }, "additionalProperties": { "anyOf": [{ "type": "string", "pattern": "^[0-9a-f]{64}$" }, { "type": "null" }] } }
+      },
+      "additionalProperties": false
+    },
+    "stepUpConsumeReceipt": { "type": "object", "required": ["ok"], "properties": { "ok": { "const": true } }, "additionalProperties": false },
+    "offlineAuthorisationRequest": {
+      "type": "object",
+      "required": ["trustedDeviceId", "publicKey"],
+      "properties": { "trustedDeviceId": { "$ref": "#/$defs/id" }, "publicKey": { "type": "string", "minLength": 1, "maxLength": 4096 } },
+      "additionalProperties": false
+    },
+    "offlineAuthorisationReceipt": {
+      "type": "object",
+      "required": ["ok", "authorisation"],
+      "properties": {
+        "ok": { "const": true },
+        "authorisation": {
+          "type": "object",
+          "required": ["id", "homeId", "membershipId", "trustedDeviceId", "areaIds", "scopes", "policyRevision"],
+          "properties": {
+            "id": { "$ref": "#/$defs/id" }, "homeId": { "$ref": "#/$defs/id" },
+            "membershipId": { "$ref": "#/$defs/id" }, "trustedDeviceId": { "$ref": "#/$defs/id" },
+            "areaIds": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/$defs/id" } },
+            "scopes": { "const": ["tenant:device-command"] }, "policyRevision": { "type": "integer", "minimum": 0 },
+            "hubInstallationId": { "$ref": "#/$defs/id" },
+            "membershipRevision": { "type": "integer", "minimum": 0 },
+            "issuedAt": { "$ref": "#/$defs/timestamp" },
+            "lanEndpoint": { "$ref": "#/$defs/customerLanEndpoint" }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "offlineRevocationReceipt": {
+      "type": "object", "required": ["ok", "revoked"],
+      "properties": { "ok": { "const": true }, "revoked": { "type": "integer", "minimum": 0 } },
+      "additionalProperties": false
+    },
+    "supportNotificationProjection": {
+      "type": "object", "required": ["ok", "notifications"],
+      "properties": {
+        "ok": { "const": true },
+        "notifications": { "type": "array", "maxItems": 100, "items": { "type": "object", "required": ["id", "ticketId", "eventType", "createdAt"], "properties": { "id": { "$ref": "#/$defs/id" }, "ticketId": { "$ref": "#/$defs/id" }, "eventType": { "enum": ["STARTED", "REVOKED", "ENDED", "EXPIRED"] }, "createdAt": { "$ref": "#/$defs/timestamp" } }, "additionalProperties": false } }
+      },
+      "additionalProperties": false
+    },
+    "supportAccessApprovalProjection": {
+      "type": "object", "required": ["ok", "requests"],
+      "properties": {
+        "ok": { "const": true },
+        "requests": { "type": "array", "maxItems": 100, "items": { "type": "object", "required": ["requestId", "ticketId", "publicReference", "requestedScope", "areaIds", "createdAt"], "properties": {
+          "requestId": { "$ref": "#/$defs/id" }, "ticketId": { "$ref": "#/$defs/id" }, "publicReference": { "type": "string", "minLength": 1, "maxLength": 32 },
+          "requestedScope": { "enum": ["TENANT_SCOPE", "PROPERTY_SCOPE"] }, "areaIds": { "type": "array", "maxItems": 100, "items": { "$ref": "#/$defs/id" }, "uniqueItems": true }, "createdAt": { "$ref": "#/$defs/timestamp" }
+        }, "additionalProperties": false } }
+      }, "additionalProperties": false
+    },
+    "supportTicketCloseRequest": {
+      "type": "object", "required": ["action"],
+      "properties": { "action": { "const": "close" }, "proof": { "type": "string", "minLength": 1, "maxLength": 8192, "writeOnly": true } },
+      "additionalProperties": false
+    },
+    "supportTicketCloseReceipt": {
+      "type": "object", "required": ["ok", "ticketId", "status", "message", "hubEnforcement"],
+      "properties": { "ok": { "const": true }, "ticketId": { "$ref": "#/$defs/id" }, "status": { "const": "CLOSED" }, "message": { "type": "string", "maxLength": 240 }, "hubEnforcement": { "enum": ["PENDING", "ACKNOWLEDGED", "EXPIRED", "NOT_REQUIRED"] } },
+      "additionalProperties": false
+    },
+    "lanEndpointObservation": {
+      "type": "object",
+      "required": ["version", "revision", "state", "discoveryHost"],
+      "properties": {
+        "version": { "const": 1 },
+        "revision": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+        "state": { "enum": ["CURRENT", "UNAVAILABLE"] },
+        "baseUrl": {
+          "type": "string",
+          "maxLength": 64,
+          "pattern": "^http://(?:(?:10\\.(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9]))|(?:192\\.168\\.(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9]))|(?:172\\.(?!(?:17|18)\\.)(?:1[6-9]|2[0-9]|3[01])\\.(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9]))):(?:80|8123)$",
+          "not": { "pattern": "\\.(?:0|255):(?:80|8123)$" }
+        },
+        "discoveryHost": { "type": "string", "maxLength": 80, "pattern": "^dinodia-[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\\.local$" }
+      },
+      "oneOf": [
+        { "properties": { "state": { "const": "CURRENT" } }, "required": ["baseUrl"] },
+        { "properties": { "state": { "const": "UNAVAILABLE" } }, "not": { "required": ["baseUrl"] } }
+      ],
+      "additionalProperties": false
+    },
+    "lanTlsIdentityObservation": {
+      "type": "object",
+      "required": ["version", "revision", "state", "publicHubId", "host", "port", "certificateGeneration", "currentSpkiPin", "currentNotBefore", "currentNotAfter", "acknowledgedGeneration"],
+      "properties": {
+        "version": { "const": 1 }, "revision": { "type": "integer", "minimum": 1 },
+        "state": { "enum": ["CURRENT", "UNAVAILABLE"] },
+        "publicHubId": { "type": "string", "pattern": "^[a-f0-9]{20}$" },
+        "host": { "type": "string", "pattern": "^dinodia-[a-f0-9]{20}\\.local$" },
+        "port": { "const": 8123 }, "certificateGeneration": { "type": "integer", "minimum": 1 },
+        "currentSpkiPin": { "type": "string", "pattern": "^sha256/[A-Za-z0-9+/]{43}=$" },
+        "currentNotBefore": { "$ref": "#/$defs/timestamp" }, "currentNotAfter": { "$ref": "#/$defs/timestamp" },
+        "nextCertificateGeneration": { "type": "integer", "minimum": 2 },
+        "nextSpkiPin": { "type": "string", "pattern": "^sha256/[A-Za-z0-9+/]{43}=$" },
+        "nextNotBefore": { "$ref": "#/$defs/timestamp" }, "nextNotAfter": { "$ref": "#/$defs/timestamp" },
+        "acknowledgedGeneration": { "type": "integer", "minimum": 0 }
+      },
+      "allOf": [{
+        "if": { "required": ["nextCertificateGeneration", "nextSpkiPin", "nextNotBefore", "nextNotAfter"] },
+        "then": {},
+        "else": { "not": { "anyOf": [{ "required": ["nextCertificateGeneration"] }, { "required": ["nextSpkiPin"] }, { "required": ["nextNotBefore"] }, { "required": ["nextNotAfter"] }] } }
+      }],
+      "additionalProperties": false
+    },
+    "updaterMaintenanceStatus": {
+      "type": "object",
+      "required": ["schemaVersion", "status"],
+      "properties": {
+        "schemaVersion": { "const": "dinodia.v1" },
+        "status": {
+          "type": "object",
+          "required": ["phase", "trustState", "activeReleaseVersion", "lastAttempt", "busy"],
+          "properties": {
+            "phase": { "enum": ["idle", "downloading", "verifying", "staged", "maintenance", "activating", "health_check", "active", "rolled_back", "failed"] },
+            "trustState": { "enum": ["ready", "unprovisioned"] },
+            "activeReleaseVersion": { "type": ["string", "null"], "maxLength": 96 },
+            "lastAttempt": {
+              "type": ["object", "null"],
+              "required": ["phase", "result", "updatedAt"],
+              "properties": {
+                "phase": { "enum": ["downloading", "verifying", "staged", "maintenance", "activating", "health_check", "active", "rolled_back", "failed"] },
+                "result": { "type": ["string", "null"], "maxLength": 96 },
+                "updatedAt": { "anyOf": [{ "$ref": "#/$defs/timestamp" }, { "type": "null" }] }
+              },
+              "additionalProperties": false
+            },
+            "busy": { "type": "boolean" }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "customerPendingRelationshipsProjection": {
+      "type": "object",
+      "required": ["schemaVersion", "asOf", "pendingRelationships"],
+      "properties": {
+        "schemaVersion": { "const": "dinodia.v1" },
+        "asOf": { "$ref": "#/$defs/timestamp" },
+        "pendingRelationships": { "type": "array", "maxItems": 150, "items": { "$ref": "#/$defs/customerPendingRelationship" } }
+      },
+      "additionalProperties": false
+    },
+    "customerPendingRelationship": {
+      "type": "object",
+      "required": ["id", "type", "postcode", "createdAt", "expiresAt", "state", "allowedActions"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "type": { "enum": ["INVITATION", "ROOM_ACCESS_REQUEST", "HOME_SETUP", "INSTALLATION_PENDING"] },
+        "postcode": { "type": ["string", "null"], "maxLength": 32 },
+        "createdAt": { "$ref": "#/$defs/timestamp" },
+        "expiresAt": { "anyOf": [{ "$ref": "#/$defs/timestamp" }, { "type": "null" }] },
+        "state": { "type": "string", "pattern": "^[A-Z_]{1,48}$" },
+        "allowedActions": { "type": "array", "items": { "enum": ["ACCEPT", "DECLINE", "CANCEL", "VIEW_STATUS", "RESUME_SETUP", "REFRESH"] }, "uniqueItems": true },
+        "role": { "enum": ["PROPERTY_MANAGER", "TENANT"] },
+        "inviterLabel": { "type": "string", "minLength": 1, "maxLength": 160 },
+        "areaLabel": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "decisionRevision": { "$ref": "#/$defs/timestamp" },
+        "revision": { "type": "integer", "minimum": 0 },
+        "requiredStep": { "type": ["string", "null"], "pattern": "^[A-Z_]{1,80}$" }
+      },
+      "allOf": [
+        { "if": { "properties": { "type": { "const": "INVITATION" } }, "required": ["type"] }, "then": { "required": ["role", "inviterLabel", "decisionRevision"], "properties": { "postcode": { "type": "string", "minLength": 1, "maxLength": 32 }, "allowedActions": { "const": ["ACCEPT", "DECLINE"] } }, "not": { "anyOf": [{ "required": ["areaLabel"] }, { "required": ["revision"] }, { "required": ["requiredStep"] }] } } },
+        { "if": { "properties": { "type": { "const": "ROOM_ACCESS_REQUEST" } }, "required": ["type"] }, "then": { "required": ["areaLabel", "decisionRevision"], "properties": { "postcode": { "type": "string", "minLength": 1, "maxLength": 32 }, "allowedActions": { "const": ["VIEW_STATUS", "CANCEL"] } }, "not": { "anyOf": [{ "required": ["role"] }, { "required": ["inviterLabel"] }, { "required": ["revision"] }, { "required": ["requiredStep"] }] } } },
+        { "if": { "properties": { "type": { "enum": ["HOME_SETUP", "INSTALLATION_PENDING"] } }, "required": ["type"] }, "then": { "required": ["revision", "requiredStep"], "not": { "anyOf": [{ "required": ["role"] }, { "required": ["inviterLabel"] }, { "required": ["areaLabel"] }] } } },
+        { "if": { "properties": { "type": { "const": "HOME_SETUP" } }, "required": ["type"] }, "then": { "properties": { "allowedActions": { "const": ["RESUME_SETUP"] } } } },
+        { "if": { "properties": { "type": { "const": "INSTALLATION_PENDING" } }, "required": ["type"] }, "then": { "properties": { "postcode": { "type": "string", "minLength": 1, "maxLength": 32 }, "allowedActions": { "const": ["VIEW_STATUS", "REFRESH"] } } } }
+      ],
+      "additionalProperties": false
+    },
+    "customerInvitationDecisionRequest": {
+      "type": "object",
+      "required": ["decision", "expectedUpdatedAt"],
+      "properties": { "decision": { "enum": ["ACCEPT", "DECLINE"] }, "expectedUpdatedAt": { "$ref": "#/$defs/timestamp" } },
+      "additionalProperties": false
+    },
+    "customerMembershipInvitationRequest": {
+      "type": "object",
+      "required": ["email", "areaIds", "expectedManagementRevision"],
+      "properties": {
+        "email": { "type": "string", "format": "email", "maxLength": 320 },
+        "areaIds": { "type": "array", "items": { "$ref": "#/$defs/id" }, "uniqueItems": true, "maxItems": 64 },
+        "expectedManagementRevision": { "type": "integer", "minimum": 0 },
+        "resendInvitationId": { "$ref": "#/$defs/id" }
+      },
+      "additionalProperties": false
+    },
+    "customerMembershipInvitationReceipt": {
+      "type": "object",
+      "required": ["schemaVersion", "ok", "invitationId", "homeId", "role", "state", "expiresAt", "emailSubmission", "idempotentReplay"],
+      "properties": {
+        "schemaVersion": { "const": "dinodia.v1" }, "ok": { "const": true },
+        "invitationId": { "$ref": "#/$defs/id" }, "homeId": { "$ref": "#/$defs/id" },
+        "role": { "enum": ["PROPERTY_MANAGER", "TENANT"] },
+        "state": { "enum": ["PENDING", "REVOKED"] },
+        "expiresAt": { "$ref": "#/$defs/timestamp" },
+        "emailSubmission": { "enum": ["PENDING", "ACCEPTED", "NOT_SENT", "FAILED"] },
+        "idempotentReplay": { "type": "boolean" }
+      },
+      "additionalProperties": false
+    },
+    "customerPropertyManagerListReceipt": {
+      "type": "object",
+      "required": ["schemaVersion", "ok", "homeId", "managementRevision", "managers"],
+      "properties": {
+        "schemaVersion": { "const": "dinodia.v1" }, "ok": { "const": true }, "homeId": { "$ref": "#/$defs/id" },
+        "managementRevision": { "type": "integer", "minimum": 0 },
+        "managers": { "type": "array", "maxItems": 32, "items": { "type": "object", "required": ["membershipId", "displayName", "activatedAt"], "properties": { "membershipId": { "$ref": "#/$defs/id" }, "displayName": { "type": "string", "minLength": 1, "maxLength": 160 }, "activatedAt": { "$ref": "#/$defs/timestamp" } }, "additionalProperties": false } }
+      },
+      "additionalProperties": false
+    },
+    "customerInvitationDecisionReceipt": {
+      "type": "object",
+      "required": ["schemaVersion", "ok", "invitationId", "decision", "state", "homeMembershipId", "idempotentReplay"],
+      "properties": {
+        "schemaVersion": { "const": "dinodia.v1" }, "ok": { "const": true }, "invitationId": { "$ref": "#/$defs/id" },
+        "decision": { "enum": ["ACCEPT", "DECLINE"] }, "state": { "enum": ["ACCEPTED", "DECLINED"] },
+        "homeMembershipId": { "anyOf": [{ "$ref": "#/$defs/id" }, { "type": "null" }] }, "idempotentReplay": { "type": "boolean" }
+      },
+      "allOf": [
+        { "if": { "properties": { "decision": { "const": "ACCEPT" } }, "required": ["decision"] }, "then": { "properties": { "state": { "const": "ACCEPTED" }, "homeMembershipId": { "$ref": "#/$defs/id" } } } },
+        { "if": { "properties": { "decision": { "const": "DECLINE" } }, "required": ["decision"] }, "then": { "properties": { "state": { "const": "DECLINED" }, "homeMembershipId": { "type": "null" } } } }
+      ],
+      "additionalProperties": false
+    },
+    "customerInvitationStatusReceipt": {
+      "type": "object",
+      "required": ["schemaVersion", "ok", "invitationId", "state", "homeId", "role", "homeMembershipId"],
+      "properties": {
+        "schemaVersion": { "const": "dinodia.v1" }, "ok": { "const": true },
+        "invitationId": { "$ref": "#/$defs/id" },
+        "state": { "enum": ["PENDING", "ACCEPTED", "DECLINED", "EXPIRED", "REPLACED", "REVOKED"] },
+        "homeId": { "$ref": "#/$defs/id" }, "role": { "enum": ["OWNER", "PROPERTY_MANAGER", "TENANT"] },
+        "homeMembershipId": { "anyOf": [{ "$ref": "#/$defs/id" }, { "type": "null" }] }
+      },
+      "allOf": [
+        { "if": { "properties": { "state": { "enum": ["PENDING", "DECLINED", "EXPIRED", "REPLACED", "REVOKED"] } }, "required": ["state"] }, "then": { "properties": { "homeMembershipId": { "type": "null" } } } }
+      ],
+      "additionalProperties": false
+    },
+    "customerRoomQrScanRequest": {
+      "type": "object", "required": ["reference"],
+      "properties": { "reference": { "type": "string", "pattern": "^dno_room_[A-Za-z0-9_-]{40,64}$" } }, "additionalProperties": false
+    },
+    "customerRoomQrScanReceipt": {
+      "type": "object", "required": ["schemaVersion", "ok", "state", "areaLabel", "qrGeneration", "requestValiditySeconds"],
+      "properties": { "schemaVersion": { "const": "dinodia.v1" }, "ok": { "const": true }, "state": { "const": "AVAILABLE" }, "areaLabel": { "type": "string", "minLength": 1, "maxLength": 80 }, "qrGeneration": { "type": "integer", "minimum": 1 }, "requestValiditySeconds": { "const": 604800 } },
+      "additionalProperties": false
+    },
+    "publicRoomAccessEmailChallengeRequest": {
+      "type": "object", "required": ["reference", "expectedGeneration", "email", "idempotencyKey"],
+      "properties": { "reference": { "type": "string", "pattern": "^dno_room_[A-Za-z0-9_-]{40,64}$" }, "expectedGeneration": { "type": "integer", "minimum": 1 }, "email": { "type": "string", "format": "email", "maxLength": 320 }, "idempotencyKey": { "type": "string", "minLength": 16, "maxLength": 160, "pattern": "^[A-Za-z0-9._:-]{16,160}$" } },
+      "additionalProperties": false
+    },
+    "publicRoomAccessEmailChallengeReceipt": {
+      "type": "object", "required": ["schemaVersion", "ok", "state", "requestId", "expiresAt", "emailSubmission", "idempotentReplay"],
+      "properties": { "schemaVersion": { "const": "dinodia.v1" }, "ok": { "const": true }, "state": { "enum": ["VERIFY_EMAIL", "PENDING"] }, "requestId": { "$ref": "#/$defs/id" }, "challengeId": { "$ref": "#/$defs/id" }, "expiresAt": { "$ref": "#/$defs/timestamp" }, "revision": { "$ref": "#/$defs/timestamp" }, "emailSubmission": { "enum": ["ACCEPTED", "PENDING", "NOT_REQUIRED"] }, "idempotentReplay": { "type": "boolean" } },
+      "allOf": [
+        { "if": { "properties": { "state": { "const": "VERIFY_EMAIL" } }, "required": ["state"] }, "then": { "required": ["challengeId"], "not": { "required": ["revision"] } } },
+        { "if": { "properties": { "state": { "const": "PENDING" } }, "required": ["state"] }, "then": { "required": ["revision"], "not": { "required": ["challengeId"] }, "properties": { "emailSubmission": { "const": "NOT_REQUIRED" } } } }
+      ],
+      "additionalProperties": false
+    },
+    "publicRoomAccessEmailVerificationRequest": {
+      "type": "object", "required": ["requestId", "challengeId", "code"],
+      "properties": { "requestId": { "$ref": "#/$defs/id" }, "challengeId": { "$ref": "#/$defs/id" }, "code": { "type": "string", "pattern": "^\\d{6}$" } },
+      "additionalProperties": false
+    },
+    "publicRoomAccessEmailVerificationReceipt": {
+      "type": "object", "required": ["schemaVersion", "ok", "state", "requestId", "expiresAt", "revision", "idempotentReplay"],
+      "properties": { "schemaVersion": { "const": "dinodia.v1" }, "ok": { "const": true }, "state": { "const": "PENDING" }, "requestId": { "$ref": "#/$defs/id" }, "expiresAt": { "$ref": "#/$defs/timestamp" }, "revision": { "$ref": "#/$defs/timestamp" }, "idempotentReplay": { "type": "boolean" } },
+      "additionalProperties": false
+    },
+    "customerRoomAccessRequestRequest": {
+      "type": "object", "required": ["reference", "expectedGeneration", "idempotencyKey"],
+      "properties": { "reference": { "type": "string", "pattern": "^dno_room_[A-Za-z0-9_-]{40,64}$" }, "expectedGeneration": { "type": "integer", "minimum": 1 }, "idempotencyKey": { "type": "string", "minLength": 16, "maxLength": 160, "pattern": "^[A-Za-z0-9._:-]{16,160}$" } },
+      "additionalProperties": false
+    },
+    "customerRoomAccessRequestReceipt": {
+      "type": "object", "required": ["schemaVersion", "ok", "requestId", "areaLabel", "state", "expiresAt", "revision", "coalesced", "idempotentReplay"],
+      "properties": { "schemaVersion": { "const": "dinodia.v1" }, "ok": { "const": true }, "requestId": { "$ref": "#/$defs/id" }, "areaLabel": { "type": "string", "minLength": 1, "maxLength": 80 }, "state": { "const": "PENDING" }, "expiresAt": { "$ref": "#/$defs/timestamp" }, "revision": { "$ref": "#/$defs/timestamp" }, "coalesced": { "type": "boolean" }, "idempotentReplay": { "type": "boolean" } },
+      "additionalProperties": false
+    },
+    "customerRoomAccessCancelRequest": {
+      "type": "object", "required": ["expectedRevision", "idempotencyKey"],
+      "properties": { "expectedRevision": { "$ref": "#/$defs/timestamp" }, "idempotencyKey": { "type": "string", "minLength": 16, "maxLength": 160, "pattern": "^[A-Za-z0-9._:-]{16,160}$" } }, "additionalProperties": false
+    },
+    "customerRoomAccessDecisionRequest": {
+      "type": "object", "required": ["requestId", "decision", "expectedRevision", "idempotencyKey", "proof"],
+      "properties": { "requestId": { "$ref": "#/$defs/id" }, "decision": { "enum": ["APPROVE", "REJECT"] }, "expectedRevision": { "$ref": "#/$defs/timestamp" }, "idempotencyKey": { "type": "string", "minLength": 16, "maxLength": 160, "pattern": "^[A-Za-z0-9._:-]{16,160}$" }, "proof": { "type": "string", "minLength": 40, "maxLength": 8192 } }, "additionalProperties": false
+    },
+    "customerRoomAccessDecisionReceipt": {
+      "type": "object", "required": ["schemaVersion", "ok", "requestId", "state", "membershipId", "idempotentReplay"],
+      "properties": { "schemaVersion": { "const": "dinodia.v1" }, "ok": { "const": true }, "requestId": { "$ref": "#/$defs/id" }, "state": { "enum": ["APPROVED", "REJECTED"] }, "membershipId": { "anyOf": [{ "$ref": "#/$defs/id" }, { "type": "null" }] }, "idempotentReplay": { "type": "boolean" } },
+      "additionalProperties": false
+    },
+    "customerHomeClaimResolveRequest": {
+      "type": "object",
+      "required": ["reference"],
+      "properties": {
+        "reference": { "type": "string", "pattern": "^(dno_home_[A-Za-z0-9_-]{40,64}|DNO-HOME-[A-Za-z0-9_-]{32,64})$" },
+        "resolverProof": { "$ref": "#/$defs/customerHomeClaimResolverProof" }
+      },
+      "allOf": [{
+        "if": { "properties": { "reference": { "pattern": "^dno_home_" } }, "required": ["reference"] },
+        "then": { "not": { "required": ["resolverProof"] } },
+        "else": { "required": ["resolverProof"] }
+      }],
+      "additionalProperties": false
+    },
+    "customerHomeClaimResolverProof": {
+      "type": "object",
+      "required": ["version", "serial", "identityGeneration", "challengeId", "challenge", "resolverGeneration", "expiresAt", "timestamp", "nonce", "bodyHash", "hubSignature"],
+      "properties": {
+        "version": { "const": 1 }, "serial": { "type": "string", "minLength": 1, "maxLength": 160 },
+        "identityGeneration": { "type": "integer", "minimum": 1 }, "challengeId": { "$ref": "#/$defs/id" },
+        "challenge": { "type": "string", "pattern": "^[A-Za-z0-9_-]{20,128}$" }, "resolverGeneration": { "type": "integer", "minimum": 1 },
+        "expiresAt": { "$ref": "#/$defs/timestamp" }, "timestamp": { "type": "string", "pattern": "^\\d{10,16}$" },
+        "nonce": { "type": "string", "pattern": "^[A-Za-z0-9_-]{16,128}$" }, "bodyHash": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "hubSignature": { "type": "string", "pattern": "^[A-Za-z0-9_-]{40,2048}$" }
+      },
+      "additionalProperties": false
+    },
+    "customerHomeClaimLanEndpointRequest": {
+      "type": "object",
+      "required": ["reference"],
+      "properties": { "reference": { "type": "string", "pattern": "^DNO-HOME-[A-Za-z0-9_-]{32,64}$" } },
+      "additionalProperties": false
+    },
+    "customerHomeClaimLanEndpointReceipt": {
+      "type": "object",
+      "required": ["schemaVersion", "ok", "lanEndpoint"],
+      "properties": {
+        "schemaVersion": { "const": "dinodia.v1" },
+        "ok": { "const": true },
+        "lanEndpoint": { "$ref": "#/$defs/customerHomeClaimLanEndpoint" }
+      },
+      "additionalProperties": false
+    },
+    "customerHomeClaimResolveReceipt": {
+      "type": "object",
+      "required": ["schemaVersion", "ok", "claimId", "generation", "state", "expiresAt"],
+      "properties": {
+        "schemaVersion": { "const": "dinodia.v1" }, "ok": { "const": true }, "claimId": { "$ref": "#/$defs/id" },
+        "generation": { "type": "integer", "minimum": 1 }, "state": { "const": "SETUP" }, "expiresAt": { "$ref": "#/$defs/timestamp" }
+      },
+      "additionalProperties": false
+    },
+    "customerHomeClaimSetupStatus": {
+      "type": "object",
+      "required": ["schemaVersion", "claimId", "state", "requiredStep", "revision", "expiresAt", "postcode", "ownDraft"],
+      "properties": {
+        "schemaVersion": { "const": "dinodia.v1" }, "claimId": { "$ref": "#/$defs/id" },
+        "state": { "enum": ["SETUP", "INSTALLATION_PENDING"] }, "requiredStep": { "enum": ["PROFILE", "ADDRESS", "ADDRESS_CONFIRMATION", "POLICY", null] },
+        "revision": { "type": "integer", "minimum": 0 }, "expiresAt": { "anyOf": [{ "$ref": "#/$defs/timestamp" }, { "type": "null" }] },
+        "postcode": { "type": ["string", "null"], "maxLength": 32 },
+        "ownDraft": { "anyOf": [{ "$ref": "#/$defs/customerHomeClaimOwnDraft" }, { "type": "null" }] }
+      },
+      "allOf": [
+        { "if": { "properties": { "state": { "const": "SETUP" } }, "required": ["state"] }, "then": { "properties": { "expiresAt": { "$ref": "#/$defs/timestamp" }, "ownDraft": { "$ref": "#/$defs/customerHomeClaimOwnDraft" } } } },
+        { "if": { "properties": { "state": { "const": "INSTALLATION_PENDING" } }, "required": ["state"] }, "then": { "properties": { "expiresAt": { "type": "null" }, "ownDraft": { "type": "null" } } } }
+      ],
+      "additionalProperties": false
+    },
+    "customerHomeClaimOwnDraft": {
+      "type": "object", "required": ["addressLine1", "addressLine2", "city", "region", "postcode", "country", "timezone"],
+      "properties": {
+        "addressLine1": { "type": ["string", "null"], "maxLength": 200 }, "addressLine2": { "type": ["string", "null"], "maxLength": 200 },
+        "city": { "type": ["string", "null"], "maxLength": 120 }, "region": { "type": ["string", "null"], "maxLength": 120 },
+        "postcode": { "type": ["string", "null"], "maxLength": 32 }, "country": { "type": ["string", "null"], "maxLength": 2 },
+        "timezone": { "type": ["string", "null"], "maxLength": 80 }
+      }, "additionalProperties": false
+    },
+    "customerHomeClaimAddress": {
+      "type": "object",
+      "required": ["schemaVersion", "ok", "claimId", "addressLine1", "addressLine2", "city", "region", "postcode", "country", "timezone", "addressRevision", "addressDigest"],
+      "properties": {
+        "schemaVersion": { "const": "dinodia.v1" }, "ok": { "const": true }, "claimId": { "$ref": "#/$defs/id" },
+        "addressLine1": { "type": ["string", "null"], "maxLength": 200 }, "addressLine2": { "type": ["string", "null"], "maxLength": 200 },
+        "city": { "type": ["string", "null"], "maxLength": 120 }, "region": { "type": ["string", "null"], "maxLength": 120 },
+        "postcode": { "type": ["string", "null"], "maxLength": 32 }, "country": { "type": ["string", "null"], "maxLength": 2 },
+        "timezone": { "type": ["string", "null"], "maxLength": 80 }, "addressRevision": { "type": "integer", "minimum": 0 },
+        "addressDigest": { "type": "string", "pattern": "^[a-f0-9]{64}$" }
+      }, "additionalProperties": false
+    },
+    "customerHomeClaimSetupRequest": {
+      "type": "object", "required": ["expectedRevision", "step", "mutation"],
+      "properties": {
+        "expectedRevision": { "type": "integer", "minimum": 0 },
+        "step": { "enum": ["PROFILE", "ADDRESS", "ADDRESS_CONFIRMATION", "POLICY"] },
+        "mutation": { "type": "object" }
+      },
+      "oneOf": [
+        { "properties": { "step": { "const": "PROFILE" }, "mutation": { "type": "object", "required": ["displayName", "username"], "properties": { "displayName": { "type": "string", "minLength": 1, "maxLength": 160 }, "username": { "type": "string", "minLength": 1, "maxLength": 80 } }, "additionalProperties": false } } },
+        { "properties": { "step": { "const": "ADDRESS" }, "mutation": { "type": "object", "required": ["addressLine1", "addressLine2", "city", "region", "postcode", "country", "timezone"], "properties": { "addressLine1": { "type": "string", "minLength": 1, "maxLength": 200 }, "addressLine2": { "type": "string", "maxLength": 200 }, "city": { "type": "string", "minLength": 1, "maxLength": 120 }, "region": { "type": "string", "maxLength": 120 }, "postcode": { "type": "string", "minLength": 1, "maxLength": 32 }, "country": { "type": "string", "pattern": "^[A-Z]{2}$" }, "timezone": { "type": "string", "minLength": 1, "maxLength": 80 } }, "additionalProperties": false } } },
+        { "properties": { "step": { "const": "ADDRESS_CONFIRMATION" }, "mutation": { "type": "object", "required": ["addressRevision", "addressDigest"], "properties": { "addressRevision": { "type": "integer", "minimum": 0 }, "addressDigest": { "type": "string", "pattern": "^[a-f0-9]{64}$" } }, "additionalProperties": false } } },
+        { "properties": { "step": { "const": "POLICY" }, "mutation": { "type": "object", "required": ["policyVersion", "contentSha256", "accepted"], "properties": { "policyVersion": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,79}$" }, "contentSha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" }, "accepted": { "const": true } }, "additionalProperties": false } } }
+      ],
+      "additionalProperties": false
+    },
+    "customerHomeClaimSetupReceipt": {
+      "type": "object", "required": ["schemaVersion", "ok", "claimId", "step", "expiresAt", "revision"],
+      "properties": { "schemaVersion": { "const": "dinodia.v1" }, "ok": { "const": true }, "claimId": { "$ref": "#/$defs/id" }, "step": { "enum": ["PROFILE", "ADDRESS", "ADDRESS_CONFIRMATION", "POLICY"] }, "expiresAt": { "$ref": "#/$defs/timestamp" }, "revision": { "type": "integer", "minimum": 0 } },
+      "additionalProperties": false
+    },
+    "customerHomeClaimCompleteRequest": {
+      "type": "object", "required": ["expectedRevision", "idempotencyKey"],
+      "properties": { "expectedRevision": { "type": "integer", "minimum": 0 }, "idempotencyKey": { "type": "string", "minLength": 16, "maxLength": 160, "pattern": "^[A-Za-z0-9._:-]{16,160}$" } },
+      "additionalProperties": false
+    },
+    "customerHomeClaimCompleteReceipt": {
+      "type": "object", "required": ["schemaVersion", "ok", "claimId", "state", "idempotentReplay", "postcode"],
+      "properties": { "schemaVersion": { "const": "dinodia.v1" }, "ok": { "const": true }, "claimId": { "$ref": "#/$defs/id" }, "state": { "const": "PENDING_INSTALLATION" }, "idempotentReplay": { "type": "boolean" }, "postcode": { "type": ["string", "null"], "maxLength": 32 } },
+      "additionalProperties": false
+    },
+    "ownershipTransferStatus": {
+      "type": "object", "required": ["schemaVersion", "homeId", "managementRevision", "activeTransfer"],
+      "properties": {
+        "schemaVersion": { "const": "dinodia.v1" }, "homeId": { "$ref": "#/$defs/id" },
+        "managementRevision": { "type": "integer", "minimum": 1 },
+        "activeTransfer": { "anyOf": [{ "$ref": "#/$defs/ownershipTransferSummary" }, { "type": "null" }] }
+      }, "additionalProperties": false
+    },
+    "ownershipTransferSummary": {
+      "type": "object", "required": ["transferId", "state", "createdAt", "updatedAt", "reference", "recipientEmail", "emailDeliveryStatus", "expiresAt"],
+      "properties": {
+        "transferId": { "$ref": "#/$defs/id" }, "state": { "const": "PENDING" },
+        "createdAt": { "$ref": "#/$defs/timestamp" }, "updatedAt": { "$ref": "#/$defs/timestamp" },
+        "reference": { "type": "string", "pattern": "^dno_transfer_[0-9a-f-]{36}_[A-Za-z0-9_-]{40,64}$" },
+        "recipientEmail": { "type": "string", "format": "email", "maxLength": 320 },
+        "emailDeliveryStatus": { "enum": ["PENDING", "ACCEPTED", "FAILED"] }, "expiresAt": { "type": "null" }
+      }, "additionalProperties": false
+    },
+    "ownershipTransferStartRequest": {
+      "type": "object", "required": ["action", "recipientEmail", "expectedManagementRevision", "proof", "idempotencyKey"],
+      "properties": {
+        "action": { "const": "START" }, "recipientEmail": { "type": "string", "format": "email", "maxLength": 320 },
+        "expectedManagementRevision": { "type": "integer", "minimum": 1 },
+        "proof": { "type": "string", "minLength": 40, "maxLength": 8192 },
+        "idempotencyKey": { "type": "string", "pattern": "^[A-Za-z0-9._:-]{16,160}$", "minLength": 16, "maxLength": 160 }
+      }, "additionalProperties": false
+    },
+    "ownershipTransferCancelRequest": {
+      "type": "object", "required": ["action", "transferId", "expectedTransferUpdatedAt", "proof", "idempotencyKey"],
+      "properties": {
+        "action": { "const": "CANCEL" }, "transferId": { "$ref": "#/$defs/id" },
+        "expectedTransferUpdatedAt": { "$ref": "#/$defs/timestamp" },
+        "proof": { "type": "string", "minLength": 40, "maxLength": 8192 },
+        "idempotencyKey": { "type": "string", "pattern": "^[A-Za-z0-9._:-]{16,160}$", "minLength": 16, "maxLength": 160 }
+      }, "additionalProperties": false
+    },
+    "ownershipTransferResolveRequest": {
+      "type": "object", "required": ["reference", "idempotencyKey"],
+      "properties": {
+        "reference": { "type": "string", "minLength": 32, "maxLength": 160, "pattern": "^(?:dno_transfer_[0-9a-f-]{36}_[A-Za-z0-9_-]{40,64}|DNO-HOME-[A-Za-z0-9_-]{32,64})$" },
+        "idempotencyKey": { "type": "string", "pattern": "^[A-Za-z0-9._:-]{16,160}$", "minLength": 16, "maxLength": 160 },
+        "resolverProof": { "$ref": "#/$defs/customerHomeClaimResolverProof" }
+      }, "oneOf": [
+        { "properties": { "reference": { "pattern": "^dno_transfer_" } }, "not": { "required": ["resolverProof"] } },
+        { "required": ["resolverProof"], "properties": { "reference": { "pattern": "^DNO-HOME-" } } }
+      ], "additionalProperties": false
+    },
+    "ownershipTransferStartReceipt": {
+      "type": "object", "required": ["schemaVersion", "ok", "transferId", "reference", "state", "emailDeliveryStatus", "idempotentReplay"],
+      "properties": {
+        "schemaVersion": { "const": "dinodia.v1" }, "ok": { "const": true }, "transferId": { "$ref": "#/$defs/id" },
+        "reference": { "type": "string", "pattern": "^dno_transfer_[0-9a-f-]{36}_[A-Za-z0-9_-]{40,64}$" },
+        "state": { "const": "PENDING" }, "emailDeliveryStatus": { "enum": ["PENDING", "ACCEPTED", "FAILED"] },
+        "idempotentReplay": { "type": "boolean" }
+      }, "additionalProperties": false
+    },
+    "ownershipTransferCancelReceipt": {
+      "type": "object", "required": ["schemaVersion", "ok", "transferId", "state", "idempotentReplay"],
+      "properties": { "schemaVersion": { "const": "dinodia.v1" }, "ok": { "const": true }, "transferId": { "$ref": "#/$defs/id" }, "state": { "const": "CANCELLED" }, "idempotentReplay": { "type": "boolean" } },
+      "additionalProperties": false
+    },
+    "ownershipTransferResolveReceipt": {
+      "type": "object", "required": ["schemaVersion", "ok", "transferId", "homeId", "homeMembershipId", "state", "idempotentReplay"],
+      "properties": {
+        "schemaVersion": { "const": "dinodia.v1" }, "ok": { "const": true }, "transferId": { "$ref": "#/$defs/id" },
+        "homeId": { "$ref": "#/$defs/id" }, "homeMembershipId": { "$ref": "#/$defs/id" },
+        "state": { "const": "TRANSFERRED" }, "idempotentReplay": { "type": "boolean" }
+      }, "additionalProperties": false
+    },
+    "homeDeregistrationEffects": {
+      "type": "object", "required": ["activeMembershipsRemoved", "pendingInvitationsCancelled", "invitationRecordsPurged", "pendingRoomRequestsCancelled", "supportAccessRevoked", "privateDevicesRemoved", "permanentDevicesPreserved", "areasPreserved", "inProgressInstallationWorkPreserved", "hubCleanupGeneration"],
+      "properties": {
+        "activeMembershipsRemoved": { "type": "integer", "minimum": 1 },
+        "pendingInvitationsCancelled": { "type": "integer", "minimum": 0 },
+        "invitationRecordsPurged": { "type": "integer", "minimum": 0 },
+        "pendingRoomRequestsCancelled": { "type": "integer", "minimum": 0 },
+        "supportAccessRevoked": { "type": "integer", "minimum": 0 },
+        "privateDevicesRemoved": { "type": "integer", "minimum": 0 },
+        "permanentDevicesPreserved": { "type": "integer", "minimum": 0 },
+        "areasPreserved": { "type": "integer", "minimum": 0 },
+        "inProgressInstallationWorkPreserved": { "type": "integer", "minimum": 0 },
+        "hubCleanupGeneration": { "type": "integer", "minimum": 1 }
+      }, "additionalProperties": false
+    },
+    "homeDeregistrationPreview": {
+      "type": "object", "required": ["schemaVersion", "ok", "homeId", "managementRevision", "state", "actionAvailable", "retainedAddress", "retainsTimezone", "effects", "warning"],
+      "properties": {
+        "schemaVersion": { "const": "dinodia.v1" }, "ok": { "const": true }, "homeId": { "$ref": "#/$defs/id" },
+        "managementRevision": { "type": "integer", "minimum": 1 }, "state": { "const": "PREVIEW" },
+        "actionAvailable": { "type": "boolean" }, "retainedAddress": { "type": ["string", "null"], "maxLength": 1000 },
+        "retainsTimezone": { "type": "boolean" }, "effects": { "$ref": "#/$defs/homeDeregistrationEffects" },
+        "warning": { "type": "string", "minLength": 1, "maxLength": 1000 }
+      }, "additionalProperties": false
+    },
+    "homeDeregistrationRequest": {
+      "type": "object", "required": ["expectedManagementRevision", "confirmation", "proof", "idempotencyKey"],
+      "properties": {
+        "expectedManagementRevision": { "type": "integer", "minimum": 1 },
+        "confirmation": { "const": "DEREGISTER FULL HOME" },
+        "proof": { "type": "string", "minLength": 40, "maxLength": 8192 },
+        "idempotencyKey": { "type": "string", "pattern": "^[A-Za-z0-9._:-]{16,160}$", "minLength": 16, "maxLength": 160 }
+      }, "additionalProperties": false
+    },
+    "homeDeregistrationReceipt": {
+      "type": "object", "required": ["schemaVersion", "ok", "homeId", "state", "managementRevision", "cleanupGeneration", "hubEnforcement", "removedMembershipCount", "accountsQueuedForCleanup", "accountCleanupState", "accountCleanupProcessed", "idempotentReplay"],
+      "properties": {
+        "schemaVersion": { "const": "dinodia.v1" }, "ok": { "const": true }, "homeId": { "$ref": "#/$defs/id" },
+        "state": { "const": "WAITING_FOR_HUB_CLEANUP" }, "managementRevision": { "type": "integer", "minimum": 2 },
+        "cleanupGeneration": { "type": "integer", "minimum": 1 }, "hubEnforcement": { "const": "PENDING" },
+        "removedMembershipCount": { "type": "integer", "minimum": 1 }, "accountsQueuedForCleanup": { "type": "integer", "minimum": 1 },
+        "accountCleanupState": { "enum": ["PENDING", "COMPLETE", "ATTENTION_REQUIRED"] },
+        "accountCleanupProcessed": { "type": "integer", "minimum": 0 }, "idempotentReplay": { "type": "boolean" }
+      }, "additionalProperties": false
+    },
+    "apnsRegistrationRequest": {
+      "type": "object", "required": ["deviceToken", "environment"],
+      "properties": { "deviceToken": { "type": "string", "minLength": 64, "maxLength": 512, "pattern": "^(?:[A-Fa-f0-9]{2}){32,256}$" }, "environment": { "enum": ["DEVELOPMENT", "PRODUCTION"] } },
+      "additionalProperties": false
+    },
+    "apnsRegistrationReceipt": {
+      "type": "object", "required": ["schemaVersion", "ok", "trustedDeviceId", "revision", "state", "idempotentReplay"],
+      "properties": { "schemaVersion": { "const": "dinodia.v1" }, "ok": { "const": true }, "trustedDeviceId": { "type": "string", "format": "uuid" }, "revision": { "type": "integer", "minimum": 0 }, "state": { "enum": ["ENABLED", "DISABLED"] }, "idempotentReplay": { "type": "boolean" } },
+      "additionalProperties": false
+    },
+    "notificationPreferences": {
+      "type": "object", "required": ["version", "enabledFamilies"],
+      "properties": { "version": { "const": 1 }, "enabledFamilies": { "type": "array", "maxItems": 6, "uniqueItems": true, "items": { "type": "string", "minLength": 1, "maxLength": 80 } } },
+      "additionalProperties": false
+    },
+    "managerNotificationAssignment": {
+      "type": "object", "required": ["version", "assignments"],
+      "properties": { "version": { "const": 1 }, "assignments": { "type": "array", "maxItems": 100, "uniqueItems": true, "items": { "type": "object", "required": ["membershipId", "enabledFamilies"], "properties": { "membershipId": { "type": "string", "format": "uuid" }, "enabledFamilies": { "type": "array", "maxItems": 6, "uniqueItems": true, "items": { "type": "string", "minLength": 1, "maxLength": 80 } } }, "additionalProperties": false } } },
+      "additionalProperties": false
+    },
+    "homeownerTenantAreaGrantsRequest": {
+      "type": "object", "required": ["areaIds", "expectedAccessRevision", "expectedManagementRevision", "proof"],
+      "properties": {
+        "areaIds": { "type": "array", "maxItems": 64, "uniqueItems": true, "items": { "$ref": "#/$defs/id" } },
+        "expectedAccessRevision": { "type": "integer", "minimum": 0 },
+        "expectedManagementRevision": { "type": "integer", "minimum": 1 },
+        "proof": { "type": "string", "minLength": 32, "maxLength": 16384 }
+      }, "additionalProperties": false
+    },
+    "homeownerTenantAreaGrantsReceipt": {
+      "type": "object", "required": ["schemaVersion", "ok", "homeId", "tenantMembershipId", "areaIds", "changed", "managementRevision", "accessRevision", "decommissionTombstoneCount"],
+      "properties": {
+        "schemaVersion": { "const": "dinodia.v1" }, "ok": { "const": true },
+        "homeId": { "$ref": "#/$defs/id" }, "tenantMembershipId": { "$ref": "#/$defs/id" },
+        "areaIds": { "type": "array", "maxItems": 64, "uniqueItems": true, "items": { "$ref": "#/$defs/id" } },
+        "changed": { "type": "boolean" }, "managementRevision": { "type": "integer", "minimum": 1 },
+        "accessRevision": { "type": "integer", "minimum": 0 }, "decommissionTombstoneCount": { "type": "integer", "minimum": 0 }
+      }, "additionalProperties": false
+    },
+    "homeownerTenantRemovalRequest": {
+      "type": "object", "required": ["expectedAccessRevision", "expectedManagementRevision", "proof", "idempotencyKey"],
+      "properties": {
+        "expectedAccessRevision": { "type": "integer", "minimum": 0 },
+        "expectedManagementRevision": { "type": "integer", "minimum": 1 },
+        "proof": { "type": "string", "minLength": 32, "maxLength": 16384 },
+        "idempotencyKey": { "type": "string", "minLength": 16, "maxLength": 160, "pattern": "^[A-Za-z0-9._:-]+$" }
+      }, "additionalProperties": false
+    },
+    "homeownerTenantRemovalReceipt": {
+      "type": "object", "required": ["schemaVersion", "ok", "homeId", "tenantMembershipId", "state", "managementRevision", "accessRevision", "hubEnforcement", "idempotentReplay"],
+      "properties": {
+        "schemaVersion": { "const": "dinodia.v1" }, "ok": { "const": true },
+        "homeId": { "$ref": "#/$defs/id" }, "tenantMembershipId": { "$ref": "#/$defs/id" }, "state": { "const": "REMOVED" },
+        "managementRevision": { "type": "integer", "minimum": 1 }, "accessRevision": { "type": "integer", "minimum": 1 },
+        "hubEnforcement": { "const": "PENDING" }, "idempotentReplay": { "type": "boolean" }
+      }, "additionalProperties": false
+    },
+    "homeownerManagementOperationReceiptRequest": {
+      "oneOf": [
+        { "type": "object", "required": ["operationKind", "idempotencyKey", "expectedAccessRevision", "expectedManagementRevision", "areaIds"],
+          "properties": { "operationKind": { "const": "tenant_area_grants_replace" },
+            "idempotencyKey": { "type": "string", "minLength": 16, "maxLength": 160, "pattern": "^[A-Za-z0-9._:-]+$" },
+            "expectedAccessRevision": { "type": "integer", "minimum": 0 }, "expectedManagementRevision": { "type": "integer", "minimum": 1 },
+            "areaIds": { "type": "array", "maxItems": 64, "uniqueItems": true, "items": { "$ref": "#/$defs/id" } } }, "additionalProperties": false },
+        { "type": "object", "required": ["operationKind", "idempotencyKey", "expectedAccessRevision", "expectedManagementRevision"],
+          "properties": { "operationKind": { "const": "home_tenant_remove" },
+            "idempotencyKey": { "type": "string", "minLength": 16, "maxLength": 160, "pattern": "^[A-Za-z0-9._:-]+$" },
+            "expectedAccessRevision": { "type": "integer", "minimum": 0 }, "expectedManagementRevision": { "type": "integer", "minimum": 1 } }, "additionalProperties": false }
+      ]
+    },
+    "homeownerManagementOperationReceipt": {
+      "oneOf": [
+        { "type": "object", "required": ["schemaVersion", "ok", "status", "operationKind"],
+          "properties": { "schemaVersion": { "const": "dinodia.v1" }, "ok": { "const": true }, "status": { "const": "NOT_FOUND" },
+            "operationKind": { "enum": ["tenant_area_grants_replace", "home_tenant_remove"] } }, "additionalProperties": false },
+        { "type": "object", "required": ["schemaVersion", "ok", "status", "operationKind", "receipt"],
+          "properties": { "schemaVersion": { "const": "dinodia.v1" }, "ok": { "const": true }, "status": { "const": "COMMITTED" },
+            "operationKind": { "const": "tenant_area_grants_replace" }, "receipt": { "$ref": "#/$defs/homeownerTenantAreaGrantsReceipt" } }, "additionalProperties": false },
+        { "type": "object", "required": ["schemaVersion", "ok", "status", "operationKind", "receipt"],
+          "properties": { "schemaVersion": { "const": "dinodia.v1" }, "ok": { "const": true }, "status": { "const": "COMMITTED" },
+            "operationKind": { "const": "home_tenant_remove" }, "receipt": { "$ref": "#/$defs/homeownerTenantRemovalReceipt" } }, "additionalProperties": false }
+      ]
+    },
+    "homeownerManagerRemovalRequest": {
+      "type": "object", "required": ["expectedManagementRevision", "proof", "idempotencyKey"],
+      "properties": {
+        "expectedManagementRevision": { "type": "integer", "minimum": 1 },
+        "proof": { "type": "string", "minLength": 32, "maxLength": 16384 },
+        "idempotencyKey": { "type": "string", "minLength": 16, "maxLength": 160, "pattern": "^[A-Za-z0-9._:-]+$" }
+      }, "additionalProperties": false
+    },
+    "homeownerManagerRemovalReceipt": {
+      "type": "object", "required": ["schemaVersion", "ok", "homeId", "managerMembershipId", "state", "managementRevision", "idempotentReplay"],
+      "properties": {
+        "schemaVersion": { "const": "dinodia.v1" }, "ok": { "const": true },
+        "homeId": { "$ref": "#/$defs/id" }, "managerMembershipId": { "$ref": "#/$defs/id" }, "state": { "const": "REMOVED" },
+        "managementRevision": { "type": "integer", "minimum": 1 }, "idempotentReplay": { "type": "boolean" }
+      }, "additionalProperties": false
+    },
+    "homeownerManagementActivityItem": {
+      "type": "object", "required": ["id", "occurredAt", "activity", "actor", "target"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" }, "occurredAt": { "$ref": "#/$defs/timestamp" },
+        "activity": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "actor": { "type": "string", "minLength": 1, "maxLength": 160 },
+        "target": { "type": "string", "minLength": 1, "maxLength": 80 }
+      }, "additionalProperties": false
+    },
+    "homeownerManagementActivityPage": {
+      "type": "object", "required": ["schemaVersion", "ok", "homeId", "items", "nextCursor", "retentionStartAt", "asOf"],
+      "properties": {
+        "schemaVersion": { "const": "dinodia.v1" }, "ok": { "const": true }, "homeId": { "$ref": "#/$defs/id" },
+        "items": { "type": "array", "maxItems": 100, "items": { "$ref": "#/$defs/homeownerManagementActivityItem" } },
+        "nextCursor": { "type": ["string", "null"], "maxLength": 256, "pattern": "^[A-Za-z0-9_-]*$" },
+        "retentionStartAt": { "$ref": "#/$defs/timestamp" }, "asOf": { "$ref": "#/$defs/timestamp" }
+      }, "additionalProperties": false
+    },
+    "quietHoursPreference": {
+      "type": "object", "required": ["version", "enabled", "startLocalTime", "endLocalTime", "timeZone", "days"],
+      "properties": { "version": { "const": 1 }, "enabled": { "type": "boolean" }, "startLocalTime": { "type": "string", "pattern": "^([01][0-9]|2[0-3]):[0-5][0-9]$" }, "endLocalTime": { "type": "string", "pattern": "^([01][0-9]|2[0-3]):[0-5][0-9]$" }, "timeZone": { "type": "string", "minLength": 1, "maxLength": 64 }, "days": { "type": "array", "uniqueItems": true, "items": { "type": "integer", "minimum": 1, "maximum": 7 } } },
+      "additionalProperties": false
+    },
+    "tenantDeviceContext": {
+      "type": "object", "required": ["schemaVersion", "ok", "revision", "home", "tenant", "membership", "areaAccess", "areaOverrides", "areaGroups", "deviceOverrides", "preferences", "layout", "recovery", "pendingRemovals", "hubSync"],
+      "properties": {
+        "schemaVersion": { "const": "dinodia.v1" }, "ok": { "const": true },
+        "revision": { "type": "object", "required": ["streamId", "sequence"], "properties": { "streamId": { "$ref": "#/$defs/id" }, "sequence": { "type": "integer", "minimum": 0 } }, "additionalProperties": false },
+        "home": { "type": "object", "required": ["id", "postcode"], "properties": { "id": { "$ref": "#/$defs/id" }, "postcode": { "type": ["string", "null"], "maxLength": 24 } }, "additionalProperties": false },
+        "tenant": { "type": "object", "required": ["id", "name", "username"], "properties": { "id": { "$ref": "#/$defs/id" }, "name": { "type": "string", "maxLength": 160 }, "username": { "type": "string", "maxLength": 80 } }, "additionalProperties": false },
+        "membership": { "type": "object", "required": ["membershipId", "homeId", "role", "status", "revision"], "properties": { "membershipId": { "$ref": "#/$defs/id" }, "homeId": { "$ref": "#/$defs/id" }, "role": { "const": "tenant" }, "status": { "const": "active" }, "revision": { "type": "integer", "minimum": 1 } }, "additionalProperties": false },
+        "areaAccess": { "type": "array", "uniqueItems": true, "items": { "type": "object", "required": ["areaId"], "properties": { "areaId": { "$ref": "#/$defs/id" } }, "additionalProperties": false } },
+        "areaOverrides": { "type": "array", "items": { "type": "object", "required": ["areaId", "originalName", "overrideName"], "properties": { "areaId": { "$ref": "#/$defs/id" }, "originalName": { "type": "string", "minLength": 1, "maxLength": 80 }, "overrideName": { "type": ["string", "null"], "maxLength": 80 } }, "additionalProperties": false } },
+        "areaGroups": { "type": "array", "items": { "type": "object", "required": ["name", "areaIds"], "properties": { "name": { "type": "string", "minLength": 1, "maxLength": 80 }, "areaIds": { "type": "array", "minItems": 2, "uniqueItems": true, "items": { "$ref": "#/$defs/id" } } }, "additionalProperties": false } },
+        "deviceOverrides": { "type": "array", "items": { "$ref": "#/$defs/tenantDeviceOverride" } },
+        "preferences": { "type": "object", "required": ["layoutRevision"], "properties": { "layoutRevision": { "type": "integer", "minimum": 0 } }, "additionalProperties": false },
+        "layout": { "type": "object", "required": ["revision", "document", "updatedAt"], "properties": { "revision": { "type": "integer", "minimum": 0 }, "document": { "$ref": "#/$defs/tenantDashboardLayout" }, "updatedAt": { "type": ["string", "null"], "format": "date-time" } }, "additionalProperties": false },
+        "recovery": { "type": "array", "items": { "type": "object", "required": ["deviceId", "displayName", "expiresAt"], "properties": { "deviceId": { "$ref": "#/$defs/id" }, "displayName": { "type": "string", "maxLength": 160 }, "expiresAt": { "$ref": "#/$defs/timestamp" } }, "additionalProperties": false } },
+        "pendingRemovals": { "type": "array", "items": { "$ref": "#/$defs/tenantDevicePendingRemoval" } },
+        "hubSync": { "oneOf": [{ "$ref": "#/$defs/tenantHubSync" }, { "type": "null" }] }
+      }, "additionalProperties": false
+    },
+    "tenantDeviceOverride": {
+      "type": "object", "required": ["id", "osDeviceId", "inventoryRevision", "descriptorRevision", "managementClass", "ownerMembershipId", "areaIds", "overrideName", "customerLabel", "canManage", "canRename", "canRelabel", "canMove", "canRemove"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" }, "osDeviceId": { "$ref": "#/$defs/id" },
+        "inventoryRevision": { "type": "integer", "minimum": 1 }, "descriptorRevision": { "type": "integer", "minimum": 0 },
+        "managementClass": { "enum": ["tenant_device", "property_device"] }, "ownerMembershipId": { "type": ["string", "null"], "maxLength": 160 },
+        "areaIds": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/$defs/id" } },
+        "overrideName": { "type": ["string", "null"], "maxLength": 80 }, "customerLabel": { "type": ["string", "null"], "maxLength": 40 },
+        "canManage": { "type": "boolean" }, "canRename": { "type": "boolean" }, "canRelabel": { "type": "boolean" }, "canMove": { "type": "boolean" }, "canRemove": { "type": "boolean" }
+      }, "additionalProperties": false
+    },
+    "tenantDashboardLayout": {
+      "type": "object", "required": ["version", "tiles"],
+      "properties": {
+        "version": { "const": 1 },
+        "tiles": { "type": "array", "maxItems": 500, "items": { "type": "object", "required": ["deviceId", "size"], "properties": { "deviceId": { "$ref": "#/$defs/id" }, "size": { "enum": ["MINI", "SMALL", "MEDIUM", "LARGE", "COMPACT", "STANDARD"] }, "position": { "type": "integer", "minimum": 0, "maximum": 499 }, "label": { "type": "string", "minLength": 1, "maxLength": 40 } }, "additionalProperties": false } },
+        "labelColours": { "type": "object", "maxProperties": 64, "propertyNames": { "minLength": 1, "maxLength": 40, "pattern": "^\\S(?:.*\\S)?$" }, "additionalProperties": { "type": "string", "pattern": "^#[0-9A-Fa-f]{6}$" } }
+      }, "additionalProperties": false
+    },
+    "tenantDevicePresentationMutationRequest": {
+      "oneOf": [
+        { "type": "object", "required": ["action", "expectedInventoryRevision", "overrideName"], "properties": { "action": { "const": "rename" }, "expectedInventoryRevision": { "type": "integer", "minimum": 1 }, "overrideName": { "type": ["string", "null"], "maxLength": 80 } }, "additionalProperties": false },
+        { "type": "object", "required": ["action", "expectedInventoryRevision", "customerLabel"], "properties": { "action": { "const": "relabel" }, "expectedInventoryRevision": { "type": "integer", "minimum": 1 }, "customerLabel": { "type": ["string", "null"], "maxLength": 40 } }, "additionalProperties": false },
+        { "type": "object", "required": ["action", "expectedInventoryRevision", "areaId"], "properties": { "action": { "const": "move" }, "expectedInventoryRevision": { "type": "integer", "minimum": 1 }, "areaId": { "$ref": "#/$defs/id" } }, "additionalProperties": false }
+      ]
+    },
+    "tenantDeviceRemovalRequest": {
+      "type": "object", "required": ["expectedDescriptorRevision", "expectedInventoryRevision", "proof"],
+      "properties": { "expectedDescriptorRevision": { "type": "integer", "minimum": 1 }, "expectedInventoryRevision": { "type": "integer", "minimum": 1 }, "proof": { "type": "string", "minLength": 40, "maxLength": 8192 } }, "additionalProperties": false
+    },
+    "tenantDeviceMutationReceipt": {
+      "type": "object", "required": ["schemaVersion", "ok", "homeId", "deviceId", "action", "inventoryRevision"],
+      "properties": { "schemaVersion": { "const": "dinodia.v1" }, "ok": { "const": true }, "homeId": { "$ref": "#/$defs/id" }, "deviceId": { "$ref": "#/$defs/id" }, "action": { "enum": ["rename", "relabel", "move"] }, "inventoryRevision": { "type": "integer", "minimum": 1 }, "areaId": { "$ref": "#/$defs/id" }, "hubEnforcement": { "enum": ["PENDING", "ENFORCED"] } }, "additionalProperties": false
+    },
+    "tenantDeviceRemovalReceipt": {
+      "type": "object", "required": ["schemaVersion", "ok", "homeId", "deviceId", "osDeviceId", "state", "inventoryRevision", "hubEnforcement"],
+      "properties": { "schemaVersion": { "const": "dinodia.v1" }, "ok": { "const": true }, "homeId": { "$ref": "#/$defs/id" }, "deviceId": { "$ref": "#/$defs/id" }, "osDeviceId": { "$ref": "#/$defs/id" }, "state": { "enum": ["REMOVAL_PENDING", "REMOVED"] }, "inventoryRevision": { "type": "integer", "minimum": 1 }, "hubEnforcement": { "enum": ["PENDING", "ENFORCED"] } }, "additionalProperties": false
+    },
+    "tenantDevicePendingRemoval": {
+      "type": "object", "required": ["deviceId", "displayName", "requestedAt"], "properties": { "deviceId": { "$ref": "#/$defs/id" }, "displayName": { "type": "string", "maxLength": 160 }, "requestedAt": { "type": ["string", "null"], "format": "date-time" } }, "additionalProperties": false
+    },
+    "tenantHubSync": {
+      "type": "object", "required": ["configurationRevision", "appliedRevision", "lastSuccessfulSyncAt", "lastErrorCode"],
+      "properties": { "configurationRevision": { "type": "integer", "minimum": 0 }, "appliedRevision": { "type": "integer", "minimum": 0 }, "lastSuccessfulSyncAt": { "type": ["string", "null"], "format": "date-time" }, "lastErrorCode": { "type": ["string", "null"], "maxLength": 80 } }, "additionalProperties": false
+    },
+    "uiState": { "enum": ["restoring_session", "loading", "ready", "empty", "stale", "offline", "denied", "expired", "uncertain", "maintenance", "error"] },
+    "error": {
+      "type": "object",
+      "required": ["error"],
+      "properties": {
+        "error": {
+          "type": "object",
+          "required": ["code", "message", "requestId"],
+          "properties": {
+            "code": {
+              "enum": [
+                "AUTH_REQUIRED",
+                "TOKEN_EXPIRED",
+                "CUSTOMER_ACCESS_EXPIRED",
+                "EMAIL_VERIFICATION_REQUIRED",
+                "ROOM_ACCESS_HOME_NOT_READY",
+                "STEP_UP_REQUIRED",
+                "STEP_UP_FAILED",
+                "SCOPE_DENIED",
+                "HOME_MISMATCH",
+                "AREA_DENIED",
+                "NOT_DEVICE_OWNER",
+                "PERMANENT_DEVICE_IMMUTABLE",
+                "RESOURCE_NOT_FOUND",
+                "IDEMPOTENCY_CONFLICT",
+                "REVISION_CONFLICT",
+                "FINAL_RELATIONSHIP_CONFIRMATION_REQUIRED",
+                "CATALOG_REVISION_MISMATCH",
+                "CONTROL_REMOVED",
+                "VALIDATION_FAILED",
+                "DEVICE_OFFLINE",
+                "CONTROL_UNAVAILABLE",
+                "COMMAND_UNCERTAIN",
+                "HUB_UNAVAILABLE",
+                "UNSUPPORTED_CAPABILITY",
+                "UPDATE_REQUIRED",
+                "RATE_LIMITED",
+                "PAIRING_NOT_ADVERTISED",
+                "PAIRING_EXPIRED",
+                "PAIRING_USED",
+                "HARDWARE_IDENTITY_INVALID",
+                "PAIRING_PROOF_FAILED",
+                "CLOUDURL_NOT_REPORTED",
+                "CLOUDURL_UNVERIFIED",
+                "TUNNEL_IDENTITY_MISMATCH",
+                "SUPPORT_TICKET_CLOSED",
+                "SUPPORT_APPROVAL_REQUIRED",
+                "SUPPORT_CODE_EXPIRED",
+                "SUPPORT_CODE_USED",
+                "SUPPORT_EMPLOYEE_MISMATCH",
+                "SUPPORT_SCOPE_CHANGED",
+                "SUPPORT_REMOTE_UNAVAILABLE",
+                "FEATURE_NOT_ENABLED",
+                "INTERNAL_ERROR",
+                "AUTOMATION_INVALID",
+                "AUTOMATION_TRIGGER_INVALID",
+                "AUTOMATION_ACTIONS_INVALID",
+                "AUTOMATION_ACTION_INVALID",
+                "AUTOMATION_ACTION_DUPLICATE",
+                "AUTOMATION_SCOPE_DENIED",
+                "AUTOMATION_DESCRIPTOR_STALE",
+                "AUTOMATION_CONTROL_APP_ONLY",
+                "AUTOMATION_CONTROL_UNAVAILABLE",
+                "AUTOMATION_CONFLICT",
+                "AUTOMATION_NOT_FOUND",
+                "AUTOMATION_REVISION_CONFLICT",
+                "AUTOMATION_IDEMPOTENCY_CONFLICT"
+              ]
+            },
+            "message": { "type": "string", "maxLength": 240 },
+            "requestId": { "$ref": "#/$defs/id" },
+            "retryable": { "type": "boolean" }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

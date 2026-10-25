@@ -1,0 +1,2892 @@
+openapi: 3.1.0
+info:
+  title: Dinodia Native V2 API Contract
+  version: dinodia.v1
+  description: >-
+    Contract-only route catalogue for Native V2. Implementations must enforce current
+    authenticated membership and descriptor authority; this document does not grant access.
+servers:
+  - url: https://dinodia-platform-v2.vercel.app
+    description: Canonical Platform origin; tenant live commands use the selected hub BaseURL or verified CloudURL.
+security:
+  - CustomerBearer: []
+tags:
+  - name: Session
+  - name: Home
+  - name: Devices
+  - name: Account
+  - name: Notifications
+  - name: Support
+paths:
+  /api/v2/auth/session:
+    get:
+      summary: "Restore Customer Session"
+      operationId: restoreCustomerSession
+      tags: [Session]
+      security: [{ CustomerSessionCookie: [] }]
+      responses:
+        "200":
+          {
+            description: Restored account-global context and active memberships; no home is selected and no hub bearer is issued,
+            content:
+              {
+                application/json:
+                  { schema: { $ref: "./contract.json#/$defs/accountSessionContext" } },
+              },
+          }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+    post:
+      summary: "Create Customer Session"
+      operationId: createCustomerSession
+      tags: [Session]
+      security: []
+      requestBody:
+        required: true
+        content:
+          {
+            application/json:
+              {
+                schema: { $ref: "./contract.json#/$defs/customerSessionLoginRequest" },
+              },
+          }
+      responses:
+        "200":
+          description: Customer session established; response metadata contains no session bearer and cookie is HttpOnly.
+          content:
+            application/json:
+              schema: { $ref: "./contract.json#/$defs/customerSessionReceipt" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+    delete:
+      summary: "End Compatibility Customer Session"
+      operationId: endCompatibilityCustomerSession
+      tags: [Session]
+      security: [{ CustomerSessionCookie: [] }]
+      responses:
+        "200":
+          description: Durable customer-session revocation and cookie clearing.
+          content:
+            application/json:
+              schema: { $ref: "./contract.json#/$defs/customerSessionLogoutReceipt" }
+  /api/v2/session:
+    get:
+      summary: "Restore Canonical Account Session"
+      operationId: restoreCanonicalAccountSession
+      tags: [Session]
+      security: [{ CustomerSessionCookie: [] }]
+      responses:
+        "200":
+          {
+            description: Canonical account-global membership context,
+            content:
+              { application/json: { schema: { $ref: "./contract.json#/$defs/accountSessionContext" } } },
+          }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+    post:
+      summary: "Create Canonical Customer Session"
+      operationId: createCanonicalCustomerSession
+      tags: [Session]
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "./contract.json#/$defs/customerSessionLoginRequest" }
+      responses:
+        "200":
+          description: Customer session established with an HttpOnly session cookie; receipt contains no reusable bearer.
+          content:
+            application/json:
+              schema: { $ref: "./contract.json#/$defs/customerSessionReceipt" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+    delete:
+      summary: "End Canonical Customer Session"
+      operationId: endCanonicalCustomerSession
+      tags: [Session]
+      security: [{ CustomerSessionCookie: [] }]
+      responses:
+        "200":
+          description: Durable customer-session revocation.
+          content:
+            application/json:
+              schema: { $ref: "./contract.json#/$defs/customerSessionLogoutReceipt" }
+  /api/v2/session/logout:
+    post:
+      summary: "End Customer Session"
+      operationId: endCustomerSession
+      tags: [Session]
+      security: [{ CustomerSessionCookie: [] }]
+      responses:
+        "200":
+          description: Session revoked and cookie cleared.
+          content:
+            application/json:
+              schema: { $ref: "./contract.json#/$defs/customerSessionLogoutReceipt" }
+  /api/v2/mobile/session:
+    post:
+      summary: "Create or rotate Native Mobile Session"
+      operationId: createOrRotateMobileCustomerSession
+      tags: [Session]
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - { $ref: "./contract.json#/$defs/customerSessionLoginRequest" }
+                - { $ref: "#/components/schemas/CustomerMobileRefreshRequest" }
+      responses:
+        "200": { description: Short-lived access and rotating refresh credentials bound to the same current account, installation and session family; no cookie is issued., content: { application/json: { schema: { $ref: "./contract.json#/$defs/mobileSessionReceipt" } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+  /api/v2/mobile/session/logout:
+    post:
+      summary: "End Native Mobile Installation Session"
+      operationId: logoutMobileCustomerSession
+      tags: [Session]
+      security: [{ MobileAccessBearer: [] }]
+      responses:
+        "200": { description: Revokes current installation sessions and offline grants., content: { application/json: { schema: { $ref: "./contract.json#/$defs/customerSessionLogoutReceipt" } } } }
+  /api/v2/mobile/password/change:
+    post:
+      summary: "Change Customer Password from Native Mobile"
+      operationId: changeMobileCustomerPassword
+      tags: [Session]
+      security: [{ MobileAccessBearer: [] }]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "#/components/schemas/CustomerPasswordChangeRequest" } } } }
+      responses:
+        "200": { description: Rotates both mobile credentials and preserves only the completing installation., content: { application/json: { schema: { $ref: "./contract.json#/$defs/mobileSessionReceipt" } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+  /api/v2/mobile/password/reset:
+    post:
+      summary: "Complete Customer Password Reset from Native Mobile"
+      operationId: resetMobileCustomerPassword
+      tags: [Session]
+      security: []
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "#/components/schemas/CustomerPasswordResetWithDeviceRequest" } } } }
+      responses:
+        "200": { description: Rotates both mobile credentials for the completing installation and revokes other installations., content: { application/json: { schema: { $ref: "./contract.json#/$defs/mobileSessionReceipt" } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /api/v2/auth/challenges/{challengeId}:
+    get:
+      summary: "Read One-Use Customer Authentication Challenge State"
+      operationId: readCustomerAuthenticationChallenge
+      tags: [Session]
+      security: []
+      parameters: [{ name: challengeId, in: path, required: true, schema: { type: string, format: uuid } }]
+      responses:
+        "200": { description: Opaque challenge state only; never reveals whether an account exists., content: { application/json: { schema: { $ref: "#/components/schemas/CustomerAuthChallengeState" } } } }
+  /api/v2/auth/email/resend:
+    post:
+      summary: "Resend Customer Email Verification"
+      operationId: resendCustomerEmailVerification
+      tags: [Session]
+      security: []
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "#/components/schemas/CustomerEmailResendRequest" } } } }
+      responses:
+        "202": { description: Bounded non-enumerating accepted response; delivery is not claimed., content: { application/json: { schema: { $ref: "#/components/schemas/CustomerAuthChallengeReceipt" } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+  /api/v2/auth/email/verify:
+    post:
+      summary: "Verify Customer Email"
+      operationId: verifyCustomerEmail
+      tags: [Session]
+      security: []
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "#/components/schemas/CustomerAuthLinkRequest" } } } }
+      responses:
+        "200":
+          description: Initial verification returns VERIFIED. An authenticated mobile email change returns a rotated mobile session; cookie-backed web completion returns COMPLETED.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - { $ref: "#/components/schemas/CustomerAuthChallengeState" }
+                  - { $ref: "./contract.json#/$defs/mobileSessionReceipt" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "409": { $ref: "#/components/responses/Conflict" }
+  /api/v2/auth/password/change:
+    post:
+      summary: "Change Customer Password"
+      operationId: changeCustomerPassword
+      tags: [Session]
+      security: [{ CustomerSessionCookie: [] }]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "#/components/schemas/CustomerPasswordChangeRequest" } } } }
+      responses:
+        "200": { description: Completing installation receives a rotated session; other installations and offline grants are revoked., content: { application/json: { schema: { $ref: "#/components/schemas/CustomerPasswordChangeReceipt" } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "409": { $ref: "#/components/responses/Conflict" }
+  /api/v2/auth/password/forgot:
+    post:
+      summary: "Request Customer Password Reset"
+      operationId: requestCustomerPasswordReset
+      tags: [Session]
+      security: []
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "#/components/schemas/CustomerPasswordResetRequest" } } } }
+      responses:
+        "202": { description: Non-enumerating bounded response; provider acceptance is not inbox delivery., content: { application/json: { schema: { $ref: "#/components/schemas/CustomerAuthChallengeReceipt" } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+  /api/v2/auth/password/reset:
+    post:
+      summary: "Complete Customer Password Reset"
+      operationId: completeCustomerPasswordReset
+      tags: [Session]
+      security: []
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "#/components/schemas/CustomerPasswordResetCompleteRequest" } } } }
+      responses:
+        "200": { description: One-use reset consumed and other sessions revoked. A device-bound completion may return a rotated current-session receipt; a browser completion requires sign-in., content: { application/json: { schema: { oneOf: [{ $ref: "#/components/schemas/CustomerPasswordResetReceipt" }, { $ref: "#/components/schemas/CustomerPasswordResetSessionReceipt" }] } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "409": { $ref: "#/components/responses/Conflict" }
+  /api/v2/auth/register:
+    post:
+      summary: "Register Customer Account"
+      operationId: registerCustomerAccount
+      tags: [Session]
+      security: []
+      requestBody: { required: true, content: { application/json: { schema: { oneOf: [{ $ref: "#/components/schemas/CustomerRegistrationRequest" }, { $ref: "./contract.json#/$defs/invitedTenantRegistrationRequest" }] } } } }
+      responses:
+        "202": { description: Non-enumerating email-verification challenge receipt; no membership is created., content: { application/json: { schema: { $ref: "#/components/schemas/CustomerAuthChallengeReceipt" } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+  /api/v2/auth/requirements:
+    get:
+      summary: "Read Authenticated Customer Requirements"
+      operationId: readCustomerAuthenticationRequirements
+      tags: [Session]
+      security: [{ CustomerSessionCookie: [] }]
+      responses:
+        "200": { description: Server-declared mandatory account action., content: { application/json: { schema: { $ref: "#/components/schemas/CustomerAuthRequirements" } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /api/v2/auth/policy/acceptance:
+    post:
+      summary: "Accept the Current Account-Global Customer Policy"
+      operationId: acceptCurrentCustomerPolicy
+      tags: [Session]
+      security: [{ CustomerSessionCookie: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "./contract.json#/$defs/customerPolicyAcceptanceRequest" }
+      responses:
+        "200":
+          description: Explicit, idempotent acceptance of the exact server-configured policy text and version.
+          content:
+            application/json:
+              schema: { $ref: "./contract.json#/$defs/customerPolicyAcceptanceReceipt" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+  /api/v2/auth/security/step-up/challenge:
+    post:
+      summary: "Create Account-Scoped Trusted-Device Removal Challenge"
+      operationId: createAccountTrustedDeviceRemovalChallenge
+      tags: [Session]
+      security: [{ CustomerSessionCookie: [] }]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "#/components/schemas/AccountStepUpChallengeRequest" } } } }
+      responses:
+        "200": { description: One-use operation/target-bound challenge., content: { application/json: { schema: { $ref: "#/components/schemas/AccountStepUpChallengeReceipt" } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "409": { $ref: "#/components/responses/Conflict" }
+    delete:
+      summary: "Cancel Account-Scoped Trusted-Device Removal Challenge"
+      operationId: cancelAccountTrustedDeviceRemovalChallenge
+      tags: [Session]
+      security: [{ CustomerSessionCookie: [] }]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [challengeId], properties: { challengeId: { type: string, format: uuid } }, additionalProperties: false } } } }
+      responses:
+        "200": { description: Current unused challenge cancelled., content: { application/json: { schema: { type: object, required: [ok, cancelled], properties: { ok: { const: true }, cancelled: { const: true } }, additionalProperties: false } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "409": { $ref: "#/components/responses/Conflict" }
+  /api/v2/auth/security/step-up/issue:
+    post:
+      summary: "Issue Account-Scoped Trusted-Device Removal Proof"
+      operationId: issueAccountTrustedDeviceRemovalProof
+      tags: [Session]
+      security: [{ CustomerSessionCookie: [] }]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "#/components/schemas/AccountStepUpIssueRequest" } } } }
+      responses:
+        "200": { description: Short-lived proof bound to this customer session and target., content: { application/json: { schema: { $ref: "#/components/schemas/AccountStepUpProofReceipt" } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "409": { $ref: "#/components/responses/Conflict" }
+  /api/v2/hub-sessions:
+    post:
+      summary: "Issue Selected Tenant Home Hub Session"
+      operationId: issueSelectedHomeHubSession
+      tags: [Session]
+      description: "Requires an active selected TENANT membership. OWNER and PROPERTY_MANAGER sessions are denied and receive no direct OS endpoint or bearer; those roles use the Platform projection."
+      security: [{ CustomerSessionCookie: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [homeId]
+              properties:
+                homeId: { $ref: "./contract.json#/$defs/id" }
+              additionalProperties: false
+      responses:
+        "200":
+          description: Five-minute home- and membership-bound customer bearer; native client memory only, never persisted, logged or rendered.
+          content:
+            application/json:
+              schema: { $ref: "./contract.json#/$defs/customerHubSession" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "400": { description: Invalid or missing selected-home request }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+  /api/v2/offline-authorisations:
+    post:
+      summary: "Create Exact Membership Offline Authorisation"
+      operationId: createOfflineMembershipAuthorisation
+      tags: [Session]
+      security: [{ CustomerBearer: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "./contract.json#/$defs/offlineAuthorisationRequest" }
+      responses:
+        "200":
+          description: Tenant-only local authority for the already selected home, membership and enrolled trusted device.
+          content:
+            application/json:
+              schema: { $ref: "./contract.json#/$defs/offlineAuthorisationReceipt" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "400": { description: Trusted device public key or request fields are invalid. }
+    delete:
+      summary: "Revoke Current Membership Offline Authorisation"
+      operationId: revokeOfflineMembershipAuthorisation
+      tags: [Session]
+      security: [{ CustomerBearer: [] }]
+      responses:
+        "200":
+          description: Current trusted-device authority is revoked for the selected membership.
+          content:
+            application/json:
+              schema: { $ref: "./contract.json#/$defs/offlineRevocationReceipt" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /api/v2/security/step-up/challenge:
+    post:
+      summary: "Create Operation-Bound Step-Up Challenge"
+      operationId: createStepUpChallenge
+      tags: [Session]
+      security: [{ CustomerBearer: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "./contract.json#/$defs/stepUpChallengeRequest" }
+      responses:
+        "200":
+          description: Single-use challenge bound to the authenticated customer session, selected membership, target and operation digest.
+          content:
+            application/json:
+              schema: { $ref: "./contract.json#/$defs/stepUpChallengeReceipt" }
+        "400": { description: Operation or target is malformed or unsupported. }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { $ref: "#/components/responses/Conflict" }
+    delete:
+      summary: "Cancel Unconsumed Step-Up Challenge"
+      operationId: cancelStepUpChallenge
+      tags: [Session]
+      security: [{ CustomerBearer: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "./contract.json#/$defs/stepUpCancellationRequest" }
+      responses:
+        "200":
+          description: Only the current customer session may cancel its own unused challenge.
+          content:
+            application/json:
+              schema: { $ref: "./contract.json#/$defs/stepUpCancellationReceipt" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "409": { $ref: "#/components/responses/Conflict" }
+  /api/v2/security/step-up/issue:
+    post:
+      summary: "Issue One-Use Step-Up Proof"
+      operationId: issueStepUpProof
+      tags: [Session]
+      security: [{ CustomerBearer: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "./contract.json#/$defs/stepUpIssueRequest" }
+      responses:
+        "200":
+          description: A proof bound to one actor/session/home/membership/operation/target and consumed challenge; clients must keep it in memory only.
+          content:
+            application/json:
+              schema: { $ref: "./contract.json#/$defs/stepUpProofReceipt" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { $ref: "#/components/responses/Conflict" }
+  /api/v2/security/step-up/consume:
+    post:
+      summary: "Consume Step-Up Proof For Exact Operation"
+      operationId: consumeStepUpProof
+      tags: [Session]
+      security: [{ CustomerBearer: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "./contract.json#/$defs/stepUpConsumeRequest" }
+      responses:
+        "200":
+          description: Proof consumed atomically; no reusable proof is returned.
+          content:
+            application/json:
+              schema: { $ref: "./contract.json#/$defs/stepUpConsumeReceipt" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { $ref: "#/components/responses/Conflict" }
+  /api/v2/support/notifications:
+    get:
+      summary: "List Selected Membership Support Notifications"
+      operationId: listSelectedSupportNotifications
+      tags: [Notifications, Support]
+      security: [{ CustomerBearer: [] }]
+      responses:
+        "200":
+          description: Only the authenticated account and selected home notification projection; no private support details are included.
+          content:
+            application/json:
+              schema: { $ref: "./contract.json#/$defs/supportNotificationProjection" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /api/v2/support/access-requests:
+    get:
+      summary: "List pending support approvals for the selected membership"
+      operationId: listSupportAccessApprovals
+      tags: [Support]
+      responses:
+        "200":
+          description: Bounded approval metadata only; ticket descriptions and tenant/device-private details are never included.
+          content:
+            application/json:
+              schema: { $ref: "./contract.json#/$defs/supportAccessApprovalProjection" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+  /api/v2/homes/{homeId}/context:
+    get:
+      summary: "Get Membership Scoped Home Context"
+      operationId: getMembershipScopedHomeContext
+      tags: [Home]
+      parameters: [{ $ref: "#/components/parameters/HomeId" }]
+      responses:
+        "200":
+          {
+            description: Selected-home membership context,
+            content:
+              {
+                application/json:
+                  { schema: { $ref: "./contract.json#/$defs/membership" } },
+              },
+          }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+  /api/v2/homes/{homeId}/access-policy:
+    get:
+      summary: "Get Current Home Access Policy"
+      operationId: getCurrentHomeAccessPolicy
+      tags: [Home]
+      parameters: [{ $ref: "#/components/parameters/HomeId" }]
+      responses:
+        "200":
+          {
+            description: Current role and area authority,
+            content:
+              {
+                application/json:
+                  { schema: { $ref: "./contract.json#/$defs/accessPolicy" } },
+              },
+          }
+        "403": { $ref: "#/components/responses/Forbidden" }
+  /api/v2/homes/{homeId}/overrides:
+    get:
+      summary: "List Home Display Overrides"
+      operationId: listHomeDisplayOverrides
+      tags: [Home]
+      parameters: [{ $ref: "#/components/parameters/HomeId" }]
+      responses:
+        "200":
+          {
+            description: Revisioned display-only overrides,
+            content:
+              {
+                application/json:
+                  { schema: { $ref: "./contract.json#/$defs/override" } },
+              },
+          }
+    put:
+      summary: "Replace Home Display Overrides"
+      operationId: replaceHomeDisplayOverrides
+      tags: [Home]
+      parameters:
+        [
+          { $ref: "#/components/parameters/HomeId" },
+          { $ref: "#/components/parameters/IfMatch" },
+        ]
+      requestBody:
+        {
+          required: true,
+          content:
+            {
+              application/json:
+                { schema: { $ref: "./contract.json#/$defs/override" } },
+            },
+        }
+      responses:
+        "200": { description: Overrides saved }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { $ref: "#/components/responses/Conflict" }
+  /api/v2/homes/{homeId}/preferences:
+    get:
+      summary: "Get Home Preferences"
+      operationId: getHomePreferences
+      tags: [Home]
+      parameters: [{ $ref: "#/components/parameters/HomeId" }]
+      responses:
+        { "200": { description: Revisioned selected-home preferences plus a server-derived role catalogue. For property managers, availableFamilies contains only families assigned by the current original homeowner; mandatory notices are listed separately and are not user-toggleable. } }
+    put:
+      summary: "Update Home Preferences"
+      operationId: updateHomePreferences
+      tags: [Home]
+      parameters:
+        [
+          { $ref: "#/components/parameters/HomeId" },
+          { $ref: "#/components/parameters/IfMatch" },
+        ]
+      responses:
+        "200": { description: Preferences saved }
+        "409": { $ref: "#/components/responses/Conflict" }
+  /api/v2/homes/{homeId}/tenant-device-context:
+    get:
+      summary: "Get Selected Tenant Device Context"
+      operationId: getSelectedTenantDeviceContext
+      tags: [Devices]
+      security: [{ MobileAccessBearer: [] }]
+      description: >-
+        Returns only cloud-owned tenant membership, active Area grants, authorized
+        device metadata, tenant-owned management flags, scoped dashboard preference
+        revision and owner-only recovery summaries. It never returns device state or
+        controls; those are fetched directly from the selected Native V2 hub. Requires
+        an account-global customer session, X-Dinodia-Home-Id matching the path and an
+        active TENANT membership. Private tenant devices are filtered before response.
+      parameters:
+        - { $ref: "#/components/parameters/HomeId" }
+        - { name: X-Dinodia-Home-Id, in: header, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200":
+          description: Selected tenant projection; no-store and membership-scoped
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TenantDeviceContext" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/Forbidden" }
+  /api/v2/homes/{homeId}/tenant-devices/{deviceId}:
+    patch:
+      summary: "Update an owned tenant device presentation"
+      operationId: updateOwnedTenantDevicePresentation
+      tags: [Devices]
+      security: [{ MobileAccessBearer: [] }]
+      description: >-
+        Rename, relabel or move only a tenant_device owned by the currently selected
+        active tenant membership. The server verifies the current session,
+        owner membership, Home/hub identity and expected inventory revision.
+        Idempotency-Key reconciles an exact retry. Permanent property devices,
+        other tenants' devices, technical labels and live hub state are immutable
+        through this operation. A move must target one currently granted Area and
+        remains pending until the signed hub configuration is applied.
+      parameters:
+        - { $ref: "#/components/parameters/HomeId" }
+        - { name: deviceId, in: path, required: true, schema: { type: string, format: uuid } }
+        - { name: X-Dinodia-Home-Id, in: header, required: true, schema: { type: string, format: uuid } }
+        - { name: Idempotency-Key, in: header, required: true, schema: { type: string, minLength: 16, maxLength: 128 } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - type: object
+                  additionalProperties: false
+                  required: [action, expectedInventoryRevision, overrideName]
+                  properties:
+                    action: { const: rename }
+                    expectedInventoryRevision: { type: integer, minimum: 1 }
+                    overrideName: { type: [string, 'null'], maxLength: 80 }
+                - type: object
+                  additionalProperties: false
+                  required: [action, expectedInventoryRevision, customerLabel]
+                  properties:
+                    action: { const: relabel }
+                    expectedInventoryRevision: { type: integer, minimum: 1 }
+                    customerLabel: { type: [string, 'null'], maxLength: 40 }
+                - type: object
+                  additionalProperties: false
+                  required: [action, expectedInventoryRevision, areaId]
+                  properties:
+                    action: { const: move }
+                    expectedInventoryRevision: { type: integer, minimum: 1 }
+                    areaId: { type: string, format: uuid }
+      responses:
+        "200":
+          description: Tenant-owned presentation updated or exact retry reconciled
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TenantDeviceMutationReceipt" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/Forbidden" }
+        "409": { $ref: "#/components/responses/Conflict" }
+  /api/v2/homes/{homeId}/installation-requests:
+    get:
+      summary: "List Current Home Permanent-Installation Requests"
+      operationId: listHomeInstallationRequests
+      tags: [Home]
+      security: [{ CustomerSessionCookie: [] }, { MobileAccessBearer: [] }]
+      parameters: [{ $ref: "#/components/parameters/HomeId" }]
+      responses:
+        "200": { description: Current bounded requests visible to the selected owner or manager., content: { application/json: { schema: { $ref: "./contract.json#/$defs/installationRequestListReceipt" } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { description: Selected Home or owner/manager membership is unavailable. }
+    post:
+      summary: "Request Permanent Device Installation"
+      operationId: createHomeInstallationRequest
+      tags: [Home]
+      security: [{ CustomerSessionCookie: [] }, { MobileAccessBearer: [] }]
+      parameters: [{ $ref: "#/components/parameters/HomeId" }, { $ref: "#/components/parameters/IdempotencyKey" }]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "./contract.json#/$defs/installationRequestCreate" } } } }
+      responses:
+        "201": { description: Home-scoped installation request created without creating or changing a membership., content: { application/json: { schema: { $ref: "./contract.json#/$defs/installationRequestReceipt" } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { description: Selected Home or owner/manager membership is unavailable. }
+        "409": { $ref: "#/components/responses/Conflict" }
+  /api/v2/homes/{homeId}/installation-requests/{requestId}/cancel:
+    post:
+      summary: "Cancel a Not-Yet-Assigned Installation Request"
+      operationId: cancelHomeInstallationRequest
+      tags: [Home]
+      security: [{ CustomerSessionCookie: [] }, { MobileAccessBearer: [] }]
+      parameters: [{ $ref: "#/components/parameters/HomeId" }, { name: requestId, in: path, required: true, schema: { type: string, format: uuid } }, { $ref: "#/components/parameters/IdempotencyKey" }]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "./contract.json#/$defs/installationRequestCancel" } } } }
+      responses:
+        "200": { description: Idempotent cancellation receipt., content: { application/json: { schema: { $ref: "./contract.json#/$defs/installationRequestReceipt" } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { description: Request is not visible to the selected Home. }
+        "409": { $ref: "#/components/responses/Conflict" }
+  /api/v2/homes/{homeId}/tenant-devices/{deviceId}/remove:
+    post:
+      summary: "Request removal of the current tenant's own device"
+      operationId: requestTenantOwnedDeviceRemoval
+      tags: [Devices]
+      security: [{ MobileAccessBearer: [] }]
+      description: >-
+        Requires a fresh operation-bound confirmation for this exact device and
+        current descriptor revision. The cloud first revokes its selected-tenant
+        authority and returns REMOVAL_PENDING; only the direct Native V2 OS removal
+        and tombstone acknowledgement may report enforcement complete. Property
+        devices and another tenant's devices are never removable by this route.
+      parameters:
+        - { $ref: "#/components/parameters/HomeId" }
+        - { name: deviceId, in: path, required: true, schema: { type: string, format: uuid } }
+        - { name: X-Dinodia-Home-Id, in: header, required: true, schema: { type: string, format: uuid } }
+        - { name: Idempotency-Key, in: header, required: true, schema: { type: string, minLength: 16, maxLength: 128 } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/TenantDeviceRemovalRequest" }
+      responses:
+        "202":
+          description: Cloud authority is removed and hub enforcement is pending, or an exact retry is reconciled.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TenantDeviceRemovalReceipt" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/Forbidden" }
+        "409": { $ref: "#/components/responses/Conflict" }
+  /api/v2/me/push-registration:
+    put:
+      summary: "Register or rotate the current trusted installation APNs token"
+      operationId: registerCurrentInstallationPushToken
+      tags: [Account]
+      security: [{ CustomerSessionCookie: [] }, { MobileAccessBearer: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "./contract.json#/$defs/apnsRegistrationRequest" }
+      responses:
+        "200": { description: Encrypted token stored for the session-bound trusted installation, content: { application/json: { schema: { $ref: "./contract.json#/$defs/apnsRegistrationReceipt" } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "409": { $ref: "#/components/responses/Conflict" }
+    delete:
+      summary: "Disable push registration for the current trusted installation"
+      operationId: disableCurrentInstallationPushToken
+      tags: [Account]
+      security: [{ CustomerSessionCookie: [] }, { MobileAccessBearer: [] }]
+      responses:
+        "200": { description: Current installation token removed; replay is idempotent, content: { application/json: { schema: { $ref: "./contract.json#/$defs/apnsRegistrationReceipt" } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /api/v2/homes/{homeId}/tenant/access:
+    get:
+      summary: "Preview Removal of the Selected Tenant Home Access"
+      operationId: previewTenantHomeAccessRemoval
+      tags: [Account, Home]
+      security: [{ CustomerSessionCookie: [] }, { MobileAccessBearer: [] }]
+      parameters: [{ $ref: "#/components/parameters/HomeId" }]
+      responses:
+        "200":
+          description: Selected-tenant preview with current revisions and only a boolean indicating whether other valid relationships remain.
+          content:
+            application/json:
+              schema: { $ref: "./contract.json#/$defs/tenantMembershipRemovalPreview" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/Forbidden" }
+    delete:
+      summary: "Remove Only the Current Tenant Membership"
+      operationId: removeSelectedTenantHomeAccess
+      tags: [Account, Home]
+      security: [{ CustomerSessionCookie: [] }, { MobileAccessBearer: [] }]
+      parameters: [{ $ref: "#/components/parameters/HomeId" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "./contract.json#/$defs/tenantMembershipRemovalRequest" }
+      responses:
+        "200":
+          description: Exact membership removed, offline authority revoked and hub cleanup queued; final-account deletion occurs only after the explicit final-relationship confirmation.
+          content:
+            application/json:
+              schema: { $ref: "./contract.json#/$defs/tenantMembershipRemovalReceipt" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { $ref: "#/components/responses/Conflict" }
+  /api/v2/homes/{homeId}/analytics/bootstrap:
+    get:
+      summary: "Get Bounded Home Analytics Catalogue and Summary"
+      operationId: getNativeAnalyticsBootstrap
+      tags: [Home]
+      security: [{ CustomerSessionCookie: [] }, { MobileAccessBearer: [] }]
+      parameters:
+        - { $ref: "#/components/parameters/HomeId" }
+        - in: header
+          name: X-Dinodia-Home-Id
+          required: true
+          description: Selected-home selector only; the server independently resolves current account membership and role.
+          schema: { type: string, format: uuid }
+      responses:
+        "200": { description: Bounded current catalogue, explicit display groups, recent summaries and truthful freshness state., content: { application/json: { schema: { $ref: "./contract.json#/$defs/analyticsBootstrap" } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+  /api/v2/homes/{homeId}/analytics/usage:
+    get:
+      summary: "Get Bounded Home Device-Activity History"
+      operationId: getNativeAnalyticsUsage
+      tags: [Home]
+      security: [{ CustomerSessionCookie: [] }, { MobileAccessBearer: [] }]
+      parameters:
+        - { $ref: "#/components/parameters/HomeId" }
+        - { in: header, name: X-Dinodia-Home-Id, required: true, description: Selected-home selector only; it grants no membership or role., schema: { type: string, format: uuid } }
+        - { in: query, name: metric, required: true, schema: { type: string, enum: [light, radiator, boiler] } }
+        - { in: query, name: level, required: false, schema: { type: string, enum: [hour, day, week, month, year], default: day } }
+        - { in: query, name: from, required: false, description: Inclusive RFC 3339 instant within the retained 12-month range., schema: { type: string, format: date-time } }
+        - { in: query, name: to, required: false, description: Exclusive RFC 3339 instant no later than request time., schema: { type: string, format: date-time } }
+        - { in: query, name: areaIds, required: false, description: Comma-separated selected-Home Area UUIDs; mutually exclusive with groupId., schema: { type: string, maxLength: 2400 } }
+        - { in: query, name: deviceIds, required: false, description: Comma-separated permanent property-device UUIDs, maximum 100., schema: { type: string, maxLength: 3700 } }
+        - { in: query, name: groupId, required: false, description: Current server-derived display group identifier; mutually exclusive with areaIds., schema: { type: string, pattern: "^analytics-group-[a-f0-9]{24}$" } }
+      responses:
+        "200": { description: Measured device activity; missing evidence remains a gap and is never synthesized as Off., content: { application/json: { schema: { $ref: "./contract.json#/$defs/analyticsUsageResponse" } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "413": { description: Query exceeds bounded row/filter limits; choose a shorter period or fewer devices. }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+  /api/v2/homes/{homeId}/analytics/temperature:
+    get:
+      summary: "Get Bounded Home Radiator-Temperature History"
+      operationId: getNativeAnalyticsTemperature
+      tags: [Home]
+      security: [{ CustomerSessionCookie: [] }, { MobileAccessBearer: [] }]
+      parameters:
+        - { $ref: "#/components/parameters/HomeId" }
+        - { in: header, name: X-Dinodia-Home-Id, required: true, description: Selected-home selector only; it grants no membership or role., schema: { type: string, format: uuid } }
+        - { in: query, name: level, required: false, schema: { type: string, enum: [hour, day, week, month, year], default: day } }
+        - { in: query, name: from, required: false, description: Inclusive RFC 3339 instant within the retained 12-month range., schema: { type: string, format: date-time } }
+        - { in: query, name: to, required: false, description: Exclusive RFC 3339 instant no later than request time., schema: { type: string, format: date-time } }
+        - { in: query, name: areaIds, required: false, description: Comma-separated selected-Home Area UUIDs; mutually exclusive with groupId., schema: { type: string, maxLength: 2400 } }
+        - { in: query, name: deviceIds, required: false, description: Comma-separated permanent Radiator UUIDs, maximum 100., schema: { type: string, maxLength: 3700 } }
+        - { in: query, name: groupId, required: false, description: Current server-derived display group identifier; mutually exclusive with areaIds., schema: { type: string, pattern: "^analytics-group-[a-f0-9]{24}$" } }
+      responses:
+        "200": { description: Bounded source-timestamped Radiator observations with honest freshness., content: { application/json: { schema: { $ref: "./contract.json#/$defs/analyticsTemperatureResponse" } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "413": { description: Query exceeds bounded row/filter limits; choose a shorter period or fewer devices. }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+  /api/v2/homes/{homeId}/areas:
+    get:
+      summary: "List Invitation Areas for Current Home Managers"
+      operationId: listInvitationAreas
+      tags: [Home]
+      security: [{ CustomerSessionCookie: [] }, { MobileAccessBearer: [] }]
+      parameters: [{ $ref: "#/components/parameters/HomeId" }]
+      responses:
+        "200":
+          description: Active Area IDs and names plus the current management revision, visible only to an active owner or property manager.
+          content:
+            application/json:
+              schema: { $ref: "./contract.json#/$defs/homeInvitationAreasReceipt" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { description: Home or owner/manager membership is not visible to this account. }
+  /api/v2/homes/{homeId}/property-managers:
+    get:
+      summary: "List Property Managers"
+      operationId: listPropertyManagers
+      tags: [Home]
+      security: [{ CustomerSessionCookie: [] }, { MobileAccessBearer: [] }]
+      parameters: [{ $ref: "#/components/parameters/HomeId" }]
+      responses:
+        "200":
+          description: Current active manager memberships, without account email or private property data.
+          content:
+            application/json:
+              schema: { $ref: "./contract.json#/$defs/customerPropertyManagerListReceipt" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { description: Home or membership not visible to this account. }
+    post:
+      summary: "Invite Property Manager"
+      operationId: invitePropertyManager
+      tags: [Home]
+      security: [{ CustomerSessionCookie: [] }, { MobileAccessBearer: [] }]
+      parameters:
+        [
+          { $ref: "#/components/parameters/HomeId" },
+          { $ref: "#/components/parameters/IdempotencyKey" },
+        ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "./contract.json#/$defs/customerMembershipInvitationRequest" }
+      responses:
+        "201":
+          description: Invitation created; invitation alone does not create membership.
+          content:
+            application/json:
+              schema: { $ref: "./contract.json#/$defs/customerMembershipInvitationReceipt" }
+        "200": { description: Exact duplicate request coalesced to its existing invitation receipt. }
+        "202": { description: The idempotent request is still being submitted to the mail provider. }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { $ref: "#/components/responses/Conflict" }
+  /api/v2/homes/{homeId}/invitations:
+    get:
+      summary: "List Current Home Invitations for the Inviting Membership"
+      operationId: listHomePendingInvitations
+      tags: [Home]
+      security: [{ CustomerSessionCookie: [] }, { MobileAccessBearer: [] }]
+      parameters:
+        - { $ref: "#/components/parameters/HomeId" }
+        - { in: query, name: cursor, required: false, description: Opaque keyset cursor returned by the preceding page., schema: { type: string, maxLength: 256 } }
+      responses:
+        "200":
+          description: Current unexpired pending invitations only; owners can see both supported roles and property managers only tenant invitations. Secrets and credential hashes are never projected.
+          content:
+            application/json:
+              schema: { $ref: "./contract.json#/$defs/homePendingInvitationsReceipt" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { description: Home or an authorized owner/property-manager membership is not visible to this account. }
+  /api/v2/homes/{homeId}/tenant/invitations:
+    post:
+      summary: "Invite a Tenant to Exact Current Areas"
+      operationId: inviteTenant
+      tags: [Home]
+      security: [{ CustomerSessionCookie: [] }, { MobileAccessBearer: [] }]
+      parameters:
+        - { $ref: "#/components/parameters/HomeId" }
+        - { $ref: "#/components/parameters/IdempotencyKey" }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "./contract.json#/$defs/customerMembershipInvitationRequest" }
+      responses:
+        "201":
+          description: Tenant invitation submitted; only the requested current Area grants can be accepted.
+          content:
+            application/json:
+              schema: { $ref: "./contract.json#/$defs/customerMembershipInvitationReceipt" }
+        "200": { description: Exact duplicate request coalesced to its existing invitation receipt. }
+        "202": { description: The idempotent request is still being submitted to the mail provider. }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { $ref: "#/components/responses/Conflict" }
+  /api/v2/homes/{homeId}/tenant/devices:
+    get:
+      summary: "List Authorized Native Devices"
+      operationId: listAuthorizedNativeDevices
+      tags: [Devices]
+      parameters: [{ $ref: "#/components/parameters/HomeId" }]
+      responses:
+        "200":
+          {
+            description: Selected-membership devices only,
+            content:
+              {
+                application/json:
+                  { schema: { $ref: "./contract.json#/$defs/device" } },
+              },
+          }
+        "403": { $ref: "#/components/responses/Forbidden" }
+  /api/v2/homes/{homeId}/tenant/devices/{deviceId}:
+    get:
+      summary: "Get Authorized Native Device"
+      operationId: getAuthorizedNativeDevice
+      tags: [Devices]
+      parameters:
+        [
+          { $ref: "#/components/parameters/DeviceId" },
+          { $ref: "#/components/parameters/HomeId" },
+        ]
+      responses:
+        "200":
+          {
+            description: Current device descriptor,
+            content:
+              {
+                application/json:
+                  { schema: { $ref: "./contract.json#/$defs/device" } },
+              },
+          }
+        "404": { description: Missing or privacy-hidden device }
+        "403": { $ref: "#/components/responses/Forbidden" }
+  /api/dinodia/v1/devices:
+    get:
+      summary: "Read Selected Home Hub Device Descriptors"
+      operationId: readSelectedHomeHubDeviceDescriptors
+      tags: [Devices]
+      description: Direct authenticated request to the selected hub over pinned HTTPS LAN BaseURL or the independently verified CloudURL. The home and membership are taken from the signed app token, never from query parameters.
+      servers:
+        - url: https://dinodia-{hubId}.local:8123
+          variables:
+            hubId: { default: hub-identifier, description: "Public hub DNS label, not an authority claim" }
+      responses:
+        "200":
+          description: Current membership/area filtered canonical Native v1 device envelope
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [schemaVersion, homeId, streamId, sequence, generatedAt, revision, data]
+                properties:
+                  schemaVersion: { const: dinodia.v1 }
+                  homeId: { type: string }
+                  streamId: { type: string }
+                  sequence: { type: integer, minimum: 0 }
+                  generatedAt: { type: string, format: date-time }
+                  revision: { type: integer, minimum: 0 }
+                  data:
+                    type: array
+                    items: { $ref: "./contract.json#/$defs/device" }
+                additionalProperties: false
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "503": { description: Current catalogue cannot be represented without losing safety or authority fields }
+  /api/v2/alexa/link-status:
+    get:
+      summary: "Read Current Tenant Alexa Links and Authorized Area Choices"
+      operationId: getNativeAlexaLinkStatus
+      tags: [Devices]
+      security: [{ CustomerSessionCookie: [] }, { MobileAccessBearer: [] }]
+      description: Returns only the caller's active tenant memberships, current granted canonical Areas, and complete authorized display groups. It never treats the app's selected Home or client role as Alexa authority.
+      responses:
+        "200":
+          description: Current account-global skill connection and membership-scoped selections
+          content:
+            application/json:
+              schema: { $ref: "./contract.json#/$defs/alexaLinkStatusResponse" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+    post:
+      summary: "Create a One-Time Tenant Alexa Connect Intent"
+      operationId: createNativeAlexaConnectIntent
+      tags: [Devices]
+      security: [{ CustomerSessionCookie: [] }, { MobileAccessBearer: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "./contract.json#/$defs/alexaConnectIntentRequest" }
+      responses:
+        "201":
+          description: Short-lived, single-use connect intent for the explicitly authorized Area set
+          content:
+            application/json:
+              schema: { $ref: "./contract.json#/$defs/alexaConnectIntentReceipt" }
+        "400": { description: Invalid request or additional authority fields rejected }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "503": { description: Native Alexa is intentionally held until its approved activation stage }
+  /api/v2/alexa/home-scope:
+    post:
+      summary: "Save Exact Current Tenant Alexa Area Selection"
+      operationId: saveNativeAlexaHomeScope
+      tags: [Devices]
+      security: [{ CustomerSessionCookie: [] }, { MobileAccessBearer: [] }]
+      parameters:
+        - { $ref: "#/components/parameters/HomeId" }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "./contract.json#/$defs/alexaHomeScopeSaveRequest" }
+      responses:
+        "200":
+          description: Server-confirmed selection and new scope/link revisions
+          content:
+            application/json:
+              schema: { $ref: "./contract.json#/$defs/alexaHomeScopeSaveReceipt" }
+        "400": { description: Invalid request or additional authority fields rejected }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "503": { description: Native Alexa is intentionally held until its approved activation stage }
+  /api/v2/alexa/home-scope/unlink:
+    post:
+      summary: "Unlink One Tenant Property from Alexa"
+      operationId: unlinkNativeAlexaHome
+      tags: [Devices]
+      security: [{ CustomerSessionCookie: [] }, { MobileAccessBearer: [] }]
+      parameters:
+        - { $ref: "#/components/parameters/HomeId" }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "./contract.json#/$defs/alexaUnlinkRequest" }
+      responses:
+        "200":
+          description: Exact selected tenant property was unlinked; remaining account connections are preserved
+          content:
+            application/json:
+              schema: { $ref: "./contract.json#/$defs/alexaUnlinkReceipt" }
+        "400": { description: Invalid request or additional authority fields rejected }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "503": { description: Native Alexa is intentionally held until its approved activation stage }
+  /api/v2/alexa/accept-grant:
+    post:
+      summary: Complete Alexa Event-Gateway Grant
+      operationId: acceptNativeAlexaGrant
+      tags: [Devices]
+      security: [{ AlexaBearer: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "./contract.json#/$defs/alexaAcceptGrantRequest" }
+      responses:
+        "200":
+          description: The provider grant was accepted once and the linked token material was safely refreshed.
+          content:
+            application/json:
+              schema: { $ref: "./contract.json#/$defs/alexaAcceptGrantReceipt" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+  /api/v2/alexa/oauth/authorize:
+    get:
+      summary: Begin Tenant-Authorized Alexa OAuth
+      operationId: beginNativeAlexaOAuthAuthorization
+      tags: [Devices]
+      security: []
+      parameters:
+        - { name: client_id, in: query, required: true, schema: { type: string, maxLength: 160 } }
+        - { name: redirect_uri, in: query, required: true, schema: { type: string, format: uri, maxLength: 500 } }
+        - { name: response_type, in: query, required: true, schema: { const: code } }
+        - { name: state, in: query, required: true, schema: { type: string, pattern: "^[A-Za-z0-9._~-]{1,512}$" } }
+        - { name: scope, in: query, required: true, schema: { const: "alexa::skills:account_linking" } }
+        - { name: code_challenge, in: query, required: true, schema: { type: string, pattern: "^[A-Za-z0-9_-]{43}$" } }
+        - { name: code_challenge_method, in: query, required: true, schema: { const: S256 } }
+      responses:
+        "200": { description: No-store HTML page asking the tenant to enter and review a one-time Dinodia connect intent, content: { text/html: { schema: { type: string } } } }
+        "400": { description: Invalid OAuth request; no access is granted }
+        "503": { description: Alexa OAuth is not enabled or its exact client configuration is unavailable }
+    post:
+      summary: Review and Explicitly Approve Alexa Linking
+      operationId: approveNativeAlexaOAuthAuthorization
+      tags: [Devices]
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              required: [client_id, redirect_uri, response_type, state, scope, code_challenge, code_challenge_method, connect_intent]
+              properties:
+                client_id: { type: string, maxLength: 160 }
+                redirect_uri: { type: string, format: uri, maxLength: 500 }
+                response_type: { const: code }
+                state: { type: string, pattern: "^[A-Za-z0-9._~-]{1,512}$" }
+                scope: { const: "alexa::skills:account_linking" }
+                code_challenge: { type: string, pattern: "^[A-Za-z0-9_-]{43}$" }
+                code_challenge_method: { const: S256 }
+                connect_intent: { type: string, pattern: "^[A-Za-z0-9_-]{40,128}$" }
+                approve: { const: authorize }
+              additionalProperties: false
+      responses:
+        "200": { description: No-store HTML review page after exact live tenant authority is revalidated, content: { text/html: { schema: { type: string } } } }
+        "303": { description: Explicit approval consumed the one-time intent and redirects only to the previously allowed HTTPS callback with code and original state }
+        "400": { description: Invalid, expired, revoked or replayed connect intent; no link is granted }
+        "503": { description: Alexa OAuth is intentionally held or unavailable }
+  /api/v2/alexa/oauth/token:
+    post:
+      summary: Exchange or Rotate Native Alexa OAuth Tokens
+      operationId: exchangeNativeAlexaOAuthToken
+      tags: [Devices]
+      security: [{ AlexaOAuthClientBasic: [] }]
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              required: [grant_type]
+              properties:
+                grant_type: { enum: [authorization_code, refresh_token] }
+                client_id: { type: string, maxLength: 160 }
+                code: { type: string, maxLength: 256 }
+                redirect_uri: { type: string, format: uri, maxLength: 500 }
+                code_verifier: { type: string, maxLength: 128 }
+                refresh_token: { type: string, maxLength: 160 }
+              additionalProperties: false
+      responses:
+        "200":
+          description: Short-lived access token and rotating refresh token; plaintext credentials are never stored.
+          content:
+            application/json:
+              schema: { $ref: "./contract.json#/$defs/alexaOAuthTokenResponse" }
+        "400": { description: Invalid client, grant, PKCE verifier, expired or replayed one-use credential }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+  /api/v2/alexa/oauth/revoke:
+    post:
+      summary: Revoke Native Alexa OAuth Link
+      operationId: revokeNativeAlexaOAuthToken
+      tags: [Devices]
+      security: [{ AlexaOAuthClientBasic: [] }]
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              required: [token]
+              properties:
+                token: { type: string, minLength: 40, maxLength: 160 }
+                token_type_hint: { enum: [access_token, refresh_token] }
+                client_id: { type: string, maxLength: 160 }
+              additionalProperties: false
+      responses:
+        "200":
+          description: Non-enumerating provider revocation response; all link scopes and token families are revoked.
+          content:
+            application/json:
+              schema: { $ref: "./contract.json#/$defs/alexaOAuthRevokeReceipt" }
+  /api/v2/alexa/discovery:
+    get:
+      summary: "Get Native Alexa Discovery Projection"
+      operationId: getNativeAlexaDiscoveryProjection
+      tags: [Devices]
+      security: [{ AlexaBearer: [] }]
+      description: Native Alexa discovery is server-filtered to current tenant-granted and explicitly selected canonical Areas, supported current descriptors and private-device ownership. No HA or static fallback is permitted.
+      responses:
+        "200":
+          description: Current selected-home and area-scoped canonical discovery projection
+          content:
+            application/json:
+              schema: { $ref: "./contract.json#/$defs/alexaDiscoveryProjection" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "503": { description: Native Alexa activation is intentionally held until its approved activation stage }
+  /api/v2/alexa/directives:
+    post:
+      summary: "Dispatch Native Alexa Directive"
+      operationId: dispatchNativeAlexaDirective
+      tags: [Devices]
+      security: [{ AlexaBearer: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [directive], properties: { directive: { type: object } }, additionalProperties: false }
+      responses:
+        "200": { description: Canonical selected-home directive result }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "503": { description: Native Alexa activation is intentionally held until its approved activation stage; no fallback is permitted }
+  /api/v2/alexa/report-state:
+    post:
+      summary: "Report Native Alexa State"
+      operationId: reportNativeAlexaState
+      tags: [Devices]
+      security: [{ AlexaBearer: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [directive], properties: { directive: { type: object } }, additionalProperties: false }
+      responses:
+        "200": { description: Current canonical control state projection }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "503": { description: Native Alexa activation is intentionally held until its approved activation stage; no static fallback is permitted }
+  /api/dinodia/v1/commands:
+    post:
+      summary: "Issue Dinodia OSCommand"
+      operationId: issueDinodiaOSCommand
+      tags: [Devices]
+      description: Tenant live command is sent directly to the selected hub's pinned HTTPS BaseURL or verified CloudURL. Platform does not proxy device commands; HA/AWS transports are forbidden.
+      servers:
+        - url: https://dinodia-{hubId}.local:8123
+          description: Illustrative pinned LAN authority; resolve the selected hub endpoint from its current Platform record.
+          variables:
+            hubId:
+              {
+                default: hub-identifier,
+                description: "Public hub DNS label, not an authority claim",
+              }
+      parameters: [{ $ref: "#/components/parameters/IdempotencyKey" }]
+      requestBody:
+        {
+          required: true,
+          content:
+            {
+              application/json:
+                { schema: { $ref: "./contract.json#/$defs/command" } },
+            },
+        }
+      responses:
+        "202": { description: Hub accepted idempotent command }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "422":
+          {
+            description: Current descriptor rejects command value or sensitive policy,
+          }
+  /api/dinodia/v1/maintenance/status:
+    servers:
+      - url: https://dinodia-{hubId}.local:8123
+        description: Current selected tenant hub over its pinned HTTPS LAN endpoint or verified CloudURL.
+        variables:
+          hubId: { default: hub-identifier, description: Public hub DNS label resolved from the authenticated selected-home session. }
+    get:
+      summary: Read native updater maintenance status
+      operationId: readNativeUpdaterMaintenanceStatus
+      tags: [Devices]
+      description: Read-only. Requires a current selected tenant hub session or an authenticated scoped Dinodia operator; exposes no signing material, artifact URL or environment data. A disabled release-signing trust state is reported as unprovisioned and does not enable updates.
+      security: [{ CustomerBearer: [] }]
+      responses:
+        "200":
+          description: Bounded updater phase and release status.
+          content:
+            application/json:
+              schema: { $ref: "./contract.json#/$defs/updaterMaintenanceStatus" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "503": { $ref: "#/components/responses/ServiceUnavailable" }
+  /api/v2/tenant/account/delete:
+    post:
+      summary: "Delete Customer Account"
+      operationId: deleteCustomerAccount
+      tags: [Account]
+      parameters: [{ $ref: "#/components/parameters/IdempotencyKey" }]
+      responses:
+        "202":
+          {
+            description: Account deletion follows final-relationship retention rules,
+          }
+        "409": { $ref: "#/components/responses/Conflict" }
+  /api/v2/notifications:
+    get:
+      summary: "List Authorized Notifications"
+      operationId: listAuthorizedNotifications
+      tags: [Notifications]
+      responses:
+        { "200": { description: Current audience-scoped notification items } }
+  /api/v2/notifications/{notificationId}/acknowledgement:
+    put:
+      summary: "Acknowledge Notification"
+      operationId: acknowledgeNotification
+      tags: [Notifications]
+      parameters:
+        [
+          {
+            name: notificationId,
+            in: path,
+            required: true,
+            schema: { type: string },
+          },
+        ]
+      responses:
+        { "204": { description: Notification acknowledgement recorded } }
+  /api/v2/homes/{homeId}/activity:
+    get:
+      summary: "List Home Activity"
+      operationId: listHomeActivity
+      tags: [Home]
+      parameters: [{ $ref: "#/components/parameters/HomeId" }]
+      responses:
+        { "200": { description: Role-filtered activity for selected home } }
+  /api/v2/trusted-devices:
+    get:
+      summary: "List Trusted Customer Devices"
+      operationId: listTrustedCustomerDevices
+      tags: [Account]
+      responses: { "200": { description: Current account's trusted devices } }
+  /api/v2/me/pending-relationships:
+    get:
+      summary: "List Safe Pending Customer Relationships"
+      operationId: listCustomerPendingRelationships
+      tags: [Account]
+      security: [{ CustomerSessionCookie: [] }, { MobileAccessBearer: [] }]
+      responses:
+        "200":
+          description: Account-global bounded pending projection; includes only server-declared actions and no protected home/device detail.
+          content:
+            application/json:
+              schema: { $ref: "./contract.json#/$defs/customerPendingRelationshipsProjection" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+  /api/v2/me/profile:
+    get:
+      summary: "Read the authenticated customer's account profile"
+      operationId: getCustomerProfile
+      tags: [Account]
+      security: [{ CustomerSessionCookie: [] }, { MobileAccessBearer: [] }]
+      responses:
+        "200": { description: Account-global profile only; home address and membership authority are not returned., content: { application/json: { schema: { $ref: "./contract.json#/$defs/customerProfileReceipt" } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+    patch:
+      summary: "Update account profile with exact fresh trusted-device proof"
+      operationId: updateCustomerProfile
+      tags: [Account]
+      security: [{ CustomerSessionCookie: [] }, { MobileAccessBearer: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "./contract.json#/$defs/customerProfileUpdateRequest" }
+      responses:
+        "200": { description: Exact account profile revision updated; phone remains optional and unverified., content: { application/json: { schema: { $ref: "./contract.json#/$defs/customerProfileReceipt" } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { $ref: "#/components/responses/Conflict" }
+  /api/v2/me/username:
+    patch:
+      summary: Select the invited tenant username after email verification and mandatory password replacement
+      operationId: selectInvitedTenantUsername
+      tags: [Account]
+      security: [{ CustomerSessionCookie: [] }, { MobileAccessBearer: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "./contract.json#/$defs/invitedTenantUsernameRequest" }
+      responses:
+        "200": { description: Final username selected; the account may now proceed to its current policy and pending invitation gate., content: { application/json: { schema: { $ref: "./contract.json#/$defs/invitedTenantUsernameReceipt" } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "409": { $ref: "#/components/responses/Conflict" }
+  /api/v2/me/email-change:
+    post:
+      summary: Request a verified account email change
+      operationId: requestCustomerEmailChange
+      tags: [Account]
+      security: [{ CustomerSessionCookie: [] }, { MobileAccessBearer: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "./contract.json#/$defs/customerEmailChangeRequest" }
+      responses:
+        "202": { description: New address remains pending; existing address stays active until one-use confirmation., content: { application/json: { schema: { $ref: "./contract.json#/$defs/customerEmailChangeReceipt" } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { $ref: "#/components/responses/Conflict" }
+  /api/v2/invitations/{invitationId}/decision:
+    post:
+      summary: "Accept or Decline a Current Property Invitation"
+      operationId: decideCustomerMembershipInvitation
+      tags: [Account]
+      security: [{ CustomerSessionCookie: [] }, { MobileAccessBearer: [] }]
+      parameters: [{ name: invitationId, in: path, required: true, schema: { type: string, format: uuid } }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "./contract.json#/$defs/customerInvitationDecisionRequest" }
+      responses:
+        "200":
+          description: Idempotent decision receipt; ACCEPT creates exactly one current membership and only the invitation's active Area grants.
+          content:
+            application/json:
+              schema: { $ref: "./contract.json#/$defs/customerInvitationDecisionReceipt" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { description: Invitation is not visible to this verified account; no target or Home data is returned. }
+        "409": { $ref: "#/components/responses/Conflict" }
+  /api/v2/invitations/{invitationId}/status:
+    get:
+      summary: "Read the Authenticated Recipient's Exact Invitation Outcome"
+      operationId: getCustomerInvitationDecisionStatus
+      tags: [Account]
+      security: [{ CustomerSessionCookie: [] }, { MobileAccessBearer: [] }]
+      parameters: [{ name: invitationId, in: path, required: true, schema: { type: string, format: uuid } }]
+      responses:
+        "200":
+          description: Exact recipient-scoped invitation state; no invitation token, email, address, Area or device data is returned.
+          content:
+            application/json:
+              schema: { $ref: "./contract.json#/$defs/customerInvitationStatusReceipt" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { description: Invitation is not visible to this verified account; missing and wrong-recipient requests are indistinguishable. }
+  /api/public/areas/scan:
+    post:
+      summary: "Preview a Room QR without exposing protected property data"
+      operationId: previewRoomQr
+      tags: [Home]
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "./contract.json#/$defs/customerRoomQrScanRequest" }
+      responses:
+        "200": { description: Bounded preview for the current Area credential only., content: { application/json: { schema: { $ref: "./contract.json#/$defs/customerRoomQrScanReceipt" } } } }
+        "404": { description: Unknown or unavailable QR; no Home identity is disclosed. }
+        "409": { description: Home is not currently accepting Room requests. }
+  /api/public/areas/request-access/email-challenges:
+    post:
+      summary: "Begin a Private Prospective Room Request Email Verification"
+      operationId: beginProspectiveRoomAccess
+      tags: [Home]
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "./contract.json#/$defs/publicRoomAccessEmailChallengeRequest" }
+      responses:
+        "200": { description: The verified email already has a pending Room request; no duplicate request is created., content: { application/json: { schema: { $ref: "./contract.json#/$defs/publicRoomAccessEmailChallengeReceipt" } } } }
+        "202": { description: Email proof submitted; no account, membership, request-queue row or notification exists before verification., content: { application/json: { schema: { $ref: "./contract.json#/$defs/publicRoomAccessEmailChallengeReceipt" } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+  /api/public/areas/request-access/email-challenges/verify:
+    post:
+      summary: "Verify Prospective Room Request Email and Publish the Seven-Day Request"
+      operationId: verifyProspectiveRoomAccess
+      tags: [Home]
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "./contract.json#/$defs/publicRoomAccessEmailVerificationRequest" }
+      responses:
+        "201": { description: Email is verified; one exact original-Area request becomes visible to the authorised owner/manager queue., content: { application/json: { schema: { $ref: "./contract.json#/$defs/publicRoomAccessEmailVerificationReceipt" } } } }
+        "200": { description: Exact verification retry reconciles the same request., content: { application/json: { schema: { $ref: "./contract.json#/$defs/publicRoomAccessEmailVerificationReceipt" } } } }
+        "409": { $ref: "#/components/responses/Conflict" }
+  /api/public/support/email-challenges:
+    post:
+      summary: "Request Public Get Help Email Verification"
+      operationId: requestPublicSupportEmailVerification
+      tags: [Support]
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "./contract.json#/$defs/publicSupportEmailChallengeRequest" }
+      responses:
+        "202":
+          description: Bounded one-use reply-address code submitted to the mail provider; provider acceptance is not inbox delivery and no ticket exists yet.
+          content:
+            application/json:
+              schema: { $ref: "./contract.json#/$defs/publicSupportEmailChallengeReceipt" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+  /api/public/support/email-challenges/{challengeId}/verify:
+    post:
+      summary: "Verify Public Get Help Reply Address and Submit Standalone Ticket"
+      operationId: verifyPublicSupportEmailAndSubmitTicket
+      tags: [Support]
+      security: []
+      parameters:
+        [{ name: challengeId, in: path, required: true, schema: { type: string, format: uuid } }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "./contract.json#/$defs/publicSupportEmailVerificationRequest" }
+      responses:
+        "201": { description: Reply address verified and one standalone non-household ticket created., content: { application/json: { schema: { $ref: "./contract.json#/$defs/publicSupportTicketReceipt" } } } }
+        "200": { description: Exact same consumed submission reconciled without another ticket., content: { application/json: { schema: { $ref: "./contract.json#/$defs/publicSupportTicketReceipt" } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+  /api/public/areas/request-access:
+    post:
+      summary: "Submit a Verified Customer's Seven-Day Area Access Request"
+      operationId: requestRoomAccess
+      tags: [Home]
+      security: [{ CustomerSessionCookie: [] }, { MobileAccessBearer: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "./contract.json#/$defs/customerRoomAccessRequestRequest" }
+      responses:
+        "201": { description: New exact-Area request; creates no membership until approval., content: { application/json: { schema: { $ref: "./contract.json#/$defs/customerRoomAccessRequestReceipt" } } } }
+        "200": { description: Same pending request coalesced or exact idempotent replay., content: { application/json: { schema: { $ref: "./contract.json#/$defs/customerRoomAccessRequestReceipt" } } } }
+        "403": { description: Current account email is not verified; no request is created. }
+        "409": { $ref: "#/components/responses/Conflict" }
+  /api/v2/room-access-requests/{requestId}:
+    get:
+      summary: "Read the Requester's Own Room Request Status"
+      operationId: readOwnRoomAccessRequest
+      tags: [Home]
+      security: [{ CustomerSessionCookie: [] }, { MobileAccessBearer: [] }]
+      parameters: [{ name: requestId, in: path, required: true, schema: { type: string, format: uuid } }]
+      responses:
+        "200": { description: Requester-only status; no other account data., content: { application/json: { schema: { type: object, additionalProperties: false, required: [schemaVersion, ok, requestId, state, areaLabel, createdAt, expiresAt, revision, allowedActions], properties: { schemaVersion: { const: "dinodia.v1" }, ok: { const: true }, requestId: { type: string, format: uuid }, state: { type: string, enum: [PENDING, APPROVED, REJECTED, EXPIRED, CANCELLED] }, areaLabel: { type: string, maxLength: 80 }, createdAt: { type: string, format: date-time }, expiresAt: { type: string, format: date-time }, revision: { type: string, format: date-time }, allowedActions: { type: array, items: { type: string, enum: [VIEW_STATUS, CANCEL] } } } } } } }
+        "404": { description: Not owned by this account or no longer available. }
+  /api/v2/room-access-requests/{requestId}/cancel:
+    post:
+      summary: "Cancel the Requester's Pending Room Request"
+      operationId: cancelOwnRoomAccessRequest
+      tags: [Home]
+      security: [{ CustomerSessionCookie: [] }, { MobileAccessBearer: [] }]
+      parameters: [{ name: requestId, in: path, required: true, schema: { type: string, format: uuid } }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "./contract.json#/$defs/customerRoomAccessCancelRequest" }
+      responses:
+        "200": { description: Idempotent cancellation receipt. }
+        "404": { description: Not owned by this account. }
+        "409": { $ref: "#/components/responses/Conflict" }
+  /api/v2/homes/{homeId}/area-access-requests:
+    get:
+      summary: "List Current Room Requests for an Owner or Manager"
+      operationId: listHomeRoomAccessRequests
+      tags: [Home]
+      security: [{ CustomerSessionCookie: [] }, { MobileAccessBearer: [] }]
+      parameters: [{ name: homeId, in: path, required: true, schema: { type: string, format: uuid } }]
+      responses:
+        "200": { description: Bounded verified requester and Area details for current unexpired requests. }
+        "404": { description: No current owner/manager authority for this Home. }
+    post:
+      summary: "Approve or Reject a Current Room Access Request"
+      operationId: decideHomeRoomAccessRequest
+      tags: [Home]
+      security: [{ CustomerSessionCookie: [] }, { MobileAccessBearer: [] }]
+      parameters: [{ name: homeId, in: path, required: true, schema: { type: string, format: uuid } }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "./contract.json#/$defs/customerRoomAccessDecisionRequest" }
+      responses:
+        "200": { description: Approve grants only the originally scanned Area; rejection grants none., content: { application/json: { schema: { $ref: "./contract.json#/$defs/customerRoomAccessDecisionReceipt" } } } }
+        "404": { description: No current owner/manager authority or request is not in this Home. }
+        "409": { $ref: "#/components/responses/Conflict" }
+  /api/v2/home-claims/resolve:
+    post:
+      summary: "Resolve and Reserve an Initial Home Claim"
+      operationId: resolveCustomerHomeClaim
+      tags: [Home]
+      security: [{ CustomerSessionCookie: [] }, { MobileAccessBearer: [] }]
+      parameters: [{ $ref: "#/components/parameters/IdempotencyKey" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "./contract.json#/$defs/customerHomeClaimResolveRequest" }
+      responses:
+        "200":
+          description: Safe reservation receipt. The QR secret is never repeated; the claim remains ownerless and unconsumed.
+          content:
+            application/json:
+              schema: { $ref: "./contract.json#/$defs/customerHomeClaimResolveReceipt" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+  /api/v2/home-claims/lan-endpoint:
+    post:
+      summary: "Get the Fresh Pinned Hub Endpoint for a Permanent Home Label"
+      operationId: getCustomerHomeClaimLanEndpoint
+      tags: [Home]
+      security: [{ CustomerSessionCookie: [] }, { MobileAccessBearer: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "./contract.json#/$defs/customerHomeClaimLanEndpointRequest" }
+      responses:
+        "200":
+          description: "Current signed-in claimant’s exact verified hub identity and private LAN address from the identity-bound signed OS observation, with a separate maximum 420-second address validity; contains no Home or membership data."
+          content:
+            application/json:
+              schema: { $ref: "./contract.json#/$defs/customerHomeClaimLanEndpointReceipt" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { description: "The current label or verified hub endpoint is unavailable." }
+        "429": { $ref: "#/components/responses/RateLimited" }
+  /api/v2/home-claims/{claimId}/status:
+    get:
+      summary: "Read Claimant-Owned Home Setup Status"
+      operationId: getCustomerHomeClaimStatus
+      tags: [Home]
+      security: [{ CustomerSessionCookie: [] }, { MobileAccessBearer: [] }]
+      parameters: [{ name: claimId, in: path, required: true, schema: { type: string, format: uuid } }]
+      responses:
+        "200":
+          description: Only this account's own draft and bounded pending state; no household devices or other claimant data.
+          content:
+            application/json:
+              schema: { $ref: "./contract.json#/$defs/customerHomeClaimSetupStatus" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { description: Claim is not visible to this account. }
+  /api/v2/home-claims/{claimId}/resume:
+    post:
+      summary: "Resume a Current Home Claim Setup"
+      operationId: resumeCustomerHomeClaimSetup
+      tags: [Home]
+      security: [{ CustomerSessionCookie: [] }, { MobileAccessBearer: [] }]
+      parameters: [{ name: claimId, in: path, required: true, schema: { type: string, format: uuid } }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [expectedRevision, idempotencyKey], properties: { expectedRevision: { type: integer, minimum: 0 }, idempotencyKey: { type: string, minLength: 16, maxLength: 160 } }, additionalProperties: false }
+      responses:
+        "200": { description: Current safe setup status after revision revalidation. }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { description: Claim is not visible to this account. }
+        "409": { $ref: "#/components/responses/Conflict" }
+  /api/v2/home-claims/{claimId}/address:
+    get:
+      summary: "Read Current Address Confirmation Challenge"
+      operationId: getCustomerHomeClaimAddressChallenge
+      tags: [Home]
+      security: [{ CustomerSessionCookie: [] }, { MobileAccessBearer: [] }]
+      parameters: [{ name: claimId, in: path, required: true, schema: { type: string, format: uuid } }]
+      responses:
+        "200":
+          description: Current address plus server-computed revision-bound digest for this claimant only.
+          content:
+            application/json:
+              schema: { $ref: "./contract.json#/$defs/customerHomeClaimAddress" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { description: Claim is not visible to this account. }
+  /api/v2/home-claims/{claimId}/setup:
+    post:
+      summary: "Commit One Revision-Bound Home Setup Step"
+      operationId: saveCustomerHomeClaimSetupStep
+      tags: [Home]
+      security: [{ CustomerSessionCookie: [] }, { MobileAccessBearer: [] }]
+      parameters: [{ name: claimId, in: path, required: true, schema: { type: string, format: uuid } }, { $ref: "#/components/parameters/IdempotencyKey" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "./contract.json#/$defs/customerHomeClaimSetupRequest" }
+      responses:
+        "200":
+          description: Revision-bound step receipt. Only actual changed profile/address/current-policy/confirmation commits extend the claim reservation.
+          content:
+            application/json:
+              schema: { $ref: "./contract.json#/$defs/customerHomeClaimSetupReceipt" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "409": { $ref: "#/components/responses/Conflict" }
+  /api/v2/home-claims/{claimId}/complete:
+    post:
+      summary: "Complete Claimant Setup Without Activating Ownership"
+      operationId: completeCustomerHomeClaimSetup
+      tags: [Home]
+      security: [{ CustomerSessionCookie: [] }, { MobileAccessBearer: [] }]
+      parameters: [{ name: claimId, in: path, required: true, schema: { type: string, format: uuid } }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "./contract.json#/$defs/customerHomeClaimCompleteRequest" }
+      responses:
+        "200":
+          description: Converts the current claim to pending installation only. It does not create membership or consume the claim reference.
+          content:
+            application/json:
+              schema: { $ref: "./contract.json#/$defs/customerHomeClaimCompleteReceipt" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "409": { $ref: "#/components/responses/Conflict" }
+  /api/v2/homes/{homeId}/ownership-transfer:
+    get:
+      summary: "Read the Current Homeowner’s Transfer Status"
+      operationId: getOwnershipTransferStatus
+      tags: [Home]
+      security: [{ CustomerSessionCookie: [] }, { MobileAccessBearer: [] }]
+      parameters: [{ name: homeId, in: path, required: true, schema: { type: string, format: uuid } }]
+      responses:
+        "200": { description: Bounded transfer state visible only to the current owner, content: { application/json: { schema: { $ref: "./contract.json#/$defs/ownershipTransferStatus" } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { description: Caller is not the current owner of this Home. }
+    post:
+      summary: "Start or Cancel a Non-expiring Ownership Transfer"
+      operationId: changeOwnershipTransfer
+      tags: [Home]
+      security: [{ CustomerSessionCookie: [] }, { MobileAccessBearer: [] }]
+      parameters: [{ name: homeId, in: path, required: true, schema: { type: string, format: uuid } }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - { $ref: "./contract.json#/$defs/ownershipTransferStartRequest" }
+                - { $ref: "./contract.json#/$defs/ownershipTransferCancelRequest" }
+      responses:
+        "200": { description: Cancellation receipt; all QR, email and live resolver presentations are invalidated, content: { application/json: { schema: { $ref: "./contract.json#/$defs/ownershipTransferCancelReceipt" } } } }
+        "202": { description: Transfer started; owner must share the reference only with the exact verified recipient, content: { application/json: { schema: { $ref: "./contract.json#/$defs/ownershipTransferStartReceipt" } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { description: Caller is not the current owner of this Home. }
+        "409": { $ref: "#/components/responses/Conflict" }
+  /api/v2/ownership-transfers/resolve:
+    post:
+      summary: "Accept an Ownership Transfer for the Signed-in Verified Recipient"
+      operationId: acceptOwnershipTransfer
+      tags: [Home]
+      security: [{ CustomerSessionCookie: [] }, { MobileAccessBearer: [] }]
+      parameters: [{ $ref: "#/components/parameters/IdempotencyKey" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "./contract.json#/$defs/ownershipTransferResolveRequest" }
+      responses:
+        "200": { description: One-time current-role and relationship transition receipt, content: { application/json: { schema: { $ref: "./contract.json#/$defs/ownershipTransferResolveReceipt" } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { description: Transfer is not available to this verified recipient. }
+        "409": { $ref: "#/components/responses/Conflict" }
+  /api/v2/trusted-devices/{trustedDeviceId}:
+    delete:
+      summary: "Revoke Trusted Customer Device"
+      operationId: revokeTrustedCustomerDevice
+      tags: [Account]
+      parameters:
+        [
+          {
+            name: trustedDeviceId,
+            in: path,
+            required: true,
+            schema: { type: string },
+          },
+          { $ref: "#/components/parameters/StepUpProof" },
+        ]
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: "./contract.json#/$defs/trustedDeviceRemovalRequest" }
+      responses:
+        "200":
+          description: Device revoked account-wide and connected authority invalidated.
+          content:
+            application/json:
+              schema: { $ref: "./contract.json#/$defs/trustedDeviceRemovalReceipt" }
+  /api/v2/support/tickets:
+    get:
+      summary: "List Role Scoped Support Tickets"
+      operationId: listRoleScopedSupportTickets
+      tags: [Support]
+      responses:
+        {
+          "200":
+            {
+              description: Current customer's bounded tickets for the selected membership only,
+              content: { application/json: { schema: { $ref: "./contract.json#/$defs/supportTicketListReceipt" } } },
+            },
+        }
+    post:
+      summary: "Create Support Ticket"
+      operationId: createSupportTicket
+      tags: [Support]
+      requestBody:
+        {
+          required: true,
+          content:
+            {
+              application/json:
+                { schema: { $ref: "./contract.json#/$defs/supportTicketCreateRequest" } },
+            },
+        }
+      responses:
+        {
+          "201":
+            {
+              description: Support ticket created without expanding account authority,
+              content: { application/json: { schema: { $ref: "./contract.json#/$defs/supportTicketCreateReceipt" } } },
+            },
+        }
+  /api/v2/support/tickets/{ticketId}/code-exchange:
+    post:
+      summary: "Exchange Approved Support Code"
+      operationId: exchangeApprovedSupportCode
+      tags: [Support]
+      parameters:
+        [{ name: ticketId, in: path, required: true, schema: { type: string } }]
+      requestBody:
+        {
+          required: true,
+          content:
+            {
+              application/json:
+                {
+                  schema:
+                    { $ref: "./contract.json#/$defs/supportCodeExchange" },
+                },
+            },
+        }
+      responses:
+        "200":
+          {
+            description: One-use code exchanged into a short scope-bound support session,
+          }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { $ref: "#/components/responses/Conflict" }
+  /api/v2/support/tickets/{ticketId}:
+    get:
+      summary: "Get Customer Support Ticket"
+      operationId: getCustomerSupportTicket
+      tags: [Support]
+      parameters: [{ name: ticketId, in: path, required: true, schema: { type: string } }]
+      responses:
+        "200":
+          {
+            description: Ticket projection filtered to the exact requester and selected membership; only customer-visible timeline rows are returned,
+            content: { application/json: { schema: { $ref: "./contract.json#/$defs/supportTicketDetailReceipt" } } },
+          }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { description: Ticket is not visible to this principal. }
+    patch:
+      summary: "Update Customer Support Ticket"
+      operationId: updateCustomerSupportTicket
+      tags: [Support]
+      parameters: [{ name: ticketId, in: path, required: true, schema: { type: string } }, { $ref: "#/components/parameters/IfMatch" }, { $ref: "#/components/parameters/IdempotencyKey" }]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, additionalProperties: false } } } }
+      responses:
+        "200": { description: Revisioned customer-visible ticket update. }
+        "409": { $ref: "#/components/responses/Conflict" }
+    post:
+      summary: "Close Customer Support Ticket"
+      operationId: closeCustomerSupportTicket
+      tags: [Support]
+      security: [{ CustomerBearer: [] }]
+      parameters:
+        - { name: ticketId, in: path, required: true, schema: { $ref: "./contract.json#/$defs/id" } }
+        - { $ref: "#/components/parameters/StepUpProof" }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "./contract.json#/$defs/supportTicketCloseRequest" }
+      responses:
+        "200":
+          description: Current customer's ticket closed after exact single-use step-up; cloud access is revoked immediately and hub acknowledgement may remain pending.
+          content:
+            application/json:
+              schema: { $ref: "./contract.json#/$defs/supportTicketCloseReceipt" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { $ref: "#/components/responses/Conflict" }
+  /api/v2/support/tickets/{ticketId}/access-requests:
+    get:
+      summary: "List Ticket Support Access Requests"
+      operationId: listTicketSupportAccessRequests
+      tags: [Support]
+      parameters: [{ name: ticketId, in: path, required: true, schema: { type: string } }]
+      responses:
+        "200": { description: Access requests visible to the current customer or assigned employee. }
+        "403": { $ref: "#/components/responses/Forbidden" }
+    post:
+      summary: "Request Ticket Support Access"
+      operationId: requestTicketSupportAccess
+      tags: [Support]
+      parameters: [{ name: ticketId, in: path, required: true, schema: { type: string } }]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "./contract.json#/$defs/supportAccessRequestCreateRequest" } } } }
+      responses:
+        "201":
+          description: Scope-bound access request; no support authority is granted.
+          content:
+            application/json:
+              schema: { $ref: "./contract.json#/$defs/supportAccessRequestCreateReceipt" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+  /api/v2/support/tickets/{ticketId}/access-requests/{requestId}/approve:
+    post:
+      summary: "Record Ticket Support Access Decision"
+      operationId: decideTicketSupportAccess
+      tags: [Support]
+      parameters: [{ name: ticketId, in: path, required: true, schema: { type: string } }, { name: requestId, in: path, required: true, schema: { type: string } }, { $ref: "#/components/parameters/StepUpProof" }]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "./contract.json#/$defs/supportAccessDecisionRequest" } } } }
+      responses:
+        "200":
+          description: Customer approval changes authority only and never returns the employee's one-use code.
+          content:
+            application/json:
+              schema: { $ref: "./contract.json#/$defs/supportAccessDecisionReceipt" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { $ref: "#/components/responses/Conflict" }
+  /api/v2/support/tickets/{ticketId}/access-requests/{requestId}/issue:
+    post:
+      summary: "Issue Ticket Support Code"
+      operationId: issueTicketSupportCode
+      tags: [Support]
+      parameters: [{ name: ticketId, in: path, required: true, schema: { type: string } }, { name: requestId, in: path, required: true, schema: { type: string } }]
+      responses:
+        "200":
+          description: One-time code is returned once only to the assigned, recently authenticated employee; storage is hash-only.
+          content:
+            application/json:
+              schema: { $ref: "./contract.json#/$defs/supportAccessIssueReceipt" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+  /api/v2/support/tickets/{ticketId}/access-requests/{requestId}/revoke:
+    post:
+      summary: "Revoke Ticket Support Access"
+      operationId: revokeTicketSupportAccess
+      tags: [Support]
+      description: "Requires the current OWNER or PROPERTY_MANAGER membership that approved the active property-scoped request, plus fresh step-up bound to support_access_revoke and these exact ticket/request IDs. The proof may be carried in the optional header or the request body."
+      parameters: [{ name: ticketId, in: path, required: true, schema: { type: string } }, { name: requestId, in: path, required: true, schema: { type: string } }, { $ref: "#/components/parameters/StepUpProof" }]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "./contract.json#/$defs/supportAccessRevokeRequest" } } } }
+      responses:
+        "200":
+          description: Cloud support authority is revoked immediately; hub acknowledgement may remain pending.
+          content:
+            application/json:
+              schema: { $ref: "./contract.json#/$defs/supportAccessRevokeReceipt" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { $ref: "#/components/responses/Conflict" }
+  /api/v2/homes/{homeId}/reset-property-ownership:
+    post:
+      summary: "Reset Property Ownership"
+      operationId: resetPropertyOwnership
+      tags: [Home]
+      parameters: [{ $ref: "#/components/parameters/HomeId" }, { $ref: "#/components/parameters/IfMatch" }, { $ref: "#/components/parameters/IdempotencyKey" }]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [stepUpOperationId], properties: { stepUpOperationId: { type: string } }, additionalProperties: false } } } }
+      responses:
+        "202": { description: Customer relationships are revoked immediately; hub cleanup remains tracked until acknowledgement. }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { $ref: "#/components/responses/Conflict" }
+  /api/automations:
+    get:
+      summary: "List Selected Tenant Automations"
+      operationId: listSelectedTenantAutomations
+      tags: [Home]
+      security: [{ MobileAccessBearer: [] }, { CustomerSessionCookie: [] }]
+      parameters: [{ name: X-Dinodia-Home-Id, in: header, required: true, schema: { type: string, format: uuid } }]
+      responses:
+        "200": { description: Selected-tenant-only current projection; includes truthful delivery state and no other membership's definitions., content: { application/json: { schema: { $ref: "./contract.json#/$defs/tenantAutomationProjection" } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+    post:
+      summary: "Create Selected Tenant Automation"
+      operationId: createSelectedTenantAutomation
+      tags: [Home]
+      security: [{ MobileAccessBearer: [] }, { CustomerSessionCookie: [] }]
+      parameters: [{ name: X-Dinodia-Home-Id, in: header, required: true, schema: { type: string, format: uuid } }, { $ref: "#/components/parameters/IdempotencyKey" }]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "./contract.json#/$defs/tenantAutomationDefinition" } } } }
+      responses:
+        "201": { description: Definition saved; deliveryState does not claim OS activation., content: { application/json: { schema: { $ref: "./contract.json#/$defs/tenantAutomationCreateReceipt" } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { $ref: "#/components/responses/Conflict" }
+  /api/automations/{automationId}:
+    parameters: [{ name: automationId, in: path, required: true, schema: { type: string, format: uuid } }]
+    get:
+      summary: "Read Selected Tenant Automation"
+      operationId: readSelectedTenantAutomation
+      tags: [Home]
+      security: [{ MobileAccessBearer: [] }, { CustomerSessionCookie: [] }]
+      parameters: [{ name: X-Dinodia-Home-Id, in: header, required: true, schema: { type: string, format: uuid } }]
+      responses:
+        "200": { description: Full definition for its owning selected tenant only., content: { application/json: { schema: { $ref: "./contract.json#/$defs/tenantAutomationDetailEnvelope" } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    put:
+      summary: "Update Selected Tenant Automation"
+      operationId: updateSelectedTenantAutomation
+      tags: [Home]
+      security: [{ MobileAccessBearer: [] }, { CustomerSessionCookie: [] }]
+      parameters: [{ name: X-Dinodia-Home-Id, in: header, required: true, schema: { type: string, format: uuid } }, { $ref: "#/components/parameters/IdempotencyKey" }]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "./contract.json#/$defs/tenantAutomationUpdateRequest" } } } }
+      responses:
+        "200": { description: Revisioned definition update; hub/application state is explicit., content: { application/json: { schema: { $ref: "./contract.json#/$defs/tenantAutomationMutationReceipt" } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { $ref: "#/components/responses/Conflict" }
+    delete:
+      summary: "Delete Selected Tenant Automation"
+      operationId: deleteSelectedTenantAutomation
+      tags: [Home]
+      security: [{ MobileAccessBearer: [] }, { CustomerSessionCookie: [] }]
+      parameters: [{ name: X-Dinodia-Home-Id, in: header, required: true, schema: { type: string, format: uuid } }, { $ref: "#/components/parameters/IdempotencyKey" }]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "./contract.json#/$defs/tenantAutomationDeleteRequest" } } } }
+      responses:
+        "200": { description: Cloud authority is removed immediately; OS removal remains pending until its matching acknowledgement., content: { application/json: { schema: { $ref: "./contract.json#/$defs/tenantAutomationMutationReceipt" } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { $ref: "#/components/responses/Conflict" }
+  /api/automations/{automationId}/enabled:
+    post:
+      summary: "Set Selected Tenant Automation Enabled State"
+      operationId: setSelectedTenantAutomationEnabled
+      tags: [Home]
+      security: [{ MobileAccessBearer: [] }, { CustomerSessionCookie: [] }]
+      parameters: [{ name: automationId, in: path, required: true, schema: { type: string, format: uuid } }, { name: X-Dinodia-Home-Id, in: header, required: true, schema: { type: string, format: uuid } }, { $ref: "#/components/parameters/IdempotencyKey" }]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "./contract.json#/$defs/tenantAutomationEnableRequest" } } } }
+      responses:
+        "200": { description: Enabling is accepted only after current validation and hub delivery state checks., content: { application/json: { schema: { $ref: "./contract.json#/$defs/tenantAutomationMutationReceipt" } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { $ref: "#/components/responses/Conflict" }
+  /api/v2/homes/{homeId}/property-automations:
+    get:
+      summary: "List Selected Home Property-Affecting Tenant Automations"
+      operationId: listPropertyAutomationOversight
+      tags: [Home]
+      security: [{ MobileAccessBearer: [] }, { CustomerSessionCookie: [] }]
+      parameters: [{ $ref: "#/components/parameters/HomeId" }, { name: X-Dinodia-Home-Id, in: header, required: true, schema: { type: string, format: uuid } }]
+      responses:
+        "200": { description: Current owner/manager projection; private-only rules and private action fragments are excluded., content: { application/json: { schema: { $ref: "./contract.json#/$defs/propertyAutomationLiveProjection" } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/v2/homes/{homeId}/property-automations/{automationId}/disable:
+    post:
+      summary: "Disable Tenant Automation Affecting Permanent Devices"
+      operationId: disablePropertyAutomation
+      tags: [Home]
+      security: [{ MobileAccessBearer: [] }, { CustomerSessionCookie: [] }]
+      parameters: [{ $ref: "#/components/parameters/HomeId" }, { name: automationId, in: path, required: true, schema: { type: string, format: uuid } }, { name: X-Dinodia-Home-Id, in: header, required: true, schema: { type: string, format: uuid } }, { $ref: "#/components/parameters/IdempotencyKey" }]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "./contract.json#/$defs/propertyAutomationInterventionRequest" } } } }
+      responses:
+        "200": { description: Cloud execution authority is blocked now; OS enforcement and mandatory tenant notice are reported separately., content: { application/json: { schema: { $ref: "./contract.json#/$defs/propertyAutomationInterventionReceipt" } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+  /api/v2/homes/{homeId}/property-automations/{automationId}:
+    delete:
+      summary: "Delete Tenant Automation Affecting Permanent Devices"
+      operationId: deletePropertyAutomation
+      tags: [Home]
+      security: [{ MobileAccessBearer: [] }, { CustomerSessionCookie: [] }]
+      parameters: [{ $ref: "#/components/parameters/HomeId" }, { name: automationId, in: path, required: true, schema: { type: string, format: uuid } }, { name: X-Dinodia-Home-Id, in: header, required: true, schema: { type: string, format: uuid } }, { $ref: "#/components/parameters/IdempotencyKey" }]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "./contract.json#/$defs/propertyAutomationInterventionRequest" } } } }
+      responses:
+        "200": { description: Irreversible cloud removal is immediate; bounded OS tombstone acknowledgement is shown separately., content: { application/json: { schema: { $ref: "./contract.json#/$defs/propertyAutomationInterventionReceipt" } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+  /api/dinodia/v1/snapshot:
+    servers: [{ url: "https://{hubHost}:8123", variables: { hubHost: { default: "dinodia-example.local" } } }]
+    get:
+      summary: "Read Selected Home Snapshot"
+      operationId: readSelectedHomeSnapshot
+      description: "Negotiate X-Dinodia-State-Evidence-Version 2 to receive data.stateEvidenceVersion=2 and independently validated controlStateEvidence2 states. Default v1 shape is unchanged. Both Local and authorized CloudURL use the same authority and evidence."
+      tags: [Devices]
+      security: [{ CustomerBearer: [] }]
+      parameters: [{ name: homeId, in: query, required: true, schema: { type: string } }, { name: homeMembershipId, in: query, required: true, schema: { type: string } }, { name: cursor, in: query, required: false, schema: { type: string } }]
+      responses:
+        "200": { description: Bounded home-scoped snapshot page with stream/revision envelope and tombstones. }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+  /api/dinodia/v1/areas:
+    servers: [{ url: "https://{hubHost}:8123", variables: { hubHost: { default: "dinodia-example.local" } } }]
+    get:
+      summary: "List Canonical Areas"
+      operationId: listCanonicalAreas
+      tags: [Home]
+      security: [{ CustomerBearer: [] }]
+      responses: { "200": { description: "Canonical original/override area DTOs, including empty active areas." }, "401": { $ref: "#/components/responses/Unauthorized" } }
+  /api/dinodia/v1/devices/{deviceId}:
+    servers: [{ url: "https://{hubHost}:8123", variables: { hubHost: { default: "dinodia-example.local" } } }]
+    get:
+      summary: "Get Current Native Device"
+      operationId: getCurrentNativeDevice
+      tags: [Devices]
+      security: [{ CustomerBearer: [] }]
+      parameters: [{ $ref: "#/components/parameters/DeviceId" }]
+      responses: { "200": { description: Current device descriptor and separately revisioned state. }, "401": { $ref: "#/components/responses/Unauthorized" }, "403": { $ref: "#/components/responses/Forbidden" }, "404": { description: Not visible in the selected membership scope. } }
+  /api/dinodia/v1/control-catalog:
+    servers: [{ url: "https://{hubHost}:8123", variables: { hubHost: { default: "dinodia-example.local" } } }]
+    get:
+      summary: "Get Current Control Catalog"
+      operationId: getCurrentControlCatalog
+      tags: [Devices]
+      security: [{ CustomerBearer: [] }]
+      parameters: [{ name: deviceId, in: query, required: true, schema: { type: string } }]
+      responses: { "200": { description: Current descriptor revision and bounded typed controls. }, "409": { $ref: "#/components/responses/Conflict" } }
+  /api/dinodia/v1/events:
+    servers: [{ url: "https://{hubHost}:8123", variables: { hubHost: { default: "dinodia-example.local" } } }]
+    get:
+      summary: "Subscribe Home Events"
+      operationId: subscribeHomeEvents
+      description: "X-Dinodia-State-Evidence-Version 2 selects controlStateEvidence2 for the lifetime of this authenticated stream; reconnect to change versions. Unknown versions are rejected."
+      tags: [Devices]
+      security: [{ CustomerBearer: [] }]
+      parameters: [{ name: homeId, in: query, required: true, schema: { type: string } }, { name: homeMembershipId, in: query, required: true, schema: { type: string } }, { name: streamId, in: query, required: false, schema: { type: string } }, { name: sequence, in: query, required: false, schema: { type: integer, minimum: 0 } }]
+      responses: { "200": { description: Authenticated ordered dinodia.v1 event stream; current authorization is rechecked. }, "401": { $ref: "#/components/responses/Unauthorized" }, "403": { $ref: "#/components/responses/Forbidden" } }
+  /api/dinodia/v1/commands/{commandId}:
+    servers: [{ url: "https://{hubHost}:8123", variables: { hubHost: { default: "dinodia-example.local" } } }]
+    get:
+      summary: "Get Command Receipt"
+      operationId: getCommandReceipt
+      tags: [Devices]
+      security: [{ CustomerBearer: [] }]
+      parameters: [{ name: commandId, in: path, required: true, schema: { type: string } }]
+      responses: { "200": { description: "Accepted, completed, rejected, uncertain or expired command receipt." }, "401": { $ref: "#/components/responses/Unauthorized" }, "404": { description: "Receipt is not visible in the current home/membership scope." } }
+  /api/dinodia/v1/commissioning/sessions:
+    servers: [{ url: "https://{hubHost}:8123", variables: { hubHost: { default: "dinodia-example.local" } } }]
+    post:
+      summary: "Create Commissioning Session"
+      operationId: createCommissioningSession
+      tags: [Devices]
+      security: [{ CustomerBearer: [] }]
+      parameters: [{ $ref: "#/components/parameters/IdempotencyKey" }]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "./contract.json#/$defs/nativeCommissioningStartRequest" } } } }
+      responses: { "201": { description: Fifteen-minute bounded commissioning session., content: { application/json: { schema: { $ref: "./contract.json#/$defs/nativeCommissioningSession" } } } }, "400": { $ref: "#/components/responses/BadRequest" }, "401": { $ref: "#/components/responses/Unauthorized" }, "403": { $ref: "#/components/responses/Forbidden" }, "409": { $ref: "#/components/responses/Conflict" }, "503": { description: Protocol disabled or radio unavailable; no fallback is attempted. } }
+  /api/dinodia/v1/commissioning/sessions/{sessionId}:
+    servers: [{ url: "https://{hubHost}:8123", variables: { hubHost: { default: "dinodia-example.local" } } }]
+    get:
+      summary: "Get Commissioning Session"
+      operationId: getCommissioningSession
+      tags: [Devices]
+      security: [{ CustomerBearer: [] }]
+      parameters: [{ name: sessionId, in: path, required: true, schema: { type: string, format: uuid } }, { name: after, in: query, required: false, schema: { type: integer, minimum: 0 } }, { name: candidateAfter, in: query, required: false, schema: { type: string, format: uuid } }]
+      responses:
+        "200":
+          description: Current bounded commissioning page and event projection.
+          content:
+            application/json:
+              schema: { $ref: "./contract.json#/$defs/nativeCommissioningSession" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { description: Session is unavailable or outside current membership scope. }
+  /api/dinodia/v1/commissioning/sessions/{sessionId}/events:
+    servers: [{ url: "https://{hubHost}:8123", variables: { hubHost: { default: "dinodia-example.local" } } }]
+    get:
+      summary: "Subscribe to Current Commissioning Session Events"
+      description: "Upgrade to an authenticated WebSocket. Every message is a bounded current session projection; the hub revalidates the same selected tenant and session authority before delivery."
+      operationId: subscribeCommissioningSessionEvents
+      tags: [Devices]
+      security: [{ CustomerBearer: [] }]
+      parameters: [{ name: sessionId, in: path, required: true, schema: { type: string, format: uuid } }, { name: after, in: query, required: false, schema: { type: integer, minimum: 0 } }]
+      responses:
+        "101": { description: Authenticated WebSocket upgrade; messages use the bounded nativeCommissioningSession projection. }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { description: Session is unavailable or outside current membership scope. }
+  /api/dinodia/v1/commissioning/sessions/{sessionId}/matter-payload:
+    servers: [{ url: "https://{hubHost}:8123", variables: { hubHost: { default: "dinodia-example.local" } } }]
+    post:
+      summary: "Submit Matter Setup Payload"
+      operationId: submitMatterCommissioningPayload
+      tags: [Devices]
+      security: [{ CustomerBearer: [] }]
+      parameters: [{ name: sessionId, in: path, required: true, schema: { type: string, format: uuid } }]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "./contract.json#/$defs/nativeCommissioningMatterPayload" } } } }
+      responses:
+        "202":
+          description: Payload accepted for bounded local commissioning only.
+          content:
+            application/json:
+              schema: { $ref: "./contract.json#/$defs/nativeCommissioningSession" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { $ref: "#/components/responses/Conflict" }
+  /api/dinodia/v1/commissioning/sessions/{sessionId}/select:
+    servers: [{ url: "https://{hubHost}:8123", variables: { hubHost: { default: "dinodia-example.local" } } }]
+    post:
+      summary: "Select a Discovered Device and Original Area"
+      operationId: selectCommissioningCandidate
+      tags: [Devices]
+      security: [{ CustomerBearer: [] }]
+      parameters: [{ name: sessionId, in: path, required: true, schema: { type: string, format: uuid } }]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "./contract.json#/$defs/nativeCommissioningSelectRequest" } } } }
+      responses:
+        "200":
+          description: Revision-bound selected candidate projection.
+          content:
+            application/json:
+              schema: { $ref: "./contract.json#/$defs/nativeCommissioningSession" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { $ref: "#/components/responses/Conflict" }
+  /api/dinodia/v1/commissioning/sessions/{sessionId}/complete:
+    servers: [{ url: "https://{hubHost}:8123", variables: { hubHost: { default: "dinodia-example.local" } } }]
+    post:
+      summary: "Complete or Safely Remove the Commissioned Device"
+      operationId: completeNativeCommissioning
+      tags: [Devices]
+      security: [{ CustomerBearer: [] }]
+      parameters: [{ name: sessionId, in: path, required: true, schema: { type: string, format: uuid } }]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "./contract.json#/$defs/nativeCommissioningCompletion" } } } }
+      responses:
+        "200":
+          description: Current terminal state and cleanup receipt.
+          content:
+            application/json:
+              schema: { $ref: "./contract.json#/$defs/nativeCommissioningSession" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { $ref: "#/components/responses/Conflict" }
+  /api/dinodia/v1/commissioning/sessions/{sessionId}/cancel:
+    servers: [{ url: "https://{hubHost}:8123", variables: { hubHost: { default: "dinodia-example.local" } } }]
+    post:
+      summary: "Cancel Native Commissioning"
+      operationId: cancelNativeCommissioning
+      tags: [Devices]
+      security: [{ CustomerBearer: [] }]
+      parameters: [{ name: sessionId, in: path, required: true, schema: { type: string, format: uuid } }]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "./contract.json#/$defs/nativeCommissioningAction" } } } }
+      responses:
+        "200":
+          description: Cancelled state and cleanup status.
+          content:
+            application/json:
+              schema: { $ref: "./contract.json#/$defs/nativeCommissioningSession" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { $ref: "#/components/responses/Conflict" }
+  /api/dinodia/v1/commissioning/sessions/{sessionId}/resume:
+    servers: [{ url: "https://{hubHost}:8123", variables: { hubHost: { default: "dinodia-example.local" } } }]
+    post:
+      summary: "Resume Recoverable Native Commissioning"
+      operationId: resumeNativeCommissioning
+      tags: [Devices]
+      security: [{ CustomerBearer: [] }]
+      parameters: [{ name: sessionId, in: path, required: true, schema: { type: string, format: uuid } }]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "./contract.json#/$defs/nativeCommissioningAction" } } } }
+      responses:
+        "200":
+          description: Resumed bounded session projection.
+          content:
+            application/json:
+              schema: { $ref: "./contract.json#/$defs/nativeCommissioningSession" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { $ref: "#/components/responses/Conflict" }
+  /api/dinodia/v1/support/exchange:
+    servers: [{ url: "https://{hubHost}:8123", variables: { hubHost: { default: "dinodia-example.local" } } }]
+    post:
+      summary: "Exchange Support Code At Hub"
+      operationId: exchangeSupportCodeAtHub
+      tags: [Support]
+      security: [{ EmployeeBearer: [] }]
+      parameters: [{ $ref: "#/components/parameters/IdempotencyKey" }]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "./contract.json#/$defs/supportCodeExchange" } } } }
+      responses: { "200": { description: Scope-bound support session; no dashboard principal is created. }, "403": { $ref: "#/components/responses/Forbidden" }, "409": { $ref: "#/components/responses/Conflict" } }
+  /api/dinodia/v1/support/session/status:
+    servers: [{ url: "https://{hubHost}:8123", variables: { hubHost: { default: "dinodia-example.local" } } }]
+    get:
+      summary: "Get Support Session Status"
+      operationId: getSupportSessionStatus
+      tags: [Support]
+      security: [{ SupportSession: [] }]
+      responses: { "200": { description: Redacted current scope and absolute expiry; no reusable proof is returned. }, "401": { $ref: "#/components/responses/Unauthorized" } }
+  /api/dinodia/v1/support/session/end:
+    servers: [{ url: "https://{hubHost}:8123", variables: { hubHost: { default: "dinodia-example.local" } } }]
+    post:
+      summary: "End Support Session"
+      operationId: endSupportSession
+      tags: [Support]
+      security: [{ SupportSession: [] }]
+      responses: { "204": { description: Local support authority and sockets revoked. }, "401": { $ref: "#/components/responses/Unauthorized" } }
+  /api/installer/hubs/provision:
+    post:
+      summary: "Provision Certified Hub"
+      operationId: provisionCertifiedHub
+      tags: [Home]
+      security: [{ EmployeeBearer: [] }]
+      parameters: [{ $ref: "#/components/parameters/IdempotencyKey" }]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [pairingCode, workflowId], properties: { pairingCode: { type: string, minLength: 1 }, workflowId: { type: string, minLength: 1 } }, additionalProperties: false } } } }
+      responses: { "200": { description: Assigned-workflow-bound Home and HubInstallation result; pairing secret is not returned. }, "401": { description: Employee session required. }, "409": { $ref: "#/components/responses/Conflict" } }
+  /api/installer/installation-requests:
+    get:
+      summary: "List Assigned Permanent-Installation Requests"
+      operationId: listStaffInstallationRequests
+      tags: [Home]
+      security: [{ EmployeeBearer: [] }]
+      responses: { "200": { description: Staff-scoped request queue and bounded assignment options. }, "401": { description: Current Company Portal employee session required. }, "403": { $ref: "#/components/responses/Forbidden" } }
+  /api/installer/installation-requests/{requestId}/start:
+    post:
+      summary: "Start or Assign Permanent-Installation Work"
+      operationId: startStaffInstallationRequest
+      tags: [Home]
+      security: [{ EmployeeBearer: [] }]
+      parameters: [{ name: requestId, in: path, required: true, schema: { type: string, format: uuid } }, { $ref: "#/components/parameters/IdempotencyKey" }]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "./contract.json#/$defs/installationRequestStart" } } } }
+      responses: { "200": { description: Exact replay or current assigned-work result. }, "201": { description: Work assigned or started. }, "401": { description: Current Company Portal employee session required. }, "403": { $ref: "#/components/responses/Forbidden" }, "409": { $ref: "#/components/responses/Conflict" } }
+  /api/installer/installation-requests/{requestId}/complete:
+    post:
+      summary: "Complete Assigned Permanent-Installation Work"
+      operationId: completeStaffInstallationRequest
+      tags: [Home]
+      security: [{ EmployeeBearer: [] }]
+      parameters: [{ name: requestId, in: path, required: true, schema: { type: string, format: uuid } }, { $ref: "#/components/parameters/IdempotencyKey" }]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "./contract.json#/$defs/installationRequestComplete" } } } }
+      responses: { "200": { description: Completed only after a qualifying permanent-device result has synced. }, "401": { description: Current Company Portal employee session required. }, "403": { $ref: "#/components/responses/Forbidden" }, "409": { $ref: "#/components/responses/Conflict" } }
+  /api/installer/hubs/{hubInstallationId}/provisioning-status:
+    get:
+      summary: "Get Hub Provisioning Status"
+      operationId: getHubProvisioningStatus
+      tags: [Home]
+      parameters: [{ name: hubInstallationId, in: path, required: true, schema: { type: string } }]
+      security: [{ EmployeeBearer: [] }]
+      responses: { "200": { description: Authorized redacted installation and machine-credential lifecycle state. }, "403": { $ref: "#/components/responses/Forbidden" } }
+  /api/installer/hubs/{hubInstallationId}/cloudflare-status:
+    get:
+      summary: "Get Reserved Cloudflare Status"
+      operationId: getReservedCloudflareStatus
+      tags: [Home]
+      parameters: [{ name: hubInstallationId, in: path, required: true, schema: { type: string } }]
+      security: [{ EmployeeBearer: [] }]
+      responses: { "200": { description: Current reservation and independently verified CloudURL state. }, "403": { $ref: "#/components/responses/Forbidden" } }
+  /api/hub-provisioning/pairings/advertise:
+    post:
+      summary: "Advertise Certified Pairing Attempt"
+      operationId: advertiseCertifiedPairingAttempt
+      tags: [Home]
+      security: [{ HubSignature: [] }]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, additionalProperties: false } } } }
+      responses: { "201": { description: Durable pairing attempt with one-way presentation-code hash. }, "401": { $ref: "#/components/responses/Unauthorized" } }
+  /api/hub-provisioning/pairings/{attemptId}/poll:
+    post:
+      summary: "Poll Pairing Attempt"
+      operationId: pollPairingAttempt
+      tags: [Home]
+      security: [{ HubSignature: [] }]
+      parameters: [{ name: attemptId, in: path, required: true, schema: { type: string } }]
+      responses: { "200": { description: Current signed challenge or machine-credential delivery envelope. }, "401": { $ref: "#/components/responses/Unauthorized" } }
+  /api/hub-provisioning/pairings/{attemptId}/prove:
+    post:
+      summary: "Prove Pairing Challenge"
+      operationId: provePairingChallenge
+      tags: [Home]
+      security: [{ HubSignature: [] }]
+      parameters: [{ name: attemptId, in: path, required: true, schema: { type: string } }, { $ref: "#/components/parameters/IdempotencyKey" }]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, additionalProperties: false } } } }
+      responses: { "200": { description: Challenge proof accepted for the registered generation and key. }, "401": { $ref: "#/components/responses/Unauthorized" }, "409": { $ref: "#/components/responses/Conflict" } }
+  /api/hub-provisioning/pairings/{attemptId}/ack:
+    post:
+      summary: "Acknowledge Pairing Credential"
+      operationId: acknowledgePairingCredential
+      tags: [Home]
+      security: [{ HubSignature: [] }]
+      parameters: [{ name: attemptId, in: path, required: true, schema: { type: string } }, { $ref: "#/components/parameters/IdempotencyKey" }]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, additionalProperties: false } } } }
+      responses: { "200": { description: Exact machine-credential version acknowledged by the paired hub. }, "401": { $ref: "#/components/responses/Unauthorized" }, "409": { $ref: "#/components/responses/Conflict" } }
+  /api/v2/homes/{homeId}/activity/export:
+    get:
+      summary: Export bounded Home management activity as CSV
+      operationId: exportHomeManagementActivityCsv
+      tags: [Home]
+      security: [{ MobileAccessBearer: [] }, { CustomerSessionCookie: [] }]
+      parameters: [{ $ref: "#/components/parameters/HomeId" }]
+      responses: { "200": { description: Selected-membership, bounded CSV export; no tenant-private device data. }, "401": { $ref: "#/components/responses/Unauthorized" }, "404": { $ref: "#/components/responses/Forbidden" } }
+  /api/v2/homes/{homeId}/areas/{areaId}/override:
+    patch:
+      summary: Update an authorized Area presentation override
+      operationId: updateHomeAreaPresentationOverride
+      tags: [Home]
+      security: [{ MobileAccessBearer: [] }, { CustomerSessionCookie: [] }]
+      parameters: [{ $ref: "#/components/parameters/HomeId" }, { name: areaId, in: path, required: true, schema: { type: string, format: uuid } }, { $ref: "#/components/parameters/IdempotencyKey" }]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, additionalProperties: false } } } }
+      responses: { "200": { description: Revision-bound customer-facing Area name saved without changing the canonical Area identity or grants. }, "401": { $ref: "#/components/responses/Unauthorized" }, "409": { $ref: "#/components/responses/Conflict" } }
+  /api/v2/homes/{homeId}/deregister-full-home/commit:
+    post:
+      summary: Deregister Full Home (destructive commit remains Stage 13 gated)
+      operationId: commitHomeDeregistration
+      tags: [Home]
+      security: [{ MobileAccessBearer: [] }, { CustomerSessionCookie: [] }]
+      parameters: [{ $ref: "#/components/parameters/HomeId" }]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "./contract.json#/$defs/homeDeregistrationRequest" } } } }
+      responses:
+        "202": { description: Customer authority was removed and hub enforcement remains pending; account cleanup is separately reported, content: { application/json: { schema: { $ref: "./contract.json#/$defs/homeDeregistrationReceipt" } } } }
+        "503": { description: Commit is intentionally unavailable until the Stage 13 safety release. }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /api/v2/homes/{homeId}/deregister-full-home/preview:
+    post:
+      summary: Preview Full Home deregistration consequences (read-only)
+      operationId: previewHomeDeregistration
+      tags: [Home]
+      security: [{ MobileAccessBearer: [] }, { CustomerSessionCookie: [] }]
+      parameters: [{ $ref: "#/components/parameters/HomeId" }]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, additionalProperties: false } } } }
+      responses:
+        "200": { description: Current selected-owner consequences; this preview performs no mutation, content: { application/json: { schema: { $ref: "./contract.json#/$defs/homeDeregistrationPreview" } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { description: Selected Home is not currently authorised for this owner, content: { application/json: { schema: { $ref: "#/components/schemas/NativeError" } } } }
+  /api/v2/homes/{homeId}/devices/{deviceId}/information:
+    get:
+      summary: Read authorized permanent-device information
+      operationId: readHomePermanentDeviceInformation
+      tags: [Devices]
+      security: [{ MobileAccessBearer: [] }, { CustomerSessionCookie: [] }]
+      parameters: [{ $ref: "#/components/parameters/HomeId" }, { $ref: "#/components/parameters/DeviceId" }]
+      responses: { "200": { description: Current selected-home permanent-device information only; no controls or tenant-owned device details. }, "401": { $ref: "#/components/responses/Unauthorized" }, "404": { $ref: "#/components/responses/Forbidden" } }
+  /api/v2/homes/{homeId}/devices/{deviceId}/override:
+    patch:
+      summary: Update permanent-device presentation metadata
+      operationId: updatePermanentDevicePresentationOverride
+      tags: [Devices]
+      security: [{ MobileAccessBearer: [] }, { CustomerSessionCookie: [] }]
+      parameters: [{ $ref: "#/components/parameters/HomeId" }, { $ref: "#/components/parameters/DeviceId" }, { $ref: "#/components/parameters/IdempotencyKey" }]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, additionalProperties: false } } } }
+      responses: { "200": { description: Authorized customer-facing label update; technical identity and controls are unchanged. }, "401": { $ref: "#/components/responses/Unauthorized" }, "409": { $ref: "#/components/responses/Conflict" } }
+  /api/v2/homes/{homeId}/floorplan:
+    get:
+      summary: Read the current Home floorplan
+      operationId: readHomeFloorplan
+      tags: [Home]
+      security: [{ MobileAccessBearer: [] }, { CustomerSessionCookie: [] }]
+      parameters: [{ $ref: "#/components/parameters/HomeId" }]
+      responses: { "200": { description: Revisioned canonical-Area layout for the selected Home. }, "401": { $ref: "#/components/responses/Unauthorized" }, "404": { $ref: "#/components/responses/Forbidden" } }
+    put:
+      summary: Save the Home floorplan with compare-and-set revision
+      operationId: updateHomeFloorplan
+      tags: [Home]
+      security: [{ MobileAccessBearer: [] }, { CustomerSessionCookie: [] }]
+      parameters: [{ $ref: "#/components/parameters/HomeId" }, { $ref: "#/components/parameters/IdempotencyKey" }]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, additionalProperties: false } } } }
+      responses: { "200": { description: Floorplan saved atomically for the selected Home. }, "401": { $ref: "#/components/responses/Unauthorized" }, "409": { $ref: "#/components/responses/Conflict" } }
+  /api/v2/homes/{homeId}/homeowner-context:
+    get:
+      summary: Read owner/property-manager Home projection
+      operationId: readHomeownerContext
+      tags: [Home]
+      security: [{ MobileAccessBearer: [] }, { CustomerSessionCookie: [] }]
+      parameters: [{ $ref: "#/components/parameters/HomeId" }]
+      responses: { "200": { description: Selected Home, Areas and permanent-device projection; tenant-owned devices are excluded. The hub may include a bounded current-generation remoteAccessState (READY, RECONNECTING, RECONNECT_REQUIRED, HELD, UNCONFIGURED, UNAVAILABLE, or UNKNOWN); no tunnel identifier, hostname or credential is exposed. }, "401": { $ref: "#/components/responses/Unauthorized" }, "404": { $ref: "#/components/responses/Forbidden" } }
+  /api/v2/homes/{homeId}/hub-status:
+    get:
+      summary: Read heartbeat-derived Hub status
+      operationId: readHomeHubStatus
+      tags: [Home]
+      security: [{ MobileAccessBearer: [] }, { CustomerSessionCookie: [] }]
+      parameters: [{ $ref: "#/components/parameters/HomeId" }]
+      responses: { "200": { description: Current heartbeat status and last accepted online timestamp. }, "401": { $ref: "#/components/responses/Unauthorized" }, "404": { $ref: "#/components/responses/Forbidden" } }
+  /api/v2/homes/{homeId}/notification-preferences:
+    get:
+      summary: Read role-scoped Home notification catalogue and preferences
+      operationId: readHomeNotificationPreferences
+      tags: [Notifications]
+      security: [{ MobileAccessBearer: [] }, { CustomerSessionCookie: [] }]
+      parameters: [{ $ref: "#/components/parameters/HomeId" }]
+      responses: { "200": { description: Server-owned role catalogue, locked mandatory families and current preference revision. }, "401": { $ref: "#/components/responses/Unauthorized" }, "404": { $ref: "#/components/responses/Forbidden" } }
+    put:
+      summary: Save authorized Home notification preferences
+      operationId: updateHomeNotificationPreferences
+      tags: [Notifications]
+      security: [{ MobileAccessBearer: [] }, { CustomerSessionCookie: [] }]
+      parameters: [{ $ref: "#/components/parameters/HomeId" }, { $ref: "#/components/parameters/IfMatch" }]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, additionalProperties: false } } } }
+      responses: { "200": { description: Preferences saved under the current owner/manager policy. }, "401": { $ref: "#/components/responses/Unauthorized" }, "409": { $ref: "#/components/responses/Conflict" } }
+  /api/v2/homes/{homeId}/ownership-transfer/cancel:
+    post:
+      summary: Cancel ownership transfer (Stage 13 gated)
+      operationId: cancelHomeOwnershipTransfer
+      tags: [Home]
+      security: [{ MobileAccessBearer: [] }, { CustomerSessionCookie: [] }]
+      parameters: [{ $ref: "#/components/parameters/HomeId" }, { $ref: "#/components/parameters/IdempotencyKey" }]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, additionalProperties: false } } } }
+      responses: { "503": { description: Intentionally unavailable until the Stage 13 safety rehearsal is approved. }, "401": { $ref: "#/components/responses/Unauthorized" } }
+  /api/v2/homes/{homeId}/ownership-transfer/commit:
+    post:
+      summary: Commit ownership transfer (Stage 13 gated)
+      operationId: commitHomeOwnershipTransfer
+      tags: [Home]
+      security: [{ MobileAccessBearer: [] }, { CustomerSessionCookie: [] }]
+      parameters: [{ $ref: "#/components/parameters/HomeId" }, { $ref: "#/components/parameters/IdempotencyKey" }]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, additionalProperties: false } } } }
+      responses: { "503": { description: Intentionally unavailable until the Stage 13 safety rehearsal is approved. }, "401": { $ref: "#/components/responses/Unauthorized" } }
+  /api/v2/homes/{homeId}/ownership-transfer/preview:
+    post:
+      summary: Preview ownership transfer (Stage 13 gated)
+      operationId: previewHomeOwnershipTransfer
+      tags: [Home]
+      security: [{ MobileAccessBearer: [] }, { CustomerSessionCookie: [] }]
+      parameters: [{ $ref: "#/components/parameters/HomeId" }]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, additionalProperties: false } } } }
+      responses: { "503": { description: Intentionally unavailable until the Stage 13 safety rehearsal is approved. }, "401": { $ref: "#/components/responses/Unauthorized" } }
+  /api/v2/homes/{homeId}/property-managers/{managerId}:
+    delete:
+      summary: Remove a property manager
+      operationId: removeHomePropertyManager
+      tags: [Home]
+      security: [{ MobileAccessBearer: [] }, { CustomerSessionCookie: [] }]
+      parameters: [{ $ref: "#/components/parameters/HomeId" }, { name: managerId, in: path, required: true, schema: { type: string, format: uuid } }, { $ref: "#/components/parameters/StepUpProof" }, { $ref: "#/components/parameters/IdempotencyKey" }]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, additionalProperties: false } } } }
+      responses: { "200": { description: Authorized property-manager removal receipt. }, "401": { $ref: "#/components/responses/Unauthorized" }, "409": { $ref: "#/components/responses/Conflict" } }
+  /api/v2/homes/{homeId}/property-managers/invitations:
+    post:
+      summary: Invite a property manager
+      operationId: inviteHomePropertyManager
+      tags: [Home]
+      security: [{ MobileAccessBearer: [] }, { CustomerSessionCookie: [] }]
+      parameters: [{ $ref: "#/components/parameters/HomeId" }, { $ref: "#/components/parameters/IdempotencyKey" }]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, additionalProperties: false } } } }
+      responses: { "202": { description: Seven-day invitation created; no membership is granted until acceptance. }, "401": { $ref: "#/components/responses/Unauthorized" }, "409": { $ref: "#/components/responses/Conflict" } }
+  /api/v2/homes/{homeId}/property-managers/invitations/{invitationId}/resend:
+    post:
+      summary: Resend a property-manager invitation
+      operationId: resendHomePropertyManagerInvitation
+      tags: [Home]
+      security: [{ MobileAccessBearer: [] }, { CustomerSessionCookie: [] }]
+      parameters: [{ $ref: "#/components/parameters/HomeId" }, { name: invitationId, in: path, required: true, schema: { type: string, format: uuid } }, { $ref: "#/components/parameters/IdempotencyKey" }]
+      responses: { "202": { description: New invitation generation issued; the prior generation is invalidated. }, "401": { $ref: "#/components/responses/Unauthorized" }, "409": { $ref: "#/components/responses/Conflict" } }
+  /api/v2/homes/{homeId}/room-access-requests:
+    get:
+      summary: List selected-Home Room access requests
+      operationId: listHomeRoomAccessRequests
+      tags: [Home]
+      security: [{ MobileAccessBearer: [] }, { CustomerSessionCookie: [] }]
+      parameters: [{ $ref: "#/components/parameters/HomeId" }]
+      responses: { "200": { description: Selected-home pending requests visible to authorized owner/managers. }, "401": { $ref: "#/components/responses/Unauthorized" }, "404": { $ref: "#/components/responses/Forbidden" } }
+    post:
+      summary: Create a Room access request
+      operationId: createHomeRoomAccessRequest
+      tags: [Home]
+      security: [{ MobileAccessBearer: [] }, { CustomerSessionCookie: [] }]
+      parameters: [{ $ref: "#/components/parameters/HomeId" }, { $ref: "#/components/parameters/IdempotencyKey" }]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, additionalProperties: false } } } }
+      responses: { "201": { description: Exact requested Area access request created or coalesced. }, "401": { $ref: "#/components/responses/Unauthorized" }, "409": { $ref: "#/components/responses/Conflict" } }
+  /api/v2/homes/{homeId}/room-access-requests/{requestId}/decision:
+    post:
+      summary: Decide a Room access request
+      operationId: decideHomeRoomAccessRequest
+      tags: [Home]
+      security: [{ MobileAccessBearer: [] }, { CustomerSessionCookie: [] }]
+      parameters: [{ $ref: "#/components/parameters/HomeId" }, { name: requestId, in: path, required: true, schema: { type: string, format: uuid } }, { $ref: "#/components/parameters/StepUpProof" }, { $ref: "#/components/parameters/IdempotencyKey" }]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, additionalProperties: false } } } }
+      responses: { "200": { description: Revision-checked approve or reject receipt with exactly the requested Area grant. }, "401": { $ref: "#/components/responses/Unauthorized" }, "409": { $ref: "#/components/responses/Conflict" } }
+  /api/v2/homes/{homeId}/tenants:
+    get:
+      summary: List Home tenant membership summaries
+      operationId: listHomeTenants
+      tags: [Home]
+      security: [{ MobileAccessBearer: [] }, { CustomerSessionCookie: [] }]
+      parameters: [{ $ref: "#/components/parameters/HomeId" }]
+      responses: { "200": { description: Selected-home tenant summaries and grants; no private device state. }, "401": { $ref: "#/components/responses/Unauthorized" }, "404": { $ref: "#/components/responses/Forbidden" } }
+  /api/v2/homes/{homeId}/tenants/invitations:
+    post:
+      summary: Invite a tenant to exact selected-Home Areas
+      operationId: inviteHomeTenant
+      tags: [Home]
+      security: [{ MobileAccessBearer: [] }, { CustomerSessionCookie: [] }]
+      parameters: [{ $ref: "#/components/parameters/HomeId" }, { $ref: "#/components/parameters/IdempotencyKey" }]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, additionalProperties: false } } } }
+      responses: { "202": { description: Seven-day invitation created; selected Area grants apply only after explicit acceptance. }, "401": { $ref: "#/components/responses/Unauthorized" }, "409": { $ref: "#/components/responses/Conflict" } }
+  /api/v2/homes/{homeId}/tenants/invitations/{invitationId}/resend:
+    post:
+      summary: Resend a tenant invitation
+      operationId: resendHomeTenantInvitation
+      tags: [Home]
+      security: [{ MobileAccessBearer: [] }, { CustomerSessionCookie: [] }]
+      parameters: [{ $ref: "#/components/parameters/HomeId" }, { name: invitationId, in: path, required: true, schema: { type: string, format: uuid } }, { $ref: "#/components/parameters/IdempotencyKey" }]
+      responses: { "202": { description: New invitation generation issued; the prior generation is invalidated. }, "401": { $ref: "#/components/responses/Unauthorized" }, "409": { $ref: "#/components/responses/Conflict" } }
+  /api/v2/homes/{homeId}/tenants/{tenantId}:
+    delete:
+      summary: Remove a tenant membership from this Home
+      operationId: removeHomeTenant
+      tags: [Home]
+      security: [{ MobileAccessBearer: [] }, { CustomerSessionCookie: [] }]
+      parameters: [{ $ref: "#/components/parameters/HomeId" }, { name: tenantId, in: path, required: true, schema: { type: string, format: uuid } }, { $ref: "#/components/parameters/StepUpProof" }, { $ref: "#/components/parameters/IdempotencyKey" }]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, additionalProperties: false } } } }
+      responses: { "200": { description: Selected relationship removed; other valid Home relationships are preserved. }, "401": { $ref: "#/components/responses/Unauthorized" }, "409": { $ref: "#/components/responses/Conflict" } }
+  /api/v2/homes/{homeId}/tenants/{tenantId}/area-grants:
+    put:
+      summary: Replace a tenant's selected Home Area grants
+      operationId: replaceHomeTenantAreaGrants
+      tags: [Home]
+      security: [{ MobileAccessBearer: [] }, { CustomerSessionCookie: [] }]
+      parameters: [{ $ref: "#/components/parameters/HomeId" }, { name: tenantId, in: path, required: true, schema: { type: string, format: uuid } }, { $ref: "#/components/parameters/StepUpProof" }, { $ref: "#/components/parameters/IdempotencyKey" }]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, additionalProperties: false } } } }
+      responses: { "200": { description: Exact current Area-grant replacement receipt. }, "401": { $ref: "#/components/responses/Unauthorized" }, "409": { $ref: "#/components/responses/Conflict" } }
+  /api/v2/homes/{homeId}/tenants/{tenantId}/management-operation-receipt:
+    post:
+      summary: Reconcile an exact prior tenant Area-save or removal receipt
+      operationId: reconcileHomeTenantManagementReceipt
+      tags: [Home]
+      security: [{ MobileAccessBearer: [] }, { CustomerSessionCookie: [] }]
+      parameters: [{ $ref: "#/components/parameters/HomeId" }, { name: tenantId, in: path, required: true, schema: { type: string, format: uuid } }]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "#/components/schemas/HomeownerManagementOperationReceiptRequest" } } } }
+      responses:
+        "200": { description: Current authorized actor's exact prior operation receipt, or an authoritative NOT_FOUND after same-key serialization. No proof is accepted or consumed., content: { application/json: { schema: { $ref: "#/components/schemas/HomeownerManagementOperationReceipt" } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { description: Current selected-home authority or target scope is unavailable. }
+        "409": { $ref: "#/components/responses/Conflict" }
+components:
+  securitySchemes:
+    CustomerSessionCookie:
+      { type: apiKey, in: cookie, name: dinodia_customer_session }
+    CustomerBearer:
+      { type: http, scheme: bearer, bearerFormat: customer-session }
+    MobileAccessBearer:
+      { type: http, scheme: bearer, bearerFormat: short-lived-account-session-access }
+    AlexaBearer:
+      { type: http, scheme: bearer, bearerFormat: linked-alexa-account }
+    AlexaOAuthClientBasic:
+      { type: http, scheme: basic, description: Exact configured OAuth client; never use customer credentials here. }
+    EmployeeBearer:
+      { type: http, scheme: bearer, bearerFormat: signed-employee-session }
+    HubSignature:
+      { type: http, scheme: bearer, bearerFormat: machine-authenticated-hub-request }
+    SupportSession:
+      { type: http, scheme: bearer, bearerFormat: short-lived-scope-bound-support-session }
+  parameters:
+    HomeId:
+      {
+        name: homeId,
+        in: path,
+        required: true,
+        schema: { type: string, minLength: 1, maxLength: 160 },
+      }
+    DeviceId:
+      {
+        name: deviceId,
+        in: path,
+        required: true,
+        schema: { type: string, minLength: 1, maxLength: 160 },
+      }
+    IfMatch:
+      { name: If-Match, in: header, required: true, schema: { type: string } }
+    IdempotencyKey:
+      {
+        name: Idempotency-Key,
+        in: header,
+        required: true,
+        schema: { type: string, minLength: 16, maxLength: 160 },
+      }
+    StepUpProof:
+      { name: X-Dinodia-Step-Up-Proof, in: header, required: false, schema: { type: string, minLength: 1, maxLength: 8192 } }
+  schemas:
+    HomeownerManagementOperationReceiptRequest:
+      { $ref: "./contract.json#/$defs/homeownerManagementOperationReceiptRequest" }
+    HomeownerManagementOperationReceipt:
+      { $ref: "./contract.json#/$defs/homeownerManagementOperationReceipt" }
+    CustomerMobileRefreshRequest:
+      type: object
+      required: [refreshToken]
+      properties:
+        refreshToken: { type: string, pattern: "^dno-customer-session-[A-Za-z0-9_-]{32,160}$", writeOnly: true }
+      additionalProperties: false
+    HubLanEndpointObservation:
+      $ref: "./contract.json#/$defs/lanEndpointObservation"
+    HubLanTlsIdentityObservation:
+      $ref: "./contract.json#/$defs/lanTlsIdentityObservation"
+    NativeError:
+      $ref: "./contract.json#/$defs/error"
+    CustomerAuthChallengeState:
+      type: object
+      required: [ok, state]
+      properties:
+        ok: { const: true }
+        state: { type: string, enum: [PENDING, VERIFIED, COMPLETED, EXPIRED] }
+        offlineHubEnforcement: { type: string, enum: [PENDING, NOT_REQUIRED] }
+      additionalProperties: false
+    CustomerAuthChallengeReceipt:
+      type: object
+      required: [ok, challengeId, expiresAt, state]
+      properties:
+        ok: { const: true }
+        challengeId: { type: string, format: uuid }
+        expiresAt: { type: string, format: date-time }
+        state: { const: PENDING }
+      additionalProperties: false
+    CustomerEmailResendRequest:
+      type: object
+      required: [challengeId, email]
+      properties:
+        challengeId: { type: string, format: uuid }
+        email: { type: string, format: email, maxLength: 320 }
+      additionalProperties: false
+    CustomerAuthLinkRequest:
+      type: object
+      required: [challengeId, token]
+      properties:
+        challengeId: { type: string, format: uuid }
+        token: { type: string, minLength: 40, maxLength: 64 }
+      additionalProperties: false
+    CustomerPasswordResetRequest:
+      type: object
+      required: [email]
+      properties:
+        email: { type: string, format: email, maxLength: 320 }
+      additionalProperties: false
+    CustomerPasswordChangeRequest:
+      type: object
+      required: [currentPassword, newPassword]
+      properties:
+        currentPassword: { type: string, maxLength: 1024 }
+        newPassword: { type: string, minLength: 12, maxLength: 1024 }
+      additionalProperties: false
+    CustomerPasswordResetCompleteRequest:
+      oneOf:
+        - $ref: "#/components/schemas/CustomerPasswordResetBasicRequest"
+        - $ref: "#/components/schemas/CustomerPasswordResetWithDeviceRequest"
+    CustomerPasswordResetBasicRequest:
+      type: object
+      required: [challengeId, token, password]
+      properties:
+        challengeId: { type: string, format: uuid }
+        token: { type: string, minLength: 40, maxLength: 64 }
+        password: { type: string, minLength: 12, maxLength: 1024 }
+      additionalProperties: false
+    CustomerPasswordResetWithDeviceRequest:
+      type: object
+      required: [challengeId, token, password, deviceInstallationId, deviceName, model, osFamily, osVersion, publicKey]
+      properties:
+        challengeId: { type: string, format: uuid }
+        token: { type: string, minLength: 40, maxLength: 64 }
+        password: { type: string, minLength: 12, maxLength: 1024 }
+        deviceInstallationId: { type: string, pattern: "^[A-Za-z0-9:_-]{1,160}$" }
+        deviceName: { type: string, minLength: 1, maxLength: 160 }
+        model: { type: string, maxLength: 160 }
+        osFamily: { type: string, maxLength: 80 }
+        osVersion: { type: string, maxLength: 80 }
+        publicKey: { type: string, maxLength: 4096 }
+      additionalProperties: false
+    CustomerRegistrationRequest:
+      type: object
+      required: [displayName, username, email, password]
+      properties:
+        displayName: { type: string, minLength: 1, maxLength: 160 }
+        username: { type: string, minLength: 1, maxLength: 80 }
+        email: { type: string, format: email, maxLength: 320 }
+        password: { type: string, minLength: 12, maxLength: 1024 }
+      additionalProperties: false
+    CustomerPasswordChangeReceipt:
+      type: object
+      required: [ok, nextAction, sessionId, expiresAt, offlineHubEnforcement]
+      properties:
+        ok: { const: true }
+        nextAction: { const: CONTINUE }
+        sessionId: { type: string, format: uuid }
+        expiresAt: { type: string, format: date-time }
+        offlineHubEnforcement: { const: PENDING }
+      additionalProperties: false
+    CustomerPasswordResetReceipt:
+      type: object
+      required: [ok, state, nextAction, otherSessionsRevoked, offlineHubEnforcement]
+      properties:
+        ok: { const: true }
+        state: { const: COMPLETED }
+        nextAction: { const: SIGN_IN }
+        otherSessionsRevoked: { const: true }
+        offlineHubEnforcement: { type: string, enum: [PENDING, NOT_REQUIRED] }
+      additionalProperties: false
+    CustomerPasswordResetSessionReceipt:
+      $ref: "./contract.json#/$defs/customerSessionReceipt"
+    CustomerAuthRequirements:
+      $ref: "./contract.json#/$defs/customerAuthRequirements"
+    CustomerPolicyAcceptanceRequest:
+      $ref: "./contract.json#/$defs/customerPolicyAcceptanceRequest"
+    CustomerPolicyAcceptanceReceipt:
+      $ref: "./contract.json#/$defs/customerPolicyAcceptanceReceipt"
+    AccountStepUpChallengeRequest:
+      $ref: "./contract.json#/$defs/stepUpChallengeRequest"
+    AccountStepUpChallengeReceipt:
+      $ref: "./contract.json#/$defs/stepUpChallengeReceipt"
+    AccountStepUpIssueRequest:
+      $ref: "./contract.json#/$defs/stepUpIssueRequest"
+    AccountStepUpProofReceipt:
+      $ref: "./contract.json#/$defs/stepUpProofReceipt"
+    TenantDeviceContext:
+      $ref: "./contract.json#/$defs/tenantDeviceContext"
+    TenantDevicePresentationMutationRequest:
+      $ref: "./contract.json#/$defs/tenantDevicePresentationMutationRequest"
+    TenantDeviceMutationReceipt:
+      $ref: "./contract.json#/$defs/tenantDeviceMutationReceipt"
+    TenantDeviceRemovalRequest:
+      $ref: "./contract.json#/$defs/tenantDeviceRemovalRequest"
+    TenantDeviceRemovalReceipt:
+      $ref: "./contract.json#/$defs/tenantDeviceRemovalReceipt"
+  responses:
+    BadRequest:
+      description: The canonical request DTO is malformed or violates a bounded field constraint.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/NativeError" }
+    Unauthorized:
+      description: Missing, malformed, expired or revoked customer session.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/NativeError" }
+    Forbidden:
+      description: Authenticated principal lacks current membership, role, area or device authority.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/NativeError" }
+    NotFound:
+      description: The selected Home or requested resource is unavailable to this account.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/NativeError" }
+    Conflict:
+      description: Revision, descriptor, idempotency, trusted-device identity or lifecycle conflict.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/NativeError" }
+    RateLimited:
+      description: The durable account or device rate limit was reached.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/NativeError" }
+    ServiceUnavailable:
+      description: The selected Home or required Native V2 authority is unavailable; no alternate backend is attempted.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/NativeError" }
