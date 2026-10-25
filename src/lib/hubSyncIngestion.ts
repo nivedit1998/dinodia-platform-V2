@@ -189,7 +189,7 @@ async function applyHubSyncEventInner(tx: Prisma.TransactionClient, input: SyncE
   const { event, homeId, hubInstallationId, now } = input;
   const payload = event.payload;
   if (event.type === 'sync.compacted') return;
-  if (process.env.DINODIA_CALENDAR_ANALYTICS_ENABLED === 'true' && await sealedLegacyEvent(tx, input)) return;
+  if (await sealedLegacyEvent(tx, input)) return;
   if (event.type === 'analytics.day' || event.type === 'analytics.daily.barrier') return ingestDailyAnalytics(tx, input);
 
   if (event.type === 'area.upsert') {

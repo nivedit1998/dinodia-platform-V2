@@ -458,6 +458,7 @@ function loadHubCloudConfigurationBuilder() {
   const loaded = { exports: {} };
   const localRequire = (specifier) => specifier === './hubSyncEnvelope' ? envelope
     : specifier === './deletionReferences' ? compile('src/lib/deletionReferences.ts')
+    : specifier === './dailyAnalyticsSchema' ? compile('src/lib/dailyAnalyticsSchema.ts')
     : specifier === './analyticsIntervals' ? analyticsIntervalDomain() : require(specifier);
   new Function('require', 'module', 'exports', compiled)(localRequire, loaded, loaded.exports);
   return loaded.exports.buildHubCloudConfiguration;
@@ -12584,13 +12585,16 @@ try {
   await customerAuthorizationChecks(deliveryEnv);
   if (process.env.CALENDAR_ANALYTICS_ONLY === '1') {
     await calendarAnalyticsDatabaseChecks({ prisma, fixture: customerFixture, osRoot, databaseUrl,
-      base: `http://127.0.0.1:${appPort}`, machineRequest, fetchJson });
+      base: `http://127.0.0.1:${appPort}`, machineRequest, fetchJson,
+      setEngine: async enabled => { await stopPlatform(); await startPlatform({ ...deliveryEnv,
+        DINODIA_CALENDAR_ANALYTICS_ENABLED: enabled ? 'true' : 'false' }); } });
     // Prove the migration bridge on this disposable loopback database only.
     // Candidate feature-OFF must function against the exact predecessor schema.
     await stopPlatform();
     if (!['127.0.0.1', 'localhost'].includes(new URL(databaseUrl).hostname)) fail('Calendar bridge requires disposable loopback database');
     await prisma.$executeRawUnsafe('DROP TABLE "NativeAnalyticsDay", "NativeAnalyticsRetention"');
     await prisma.$executeRawUnsafe('DROP FUNCTION "guard_native_analytics_day"(), "guard_native_analytics_retention"()');
+    await prisma.$executeRawUnsafe('DROP FUNCTION "native_analytics_day_start"(date,text)');
     await prisma.$executeRaw`DELETE FROM "_prisma_migrations" WHERE migration_name='20261025140000_calendar_daily_analytics'`;
     await startPlatform({ ...deliveryEnv, DINODIA_CALENDAR_ANALYTICS_ENABLED: 'false' });
     const bridgeBase = `http://127.0.0.1:${appPort}`;

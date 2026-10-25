@@ -5,7 +5,7 @@ import { createRequire } from 'node:module';
 import { randomUUID, createHash } from 'node:crypto';
 const require = createRequire(import.meta.url), ts = require('typescript');
 
-export async function calendarAnalyticsDatabaseChecks({ prisma, fixture: f, osRoot, databaseUrl, base, machineRequest, fetchJson }) {
+export async function calendarAnalyticsDatabaseChecks({ prisma, fixture: f, osRoot, databaseUrl, base, machineRequest, fetchJson, setEngine }) {
   const url = new URL(databaseUrl);
   assert.ok(['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname), 'Disposable loopback database only');
   // Isolate the calendar matrix from earlier disposable analytics fixtures;
@@ -43,6 +43,7 @@ export async function calendarAnalyticsDatabaseChecks({ prisma, fixture: f, osRo
   await prisma.nativeAnalyticsRetention.create({ data: { homeId: f.homeOneId, hubInstallationId: f.hubOneId,
     timezone: 'Europe/London', writerFrom, writerEnabled: true } });
 
+  let lastBody;
   async function signed(events) {
     const cursor = await prisma.hubInstallation.findUniqueOrThrow({ where: { id: f.hubOneId } });
     const from = Number(cursor.syncAcceptedSequence) + 1;
@@ -55,6 +56,7 @@ export async function calendarAnalyticsDatabaseChecks({ prisma, fixture: f, osRo
       body: { serial: f.identityOneSerial, identityGeneration: f.identityOneGeneration, ...envelope } });
     const response = await submit();
     assert.equal(response.response.status, 200, `signed daily upload: ${JSON.stringify(response.body)}`);
+    lastBody = response.body;
     const duplicate = await submit();
     assert.equal(duplicate.response.status, 200, 'exact authenticated retry is idempotent');
     return envelope;
@@ -66,8 +68,11 @@ export async function calendarAnalyticsDatabaseChecks({ prisma, fixture: f, osRo
     purgeAt: new Date(new Date(oldStart).setUTCFullYear(new Date(oldStart).getUTCFullYear() + 1)).toISOString() } };
   await signed([legacy]);
   assert.equal(await prisma.nativeDeviceUsageBucket.count({ where: { deviceId: device.id } }), 1);
+  await setEngine(false);
   await signed([{ type: 'analytics.daily.barrier', aggregateId: writerFrom.toISOString(), critical: true,
     payload: { version: 1, writerFrom: writerFrom.toISOString(), timezone: 'Europe/London' } }]);
+  assert.equal((await prisma.nativeAnalyticsRetention.findUniqueOrThrow({ where: { hubInstallationId: f.hubOneId } })).legacySealedThrough.getTime(), writerFrom.getTime());
+  assert.equal(lastBody.configuration.analyticsHistory.writerFrom, writerFrom.toISOString(), 'prepared writer remains configured during feature-OFF recovery');
   const state = {};
   daily.initialize(state, { version: 1, enabled: true, writerFrom: writerFrom.toISOString(), timezone: 'Europe/London' });
   const source = { osDeviceId, osAreaId: f.areaOneOsId, category: 'LIGHT', controlId, sourceGeneration: f.identityOneGeneration,
@@ -75,6 +80,7 @@ export async function calendarAnalyticsDatabaseChecks({ prisma, fixture: f, osRo
   daily.recordUsageInterval(state, source, writerFrom.getTime(), writerFrom.getTime() + 600000, 'on');
   const event = () => { const e = daily.dailyEvents(state)[0]; return { type: 'analytics.day', aggregateId: e.aggregateId, payload: e.payload }; };
   await signed([event()]);
+  await setEngine(true);
   daily.recordUsageInterval(state, source, writerFrom.getTime() + 600000, writerFrom.getTime() + 900000, 'off');
   await signed([event()]);
   const accepted = await prisma.nativeAnalyticsDay.findFirstOrThrow({ where: { deviceId: device.id, origin: 'HUB' } });
@@ -87,6 +93,17 @@ export async function calendarAnalyticsDatabaseChecks({ prisma, fixture: f, osRo
   assert.equal(complete, true, 'bounded legacy backfill reaches the immutable writer boundary');
   const historical = await prisma.nativeAnalyticsDay.findFirstOrThrow({ where: { deviceId: device.id, origin: 'LEGACY' } });
   assert.equal(historical.onSeconds, 3600); assert.ok(historical.verifiedAt);
+  for (const [instant, zone] of [['2026-11-01T16:00:00Z', 'America/Havana'], ['2026-09-06T16:00:00Z', 'America/Santiago']]) {
+    const boundary = historyDay(Date.parse(instant), zone);
+    const date = boundary.date;
+    const sqlBoundary = await prisma.$queryRaw`SELECT "native_analytics_day_start"(${date}::date, ${zone}::text) AS start,
+      "native_analytics_day_start"(${date}::date + 1, ${zone}::text) AS ending`;
+    assert.equal(sqlBoundary[0].start.getTime(), boundary.start);
+    assert.equal(sqlBoundary[0].ending.getTime(), boundary.end);
+  }
+  const defaultHavana = await prisma.$queryRaw`SELECT timestamp '2026-11-01 00:00:00' AT TIME ZONE 'America/Havana' AT TIME ZONE 'UTC' AS start`;
+  assert.equal(defaultHavana[0].start.getTime() - historyDay(Date.parse('2026-11-01T16:00:00Z'), 'America/Havana').start, 3600000,
+    'reproduce the old PostgreSQL ambiguous-midnight mismatch before asserting the replacement');
   await assert.rejects(prisma.$transaction(tx => compactDailyHistory(tx, f.hubOneId, now)), /daily_compaction_not_verified/);
   await prisma.nativeAnalyticsRetention.update({ where: { hubInstallationId: f.hubOneId }, data: { readsEnabled: true, pruningEnabled: true } });
   await prisma.nativeAnalyticsDay.update({ where: { id: historical.id }, data: {
@@ -102,9 +119,11 @@ export async function calendarAnalyticsDatabaseChecks({ prisma, fixture: f, osRo
   assert.equal(compacted.usageDeleted, 1);
   assert.equal(await prisma.nativeDeviceUsageBucket.count({ where: { deviceId: device.id } }), 0);
   assert.equal((await prisma.nativeAnalyticsDay.findUniqueOrThrow({ where: { id: historical.id } })).onSeconds, 3600);
+  await setEngine(false);
   await signed([{ ...legacy, payload: { ...legacy.payload, revision: 2 } }]);
   assert.equal(await prisma.nativeDeviceUsageBucket.count({ where: { deviceId: device.id } }), 0, 'sealed late evidence cannot resurrect pruned detail');
   assert.equal(await prisma.nativeAnalyticsUnallocated.count({ where: { deviceId: device.id, reason: 'sealed_legacy_late_evidence' } }), 1);
+  await setEngine(true);
 
   const owner = await fetchJson(`${base}/api/v2/mobile/session`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({
     email: f.propertyEmail, password: f.propertyPassword, deviceInstallationId: f.propertyInstallationId,

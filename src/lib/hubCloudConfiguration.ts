@@ -1,6 +1,7 @@
 import type { Prisma } from '@prisma/client';
 import { canonicalSyncJson, hashSyncConfiguration } from './hubSyncEnvelope';
 import { deletionReferencePrefix } from './deletionReferences';
+import { calendarSchemaPresent } from './dailyAnalyticsSchema';
 
 const MAX_CONFIGURATION_BYTES = 1024 * 1024;
 
@@ -35,7 +36,7 @@ export async function buildHubCloudConfiguration(db: Prisma.TransactionClient, i
   const capabilitySummary = hub?.capabilitySummary && typeof hub.capabilitySummary === 'object' && !Array.isArray(hub.capabilitySummary)
     ? hub.capabilitySummary as Record<string, unknown> : {};
   const supportsTenantAutomationProjection = capabilitySummary.nativeTenantAutomationProjectionV1 === true;
-  const history = process.env.DINODIA_CALENDAR_ANALYTICS_ENABLED === 'true' && capabilitySummary.nativeDailyAnalyticsV1 === true
+  const history = capabilitySummary.nativeDailyAnalyticsV1 === true && await calendarSchemaPresent(db)
     ? await db.nativeAnalyticsRetention.findUnique({where:{hubInstallationId:input.hubInstallationId}}):null;
   if(history && (history.homeId!==input.homeId||history.timezone!==home.timezone)) throw new Error('Analytics timezone requires prospective reconciliation');
   const analyticsIntervals = capabilitySummary.nativeUniversalAnalyticsV2 === true ? await db.nativeAnalyticsInterval.findMany({

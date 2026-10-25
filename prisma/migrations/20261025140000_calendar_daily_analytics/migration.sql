@@ -134,6 +134,26 @@ ALTER TABLE "NativeAnalyticsDay" ADD CONSTRAINT "NativeAnalyticsDay_coverage_che
       AND "lastObservedAt" IS NULL AND "lastValidUntil" IS NULL))
 );
 
+-- Resolve the first real instant of a local date, including skipped/repeated
+-- midnight. PostgreSQL's default ambiguous-time cast chooses the later midnight.
+CREATE FUNCTION "native_analytics_day_start"(local_day date, zone_name text)
+RETURNS timestamp(3) LANGUAGE plpgsql STABLE AS $$
+DECLARE
+  target_ms bigint := EXTRACT(EPOCH FROM local_day::timestamp)::bigint * 1000;
+  low_ms bigint := target_ms - 129600000;
+  high_ms bigint := target_ms + 129600000;
+  mid_ms bigint;
+BEGIN
+  WHILE low_ms < high_ms LOOP
+    mid_ms := (low_ms + high_ms) / 2;
+    IF (to_timestamp(mid_ms / 1000.0) AT TIME ZONE zone_name)::date < local_day THEN
+      low_ms := mid_ms + 1;
+    ELSE high_ms := mid_ms;
+    END IF;
+  END LOOP;
+  RETURN to_timestamp(low_ms / 1000.0) AT TIME ZONE 'UTC';
+END $$;
+
 CREATE FUNCTION "guard_native_analytics_day"() RETURNS trigger LANGUAGE plpgsql AS $$
 DECLARE device_row "NativeDevice"%ROWTYPE;
 BEGIN
@@ -143,8 +163,8 @@ BEGIN
     OR NOT EXISTS (SELECT 1 FROM "Area" a WHERE a.id = NEW."areaId" AND a."homeId" = NEW."homeId") THEN
     RAISE EXCEPTION 'Daily analytics requires same-home permanent-device authority' USING ERRCODE = '23514';
   END IF;
-  IF NEW."dayStartAt" <> (date_trunc('day', NEW."dayStartAt" AT TIME ZONE 'UTC' AT TIME ZONE NEW.timezone) AT TIME ZONE NEW.timezone AT TIME ZONE 'UTC')
-    OR NEW."dayEndAt" <> ((date_trunc('day', NEW."dayStartAt" AT TIME ZONE 'UTC' AT TIME ZONE NEW.timezone) + interval '1 day') AT TIME ZONE NEW.timezone AT TIME ZONE 'UTC') THEN
+  IF NEW."dayStartAt" <> "native_analytics_day_start"((NEW."dayStartAt" AT TIME ZONE 'UTC' AT TIME ZONE NEW.timezone)::date, NEW.timezone)
+    OR NEW."dayEndAt" <> "native_analytics_day_start"((NEW."dayStartAt" AT TIME ZONE 'UTC' AT TIME ZONE NEW.timezone)::date + 1, NEW.timezone) THEN
     RAISE EXCEPTION 'Daily analytics requires exact local-calendar boundaries' USING ERRCODE = '23514';
   END IF;
   IF EXISTS (SELECT 1 FROM "NativeAnalyticsDay" d
@@ -169,11 +189,13 @@ FOR EACH ROW EXECUTE FUNCTION "guard_native_analytics_retention"();
 
 REVOKE ALL ON "NativeAnalyticsRetention", "NativeAnalyticsDay" FROM PUBLIC;
 REVOKE ALL ON FUNCTION "guard_native_analytics_day"(), "guard_native_analytics_retention"() FROM PUBLIC;
+REVOKE ALL ON FUNCTION "native_analytics_day_start"(date,text) FROM PUBLIC;
 DO $$ DECLARE role_name text; BEGIN
   FOREACH role_name IN ARRAY ARRAY['anon','authenticated'] LOOP
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname=role_name) THEN
       EXECUTE format('REVOKE ALL ON "NativeAnalyticsRetention", "NativeAnalyticsDay" FROM %I', role_name);
       EXECUTE format('REVOKE ALL ON FUNCTION "guard_native_analytics_day"(), "guard_native_analytics_retention"() FROM %I', role_name);
+      EXECUTE format('REVOKE ALL ON FUNCTION "native_analytics_day_start"(date,text) FROM %I', role_name);
     END IF;
   END LOOP;
 END $$;

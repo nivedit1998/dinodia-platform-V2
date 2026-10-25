@@ -4,6 +4,7 @@ import { Stage1AuthError } from './stage1Auth';
 import { canonicalSyncJson, type HubSyncEvent } from './hubSyncEnvelope';
 import { allowedAnalyticsControls, classifyUsageAuthority } from './analyticsIntervals';
 import { historyYearCutoff, historyDayExpiry } from './analyticsHistoryCalendar';
+import { calendarSchemaPresent } from './dailyAnalyticsSchema';
 
 function reject(code: string): never {
   throw new Stage1AuthError(409, code, 'The daily analytics upload does not match its authorized history writer');
@@ -13,7 +14,7 @@ export async function ingestDailyAnalytics(tx: Prisma.TransactionClient, input: 
   event: HubSyncEvent; homeId: string; hubInstallationId: string; identityGeneration?: number;
   streamId?: string; now: Date;
 }) {
-  if (process.env.DINODIA_CALENDAR_ANALYTICS_ENABLED !== 'true') reject('hub_sync_daily_disabled');
+  if (!await calendarSchemaPresent(tx)) reject('hub_sync_daily_disabled');
   const { homeId, hubInstallationId, event, now } = input;
   const p = event.payload;
   // The authenticated sync cursor serializes envelopes; this lock also serializes
@@ -153,8 +154,8 @@ export async function quarantineDailyAnalytics(tx: Prisma.TransactionClient, inp
 export async function sealedLegacyEvent(tx: Prisma.TransactionClient, input: {
   event: HubSyncEvent; homeId: string; hubInstallationId: string; now: Date; streamId?: string;
 }) {
-  if (process.env.DINODIA_CALENDAR_ANALYTICS_ENABLED !== 'true') return false;
   if (!['usage.bucket', 'temperature.sample'].includes(input.event.type)) return false;
+  if (!await calendarSchemaPresent(tx)) return false;
   await tx.$queryRaw`SELECT "hubInstallationId" FROM "NativeAnalyticsRetention" WHERE "hubInstallationId"=${input.hubInstallationId}::uuid FOR UPDATE`;
   const state = await tx.nativeAnalyticsRetention.findUnique({ where: { hubInstallationId: input.hubInstallationId } });
   if (!state?.legacySealedThrough) return false;
