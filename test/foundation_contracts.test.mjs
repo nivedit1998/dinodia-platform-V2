@@ -31,6 +31,21 @@ function loadDinodiaContractRuntime() {
   return loaded.exports;
 }
 
+test('logical schema bridge preserves predecessor readiness and accepts only the exact additive schema', () => {
+  const { REQUIRED_MIGRATION, COMPATIBLE_ADDITIVE_MIGRATIONS: checksums, isSchemaReady } = loadFoundationRuntime();
+  const logical = '20261025010000_logical_device_parents', baseline = 'a'.repeat(64);
+  const before = Object.entries(checksums).filter(([name]) => name !== logical)
+    .map(([migration_name, checksum]) => ({ migration_name, checksum }));
+  before.push({ migration_name: REQUIRED_MIGRATION, checksum: baseline });
+  assert.equal(isSchemaReady(before, 79, baseline), true);
+  const after = [{ migration_name: logical, checksum: checksums[logical] }, ...before];
+  assert.equal(isSchemaReady(after, 80, baseline), true);
+  assert.equal(isSchemaReady([{ ...after[0], checksum: 'b'.repeat(64) }, ...before], 80, baseline), false);
+  assert.equal(isSchemaReady(after, 79, baseline), false);
+  assert.equal(fs.readFileSync('prisma/schema.prisma', 'utf8').includes('model NativePhysicalDevice'), false,
+    'Bridge retains the predecessor Prisma model so old-schema writes do not select new columns');
+});
+
 test('pending relationship projection enforces exact per-kind actions, bounded fields and server time', () => {
   const { validateCustomerPendingRelationshipsProjection: validate } = loadDinodiaContractRuntime();
   const asOf = '2026-10-05T12:00:00.000Z';
