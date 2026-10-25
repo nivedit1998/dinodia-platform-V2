@@ -44,12 +44,21 @@ BEGIN
     IF NEW."channelKey" IS NOT NULL THEN RAISE EXCEPTION 'logical channel requires a physical parent'; END IF;
     RETURN NEW;
   END IF;
-  SELECT * INTO parent FROM "NativePhysicalDevice" WHERE "id" = NEW."physicalParentId" FOR SHARE;
+  SELECT * INTO parent FROM "NativePhysicalDevice" WHERE "id" = NEW."physicalParentId" FOR UPDATE;
   IF NOT FOUND OR parent."homeId" <> NEW."homeId" OR parent."hubInstallationId" <> NEW."hubInstallationId"
     OR parent."managementClass" <> NEW."managementClass"
     OR parent."ownerMembershipId" IS DISTINCT FROM NEW."ownerMembershipId"
     OR NEW."channelKey" IS NULL OR NEW."channelKey" = '' OR NEW."channelGeneration" < 1 OR NEW."mappingRevision" < 1
   THEN RAISE EXCEPTION 'logical device parent authority mismatch'; END IF;
+  IF NEW."lifecycle" IN ('INSTALLED','VIEW_ONLY','DISCOVERED') AND EXISTS (
+    SELECT 1 FROM "NativeDevice" d WHERE d."physicalParentId" = NEW."physicalParentId" AND d."id" <> NEW."id"
+      AND d."lifecycle" IN ('INSTALLED','VIEW_ONLY','DISCOVERED')
+      AND (d."channelKey" = NEW."channelKey" OR EXISTS (
+        SELECT 1 FROM jsonb_array_elements_text(COALESCE(d."sourceBinding" -> 'sourceEntityIds','[]'::jsonb)) a(value)
+        JOIN jsonb_array_elements_text(COALESCE(NEW."sourceBinding" -> 'sourceEntityIds','[]'::jsonb)) b(value)
+          ON a.value = b.value
+      )))
+  THEN RAISE EXCEPTION 'active logical channels cannot overlap physical sources'; END IF;
   RETURN NEW;
 END $$;
 CREATE TRIGGER "NativeDevice_physical_parent_guard" BEFORE INSERT OR UPDATE ON "NativeDevice"

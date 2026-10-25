@@ -4,6 +4,7 @@ import { Stage1AuthError } from './stage1Auth';
 import { validateNativeDevice } from './contracts/dinodiaV1';
 import { bindLogicalChildren, logicalOsId, validateLogicalBindings, type LogicalBinding } from './logicalDeviceIdentity';
 import { changeAnalyticsInterval } from './analyticsIntervals';
+import { deletedTargetReference } from './deletionReferences';
 
 type Channel = { binding: LogicalBinding; catalogue: Record<string, unknown> };
 
@@ -34,6 +35,11 @@ export async function commissionLogicalChildren(tx: Prisma.TransactionClient, in
   if (!validateLogicalBindings(original.osDeviceId, channels.map(channel => channel.binding))) {
     throw new Stage1AuthError(409, 'logical_binding_invalid', 'The independent channel bindings are invalid');
   }
+  const retired = await tx.deletionSecurityReceipt.findMany({ where: { anonymousReference: {
+    in: channels.map(channel => deletedTargetReference(original.hubInstallationId, 'device', String(channel.catalogue?.osDeviceId))) },
+    actionType: { in: ['AREA_DEVICE_ERASURE', 'AREA_LEGACY_ERASURE'] } }, select: { id: true } });
+  if (retired.length) throw new Stage1AuthError(409, 'logical_identity_retired',
+    'Refresh current signed retirement evidence before commissioning a new channel generation');
   const initialArea = input.initialAreaId && !input.historicalCutover
     ? await tx.area.findFirst({ where: { id: input.initialAreaId, homeId: original.homeId, status: 'ACTIVE' }, select: { id: true } })
     : null;
