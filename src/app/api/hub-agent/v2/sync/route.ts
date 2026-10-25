@@ -5,6 +5,7 @@ import { authErrorResponse, Stage1AuthError } from '@/lib/stage1Auth';
 import { authenticateHub } from '@/lib/stage1HubAuth';
 import { buildHubCloudConfiguration, finalizeHubCloudConfiguration } from '@/lib/hubCloudConfiguration';
 import { applyHubSyncEvent, assertUsageClosureRecoveryCurrent } from '@/lib/hubSyncIngestion';
+import { suppressedSyncEvents } from '@/lib/deletionReferences';
 import { acknowledgeAppliedTenantPolicy } from '@/lib/hubTenantPolicyAcknowledgement';
 import { canReconcileHubSyncStream, HUB_SYNC_MAX_BODY_BYTES, HUB_SYNC_PROCESSING_MAX_EVENTS, hubSyncBodyHash, isInstallationBootstrapEvent, validateHubSyncEnvelope, type HubSyncEnvelope, type HubSyncEvent } from '@/lib/hubSyncEnvelope';
 import { resolveNativeInstallationSyncMode } from '@/lib/nativeInstallationSyncMode';
@@ -266,11 +267,12 @@ export async function POST(request: Request) {
           }
 
           if (envelope.events.length) {
+            const suppressedEventIds = await suppressedSyncEvents(tx, current.id, envelope.events);
             for (const event of envelope.events) {
               try {
                 await applyHubSyncEvent(tx, {
                   event, homeId: current.homeId, hubInstallationId: current.id,
-                  identityGeneration: hub.identity.identityGeneration, now,
+                  identityGeneration: hub.identity.identityGeneration, now, suppressedEventIds,
                 });
               } catch (error) {
                 const code = typeof error === 'object' && error && 'code' in error ? String((error as { code?: unknown }).code) : '';

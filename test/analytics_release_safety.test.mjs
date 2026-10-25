@@ -10,6 +10,7 @@ function load(name) {
   const code = ts.transpileModule(readFileSync(`src/lib/${name}.ts`, 'utf8'), { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText;
   const local = id => id === './stage1Auth' ? { Stage1AuthError: AuthError } : id === './hubSyncEnvelope'
     ? { canonicalSyncJson: JSON.stringify } : id === './analyticsIntervals' ? load('analyticsIntervals')
+    : id === './deletionReferences' ? load('deletionReferences')
     : id === './stage1Crypto' ? { sha256: value => require('node:crypto').createHash('sha256').update(value).digest('hex') }
     : id === './hubCloudConfiguration' ? { buildHubCloudConfiguration: async () => ({ checksum: 'fixture' }),
       finalizeHubCloudConfiguration: (candidate, revision) => ({ ...candidate, revision }) }
@@ -59,7 +60,7 @@ test('RB1 queued old generation v2 evidence is preserved without rejecting the s
   const { applyHubSyncEvent } = load('hubSyncIngestion');
   const statements = [], evidence = [];
   const device = { id: 'device', homeId: 'home', managementClass: 'PROPERTY_DEVICE', lifecycle: 'INSTALLED' };
-  const tx = { $executeRawUnsafe: async sql => statements.push(sql),
+  const tx = { deletionSecurityReceipt: { findMany: async () => [] }, $executeRawUnsafe: async sql => statements.push(sql),
     nativeDevice: { findUnique: async () => device }, area: { findUnique: async () => ({ id: 'area' }) },
     nativeAnalyticsUnallocated: { findUnique: async () => null, create: async ({ data }) => evidence.push(data) } };
   await applyHubSyncEvent(tx, { homeId: 'home', hubInstallationId: 'hub', identityGeneration: 2,
@@ -79,6 +80,7 @@ test('checked temperature evidence ends at trusted OFFLINE and cannot revive on 
     descriptorRevision: 4, descriptorDigest: 'a'.repeat(64), protocol: 'zigbee', originalName: 'Radiator',
     capabilitySummary: {}, assignments: [{ id: 'assignment', areaId: 'area', validFrom: new Date('2026-10-24T10:00:00Z') }] };
   const tx = {
+    deletionSecurityReceipt: { findMany: async () => [] },
     nativeDevice: { findUnique: async () => device, update: async () => ({}) },
     area: { findUnique: async () => ({ id: 'area', status: 'ACTIVE' }) },
     nativeAutomation: {}, deviceAreaAssignment: { findFirst: async () => null, updateMany: async () => ({ count: 0 }), create: async () => ({}) },
@@ -116,7 +118,7 @@ test('temperature observation replay after OFFLINE clipping is idempotent but ch
       valueType: 'number', observable: true, maxStateValiditySeconds: 3600 }] } } };
   const alreadyOfflineClipped = { id: 'sample', homeId: 'home', deviceId: 'device', temperature: 21.25,
     sourceObservedAt, validUntil: originalValidUntil, currentnessEndedAt: new Date('2026-10-24T10:10:00Z') };
-  const tx = { nativeDevice: { findUnique: async () => device, update: async () => ({}) },
+  const tx = { deletionSecurityReceipt: { findMany: async () => [] }, nativeDevice: { findUnique: async () => device, update: async () => ({}) },
     nativeTemperatureSample: { findUnique: async () => alreadyOfflineClipped } };
   const applyReplay = (temperature) => applyHubSyncEvent(tx, { homeId: 'home', hubInstallationId: 'hub', identityGeneration: 1,
     now: new Date('2026-10-24T10:20:00Z'), event: { id: 'temperature-replay', type: 'temperature.sample', aggregateId: sourceEventKey,
@@ -133,7 +135,7 @@ for (const dbError of [
 ]) test(`RB1 known PostgreSQL overlap is isolated for ${dbError.code || dbError.name}`, async () => {
   const { applyHubSyncEvent } = load('hubSyncIngestion');
   let reads = 0; const evidence = [];
-  const tx = { $executeRawUnsafe: async () => 0,
+  const tx = { deletionSecurityReceipt: { findMany: async () => [] }, $executeRawUnsafe: async () => 0,
     nativeDevice: { findUnique: async () => { if (!reads++) throw dbError; return { id: 'device', homeId: 'home', managementClass: 'PROPERTY_DEVICE' }; } },
     area: { findUnique: async () => ({ id: 'area' }) },
     nativeAnalyticsUnallocated: { findUnique: async () => null, create: async ({ data }) => evidence.push(data) } };
@@ -147,7 +149,7 @@ for (const dbError of [
 test('RB1 unrelated database failures remain retryable failures, never acknowledged as evidence', async () => {
   const { applyHubSyncEvent } = load('hubSyncIngestion');
   const outage = Object.assign(new Error('Synthetic database unavailable'), { code: 'P1001' });
-  const tx = { $executeRawUnsafe: async () => 0, nativeDevice: { findUnique: async () => { throw outage; } } };
+  const tx = { deletionSecurityReceipt: { findMany: async () => [] }, $executeRawUnsafe: async () => 0, nativeDevice: { findUnique: async () => { throw outage; } } };
   await assert.rejects(applyHubSyncEvent(tx, { homeId: 'home', hubInstallationId: 'hub', identityGeneration: 1,
     now: new Date(), event: { id: 'event', type: 'usage.bucket', payload: { osDeviceId: 'dev' } } }), error => error === outage);
 });

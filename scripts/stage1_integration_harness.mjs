@@ -13,6 +13,7 @@ import { stage1RouteInventory } from '../test/stage1_route_inventory.mjs';
 import { roomPlaqueIntegration } from './room_plaque_integration.mjs';
 import { verifyStateEvidenceIOS } from './state_evidence_ios_integration.mjs';
 import { verifyStateEvidenceHistory } from './state_evidence_history_integration.mjs';
+import { logicalDevicesDatabaseChecks } from './logical_devices_integration.mjs';
 
 const root = process.cwd();
 const osRoot = process.env.DINODIA_OS_ROOT || path.resolve(root, '../Dinodia OS');
@@ -449,7 +450,9 @@ function loadHubCloudConfigurationBuilder() {
   const source = fs.readFileSync(path.join(root, 'src/lib/hubCloudConfiguration.ts'), 'utf8');
   const compiled = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, esModuleInterop: true } }).outputText;
   const loaded = { exports: {} };
-  const localRequire = (specifier) => specifier === './hubSyncEnvelope' ? envelope : specifier === './analyticsIntervals' ? analyticsIntervalDomain() : require(specifier);
+  const localRequire = (specifier) => specifier === './hubSyncEnvelope' ? envelope
+    : specifier === './deletionReferences' ? compile('src/lib/deletionReferences.ts')
+    : specifier === './analyticsIntervals' ? analyticsIntervalDomain() : require(specifier);
   new Function('require', 'module', 'exports', compiled)(localRequire, loaded, loaded.exports);
   return loaded.exports.buildHubCloudConfiguration;
 }
@@ -720,6 +723,7 @@ function baseEnv() {
     // commissioning.
     DINODIA_NATIVE_ZIGBEE_COMMISSIONING_ENABLED: 'true',
     DINODIA_NATIVE_MATTER_COMMISSIONING_ENABLED: 'true',
+    DINODIA_LOGICAL_DEVICES_ENABLED: process.env.LOGICAL_DEVICES_ONLY === '1' ? 'true' : 'false',
     DINODIA_NATIVE_POLICY_TITLE: 'Disposable Stage 6 policy fixture',
     DINODIA_NATIVE_POLICY_TEXT: disposablePolicyText,
     DINODIA_NATIVE_POLICY_CONTENT_SHA256: sha256(disposablePolicyText),
@@ -1010,6 +1014,8 @@ async function startPlatform(runEnv) {
           } catch { /* Never forward malformed or unfiltered application diagnostics. */ }
         }
         const alexaRevokePhase = line.match(/\[stage12:alexa-revoke\] phase=([a-z-]{1,64})/)?.[1];
+        const commissioningFailure = line.match(/\[commissioning-failure\] code=(P\d{4}|UNKNOWN) sqlState=([A-Z0-9]{4,5}) constraint=([A-Za-z_][A-Za-z0-9_]{0,120})/);
+        if (commissioningFailure) console.log(`[logical-devices:integration] commissioning diagnostic code=${commissioningFailure[1]} sqlState=${commissioningFailure[2]} constraint=${commissioningFailure[3]}`);
         const deliveryCode = line.match(/\[native-alexa-delivery\] database code=(P\d{4})/)?.[1];
         if (deliveryCode) console.log(`[state-evidence:integration] delivery database code=${deliveryCode}`);
         if (alexaRevokePhase) console.log(`[stage12:integration] revoke phase=${alexaRevokePhase}`);
@@ -12569,6 +12575,14 @@ try {
   await bootstrapDeliveryChecks(deliveryEnv);
   await customerAuthenticationLifecycleChecks(deliveryEnv);
   await customerAuthorizationChecks(deliveryEnv);
+  if (process.env.LOGICAL_DEVICES_ONLY === '1') {
+    const logicalEnv = { ...deliveryEnv, DINODIA_NATIVE_ALEXA_ENABLED: 'true' };
+    await stopPlatform();
+    await startPlatform(logicalEnv);
+    await logicalDevicesDatabaseChecks({ prisma, fixture: customerFixture, osRoot, databaseUrl,
+      base: `http://127.0.0.1:${appPort}`, machineRequest, environment: logicalEnv });
+    verifyChildOutboundTargets();
+  } else {
   const plaqueOwner = await fetchJson(`http://127.0.0.1:${appPort}/api/v2/mobile/session`, { method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify({
     email:customerFixture.propertyEmail,password:customerFixture.propertyPassword,deviceInstallationId:customerFixture.propertyInstallationId,
     publicKey:customerFixture.propertyPublicKey,deviceName:'Disposable plaque owner phone',model:'integration-test',osFamily:'test',osVersion:'test' }) });
@@ -12640,6 +12654,7 @@ try {
   else if (stage5SyncRecoveryOnly) console.log(`[stage5:integration] PASS: focused signed Native V2 configuration-recovery route checks completed against disposable PostgreSQL; parent=${[...outboundTargets].sort().join(',')}; children=${childTargets.join(',')}`);
   else if (stage12AlexaOnly) console.log(`[stage12:integration] PASS: focused Alexa OAuth route checks completed against disposable PostgreSQL; parent=${[...outboundTargets].sort().join(',')}; children=${childTargets.join(',')}`);
   else console.log(`[stage1:integration] PASS: live Platform routes, locked Dinodia OS HTTP, browser isolation, authenticated native WebSocket command authorization and denial exercised against disposable PostgreSQL; parent=${[...outboundTargets].sort().join(',')}; children=${childTargets.join(',')}`);
+  }
 } finally {
   await cleanup();
 }

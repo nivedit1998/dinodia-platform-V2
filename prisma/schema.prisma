@@ -635,6 +635,8 @@ model Home {
   nativeAutomationExecutions NativeAutomationExecution[]
   roomAccessEmailAttempts    RoomAccessEmailAttempt[]
 
+  physicalDevices            NativePhysicalDevice[]
+
   @@index([lifecycle, installationStatus])
   @@index([postcode])
 }
@@ -657,6 +659,7 @@ model HomeMembership {
   tenantAreaGrants       TenantAreaGrant[]
   roomPlaqueRequests     RoomPlaqueRequest[]
   ownedDevices           NativeDevice[]
+  ownedPhysicalDevices   NativePhysicalDevice[]
   preferences            MemberPreferenceDocument[]
   invitationsSent        MembershipInvitation[]               @relation("InvitationInviter")
   installationRequests   PermanentDeviceInstallationRequest[]
@@ -729,11 +732,41 @@ model TenantAreaGrant {
   @@index([areaId, revokedAt])
 }
 
+model NativePhysicalDevice {
+  id                    String                @id @default(uuid()) @db.Uuid
+  homeId                String                @db.Uuid
+  hubInstallationId     String                @db.Uuid
+  osPhysicalDeviceId    String                @db.VarChar(160)
+  pairingGeneration     Int                   @default(1)
+  managementClass       DeviceManagementClass
+  ownerMembershipId     String?               @db.Uuid
+  protocol              String                @db.VarChar(80)
+  protocolIdentityHash  String                @db.VarChar(64)
+  manifestDigest        String                @db.VarChar(64)
+  manifestRevision      Int                   @default(1)
+  lifecycle             String                @default("ACTIVE") @db.VarChar(32)
+  createdAt             DateTime              @default(now())
+  updatedAt             DateTime              @updatedAt
+
+  home                  Home                  @relation(fields: [homeId], references: [id], onDelete: Cascade)
+  hubInstallation       HubInstallation       @relation(fields: [hubInstallationId], references: [id], onDelete: Cascade)
+  ownerMembership       HomeMembership?       @relation(fields: [ownerMembershipId], references: [id], onDelete: Restrict)
+  children              NativeDevice[]
+
+  @@unique([hubInstallationId, osPhysicalDeviceId, pairingGeneration], map: "NativePhysicalDevice_hub_physical_generation_key")
+  @@index([homeId, lifecycle])
+}
+
 model NativeDevice {
   id                    String                  @id @default(uuid()) @db.Uuid
   homeId                String                  @db.Uuid
   hubInstallationId     String                  @db.Uuid
   osDeviceId            String                  @db.VarChar(160)
+  physicalParentId      String?                 @db.Uuid
+  channelKey            String?                 @db.VarChar(120)
+  channelGeneration     Int                     @default(1)
+  mappingRevision       Int                     @default(1)
+  sourceBinding         Json?
   originalName          String                  @db.VarChar(160)
   overrideName          String?                 @db.VarChar(160)
   technicalLabel        String                  @db.VarChar(80)
@@ -774,8 +807,10 @@ model NativeDevice {
   alexaEndpoints       AlexaNativeEndpointProjection[]
   outageIncidents      NativeDeviceOutageIncident[]
   tenantRecoveries     NativeTenantDeviceRecovery[]
+  physicalParent       NativePhysicalDevice?                @relation(fields: [physicalParentId], references: [id], onDelete: Restrict)
 
   @@unique([hubInstallationId, osDeviceId])
+  @@unique([physicalParentId, channelKey, channelGeneration], map: "NativeDevice_parent_channel_generation_key")
   @@unique([id, homeId])
   @@index([installationRequestId])
   @@index([homeId, managementClass, lifecycle])
@@ -945,6 +980,7 @@ model HubInstallation {
   home                    Home                         @relation(fields: [homeId], references: [id], onDelete: Restrict)
   manufacturingIdentity   HubManufacturingIdentity     @relation(fields: [manufacturingIdentityId], references: [id], onDelete: Restrict)
   devices                 NativeDevice[]
+  physicalDevices         NativePhysicalDevice[]
   credentialVersions      HubCredentialVersion[]
   provisioningAttempts    HubProvisioningAttempt[]
   operatorBrowserAttempts OperatorBrowserAttempt[]

@@ -7,6 +7,7 @@ import { Stage1AuthError } from '@/lib/stage1Auth';
 import { EMPLOYEE_SESSION_SECONDS, OPERATOR_SESSION_SECONDS } from '@/lib/stage1SessionPolicy';
 import { observeDeviceSourceAlias } from '@/lib/nativeSourceAliases';
 import { changeAnalyticsInterval } from '@/lib/analyticsIntervals';
+import { commissionLogicalChildren } from '@/lib/commissioningLogicalDevices';
 
 export const dynamic = 'force-dynamic';
 const HASH = /^[a-f0-9]{64}$/i;
@@ -303,7 +304,7 @@ export async function POST(request: Request) {
         || registerExisting && (body.targetOsDeviceId !== owner.targetOsDeviceId || body.targetIdentityHash !== owner.targetIdentityHash)
         || !body.device || typeof body.device !== 'object' || Array.isArray(body.device)) fail(409, 'commissioning_finalize_invalid', 'The device is not ready for ownership registration');
       const device = body.device as Record<string, unknown>;
-      const keys = ['osDeviceId','originalName','technicalLabel','deviceType','manufacturer','model','protocol',...(Object.hasOwn(device, 'protocolIdentityHash') ? ['protocolIdentityHash'] : []),'descriptorRevision','descriptorDigest','capabilitySummary','areaId','name','customerLabel',...(Object.hasOwn(device, 'analyticsCategory') ? ['analyticsCategory'] : []),'catalogueStatus','usefulReadings'];
+      const keys = ['osDeviceId','originalName','technicalLabel','deviceType','manufacturer','model','protocol',...(Object.hasOwn(device, 'protocolIdentityHash') ? ['protocolIdentityHash'] : []),'descriptorRevision','descriptorDigest','capabilitySummary','areaId','name','customerLabel',...(Object.hasOwn(device, 'analyticsCategory') ? ['analyticsCategory'] : []),'catalogueStatus','usefulReadings', ...(Object.hasOwn(device, 'channels') ? ['channels'] : [])];
       const analyticsCategory = String(device.analyticsCategory === undefined ? owner.analyticsCategory || 'NONE' : device.analyticsCategory);
       if (!exactKeys(device, keys) || typeof body.candidateRef !== 'string' || body.candidateRef.length > 80 || !['install','view_only'].includes(String(body.disposition))
         || !['NONE','LIGHT','BOILER','RADIATOR'].includes(analyticsCategory) || !isStaff && analyticsCategory !== 'NONE'
@@ -320,6 +321,10 @@ export async function POST(request: Request) {
         || !HASH.test(String(device.descriptorDigest || '')) || !safeControlSummary(device.capabilitySummary)) fail(400, 'commissioning_finalize_invalid', 'The device projection is invalid');
       if (registerExisting && (device.osDeviceId !== owner.targetOsDeviceId || device.protocolIdentityHash !== owner.targetIdentityHash
         || body.candidateRef !== owner.candidateRef)) fail(409, 'commissioning_finalize_invalid', 'The reviewed local radio identity changed before finalization');
+      if (device.channels !== undefined && (registerExisting || body.disposition !== 'install'
+        || !HASH.test(String(device.protocolIdentityHash || '')))) fail(409, 'logical_conversion_review_required', 'Existing equipment requires an explicit channel conversion review');
+      if (device.channels !== undefined && process.env.DINODIA_LOGICAL_DEVICES_ENABLED !== 'true')
+        fail(503, 'logical_devices_not_active', 'Logical device management is not active');
       const controls = (device.capabilitySummary as { controls: Array<{ readable: boolean; writable: boolean }> }).controls;
       const hasWritable = controls.some((control) => control.readable && control.writable);
       const hasAnyWritable = controls.some((control) => control.writable);
@@ -358,7 +363,8 @@ export async function POST(request: Request) {
       const safeSummary = safeControlSummary(device.capabilitySummary) as Record<string, unknown>;
       const created = await tx.nativeDevice.create({ data: {
         homeId: authority.home.id, hubInstallationId: hub.installation.id, osDeviceId: String(device.osDeviceId), originalName: String(device.originalName),
-        overrideName: device.name == null || !String(device.name).trim() ? null : String(device.name), technicalLabel: String(device.technicalLabel), customerLabel: String(device.customerLabel),
+        overrideName: device.name == null || !String(device.name).trim() ? null : String(device.name),
+        technicalLabel: isStaff ? String(device.technicalLabel) : 'tenant_device', customerLabel: String(device.customerLabel),
         analyticsCategory: analyticsCategory as never,
         managementClass: authority.managementClass, ownerMembershipId: authority.ownerMembershipId, deviceType: String(device.deviceType),
         manufacturer: device.manufacturer == null ? null : String(device.manufacturer), model: device.model == null ? null : String(device.model), protocol,
@@ -366,14 +372,19 @@ export async function POST(request: Request) {
         descriptorRevision: Number(device.descriptorRevision), descriptorDigest: String(device.descriptorDigest),
         lifecycle: body.disposition === 'view_only' ? 'VIEW_ONLY' : 'INSTALLED', onlineState: 'UNKNOWN', installedAt: now,
         ...(isStaff ? { installationRequestId: authority.request!.id } : {}),
-        assignments: { create: { areaId, homeId: authority.home.id, source: isStaff ? (registerExisting ? 'NATIVE_STAFF_EXISTING_DEVICE_ADOPTION' : 'NATIVE_STAFF_COMMISSIONING') : 'NATIVE_TENANT_COMMISSIONING' } },
+        ...(device.channels === undefined ? { assignments: { create: { areaId, homeId: authority.home.id,
+          source: isStaff ? (registerExisting ? 'NATIVE_STAFF_EXISTING_DEVICE_ADOPTION' : 'NATIVE_STAFF_COMMISSIONING') : 'NATIVE_TENANT_COMMISSIONING' } } } : {}),
       }, select: { id: true, homeId: true, osDeviceId: true, ownerMembershipId: true, managementClass: true, lifecycle: true, customerLabel: true, descriptorRevision: true, analyticsCategory: true, inventoryRevision: true } });
       await observeDeviceSourceAlias(tx, { homeId: authority.home.id, deviceId: created.id, hubInstallationId: hub.installation.id,
         protocol: sourceProtocol, sourceDeviceId: String(device.osDeviceId),
         ...(typeof device.protocolIdentityHash === 'string' ? { protocolIdentityHash: device.protocolIdentityHash } : {}), now });
-      if (isStaff) await changeAnalyticsInterval(tx, { homeId: authority.home.id, hubInstallationId: hub.installation.id, deviceId: created.id,
+      if (isStaff && device.channels === undefined) await changeAnalyticsInterval(tx, { homeId: authority.home.id, hubInstallationId: hub.installation.id, deviceId: created.id,
         category: analyticsCategory as 'NONE' | 'LIGHT' | 'RADIATOR' | 'BOILER', selectedControlId: null, generation: hub.identity.identityGeneration, at: now });
-      const updated = await tx.nativeCommissioningSession.updateMany({ where: { id: row.id, state: 'READY', revision: row.revision, expiresAt: { gt: now } }, data: { state: 'COMPLETED', closedAt: now, finalDeviceId: created.id, revision: { increment: 1 } } });
+      const logicalDevices = device.channels === undefined ? null : await commissionLogicalChildren(tx, {
+        original: await tx.nativeDevice.findUniqueOrThrow({ where: { id: created.id } }), channels: device.channels,
+        protocolIdentityHash: String(device.protocolIdentityHash), generation: hub.identity.identityGeneration, now, initialAreaId: areaId });
+      const primaryDevice = logicalDevices?.[0] || created;
+      const updated = await tx.nativeCommissioningSession.updateMany({ where: { id: row.id, state: 'READY', revision: row.revision, expiresAt: { gt: now } }, data: { state: 'COMPLETED', closedAt: now, finalDeviceId: primaryDevice.id, revision: { increment: 1 } } });
       if (updated.count !== 1) fail(409, 'commissioning_revision_conflict', 'The commissioning session changed before ownership could be recorded');
       await tx.nativeDomainOutbox.create({ data: { homeId: authority.home.id, aggregateType: 'NativeDevice', aggregateId: created.id,
         eventType: isStaff ? (registerExisting ? 'PROPERTY_DEVICE_ADOPTED' : 'PROPERTY_DEVICE_COMMISSIONED') : 'TENANT_DEVICE_COMMISSIONED',
@@ -382,11 +393,22 @@ export async function POST(request: Request) {
         action: isStaff ? (registerExisting ? 'property_device_adopted_by_assigned_staff' : 'property_device_commissioned_by_assigned_staff') : 'tenant_device_commissioned',
         targetType: 'NativeDevice', targetId: created.id, metadata: { protocol, areaId, outcome: 'installed', operationKind: ownerOperationKind, requestId: authority.request?.id || null, workItemId: authority.work?.id || null }, purgeAt: new Date(now.getTime() + 365 * 24 * 60 * 60 * 1000) } });
       const response = { ok: true, sessionId: row.id, revision: row.revision + 1, state: 'COMPLETED', operationKind: ownerOperationKind,
-        device: { id: created.id, osDeviceId: created.osDeviceId, managementClass: created.managementClass, ownerMembershipId: created.ownerMembershipId, lifecycle: created.lifecycle, customerLabel: created.customerLabel, descriptorRevision: created.descriptorRevision, analyticsCategory: created.analyticsCategory, inventoryRevision: created.inventoryRevision } };
+        device: { id: primaryDevice.id, osDeviceId: primaryDevice.osDeviceId, managementClass: primaryDevice.managementClass, ownerMembershipId: primaryDevice.ownerMembershipId, lifecycle: primaryDevice.lifecycle, customerLabel: primaryDevice.customerLabel, descriptorRevision: primaryDevice.descriptorRevision, analyticsCategory: primaryDevice.analyticsCategory, inventoryRevision: primaryDevice.inventoryRevision },
+        ...(logicalDevices ? { logicalDevices } : {}) };
       await tx.idempotencyRecord.create({ data: { namespace: COMPLETE_NAMESPACE, keyHash: finalHash, actorId: authority.actorId, homeId: authority.home.id, hubInstallationId: hub.installation.id, requestHash: finalRequest, responseStatus: 200, responseBody: response, responseDigest: sha256(JSON.stringify(response)), expiresAt: new Date(now.getTime() + 24 * 60 * 60 * 1000) } });
       return NextResponse.json(response, { headers: { 'Cache-Control': 'no-store' } });
     }, { isolationLevel: 'Serializable', maxWait: 5000, timeout: 12000 });
   } catch (error) {
+    if (!(error instanceof Stage1AuthError)) {
+      const failure = error as { name?: string; message?: string; code?: string; meta?: { code?: string; message?: string; database_error?: string } };
+      const prismaCode = /^P\d{4}$/.test(String(failure.code)) ? failure.code : 'UNKNOWN';
+      const sqlState = /^[A-Z0-9]{5}$/.test(String(failure.meta?.code)) ? failure.meta?.code : 'NONE';
+      const diagnostic = String(failure.meta?.database_error || failure.meta?.message || failure.message || '');
+      const constraint = diagnostic.match(/\b([A-Za-z_][A-Za-z0-9_]{1,110}_(?:check|guard|fkey))\b/)?.[1] || 'NONE';
+      const errorName = /^[A-Za-z]{1,64}$/.test(String(failure.name)) ? failure.name : 'UnknownError';
+      // Never include request data, SQL values, exception text or credentials.
+      console.warn(`[commissioning-failure] code=${prismaCode} sqlState=${sqlState} constraint=${constraint} errorName=${errorName}`);
+    }
     const status = error instanceof Stage1AuthError ? error.status : 503;
     const code = error instanceof Stage1AuthError ? error.code : 'commissioning_unavailable';
     return NextResponse.json({ error: { code, message: error instanceof Stage1AuthError ? error.message : 'The commissioning service is temporarily unavailable' } }, { status, headers: { 'Cache-Control': 'no-store' } });

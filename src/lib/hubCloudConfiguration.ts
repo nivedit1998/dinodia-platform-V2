@@ -1,5 +1,6 @@
 import type { Prisma } from '@prisma/client';
 import { canonicalSyncJson, hashSyncConfiguration } from './hubSyncEnvelope';
+import { deletionReferencePrefix } from './deletionReferences';
 
 const MAX_CONFIGURATION_BYTES = 1024 * 1024;
 
@@ -86,6 +87,20 @@ export async function buildHubCloudConfiguration(db: Prisma.TransactionClient, i
       };
     }),
   } : undefined;
+  const logicalRows = capabilitySummary.nativeLogicalDevicesV1 === true
+    ? await db.$queryRaw<Array<{ osDeviceId: string; sourceBinding: Record<string, unknown> }>>`
+      SELECT d."osDeviceId", d."sourceBinding" FROM "NativeDevice" d
+      JOIN "NativePhysicalDevice" p ON p."id" = d."physicalParentId"
+      WHERE d."homeId" = ${input.homeId}::uuid AND d."hubInstallationId" = ${input.hubInstallationId}::uuid
+      AND p."homeId" = d."homeId" AND p."hubInstallationId" = d."hubInstallationId"
+      AND p."lifecycle" = 'ACTIVE' LIMIT 2000`
+    : [];
+  const logicalBindings = new Map(logicalRows.map(row => [row.osDeviceId, row.sourceBinding]));
+  const logicalSecurity = capabilitySummary.nativeLogicalDevicesV1 === true
+    ? await db.deletionSecurityReceipt.findMany({ where: { actionType: 'AREA_DEVICE_ERASURE',
+      anonymousReference: { startsWith: deletionReferencePrefix(input.hubInstallationId) } },
+      select: { anonymousReference: true }, orderBy: { anonymousReference: 'asc' }, take: 8193 }) : null;
+  if (logicalSecurity && logicalSecurity.length > 8192) throw new Error('Deletion security ledger requires bounded recovery maintenance');
   const unsigned = {
     revision: home.managementRevision,
     policyRevision: hub?.accessPolicyRevision ?? 0,
@@ -98,6 +113,7 @@ export async function buildHubCloudConfiguration(db: Prisma.TransactionClient, i
       inventoryRevision: device.inventoryRevision,
       descriptorRevision: device.descriptorRevision, descriptorDigest: device.descriptorDigest,
       osAreaIds: device.assignments.map((assignment) => assignment.area.osAreaId),
+      ...(logicalBindings.has(device.osDeviceId) ? { logicalBinding: logicalBindings.get(device.osDeviceId) } : {}),
       ...(() => { const interval = analyticsIntervals.find(row => row.deviceId === device.id); return interval ? { analyticsInterval: {
         id: interval.id, revision: interval.revision, validFrom: interval.validFrom.toISOString(), sourceGeneration: interval.sourceGeneration,
         selectedControlId: interval.selectedControlId, writerEnabled: hub?.analyticsWriterEnabled === true
@@ -113,6 +129,7 @@ export async function buildHubCloudConfiguration(db: Prisma.TransactionClient, i
       actions: automation.actions.map((action) => ({ id: action.id, osDeviceId: action.device.osDeviceId, osAreaId: action.area.osAreaId, controlId: action.controlId, descriptorRevision: action.descriptorRevision, actionValue: action.actionValue, needsAttention: action.needsAttention })),
     })),
     ...(tenantAutomationProjection ? { tenantAutomationProjection } : {}),
+    ...(logicalSecurity ? { logicalSecurity: { version: 1, deletedReferences: logicalSecurity.map(row => row.anonymousReference) } } : {}),
     releasePolicy: { mode: 'MANUAL', automaticInstallEnabled: false, desiredRelease: null },
   };
   const encoded = canonicalSyncJson(unsigned);
