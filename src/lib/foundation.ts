@@ -12,6 +12,7 @@ export const STAGE1_MODEL_COUNT = 40;
 export const REQUIRED_MIGRATION = '20261003000000_native_v2_stage3_domain_schema';
 export const REQUIRED_MODEL_COUNT = 65;
 export const COMPATIBLE_ADDITIVE_MIGRATIONS: Readonly<Record<string, string>> = Object.freeze({
+  '20261025010000_logical_device_parents': 'eacd06daaf9eac7f77beffd233b9f553c61c632c5717e08df3ddda641584864c',
   '20261024103000_state_evidence_policy': '905d3c72ea537e6e015743e8ba7bcc85e7353c5868053244f58ff4b272ed40da',
   '20261023210000_room_qr_plaques': 'be22f4084ab317f1dae158427e866172105c2c45a5b7272662b6aa326c53da67',
   '20261023110000_category_analytics_intervals': 'b6a25359b7bfeb9a453ccc8ecc45fc4f32de63050ac85bd31821cae58e910d05',
@@ -61,6 +62,9 @@ export function isSchemaReady(migrations: readonly CompletedMigration[], modelCo
   const hasStage12Alexa = newer.some((migration) => migration.migration_name === '20261009110000_stage12_alexa_oauth_scope');
   const hasAnalyticsIntervals = newer.some(migration => migration.migration_name === '20261023110000_category_analytics_intervals');
   const hasRoomPlaques = newer.some(migration => migration.migration_name === '20261023210000_room_qr_plaques');
+  const hasLogicalDevices = newer.some(migration => migration.migration_name === '20261025010000_logical_device_parents');
+  if (hasLogicalDevices && (!hasStage8 || !hasAnalyticsIntervals || !hasRoomPlaques
+    || !newer.some(migration => migration.migration_name === '20261024103000_state_evidence_policy'))) return false;
   if (newer.some(migration => migration.migration_name === '20261024103000_state_evidence_policy') && !hasAnalyticsIntervals) return false;
-  return modelCount === REQUIRED_MODEL_COUNT + (hasStage5 ? 1 : 0) + (hasProspectiveRoomAccess ? 1 : 0) + (hasStage12Alexa ? 8 : 0) + (hasAnalyticsIntervals ? 2 : 0) + (hasRoomPlaques ? 2 : 0);
+  return modelCount === REQUIRED_MODEL_COUNT + (hasStage5 ? 1 : 0) + (hasProspectiveRoomAccess ? 1 : 0) + (hasStage12Alexa ? 8 : 0) + (hasAnalyticsIntervals ? 2 : 0) + (hasRoomPlaques ? 2 : 0) + (hasLogicalDevices ? 1 : 0);
 }
