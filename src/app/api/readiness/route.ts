@@ -26,6 +26,7 @@ export async function GET() {
       logicalDevicesSchemaChecksum: logicalSchemaReady ? logicalChecksum : null,
       logicalDevicesEnabled: process.env.DINODIA_LOGICAL_DEVICES_ENABLED === 'true',
       analyticsHistoryContractVersion: calendarSchemaReady ? 1 : null,
+      analyticsHistorySchemaChecksum: calendarSchemaReady ? COMPATIBLE_ADDITIVE_MIGRATIONS[calendarName] : null,
       analyticsHistoryEnabled: process.env.DINODIA_CALENDAR_ANALYTICS_ENABLED === 'true',
       analyticsUsagePolicyVersion: ready && migration.some(row => row.migration_name === '20261024103000_state_evidence_policy') ? 3
         : ready && migration.some(row => row.migration_name === '20261023110000_category_analytics_intervals') ? 2 : null,
