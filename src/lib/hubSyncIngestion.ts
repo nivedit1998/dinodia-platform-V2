@@ -738,10 +738,20 @@ async function applyHubSyncEventInner(tx: Prisma.TransactionClient, input: SyncE
     const incidentKey = String(payload.incidentKey);
     const revision = Number(payload.revision);
     const sourceKind = String(payload.kind);
-    const prior = await tx.nativeDeviceOutageIncident.findUnique({
-      where: { hubInstallationId_sourceIncidentKey: { hubInstallationId, sourceIncidentKey: incidentKey } },
-      select: { id: true, sourceKind: true, sourceRevision: true },
+    let deviceId: string | null = null;
+    if (payload.osDeviceId !== null) {
+      const device = await tx.nativeDevice.findUnique({ where: { hubInstallationId_osDeviceId: { hubInstallationId, osDeviceId: String(payload.osDeviceId) } }, select: { id: true, homeId: true } });
+      if (!device || device.homeId !== homeId) invalid('hub_sync_incident_device_invalid', 'The incident device is not part of this enrolled home');
+      deviceId = device.id;
+    }
+    // Device outages have exactly one source: their device. Its enrolled Hub
+    // remains part of lookup authority through the existing device relation,
+    // not a second outage source. Keep the database XOR invariant unchanged.
+    const prior = await tx.nativeDeviceOutageIncident.findFirst({
+      where: { homeId, sourceIncidentKey: incidentKey, OR: [{ hubInstallationId }, { device: { hubInstallationId } }] },
+      select: { id: true, deviceId: true, sourceKind: true, sourceRevision: true },
     });
+    if (prior && prior.deviceId !== deviceId) invalid('hub_sync_incident_source_conflict', 'A stable incident identity cannot change its source target');
     if (prior && prior.sourceKind !== 'hub_unknown' && prior.sourceKind !== sourceKind) {
       invalid('hub_sync_incident_kind_conflict', 'A stable incident identity cannot change its source kind');
     }
@@ -754,16 +764,10 @@ async function applyHubSyncEventInner(tx: Prisma.TransactionClient, input: SyncE
       });
       return;
     }
-    let deviceId: string | null = null;
-    if (payload.osDeviceId !== null) {
-      const device = await tx.nativeDevice.findUnique({ where: { hubInstallationId_osDeviceId: { hubInstallationId, osDeviceId: String(payload.osDeviceId) } }, select: { id: true, homeId: true } });
-      if (!device || device.homeId !== homeId) invalid('hub_sync_incident_device_invalid', 'The incident device is not part of this enrolled home');
-      deviceId = device.id;
-    }
     const firstObservedAt = strictDate(payload.firstObservedAt, now);
     strictDate(payload.lastObservedAt, now);
     const resolvedAt = payload.state === 'resolved' && payload.resolvedAt !== null ? strictDate(payload.resolvedAt, now) : null;
-    const isHubIncident = /^(hub|integration)_/.test(sourceKind);
+    const isHubIncident = deviceId === null;
     const alertEligibleAt = new Date(firstObservedAt.getTime() + (isHubIncident ? 7 * 60_000 : 60 * 60_000));
     const data = {
       homeId,
@@ -772,7 +776,7 @@ async function applyHubSyncEventInner(tx: Prisma.TransactionClient, input: SyncE
       sourceRevision: revision,
       sourceEventId: event.id,
       deviceId,
-      hubInstallationId,
+      hubInstallationId: isHubIncident ? hubInstallationId : null,
       offlineObservedAt: firstObservedAt,
       alertEligibleAt,
       state: payload.state === 'resolved' ? 'RESOLVED' : 'OPEN',
