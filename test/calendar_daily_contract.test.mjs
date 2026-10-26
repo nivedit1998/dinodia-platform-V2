@@ -28,6 +28,48 @@ const source = { osDeviceId: 'device', osAreaId: 'area', category: 'RADIATOR', c
 const writerFrom = '2026-10-19T00:00:00.000Z';
 function state() { const s = {}; daily.initialize(s, { version: 1, enabled: true, timezone: 'Europe/London', writerFrom }); return s; }
 
+test('recovered delayed-registration snapshots pass the unchanged real ingestion boundary exactly once', async () => {
+  const oldFlag = process.env.DINODIA_CALENDAR_ANALYTICS_ENABLED;
+  process.env.DINODIA_CALENDAR_ANALYTICS_ENABLED = 'true';
+  try {
+    const { ingestDailyAnalytics } = load('src/lib/dailyAnalyticsIngestion.ts');
+    const s = state(), assigned = '2026-10-26T13:46:35.504Z', local = '2026-10-26T13:46:38.000Z';
+    const bound = { ...source, bindingRevision: 1, analyticsPolicyVersion: 3,
+      analyticsIntervalId: '11111111-1111-4111-8111-111111111111', assignmentEpochAt: local };
+    daily.recordUsageInterval(s, bound, Date.parse(local), Date.parse(local) + 60000, 'unknown');
+    let row = null, writes = 0;
+    const controls = [{ controlId: 'heat', semanticRole: 'active_heat_demand', observable: true, writable: false }];
+    const tx = { $queryRaw: async () => [],
+      nativeAnalyticsRetention: { findUnique: async () => ({ homeId: 'home', writerEnabled: true,
+        timezone: 'Europe/London', writerFrom: new Date(writerFrom), barrierStreamId: 'stream', barrierSequence: 1n }) },
+      hubInstallation: { findUnique: async () => ({ homeId: 'home', analyticsWriterEnabled: true }) },
+      nativeDevice: { findUnique: async () => ({ id: 'device-id', homeId: 'home', managementClass: 'PROPERTY_DEVICE',
+        ownerMembershipId: null, lifecycle: 'INSTALLED', analyticsCategory: 'RADIATOR' }) },
+      area: { findUnique: async () => ({ id: 'area-id', status: 'ACTIVE' }) },
+      deviceAreaAssignment: { findFirst: async () => ({ validFrom: new Date(assigned) }) },
+      nativeAnalyticsInterval: { findMany: async () => [{ id: bound.analyticsIntervalId, revision: 1,
+        sourceGeneration: 1, analyticsPolicyVersion: 3, analyticsCategory: 'RADIATOR', validFrom: new Date(assigned),
+        validUntil: null, selectedControlId: null, authorizedControls: controls }] },
+      nativeAnalyticsDay: { findUnique: async () => row, findFirst: async () => null,
+        create: async ({ data }) => { row = data; writes++; }, update: async ({ data }) => { row = data; writes++; } } };
+    const input = { homeId: 'home', hubInstallationId: 'hub', identityGeneration: 1, streamId: 'stream',
+      now: new Date(Date.parse(local) + 120000), event: { type: 'analytics.day', sequence: 2,
+        payload: daily.dailyEvents(s)[0].payload } };
+    await assert.rejects(ingestDailyAnalytics(tx, input), e => e.code === 'hub_sync_daily_assignment_invalid');
+    assert.equal(daily.reconcileAssignment(s, { id: 'device', areaId: 'area' }, {
+      managementClass: 'PROPERTY_DEVICE', lifecycle: 'INSTALLED', analyticsCategory: 'RADIATOR',
+      osAreaIds: ['area'], analyticsAssignmentStartedAt: assigned,
+      analyticsInterval: { id: bound.analyticsIntervalId, revision: 1, sourceGeneration: 1, writerEnabled: true },
+    }), true);
+    input.event.payload = daily.dailyEvents(s)[0].payload;
+    assert.equal(contract.validDailyPayload(input.event.payload), true);
+    assert.equal(contract.dailyAggregateId(input.event.payload), daily.dailyEvents(s)[0].aggregateId);
+    await ingestDailyAnalytics(tx, input); await ingestDailyAnalytics(tx, input);
+    assert.equal(writes, 1); assert.equal(row.unknownSeconds, 60);
+    assert.equal(row.assignmentEpochAt.toISOString(), '2026-10-26T13:46:35.000Z');
+  } finally { if (oldFlag === undefined) delete process.env.DINODIA_CALENDAR_ANALYTICS_ENABLED; else process.env.DINODIA_CALENDAR_ANALYTICS_ENABLED = oldFlag; }
+});
+
 test('Hub and Platform agree on DST, fractional offsets, leap years and Monday cutoffs', () => {
   for (const zone of ['Europe/London', 'UTC', 'Asia/Kathmandu', 'Asia/Kolkata', 'Pacific/Kiritimati', 'America/New_York']) {
     for (const instant of ['2026-10-25T12:00:00Z', '2026-10-26T00:00:00Z', '2026-03-29T01:30:00Z', '2028-02-29T12:00:00Z']) {
