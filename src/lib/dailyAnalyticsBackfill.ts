@@ -4,7 +4,7 @@ import { reconcileNativeUsageCoverage, type NativeUsageRow } from './nativeAnaly
 import { historyDayExpiry } from './analyticsHistoryCalendar';
 
 export type BackfillUsage = NativeUsageRow & {
-  id: string; analyticsCategory: 'LIGHT' | 'RADIATOR' | 'BOILER' | 'NONE'; controlId: string;
+  id: string; analyticsCategory: string; controlId: string;
   sourceGeneration: number; bindingRevision: number; analyticsIntervalId: string | null; analyticsPolicyVersion: number;
 };
 export type BackfillTemperature = { id: string; deviceId: string; areaId: string; sourceGeneration: number;
@@ -35,7 +35,7 @@ export function buildLegacyDays(input: { homeId: string; timezone: string; write
   const { rows, excludedDeviceHours } = reconcileNativeUsageCoverage(input.usage);
   if (excludedDeviceHours) throw new Error('legacy_usage_overlap_requires_reconciliation');
   for (const raw of rows as BackfillUsage[]) {
-    if (raw.analyticsCategory === 'NONE') throw new Error('legacy_category_invalid');
+    if (raw.analyticsCategory !== 'LIGHT' && raw.analyticsCategory !== 'RADIATOR' && raw.analyticsCategory !== 'BOILER') throw new Error('legacy_category_invalid');
     const total = raw.onSeconds + raw.offSeconds + raw.unknownSeconds;
     const time = (value: Date | string) => value instanceof Date ? value.getTime() : Date.parse(value);
     const end = raw.coverageEndAt ? time(raw.coverageEndAt)

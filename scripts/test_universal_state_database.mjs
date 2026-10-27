@@ -3,10 +3,12 @@ import {execFileSync,spawnSync} from 'node:child_process';
 import {randomBytes} from 'node:crypto';import {createRequire} from 'node:module';
 import {readFileSync} from 'node:fs';import path from 'node:path';import assert from 'node:assert/strict';
 const require=createRequire(import.meta.url),ts=require('typescript');
+const modules=new Map();
+const authErrors={Stage1AuthError:class extends Error{constructor(status,code,message){super(message);Object.assign(this,{status,code});}}};
 const name=`dinodia-udc-state-${process.pid}`,password=randomBytes(24).toString('hex');let started=false,db;
 const env=Object.fromEntries(['PATH','TMPDIR','HOME','LANG'].filter(k=>process.env[k]).map(k=>[k,process.env[k]]));
-function load(file){const m={exports:{}};const js=ts.transpileModule(readFileSync(file,'utf8'),{compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2022}}).outputText;
- new Function('require','module','exports',js)(n=>n==='./prisma'?{prisma:db}:n==='./customerSelectedHome'?{requireCustomerSelectedHome:()=>{throw new Error('Not an HTTP authorization test');}}:n==='./stage1Auth'?{Stage1AuthError:class extends Error{constructor(status,code,message){super(message);Object.assign(this,{status,code});}}}:n.startsWith('.')?load(path.resolve(path.dirname(file),n+'.ts')):require(n),m,m.exports);return m.exports;}
+function load(file){file=path.resolve(file);if(modules.has(file))return modules.get(file).exports;const m={exports:{}};modules.set(file,m);const js=ts.transpileModule(readFileSync(file,'utf8'),{compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2022}}).outputText;
+ new Function('require','module','exports',js)(n=>n==='@prisma/client'?require('../src/generated/prisma'):n==='./prisma'?{prisma:db}:n==='./customerSelectedHome'?{requireCustomerSelectedHome:()=>{throw new Error('Not an HTTP authorization test');}}:n==='./stage1Auth'?authErrors:n.startsWith('.')?load(path.resolve(path.dirname(file),n+'.ts')):require(n),m,m.exports);return m.exports;}
 try{
  execFileSync('docker',['run','-d','--name',name,'--memory=256m','--cpus=1','-e','POSTGRES_PASSWORD','-e','POSTGRES_DB=dinodia_udc_state','-p','127.0.0.1::5432','postgres:16-alpine'],{env:{...env,POSTGRES_PASSWORD:password},stdio:'pipe'});started=true;
  let ready=false;for(let i=0;i<40;i++){if(spawnSync('docker',['exec',name,'pg_isready','-U','postgres'],{stdio:'ignore'}).status===0){ready=true;break;}await new Promise(r=>setTimeout(r,250));}assert.ok(ready);
@@ -14,7 +16,8 @@ try{
  const url=`postgresql://postgres:${password}@${address}/dinodia_udc_state`;
  const migration=spawnSync('npx',['prisma','migrate','deploy'],{env:{...env,DATABASE_URL:url,DIRECT_URL:url},encoding:'utf8'});
  if(migration.status!==0){console.error(migration.stderr.replaceAll(password,'[redacted]'));throw new Error('Disposable migration failed');}
- const {PrismaClient}=require('../src/generated/prisma');db=new PrismaClient({datasourceUrl:url});
+ const {PrismaClient}=require('../src/generated/prisma');db=new PrismaClient({datasourceUrl:url,log:[{emit:'event',level:'query'}]});
+ let previousQuery='';db.$on('query',event=>{if(!/^(BEGIN|ROLLBACK|COMMIT|SAVEPOINT|RELEASE)/.test(event.query))previousQuery=event.query;});
  const home=await db.home.create({data:{timezone:'Europe/London'}});
  const identity=await db.hubManufacturingIdentity.create({data:{serialNumber:'UDC-SYNTHETIC',signingPublicKey:'synthetic',encryptionPublicKey:'synthetic',signingKeyFingerprint:'synthetic-sign',encryptionKeyFingerprint:'synthetic-encrypt'}});
  const hub=await db.hubInstallation.create({data:{homeId:home.id,manufacturingIdentityId:identity.id,serialNumberSnapshot:'UDC-SYNTHETIC',analyticsWriterEnabled:true}});
@@ -44,6 +47,9 @@ try{
  await assert.rejects(db.nativeAnalyticsStateDay.updateMany({data:{durationsSeconds:{on:61,off:0,unknown:0}}}));
  await assert.rejects(db.nativeAnalyticsStateDay.updateMany({data:{analyticsCategory:'AC'}}));
  await assert.rejects(db.$transaction(tx=>ingestMultiStateAnalytics(tx,{...input,identityGeneration:2})),e=>e.code==='hub_sync_state_coverage_invalid');
+ const {exerciseStateHistoryMatrix}=await import('./universal_state_database_matrix.mjs');
+ try{await exerciseStateHistoryMatrix({db,home,hub,area,device,interval,p,input,load,multiStateDailyAggregateId});}
+ catch(error){console.error('SYNTHETIC_LAST_SQL '+previousQuery);throw error;}
  const account=await db.customerAccount.create({data:{displayName:'Synthetic',username:'synthetic',usernameNormalized:'synthetic',email:'synthetic@example.invalid',emailNormalized:'synthetic@example.invalid',passwordHash:'synthetic-not-a-login'}});
  const member=await db.homeMembership.create({data:{homeId:home.id,customerAccountId:account.id,role:'TENANT'}});
  await db.nativeDevice.update({where:{id:device.id},data:{managementClass:'TENANT_DEVICE',ownerMembershipId:member.id,analyticsCategory:'NONE',technicalLabel:'tenant_device'}});

@@ -23,6 +23,7 @@
       }
     ],
     "paths": {
+      "@prisma/client": ["./src/generated/prisma"],
       "@/*": [
         "./src/*"
       ]

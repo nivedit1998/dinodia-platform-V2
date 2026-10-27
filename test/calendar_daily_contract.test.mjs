@@ -194,6 +194,8 @@ test('legacy backfill keeps exact counters and replaces overlapping temperature 
   assert.equal(temp.celsiusMilliseconds, 20400000);
   assert.equal(temp.minimumCelsius, 20); assert.equal(temp.maximumCelsius, 24);
   assert.equal(temp.payloadDigest, buildLegacyDays(input).find(r => r.kind === 'TEMPERATURE').payloadDigest);
+  assert.throws(() => buildLegacyDays({ ...input, usage: input.usage.map(row => ({ ...row, analyticsCategory: 'SOCKET' })) }),
+    /legacy_category_invalid/, 'new state categories must not be reconstructed into legacy binary history');
 });
 
 test('mixed legacy UTC hour crossing fractional-offset midnight is retained, never prorated as a measurement', () => {
