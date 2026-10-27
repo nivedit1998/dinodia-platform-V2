@@ -67,6 +67,9 @@ export async function exerciseStateHistoryMatrix({db,home,hub,area,device,interv
   assert.equal(await db.nativeAnalyticsStateDay.count(),2);assert.equal(await db.nativeAnalyticsStateDay.count({where:{areaId:area2.id}}),0);
   assert.equal(await db.area.count({where:{id:area2.id}}),0,'real finish workflow removes the exact Area and new history');
   assert.equal(await db.nativeDevice.count({where:{id:device.id}}),1,'surviving Area device is preserved');
+  await db.$transaction(tx=>applyHubSyncEvent(tx,send(p2)));
+  assert.equal(await db.nativeAnalyticsStateDay.count(),2,'security receipt suppresses old erased-Area state replay');
+  assert.equal(await db.nativeAnalyticsUnallocated.count({where:{areaId:area2.id}}),0,'erased payload does not reappear in quarantine');
   await maintainDailyAnalytics(db,new Date('2027-11-03T01:00:00Z'));
   assert.equal(await db.nativeAnalyticsStateDay.count(),0,'real annual maintenance removes expired new-state rows');
   await assert.rejects(db.$transaction(tx=>ingest(tx,{...send({...p3,revision:3}),now:new Date('2027-11-03T01:00:00Z')})),e=>e.code==='hub_sync_state_coverage_invalid');
