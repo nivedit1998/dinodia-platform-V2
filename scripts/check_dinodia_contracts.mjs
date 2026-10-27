@@ -323,6 +323,8 @@ const fixtureCases = [
   ["invalid/control-state-option-outside-descriptor.json", "controlState", (v) => v.state, true],
   ["ui-state-offline.json", "uiState", (v) => v, true],
   ["unknown-interaction-kind.json", "device", (v) => v.device, true],
+  ["logical-two-gang-children.json", "device", (v) => v[0], true],
+  ["logical-two-gang-children.json", "device", (v) => v[1], true],
 ];
 const semanticOnlyFixturePaths = new Set([
   "account-relationship-lifecycle.json",
