@@ -1,5 +1,5 @@
 import crypto from 'node:crypto';
-import { PrismaClient } from '@prisma/client';
+import { PrismaClient } from '../src/generated/prisma/index.js';
 
 const prisma = new PrismaClient({ datasourceUrl: process.env.DIRECT_URL });
 function canonicalRows(rows) {

@@ -1,4 +1,4 @@
-import { PrismaClient } from '@prisma/client';
+import { PrismaClient } from '../src/generated/prisma/index.js';
 
 let target;
 try { target = new URL(process.env.DIRECT_URL || ''); } catch { throw new Error('Stage 3 backfill check requires an explicit disposable loopback DIRECT_URL'); }

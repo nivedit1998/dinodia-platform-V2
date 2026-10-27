@@ -4,7 +4,7 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import dotenv from 'dotenv';
-import { PrismaClient } from '@prisma/client';
+import { PrismaClient } from '../src/generated/prisma/index.js';
 import { assertMigrationDoesNotReferenceVolatileRuntimeTables, compareExistingTablePreservation } from './native_migration_preservation.mjs';
 import { migrationBundleIdentity, STAGE6_CUSTOMER_MIGRATIONS, STAGE8_COMMISSIONING_MIGRATION, STAGE9_DEREGISTRATION_GUARD_MIGRATION, STAGE10_ANALYTICS_MAINTENANCE_MIGRATION, STAGE10_PARTIAL_USAGE_COVERAGE_MIGRATION, STAGE11_AUTOMATION_ACTION_ORDER_MIGRATION, STAGE12_ALEXA_OAUTH_SCOPE_MIGRATION, unexpectedPendingMigrations } from './native_migration_bundle.mjs';
 

@@ -6,7 +6,7 @@ import path from 'node:path';
 import {createRequire} from 'node:module';
 import {execFileSync,spawnSync} from 'node:child_process';
 import {randomUUID,randomBytes,createHash} from 'node:crypto';
-import {PrismaClient} from '@prisma/client';
+import {PrismaClient} from '../src/generated/prisma/index.js';
 const require=createRequire(import.meta.url),ts=require('typescript');
 const name=`dinodia-incident-check-${process.pid}`,password=randomBytes(24).toString('hex');
 let started=false,prisma;

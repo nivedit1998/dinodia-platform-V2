@@ -5,7 +5,7 @@ import path from 'node:path';
 import { createRequire } from 'node:module';
 import { execFileSync } from 'node:child_process';
 import dotenv from 'dotenv';
-import { PrismaClient } from '@prisma/client';
+import { PrismaClient } from '../src/generated/prisma/index.js';
 import { validateReadOnlyProductionTargets } from './read_only_production_inventory.mjs';
 
 const [mode = 'check', hubId, expectedBuild] = process.argv.slice(2);

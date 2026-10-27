@@ -1,7 +1,7 @@
 // Read-only production data prerequisite (RB4). Never prints IDs or credentials.
 import fs from 'node:fs';
 import dotenv from 'dotenv';
-import { PrismaClient } from '@prisma/client';
+import { PrismaClient } from '../src/generated/prisma/index.js';
 import { validateReadOnlyProductionTargets } from './read_only_production_inventory.mjs';
 const args = process.argv.slice(2);
 const envPath = args.find(value => value.startsWith('--env-file='))?.slice(11);

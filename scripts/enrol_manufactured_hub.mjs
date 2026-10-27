@@ -1,7 +1,7 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import process from 'node:process';
-import { PrismaClient } from '@prisma/client';
+import { PrismaClient } from '../src/generated/prisma/index.js';
 
 const inputFile = process.env.MANUFACTURING_ENROLLMENT_FILE;
 if (!inputFile) throw new Error('MANUFACTURING_ENROLLMENT_FILE is required');
