@@ -14,6 +14,6 @@ export async function GET(request: Request, context: { params: Promise<{ homeId:
     const result = request.headers.get('X-Dinodia-Analytics-Contract') === '1'
       ? {...legacy, stateCategories:await readStateAnalyticsCategories(homeId)} : legacy;
     await assertNativeAnalyticsScopeCurrent(scope);
-    return NextResponse.json(result, { headers: { 'Cache-Control': 'no-store', Pragma: 'no-cache', Vary: 'Authorization, Cookie, X-Dinodia-Home-Id' } });
+    return NextResponse.json(result, { headers: { 'Cache-Control': 'no-store', Pragma: 'no-cache', Vary: 'Authorization, Cookie, X-Dinodia-Home-Id, X-Dinodia-Analytics-Contract' } });
   } catch (error) { return nativeV1ErrorResponse(error); }
 }
