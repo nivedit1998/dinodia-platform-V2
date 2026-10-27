@@ -97,3 +97,27 @@ test('signed analytics config only reads audited intervals; it never seeds or re
   assert.equal(rows.length, 1); assert.equal(rows[0].validUntil, null);
   assert.equal(renewed.devicePolicies[0].analyticsInterval, undefined, 'generation rotation requires an audited authority renewal');
 });
+
+test('an absent current-process proof sends a legacy-safe category fallback without changing authority or grants',async()=>{
+ const previous=process.env.DINODIA_UNIVERSAL_ANALYTICS_ENABLED;
+ const db=database({supportsProjection:false});const devices=await db.nativeDevice.findMany();
+ devices[0].id=deviceId;devices[0].analyticsCategory='TV';db.nativeDevice.findMany=async()=>devices;
+ db.hubInstallation.findUnique=async()=>({accessPolicyRevision:8,analyticsWriterEnabled:true,analyticsCollectionEnabled:false,
+  capabilitySummary:{nativeUniversalAnalyticsV2:true},manufacturingIdentity:{identityGeneration:1}});
+ db.nativeAnalyticsInterval={findMany:async()=>[{id:'epoch',deviceId,revision:1,sourceGeneration:1,validFrom:new Date(),analyticsPolicyVersion:4,
+   selectedControlId:'power',authorizedControls:[{controlId:'power'}]}]};
+ let proof=null;
+ db.$queryRaw=async()=>[{proof,homeId,hubId,revision:12,identityId:'identity',generation:1}];
+ try{
+  process.env.DINODIA_UNIVERSAL_ANALYTICS_ENABLED='true';
+  const fallback=await buildHubCloudConfiguration(db,{homeId,hubInstallationId:hubId});
+  assert.equal(fallback.devicePolicies[0].analyticsCategory,'NONE');assert.equal(fallback.devicePolicies[0].analyticsInterval,undefined);
+  assert.equal(fallback.memberships[0].areaIds[0],areaId);assert.equal(devices[0].analyticsCategory,'TV');
+  proof={homeId,hubInstallationId:hubId,manufacturingIdentityId:'identity',identityGeneration:1,analyticsContractVersion:1,
+   appliedCloudRevision:11,invalidatedAt:null,receivedAt:new Date().toISOString()};
+  const current=await buildHubCloudConfiguration(db,{homeId,hubInstallationId:hubId});
+  assert.equal(current.devicePolicies[0].analyticsCategory,'TV');assert.equal(current.devicePolicies[0].analyticsInterval.analyticsPolicyVersion,4);
+  assert.equal(current.devicePolicies[0].analyticsInterval.genericCollectionEnabled,false);
+  proof.homeId='another-home';assert.equal((await buildHubCloudConfiguration(db,{homeId,hubInstallationId:hubId})).devicePolicies[0].analyticsCategory,'NONE');
+ }finally{if(previous===undefined)delete process.env.DINODIA_UNIVERSAL_ANALYTICS_ENABLED;else process.env.DINODIA_UNIVERSAL_ANALYTICS_ENABLED=previous;}
+});

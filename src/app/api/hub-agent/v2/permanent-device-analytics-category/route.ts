@@ -6,12 +6,12 @@ import { sha256 } from '@/lib/stage1Crypto';
 import { Stage1AuthError } from '@/lib/stage1Auth';
 import { EMPLOYEE_SESSION_SECONDS, OPERATOR_SESSION_SECONDS } from '@/lib/stage1SessionPolicy';
 import { changeAnalyticsInterval } from '@/lib/analyticsIntervals';
+import { isAnalyticsCategory, isStateAnalyticsCategory, type AnalyticsCategory } from '@/lib/analyticsCategories';
+import { requireUniversalAnalyticsCompatibility } from '@/lib/universalAnalyticsCompatibility';
 
 export const dynamic = 'force-dynamic';
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const NAMESPACE = 'native-property-device-analytics-category:v1';
-const CATEGORIES = new Set(['NONE', 'LIGHT', 'BOILER', 'RADIATOR']);
-type AnalyticsCategory = 'NONE' | 'LIGHT' | 'BOILER' | 'RADIATOR';
 type Body = Record<string, unknown>;
 
 function fail(status: number, code: string, message: string): never { throw new Stage1AuthError(status, code, message); }
@@ -88,7 +88,7 @@ export async function POST(request: Request) {
     const expectedCloudConfigurationRevision = Number(body.expectedCloudConfigurationRevision ?? body.expectedManagementRevision);
     if (!exactKeys(body, allowed) || body.homeId !== hub.installation.homeId || body.hubInstallationId !== hub.installation.id
       || !UUID.test(String(body.operationId || '')) || !/^[A-Za-z0-9:_-]{1,160}$/.test(String(body.osDeviceId || ''))
-      || !CATEGORIES.has(String(body.expectedAnalyticsCategory)) || !CATEGORIES.has(String(body.analyticsCategory))
+      || !isAnalyticsCategory(body.expectedAnalyticsCategory) || !isAnalyticsCategory(body.analyticsCategory)
       || revisionFields.length !== 1 || !Number.isSafeInteger(expectedCloudConfigurationRevision) || expectedCloudConfigurationRevision < 1
       || Object.hasOwn(body, 'expectedInventoryRevision') && (!Number.isSafeInteger(body.expectedInventoryRevision) || Number(body.expectedInventoryRevision) < 1)) {
       fail(400, 'analytics_category_request_invalid', 'The permanent-device analytics category request is invalid');
@@ -97,6 +97,9 @@ export async function POST(request: Request) {
     return await prisma.$transaction(async (tx) => {
       await tx.$queryRaw`SELECT id FROM "Home" WHERE id = ${hub.installation.homeId}::uuid FOR UPDATE`;
       const authority = await currentAssignedStaff(tx, body, hub);
+      if (isStateAnalyticsCategory(body.analyticsCategory)) await requireUniversalAnalyticsCompatibility(tx,{
+        homeId:hub.installation.homeId,hubInstallationId:hub.installation.id,identity:hub.identity,
+      });
       const device = await tx.nativeDevice.findFirst({ where: { homeId: authority.home.id, hubInstallationId: hub.installation.id, osDeviceId: String(body.osDeviceId),
         managementClass: 'PROPERTY_DEVICE', ownerMembershipId: null, lifecycle: { in: ['INSTALLED', 'VIEW_ONLY'] }, retiredAt: null },
       select: { id: true, osDeviceId: true, analyticsCategory: true, inventoryRevision: true, assignments: { where: { validUntil: null, area: { homeId: authority.home.id, status: 'ACTIVE' } }, select: { areaId: true }, take: 8 } } });
@@ -136,8 +139,8 @@ export async function POST(request: Request) {
       if (changedHome.count !== 1) fail(409, 'analytics_category_revision_conflict', 'The Home configuration changed; refresh the dashboard before changing this category');
       const changedDevice = !policyChanged ? { count: 1 } : await tx.nativeDevice.updateMany({ where: {
         id: device.id, homeId: authority.home.id, hubInstallationId: hub.installation.id, managementClass: 'PROPERTY_DEVICE', ownerMembershipId: null,
-        lifecycle: { in: ['INSTALLED', 'VIEW_ONLY'] }, analyticsCategory: body.expectedAnalyticsCategory as AnalyticsCategory,
-      }, data: { analyticsCategory: body.analyticsCategory as AnalyticsCategory, inventoryRevision: { increment: 1 } } });
+        lifecycle: { in: ['INSTALLED', 'VIEW_ONLY'] }, analyticsCategory: body.expectedAnalyticsCategory as never,
+      }, data: { analyticsCategory: body.analyticsCategory as never, inventoryRevision: { increment: 1 } } });
       if (changedDevice.count !== 1) fail(409, 'analytics_category_revision_conflict', 'The permanent device changed; refresh the dashboard before retrying');
       const interval = await changeAnalyticsInterval(tx, { homeId: authority.home.id, hubInstallationId: hub.installation.id, deviceId: device.id,
         category: String(body.analyticsCategory) as AnalyticsCategory, selectedControlId, generation: hub.identity.identityGeneration, at: new Date() });

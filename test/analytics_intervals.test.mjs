@@ -1,12 +1,13 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import path from 'node:path';
 import { createRequire } from 'node:module';
 import test from 'node:test';
 const require = createRequire(import.meta.url);
 const ts = require('typescript');
 function load(file) {
   const output = ts.transpileModule(fs.readFileSync(file, 'utf8'), { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText;
-  const module = { exports: {} }; new Function('require', 'module', 'exports', output)(require, module, module.exports); return module.exports;
+  const module = { exports: {} }; new Function('require', 'module', 'exports', output)(name=>name.startsWith('.')?load(path.resolve(path.dirname(file),name+'.ts')):require(name), module, module.exports); return module.exports;
 }
 const { classifyUsageAuthority } = load('src/lib/analyticsIntervals.ts');
 test('historical catalog power capability prevents brightness bypass and writable heat is excluded', () => {

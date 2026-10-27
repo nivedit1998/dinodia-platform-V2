@@ -8,6 +8,8 @@ import { EMPLOYEE_SESSION_SECONDS, OPERATOR_SESSION_SECONDS } from '@/lib/stage1
 import { observeDeviceSourceAlias } from '@/lib/nativeSourceAliases';
 import { changeAnalyticsInterval } from '@/lib/analyticsIntervals';
 import { commissionLogicalChildren } from '@/lib/commissioningLogicalDevices';
+import { isAnalyticsCategory, isStateAnalyticsCategory, type AnalyticsCategory } from '@/lib/analyticsCategories';
+import { requireUniversalAnalyticsCompatibility } from '@/lib/universalAnalyticsCompatibility';
 
 export const dynamic = 'force-dynamic';
 const HASH = /^[a-f0-9]{64}$/i;
@@ -270,7 +272,7 @@ export async function POST(request: Request) {
             || typeof body.osDeviceId !== 'string' || !/^[A-Za-z0-9:_-]{1,160}$/.test(body.osDeviceId)
             || !(body.requestedName === null || typeof body.requestedName === 'string' && body.requestedName.length <= 80)
             || typeof body.customerLabel !== 'string' || !body.customerLabel.trim() || [...body.customerLabel].length > 40
-            || !['NONE','LIGHT','BOILER','RADIATOR'].includes(String(body.analyticsCategory === undefined ? 'NONE' : body.analyticsCategory))
+            || !isAnalyticsCategory(body.analyticsCategory === undefined ? 'NONE' : body.analyticsCategory)
             || !isStaff && String(body.analyticsCategory || 'NONE') !== 'NONE'
             || !['ready','no_safe_controls','unsupported'].includes(catalogueStatus)
             || !Number.isSafeInteger(body.catalogueRevision) || Number(body.catalogueRevision) < 1 || !HASH.test(String(body.descriptorDigest || ''))) fail(403, 'commissioning_area_denied', 'The selected device or Area is not currently permitted');
@@ -288,6 +290,7 @@ export async function POST(request: Request) {
           ...(state === 'COMPLETED' ? { finalDisposition: 'REMOVED' } : {}), revision: { increment: 1 }, ...(state === 'CANCELLED' || state === 'EXPIRED' || state === 'FAILED' || state === 'COMPLETED' ? { closedAt: transitionNow } : {}) } });
         if (changed.count !== 1) fail(409, 'commissioning_revision_conflict', 'The commissioning session changed; refresh it before continuing');
         if (state === 'READY') {
+          if (isStateAnalyticsCategory(body.analyticsCategory)) await requireUniversalAnalyticsCompatibility(tx,{homeId:hub.installation.homeId,hubInstallationId:hub.installation.id,identity:hub.identity});
           const nextOwner = { ...owner, analyticsCategory: String(body.analyticsCategory === undefined ? 'NONE' : body.analyticsCategory) };
           await tx.idempotencyRecord.update({ where: { namespace_keyHash: { namespace: SESSION_NAMESPACE, keyHash: row.idempotencyKeyHash } }, data: {
             responseBody: nextOwner, responseDigest: sha256(JSON.stringify(nextOwner)),
@@ -307,7 +310,7 @@ export async function POST(request: Request) {
       const keys = ['osDeviceId','originalName','technicalLabel','deviceType','manufacturer','model','protocol',...(Object.hasOwn(device, 'protocolIdentityHash') ? ['protocolIdentityHash'] : []),'descriptorRevision','descriptorDigest','capabilitySummary','areaId','name','customerLabel',...(Object.hasOwn(device, 'analyticsCategory') ? ['analyticsCategory'] : []),'catalogueStatus','usefulReadings', ...(Object.hasOwn(device, 'channels') ? ['channels'] : [])];
       const analyticsCategory = String(device.analyticsCategory === undefined ? owner.analyticsCategory || 'NONE' : device.analyticsCategory);
       if (!exactKeys(device, keys) || typeof body.candidateRef !== 'string' || body.candidateRef.length > 80 || !['install','view_only'].includes(String(body.disposition))
-        || !['NONE','LIGHT','BOILER','RADIATOR'].includes(analyticsCategory) || !isStaff && analyticsCategory !== 'NONE'
+        || !isAnalyticsCategory(analyticsCategory) || !isStaff && analyticsCategory !== 'NONE'
         || analyticsCategory !== String(owner.analyticsCategory || 'NONE')
         || typeof device.osDeviceId !== 'string' || !/^[A-Za-z0-9:_-]{1,160}$/.test(device.osDeviceId)
         || ![device.originalName,device.technicalLabel,device.deviceType].every((v) => typeof v === 'string' && v.trim().length > 0)
@@ -361,6 +364,7 @@ export async function POST(request: Request) {
       if (sourceAlias || identityAlias) fail(409, 'device_identity_conflict', 'This radio identity is already bound to another canonical device');
       const now = new Date();
       const safeSummary = safeControlSummary(device.capabilitySummary) as Record<string, unknown>;
+      if (isStateAnalyticsCategory(analyticsCategory)) await requireUniversalAnalyticsCompatibility(tx,{homeId:hub.installation.homeId,hubInstallationId:hub.installation.id,identity:hub.identity});
       const created = await tx.nativeDevice.create({ data: {
         homeId: authority.home.id, hubInstallationId: hub.installation.id, osDeviceId: String(device.osDeviceId), originalName: String(device.originalName),
         overrideName: device.name == null || !String(device.name).trim() ? null : String(device.name),
@@ -379,7 +383,7 @@ export async function POST(request: Request) {
         protocol: sourceProtocol, sourceDeviceId: String(device.osDeviceId),
         ...(typeof device.protocolIdentityHash === 'string' ? { protocolIdentityHash: device.protocolIdentityHash } : {}), now });
       if (isStaff && device.channels === undefined) await changeAnalyticsInterval(tx, { homeId: authority.home.id, hubInstallationId: hub.installation.id, deviceId: created.id,
-        category: analyticsCategory as 'NONE' | 'LIGHT' | 'RADIATOR' | 'BOILER', selectedControlId: null, generation: hub.identity.identityGeneration, at: now });
+        category: analyticsCategory as AnalyticsCategory, selectedControlId: null, generation: hub.identity.identityGeneration, at: now });
       const logicalDevices = device.channels === undefined ? null : await commissionLogicalChildren(tx, {
         original: await tx.nativeDevice.findUniqueOrThrow({ where: { id: created.id } }), channels: device.channels,
         protocolIdentityHash: String(device.protocolIdentityHash), generation: hub.identity.identityGeneration, now, initialAreaId: areaId });

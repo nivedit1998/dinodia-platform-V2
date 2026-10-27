@@ -9,13 +9,14 @@ import { createServer } from 'node:http';
 import http from 'node:http';
 import net from 'node:net';
 import { isDeepStrictEqual } from 'node:util';
-import { Prisma, PrismaClient } from '@prisma/client';
+import { Prisma, PrismaClient } from '../src/generated/prisma/index.js';
 import { stage1RouteInventory } from '../test/stage1_route_inventory.mjs';
 import { roomPlaqueIntegration } from './room_plaque_integration.mjs';
 import { verifyStateEvidenceIOS } from './state_evidence_ios_integration.mjs';
 import { verifyStateEvidenceHistory } from './state_evidence_history_integration.mjs';
 import { logicalDevicesDatabaseChecks } from './logical_devices_integration.mjs';
 import { calendarAnalyticsDatabaseChecks } from './calendar_analytics_integration.mjs';
+import { universalStateAnalyticsIntegration } from './universal_state_analytics_integration.mjs';
 
 const root = process.cwd();
 const osRoot = process.env.DINODIA_OS_ROOT || path.resolve(root, '../Dinodia OS');
@@ -97,7 +98,10 @@ function analyticsIntervalDomain() {
   const require = createRequire(import.meta.url); const ts = require('typescript');
   const compiled = ts.transpileModule(fs.readFileSync(path.join(root, 'src/lib/analyticsIntervals.ts'), 'utf8'),
     { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText;
-  const compiledModule = { exports: {} }; new Function('require', 'module', 'exports', compiled)(require, compiledModule, compiledModule.exports); return compiledModule.exports;
+  const categoryModule={exports:{}};
+  const categoryJS=ts.transpileModule(fs.readFileSync(path.join(root,'src/lib/analyticsCategories.ts'),'utf8'),{compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2022}}).outputText;
+  new Function('require','module','exports',categoryJS)(require,categoryModule,categoryModule.exports);
+  const compiledModule = { exports: {} }; new Function('require', 'module', 'exports', compiled)(id=>id==='./analyticsCategories'?categoryModule.exports:require(id), compiledModule, compiledModule.exports); return compiledModule.exports;
 }
 
 async function universalCategoryIngestionCheck({ base, homeId, installationId, areaId, osAreaId, catalog }) {
@@ -448,8 +452,9 @@ function loadHubCloudConfigurationBuilder() {
     const source = fs.readFileSync(path.join(root, file), 'utf8');
     const compiled = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, esModuleInterop: true } }).outputText;
     const loaded = { exports: {} };
-    new Function('require', 'module', 'exports', compiled)(id => id.startsWith('.')
-      ? compile(path.relative(root, path.resolve(root, path.dirname(file), id + '.ts'))) : require(id), loaded, loaded.exports);
+    new Function('require', 'module', 'exports', compiled)(id => id==='./prisma'?{prisma}
+      : id==='./stage1Auth'?{Stage1AuthError:class extends Error{constructor(status,code,message){super(message);Object.assign(this,{status,code});}}}
+      : id.startsWith('.') ? compile(path.relative(root, path.resolve(root, path.dirname(file), id + '.ts'))) : require(id), loaded, loaded.exports);
     return loaded.exports;
   };
   const envelope = compile('src/lib/hubSyncEnvelope.ts');
@@ -459,7 +464,8 @@ function loadHubCloudConfigurationBuilder() {
   const localRequire = (specifier) => specifier === './hubSyncEnvelope' ? envelope
     : specifier === './deletionReferences' ? compile('src/lib/deletionReferences.ts')
     : specifier === './dailyAnalyticsSchema' ? compile('src/lib/dailyAnalyticsSchema.ts')
-    : specifier === './analyticsIntervals' ? analyticsIntervalDomain() : require(specifier);
+    : specifier === './analyticsIntervals' ? analyticsIntervalDomain()
+    : specifier === './universalAnalyticsCompatibility' ? compile('src/lib/universalAnalyticsCompatibility.ts') : require(specifier);
   new Function('require', 'module', 'exports', compiled)(localRequire, loaded, loaded.exports);
   return loaded.exports.buildHubCloudConfiguration;
 }
@@ -632,10 +638,9 @@ function operationDigest({ actorId, trustedDeviceId, customerSessionId, homeId, 
 function stepUpChallengeMessage({ challengeId, nonce, operationDigest }) {
   return Buffer.from(`DINODIA_STEP_UP_CHALLENGE_V1\n${challengeId}\n${nonce}\n${operationDigest}`, 'utf8');
 }
-function machineRequest({ base, path: requestPath, body, machineSecret, machineVersion = 1 }) {
+function machineRequest({ base, path: requestPath, body, machineSecret, machineVersion = 1, nonce = `harness-machine-${crypto.randomUUID()}` }) {
   const raw = JSON.stringify(body);
   const timestamp = String(Date.now());
-  const nonce = `harness-machine-${crypto.randomUUID()}`;
   const bodyHash = sha256(raw);
   const machineSignature = crypto.createHmac('sha256', sha256(machineSecret)).update(canonicalHubRequest({ method: 'POST', path: requestPath, timestamp, nonce, bodyHash }), 'utf8').digest('base64url');
   return fetchJson(`${base}${requestPath}`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-dinodia-machine-version': String(machineVersion), 'x-dinodia-machine-signature': machineSignature, 'x-dinodia-hub-timestamp': timestamp, 'x-dinodia-hub-nonce': nonce, 'x-dinodia-body-sha256': bodyHash }, body: raw });
@@ -731,7 +736,8 @@ function baseEnv() {
     DINODIA_NATIVE_ZIGBEE_COMMISSIONING_ENABLED: 'true',
     DINODIA_NATIVE_MATTER_COMMISSIONING_ENABLED: 'true',
     DINODIA_LOGICAL_DEVICES_ENABLED: process.env.LOGICAL_DEVICES_ONLY === '1' ? 'true' : 'false',
-    DINODIA_CALENDAR_ANALYTICS_ENABLED: process.env.CALENDAR_ANALYTICS_ONLY === '1' ? 'true' : 'false',
+    DINODIA_CALENDAR_ANALYTICS_ENABLED: process.env.CALENDAR_ANALYTICS_ONLY === '1' || process.env.UNIVERSAL_STATE_ANALYTICS_ONLY === '1' ? 'true' : 'false',
+    DINODIA_UNIVERSAL_ANALYTICS_ENABLED: process.env.UNIVERSAL_STATE_ANALYTICS_ONLY === '1' ? 'true' : 'false',
     DINODIA_NATIVE_POLICY_TITLE: 'Disposable Stage 6 policy fixture',
     DINODIA_NATIVE_POLICY_TEXT: disposablePolicyText,
     DINODIA_NATIVE_POLICY_CONTENT_SHA256: sha256(disposablePolicyText),
@@ -12583,7 +12589,10 @@ try {
   await bootstrapDeliveryChecks(deliveryEnv);
   await customerAuthenticationLifecycleChecks(deliveryEnv);
   await customerAuthorizationChecks(deliveryEnv);
-  if (process.env.CALENDAR_ANALYTICS_ONLY === '1') {
+  if (process.env.UNIVERSAL_STATE_ANALYTICS_ONLY === '1') {
+    await universalStateAnalyticsIntegration({prisma,fixture:customerFixture,osRoot,base:`http://127.0.0.1:${appPort}`,machineRequest,fetchJson});
+    verifyChildOutboundTargets();
+  } else if (process.env.CALENDAR_ANALYTICS_ONLY === '1') {
     await calendarAnalyticsDatabaseChecks({ prisma, fixture: customerFixture, osRoot, databaseUrl,
       base: `http://127.0.0.1:${appPort}`, machineRequest, fetchJson,
       setEngine: async enabled => { await stopPlatform(); await startPlatform({ ...deliveryEnv,

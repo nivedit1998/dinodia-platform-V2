@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import { validDailyPayload, dailyAggregateId } from './dailyAnalyticsContract';
+import { validMultiStateDailyPayload, multiStateDailyAggregateId } from './multiStateAnalyticsContract';
 
 export const HUB_SYNC_MAX_BODY_BYTES = 1024 * 1024;
 export const HUB_SYNC_MAX_BATCH_BYTES = 512 * 1024;
@@ -210,6 +211,8 @@ function validEvent(event: unknown): event is HubSyncEvent {
         &&boundedText(payload.timezone,64)&&event.aggregateId===payload.writerFrom&&event.critical===true;
     case 'analytics.day':
       return validDailyPayload(payload)&&event.aggregateId===dailyAggregateId(payload)&&event.critical===false;
+    case 'analytics.state.day':
+      return validMultiStateDailyPayload(payload)&&event.aggregateId===multiStateDailyAggregateId(payload)&&event.critical===false;
     case 'usage.bucket': {
       const legacyKeys = ['osDeviceId', 'osAreaId', 'analyticsCategory', 'controlId', 'sourceGeneration', 'bucketStart', 'revision', 'onSeconds', 'offSeconds', 'unknownSeconds', 'closedAt', 'purgeAt'];
       const coveredKeys = [...legacyKeys.slice(0, 6), 'coverageStartAt', 'coverageEndAt', ...legacyKeys.slice(6)];

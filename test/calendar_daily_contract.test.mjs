@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
-import { readFileSync } from 'node:fs';
+import { readFileSync, existsSync } from 'node:fs';
 import path from 'node:path';
 
 const require = createRequire(import.meta.url);
@@ -15,7 +15,8 @@ function load(file) {
     compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
   }).outputText;
   new Function('require', 'module', 'exports', js)(name => name.startsWith('.')
-    ? load(path.resolve(path.dirname(file), name + '.ts')) : require(name), module, module.exports);
+    ? existsSync(path.resolve(path.dirname(file), name + '.ts')) ? load(path.resolve(path.dirname(file), name + '.ts'))
+      : require(path.resolve(path.dirname(file), name)) : require(name), module, module.exports);
   return module.exports;
 }
 const calendar = load('src/lib/analyticsHistoryCalendar.ts');
@@ -240,7 +241,7 @@ test('bounded scheduled maintenance rotates past the first twenty installations'
   const visited = new Set();
   const tx = { $queryRaw: async () => [], nativeAnalyticsRetention: {
     findUniqueOrThrow: async ({ where }) => { visited.add(where.hubInstallationId); return states.find(s => s.hubInstallationId === where.hubInstallationId); } } };
-  const db = { $transaction: async callback => callback(tx), $executeRaw: async () => 0, nativeAnalyticsRetention: {
+  const db = { $queryRaw:async()=>[{available:false}], $transaction: async callback => callback(tx), $executeRaw: async () => 0, nativeAnalyticsRetention: {
     findMany: async ({ orderBy, take }) => { assert.deepEqual(orderBy, [{ updatedAt: 'asc' }, { hubInstallationId: 'asc' }]);
       return [...states].sort((a, b) => a.updatedAt - b.updatedAt).slice(0, take); },
     update: async ({ where, data }) => Object.assign(states.find(s => s.hubInstallationId === where.hubInstallationId), data) } };
@@ -254,7 +255,7 @@ test('bounded scheduled maintenance rotates past the first twenty installations'
 test('annual expiry still runs when legacy conversion cannot proceed', async () => {
   const { maintainDailyAnalytics } = load('src/lib/dailyAnalyticsMaintenance.ts');
   let expired = false, recorded = null;
-  const db = { $executeRaw: async () => { expired = true; return 1; },
+  const db = { $queryRaw:async()=>[{available:false}], $executeRaw: async () => { expired = true; return 1; },
     $transaction: async () => { assert.equal(expired, true); throw new Error('legacy_usage_boundary_requires_detail'); },
     nativeAnalyticsRetention: { findMany: async () => [{ hubInstallationId: 'hub', homeId: 'home', timezone: 'UTC' }],
       update: async ({ data }) => { recorded = data.backlogReason; } } };
