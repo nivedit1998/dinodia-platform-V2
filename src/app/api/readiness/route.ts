@@ -19,6 +19,8 @@ export async function GET() {
     const logicalSchemaReady = migration.some(row => row.migration_name === logicalMigration && row.checksum === logicalChecksum);
     const calendarName = '20261025140000_calendar_daily_analytics';
     const calendarSchemaReady = migration.some(row => row.migration_name === calendarName && row.checksum === COMPATIBLE_ADDITIVE_MIGRATIONS[calendarName]);
+    const stateName = '20261027012000_universal_state_history';
+    const stateSchemaReady = migration.some(row => row.migration_name === stateName && row.checksum === COMPATIBLE_ADDITIVE_MIGRATIONS[stateName]);
     const ready = logicalSchemaReady && (process.env.DINODIA_CALENDAR_ANALYTICS_ENABLED !== 'true' || calendarSchemaReady)
       && isSchemaReady(migration, Number(modelCount[0]?.count ?? 0), expectedMigrationChecksum);
     return Response.json({ ok: ready, ready, service: 'dinodia-platform-v2', build: safeBuildId(),
@@ -28,6 +30,9 @@ export async function GET() {
       analyticsHistoryContractVersion: calendarSchemaReady ? 1 : null,
       analyticsHistorySchemaChecksum: calendarSchemaReady ? COMPATIBLE_ADDITIVE_MIGRATIONS[calendarName] : null,
       analyticsHistoryEnabled: process.env.DINODIA_CALENDAR_ANALYTICS_ENABLED === 'true',
+      universalStateAnalyticsContractVersion: ready && stateSchemaReady ? 1 : null,
+      universalStateAnalyticsSchemaChecksum: stateSchemaReady ? COMPATIBLE_ADDITIVE_MIGRATIONS[stateName] : null,
+      universalStateAnalyticsEnabled: process.env.DINODIA_UNIVERSAL_ANALYTICS_ENABLED === 'true',
       analyticsUsagePolicyVersion: ready && migration.some(row => row.migration_name === '20261024103000_state_evidence_policy') ? 3
         : ready && migration.some(row => row.migration_name === '20261023110000_category_analytics_intervals') ? 2 : null,
     }, { status: ready ? 200 : 503, headers: { 'Cache-Control': 'no-store' } });

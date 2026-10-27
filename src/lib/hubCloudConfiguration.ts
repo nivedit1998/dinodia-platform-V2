@@ -2,6 +2,7 @@ import type { Prisma } from '@prisma/client';
 import { canonicalSyncJson, hashSyncConfiguration } from './hubSyncEnvelope';
 import { deletionReferencePrefix } from './deletionReferences';
 import { calendarSchemaPresent } from './dailyAnalyticsSchema';
+import { universalAnalyticsRuntimeAvailable, UNIVERSAL_ANALYTICS_CATEGORIES } from './universalAnalyticsCompatibility';
 
 const MAX_CONFIGURATION_BYTES = 1024 * 1024;
 
@@ -10,6 +11,7 @@ export async function buildHubCloudConfiguration(db: Prisma.TransactionClient, i
   // customer execution stays opt-in until the Stage 13 activation decision.
   // Unset/anything other than the exact string "true" fails closed.
   const automationActivationEnabled = process.env.DINODIA_NATIVE_AUTOMATIONS_ENABLED === 'true';
+  const universalRuntimeAvailable = await universalAnalyticsRuntimeAvailable(db,input.hubInstallationId);
   const [home, areas, memberships, devices, automationRows, hub] = await Promise.all([
     db.home.findUnique({ where: { id: input.homeId }, select: { id: true, managementRevision: true, timezone: true } }),
     db.area.findMany({ where: { homeId: input.homeId, status: 'ACTIVE' }, orderBy: { id: 'asc' }, select: { id: true, osAreaId: true, originalName: true, overrideName: true, revision: true } }),
@@ -115,18 +117,22 @@ export async function buildHubCloudConfiguration(db: Prisma.TransactionClient, i
     devicePolicies: devices.map((device) => ({
       osDeviceId: device.osDeviceId, managementClass: device.managementClass, ownerMembershipId: device.ownerMembershipId,
       lifecycle: device.lifecycle, customerLabel: device.customerLabel, overrideName: device.overrideName,
-      analyticsCategory: device.analyticsCategory,
+      analyticsCategory: !universalRuntimeAvailable && (UNIVERSAL_ANALYTICS_CATEGORIES as readonly string[]).includes(String(device.analyticsCategory))
+        ? 'NONE' : device.analyticsCategory,
       inventoryRevision: device.inventoryRevision,
       descriptorRevision: device.descriptorRevision, descriptorDigest: device.descriptorDigest,
       osAreaIds: device.assignments.map((assignment) => assignment.area.osAreaId),
       ...(history?.writerEnabled && device.managementClass === 'PROPERTY_DEVICE' && device.assignments.length === 1
         ? { analyticsAssignmentStartedAt: device.assignments[0].validFrom.toISOString() } : {}),
       ...(logicalBindings.has(device.osDeviceId) ? { logicalBinding: logicalBindings.get(device.osDeviceId) } : {}),
-      ...(() => { const interval = analyticsIntervals.find(row => row.deviceId === device.id); return interval ? { analyticsInterval: {
+      ...(() => { const interval = analyticsIntervals.find(row => row.deviceId === device.id);
+        if (interval?.analyticsPolicyVersion === 4 && !universalRuntimeAvailable) return {};
+        return interval ? { analyticsInterval: {
         id: interval.id, revision: interval.revision, validFrom: interval.validFrom.toISOString(), sourceGeneration: interval.sourceGeneration,
         selectedControlId: interval.selectedControlId, writerEnabled: hub?.analyticsWriterEnabled === true
+          && (interval.analyticsPolicyVersion !== 4 || universalRuntimeAvailable)
           && (interval.analyticsPolicyVersion !== 3 || capabilitySummary.nativeStateEvidenceV2 === true),
-        ...(capabilitySummary.nativeStateEvidenceV2 === true ? { analyticsPolicyVersion: interval.analyticsPolicyVersion } : {}),
+        ...(interval.analyticsPolicyVersion === 4 || capabilitySummary.nativeStateEvidenceV2 === true ? { analyticsPolicyVersion: interval.analyticsPolicyVersion } : {}),
         genericCollectionEnabled: hub?.analyticsCollectionEnabled === true,
         authorizedControlIds: Array.isArray(interval.authorizedControls) ? interval.authorizedControls.map(control => String((control as Record<string, unknown>).controlId)) : [],
       } } : {}; })(),

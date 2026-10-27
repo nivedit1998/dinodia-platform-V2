@@ -12,13 +12,14 @@ function loadTypeScript(relative, overrides = {}) {
     compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, esModuleInterop: true },
   }).outputText;
   const module = { exports: {} };
-  const localRequire = (specifier) => Object.hasOwn(overrides, specifier) ? overrides[specifier] : require(specifier);
+  const localRequire = (specifier) => Object.hasOwn(overrides, specifier) ? overrides[specifier]
+    : specifier.startsWith('.') ? loadTypeScript(path.resolve(path.dirname(relative), specifier + '.ts'), overrides) : require(specifier);
   new Function('require', 'module', 'exports', output)(localRequire, module, module.exports);
   return module.exports;
 }
 
 function categoryRouteHarness({ homeRevision = 8, cloudConfigurationRevision = 11, inventoryRevision = 4, analyticsCategory = 'NONE',
-  writerEnabled = false, evidenceCapable = false } = {}) {
+  writerEnabled = false, evidenceCapable = false, compatible = false } = {}) {
   const ids = {
     home: '11111111-1111-4111-8111-111111111111', hub: '22222222-2222-4222-8222-222222222222',
     employee: '33333333-3333-4333-8333-333333333333', employeeSession: '44444444-4444-4444-8444-444444444444',
@@ -81,6 +82,10 @@ function categoryRouteHarness({ homeRevision = 8, cloudConfigurationRevision = 1
     '@/lib/stage1Auth': { Stage1AuthError },
     '@/lib/stage1SessionPolicy': { EMPLOYEE_SESSION_SECONDS: 24 * 60 * 60, OPERATOR_SESSION_SECONDS: 30 * 60 },
     '@/lib/analyticsIntervals': loadTypeScript('src/lib/analyticsIntervals.ts'),
+    '@/lib/analyticsCategories': loadTypeScript('src/lib/analyticsCategories.ts'),
+    '@/lib/universalAnalyticsCompatibility': {requireUniversalAnalyticsCompatibility: async () => {
+      if (!compatible) throw new Stage1AuthError(409,'analytics_contract_unavailable','Compatible active Hub proof required');
+    }},
   });
   const body = { serial: 'DIN-HUB-TEST-1', identityGeneration: 3, homeId: ids.home, hubInstallationId: ids.hub,
     accessScope: 'os:admin', employeeId: ids.employee, employeeSessionId: ids.employeeSession, operatorHandoffId: ids.handoff,
@@ -91,6 +96,24 @@ function categoryRouteHarness({ homeRevision = 8, cloudConfigurationRevision = 1
   });
   return { route, request, writes };
 }
+
+test('an authorized installer can assign the SOCKET analytics category to a permanent device', async () => {
+  const { route, request, writes } = categoryRouteHarness({compatible:true});
+  const body = { ...await request.json(), analyticsCategory: 'SOCKET' };
+  const response = await route.POST(new Request(request.url, { method: 'POST', body: JSON.stringify(body) }));
+  assert.equal(response.status, 200, 'the actual authenticated category route must accept a supported new category');
+  assert.equal(writes.device.data.analyticsCategory, 'SOCKET');
+});
+
+test('a new category is rejected without a current authenticated Hub capability acknowledgement', async () => {
+  const { route, request, writes } = categoryRouteHarness({ evidenceCapable: true });
+  const body = { ...await request.json(), analyticsCategory: 'SOCKET' };
+  const response = await route.POST(new Request(request.url, { method: 'POST', body: JSON.stringify(body) }));
+  assert.equal(response.status, 409, 'a supported category must fail closed until the active Hub acknowledges its contract');
+  assert.equal(writes.home, undefined, 'the rejected assignment cannot change Home authority');
+  assert.equal(writes.device, undefined, 'the rejected assignment cannot enter signed cloud configuration');
+  assert.equal(writes.interval, undefined, 'the rejected assignment cannot open a history epoch');
+});
 
 test('an exact source-only edit advances authority revisions and keeps one installer-selected channel', async () => {
   const { route, request, writes } = categoryRouteHarness({ analyticsCategory: 'LIGHT' });

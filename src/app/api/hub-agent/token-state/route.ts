@@ -4,6 +4,7 @@ import { prisma } from '@/lib/prisma';
 import { authErrorResponse } from '@/lib/stage1Auth';
 import { authenticateHub } from '@/lib/stage1HubAuth';
 import { resolveNativeInstallationSyncMode } from '@/lib/nativeInstallationSyncMode';
+import { recordUniversalAnalyticsCompatibility, universalAnalyticsEnabled } from '@/lib/universalAnalyticsCompatibility';
 
 export const dynamic = 'force-dynamic';
 
@@ -19,6 +20,10 @@ export async function POST(request: Request) {
     const raw = await request.text();
     const hub = await authenticateHub(request, raw);
     const now = new Date();
+    if (universalAnalyticsEnabled()) await prisma.$transaction(tx => recordUniversalAnalyticsCompatibility(tx,{
+      homeId:hub.installation.homeId,hubInstallationId:hub.installation.id,identity:hub.identity,
+      declaration:hub.body.analyticsContract,requestNonce:request.headers.get('x-dinodia-hub-nonce') || '',now,
+    }),{isolationLevel:'Serializable',maxWait:5000,timeout:12000});
     const operatorVersion = Number(hub.body.operatorCredentialVersion ?? 0);
     const delivery = await prisma.$transaction(async (tx) => {
       const pending = await tx.hubCredentialVersion.findMany({ where: { hubInstallationId: hub.installation.id, purpose: 'operator-credential', state: { in: ['PENDING', 'DELIVERED'] }, revokedAt: null }, orderBy: { version: 'asc' }, select: { id: true, version: true, encryptedDeliveryEnvelope: true, state: true } });

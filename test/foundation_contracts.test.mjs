@@ -180,7 +180,8 @@ test('foundation, Stage 1 and additive Stage 12 Alexa schema remain native and b
     'AlexaOAuthAuthorizationCode', 'AlexaOAuthAuthorizationCodeIntent', 'AlexaOAuthTokenFamily',
     'AlexaOAuthAccessToken', 'AlexaOAuthRefreshToken',
   ];
-  assert.equal(modelNames.length, 82);
+  assert.equal(modelNames.length, 83);
+  assert.equal(modelNames.filter(name=>name==='NativeAnalyticsStateDay').length,1);
   assert.deepEqual(modelNames.filter(name => ['NativeAnalyticsDay', 'NativeAnalyticsRetention'].includes(name)).sort(), ['NativeAnalyticsDay', 'NativeAnalyticsRetention']);
   assert.equal(modelNames.filter(name => name === 'NativePhysicalDevice').length, 1);
   assert.match(schema, /physicalParent\s+NativePhysicalDevice\?/);
@@ -189,7 +190,7 @@ test('foundation, Stage 1 and additive Stage 12 Alexa schema remain native and b
   assert.equal(modelNames.filter((name) => name === 'HubSyncReceipt').length, 1);
   assert.deepEqual(modelNames.filter((name) => stage3Models.includes(name)).sort(), [...stage3Models].sort());
   assert.deepEqual(modelNames.filter((name) => stage12AlexaModels.includes(name)).sort(), [...stage12AlexaModels].sort());
-  assert.equal(modelNames.length - stage3Models.length - stage12AlexaModels.length - 7, 46, 'Existing foundation models remain intact; two calendar, two analytics, two plaque and one physical-parent model are additive');
+  assert.equal(modelNames.length - stage3Models.length - stage12AlexaModels.length - 8, 46, 'Existing foundation models remain intact; three calendar/state, two analytics, two plaque and one physical-parent model are additive');
   assert.doesNotMatch(schema, /HaConnection|HomeAssistant|SupportRequest|AlexaRefreshToken/);
   assert.match(schema, /model HomeMembership/);
   assert.match(schema, /model TenantAreaGrant/);

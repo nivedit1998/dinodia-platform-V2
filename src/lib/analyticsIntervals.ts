@@ -1,4 +1,5 @@
 import type { Prisma } from '@prisma/client';
+import { CATEGORY_ROLES, isAnalyticsCategory, isStateAnalyticsCategory, type AnalyticsCategory } from './analyticsCategories';
 
 type Interval = { id: string; revision: number; analyticsCategory: string; selectedControlId: string | null;
   sourceGeneration: number; validFrom: Date; validUntil: Date | null; analyticsPolicyVersion?: number };
@@ -6,16 +7,16 @@ type Input = { intervals: Interval[]; start: Date; end: Date; category: string; 
   intervalId?: string; bindingRevision?: number; newWriterFrom?: Date | null; analyticsPolicyVersion?: number };
 
 export function allowedAnalyticsControls(category: string, controls: Array<Record<string, unknown>>, selection: string | null): string[] {
-  const roles = category === 'RADIATOR' ? ['active_heat_demand'] : category === 'BOILER' ? ['active_heat_production'] : category === 'LIGHT' ? ['power', 'brightness'] : [];
+  const roles = isAnalyticsCategory(category) ? CATEGORY_ROLES[category] : [];
   const groups = new Map<string, Array<Record<string, unknown>>>();
   for (const control of controls) {
-    if (control.observable !== true || !roles.includes(String(control.semanticRole)) || category !== 'LIGHT' && control.writable === true) continue;
+    if (control.observable !== true || !roles.includes(String(control.semanticRole)) || !['LIGHT','SOCKET','TV','BLIND'].includes(category) && control.writable === true) continue;
     const key = String(control.surfaceId || control.controlId);
     groups.set(key, [...(groups.get(key) || []), control]);
   }
   const candidates = [...groups.values()].flatMap(group => {
     const power = group.filter(control => control.semanticRole === 'power');
-    const chosen = category === 'LIGHT' && power.length ? power : group;
+    const chosen = ['LIGHT','SOCKET','TV'].includes(category) && power.length ? power : group;
     if (chosen.length !== 1 || chosen[0].semanticRole === 'brightness' && chosen[0].brightnessMeaning !== 'actual_output') return [];
     return [String(chosen[0].controlId)];
   });
@@ -46,8 +47,8 @@ export function classifyUsageAuthority(input: Input): { status: 'accepted' | 'un
 // Call only inside the existing assigned-staff/commissioning transaction.
 // Device lock makes source/category revisions monotonic under simultaneous edits.
 export async function changeAnalyticsInterval(tx: Prisma.TransactionClient, input: {
-  homeId: string; hubInstallationId: string; deviceId: string; category: 'NONE' | 'LIGHT' | 'RADIATOR' | 'BOILER';
-  selectedControlId: string | null; generation: number; at: Date; forceNew?: boolean; analyticsPolicyVersion?: 2 | 3;
+  homeId: string; hubInstallationId: string; deviceId: string; category: AnalyticsCategory;
+  selectedControlId: string | null; generation: number; at: Date; forceNew?: boolean; analyticsPolicyVersion?: 2 | 3 | 4;
 }) {
   await tx.$queryRaw`SELECT id FROM "NativeDevice" WHERE id = ${input.deviceId}::uuid FOR UPDATE`;
   const device = await tx.nativeDevice.findFirst({ where: { id: input.deviceId, homeId: input.homeId, hubInstallationId: input.hubInstallationId,
@@ -56,11 +57,12 @@ export async function changeAnalyticsInterval(tx: Prisma.TransactionClient, inpu
   const summary = device.capabilitySummary as Record<string, unknown> | null;
   const catalog = summary?.controlCatalog as Record<string, unknown> | undefined;
   const controls = Array.isArray(catalog?.controls) ? catalog.controls as Array<Record<string, unknown>> : [];
-  const role = input.category === 'RADIATOR' ? ['active_heat_demand'] : input.category === 'BOILER' ? ['active_heat_production'] : input.category === 'LIGHT' ? ['power', 'brightness'] : [];
+  const role = CATEGORY_ROLES[input.category];
   const authorizedControls = controls.filter(control => role.includes(String(control.semanticRole)) && control.observable === true).slice(0, 64);
   if (input.selectedControlId && !allowedAnalyticsControls(input.category, authorizedControls, input.selectedControlId).length) throw Object.assign(new Error('Selected analytics signal is not authorized by the current catalog'), { code: 'analytics_source_invalid' });
   const prior = await tx.nativeAnalyticsInterval.findFirst({ where: { deviceId: input.deviceId }, orderBy: { revision: 'desc' } });
-  let analyticsPolicyVersion = input.analyticsPolicyVersion ?? prior?.analyticsPolicyVersion;
+  let analyticsPolicyVersion = isStateAnalyticsCategory(input.category) ? 4 : input.analyticsPolicyVersion ?? prior?.analyticsPolicyVersion;
+  if (!isStateAnalyticsCategory(input.category) && analyticsPolicyVersion === 4) analyticsPolicyVersion = undefined;
   if (analyticsPolicyVersion === undefined) {
     const installation = await tx.hubInstallation.findUnique({ where: { id: input.hubInstallationId },
       select: { analyticsWriterEnabled: true, capabilitySummary: true } });
@@ -79,6 +81,6 @@ export async function changeAnalyticsInterval(tx: Prisma.TransactionClient, inpu
   if (prior && input.at <= prior.validFrom) throw new Error('Analytics policy time must advance');
   await tx.nativeAnalyticsInterval.updateMany({ where: { deviceId: input.deviceId, validUntil: null }, data: { validUntil: input.at } });
   return tx.nativeAnalyticsInterval.create({ data: { homeId: input.homeId, hubInstallationId: input.hubInstallationId, deviceId: input.deviceId,
-    analyticsCategory: input.category, selectedControlId: input.selectedControlId, sourceGeneration: input.generation, analyticsPolicyVersion,
+    analyticsCategory: input.category as never, selectedControlId: input.selectedControlId, sourceGeneration: input.generation, analyticsPolicyVersion,
     revision: (prior?.revision ?? 0) + 1, validFrom: input.at, authorizedControls: authorizedControls as Prisma.InputJsonValue } });
 }

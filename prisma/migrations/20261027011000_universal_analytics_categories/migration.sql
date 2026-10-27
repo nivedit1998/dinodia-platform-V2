@@ -1,0 +1,5 @@
+ALTER TYPE "DeviceAnalyticsCategory" ADD VALUE IF NOT EXISTS 'SOCKET';
+ALTER TYPE "DeviceAnalyticsCategory" ADD VALUE IF NOT EXISTS 'TV';
+ALTER TYPE "DeviceAnalyticsCategory" ADD VALUE IF NOT EXISTS 'BLIND';
+ALTER TYPE "DeviceAnalyticsCategory" ADD VALUE IF NOT EXISTS 'AC';
+ALTER TYPE "DeviceAnalyticsCategory" ADD VALUE IF NOT EXISTS 'WASHING_MACHINE';

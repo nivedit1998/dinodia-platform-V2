@@ -178,6 +178,7 @@ export const stage1RouteInventory = [
   ['GET', '/api/v2/homes/:homeId/analytics/bootstrap', 'customer'],
   ['GET', '/api/v2/homes/:homeId/analytics/usage', 'customer'],
   ['GET', '/api/v2/homes/:homeId/analytics/temperature', 'customer'],
+  ['GET', '/api/v2/homes/:homeId/analytics/states', 'customer'],
   ['GET', '/api/v2/homes/:homeId/areas', 'customer'],
   ['PATCH', '/api/v2/homes/:homeId/areas/:areaId/override', 'customer'],
   ['POST', '/api/v2/homes/:homeId/deregister-full-home/commit', 'customer'],

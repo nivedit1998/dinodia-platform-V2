@@ -32,11 +32,11 @@ const exact = (v: Record<string, unknown>, keys: readonly string[]) => {
 /** Structural validation only. Ingestion must separately enforce Home, device,
  * Area, private-ownership, exact source, epoch, replay and overlap authority. */
 export function validMultiStateDailyPayload(p: Record<string, unknown>): boolean {
-  if (!object(p) || !exact(p, MULTISTATE_DAILY_KEYS) || p.contractVersion !== MULTISTATE_ANALYTICS_VERSION
+  if (!object(p) || !(exact(p, MULTISTATE_DAILY_KEYS) || exact(p, [...MULTISTATE_DAILY_KEYS, 'hourly'])) || p.contractVersion !== MULTISTATE_ANALYTICS_VERSION
     || !text(p.osDeviceId, 160) || !text(p.osAreaId, 160) || !text(p.controlId, 160)
     || !text(p.timezone, 64) || typeof p.analyticsCategory !== 'string' || !Object.hasOwn(MULTISTATE_STATES, p.analyticsCategory)
     || !dbInteger(p.sourceGeneration) || p.sourceGeneration < 1 || !dbInteger(p.bindingRevision)
-    || !dbInteger(p.revision) || p.revision < 1 || p.analyticsPolicyVersion !== 4
+    || p.bindingRevision < 1 || !dbInteger(p.revision) || p.revision < 1 || p.analyticsPolicyVersion !== 4
     || typeof p.analyticsIntervalId !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(p.analyticsIntervalId)
     || !['writerFrom', 'dayStartAt', 'dayEndAt', 'assignmentEpochAt', 'coverageStartAt', 'coverageEndAt'].every(k => date(p[k]))) return false;
   const policy = MULTISTATE_STATES[p.analyticsCategory as keyof typeof MULTISTATE_STATES];
@@ -53,7 +53,27 @@ export function validMultiStateDailyPayload(p: Record<string, unknown>): boolean
   if (writerFrom % 3_600_000 !== 0 || start < Math.max(dayStart, writerFrom, epoch) || end <= start || end > dayEnd
     || (end - start) % 1000 !== 0) return false;
   const total = Object.values(p.durationsSeconds).reduce<number>((sum, value) => sum + Number(value), 0);
-  return Number.isSafeInteger(total) && total === (end - start) / 1000;
+  if (!Number.isSafeInteger(total) || total !== (end - start) / 1000) return false;
+  if (p.hourly === undefined) return true; // compatible pre-hourly contract fixtures
+  if (!Array.isArray(p.hourly) || p.hourly.length > 27) return false;
+  if (!p.hourly.length) return true; // compact historical daily row
+  const sums: Record<string, number> = Object.fromEntries(policy.states.map(s => [s, 0]));
+  let cursor = start;
+  const hours = new Set<number>();
+  for (const part of p.hourly) {
+    if (!object(part) || !exact(part, ['hourStartAt', 'coverageStartAt', 'coverageEndAt', 'durationsSeconds'])
+      || !date(part.hourStartAt) || !date(part.coverageStartAt) || !date(part.coverageEndAt)
+      || !object(part.durationsSeconds) || !exact(part.durationsSeconds, policy.states)
+      || !Object.values(part.durationsSeconds).every(integer)) return false;
+    const hour = Date.parse(part.hourStartAt), a = Date.parse(part.coverageStartAt), b = Date.parse(part.coverageEndAt);
+    if (hour % 3_600_000 || hours.has(hour) || a !== cursor || a < hour || b > hour + 3_600_000
+      || b <= a || b > end || (b - a) % 1000) return false;
+    if (Object.values(part.durationsSeconds).reduce<number>((n, v) => n + Number(v), 0) !== (b - a) / 1000) return false;
+    for (const state of policy.states) sums[state] += Number(part.durationsSeconds[state]);
+    hours.add(hour); cursor = b;
+  }
+  const durations = p.durationsSeconds as Record<string, number>;
+  return cursor === end && policy.states.every(state => sums[state] === durations[state]);
 }
 
 /** Stable ID uses structured encoding, avoiding delimiter collisions. */

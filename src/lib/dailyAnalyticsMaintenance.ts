@@ -71,6 +71,19 @@ export async function maintainDailyAnalytics(db: PrismaClient, now: Date, clock 
       // Annual expiry is independent of conversion/compaction: an unconvertible
       // retained day must not keep expired summaries forever.
       const year = new Date(historyYearCutoff(now.getTime(), state.timezone));
+      const [stateSchema] = await db.$queryRaw<Array<{available:boolean}>>`
+        SELECT to_regclass('public."NativeAnalyticsStateDay"') IS NOT NULL AS available`;
+      if (stateSchema?.available) {
+        await db.$executeRaw`WITH doomed AS (SELECT id FROM "NativeAnalyticsStateDay"
+          WHERE "homeId"=${state.homeId}::uuid AND "hubInstallationId"=${state.hubInstallationId}::uuid AND "purgeAt"<=${now}
+          ORDER BY "purgeAt",id LIMIT 1000 FOR UPDATE SKIP LOCKED)
+          DELETE FROM "NativeAnalyticsStateDay" d USING doomed WHERE d.id=doomed.id`;
+        const week = new Date(historyWeek(now.getTime(),state.timezone).start);
+        await db.$executeRaw`WITH compact AS (SELECT id FROM "NativeAnalyticsStateDay"
+          WHERE "homeId"=${state.homeId}::uuid AND "hubInstallationId"=${state.hubInstallationId}::uuid
+            AND "dayEndAt"<=${week} AND hourly<>'[]'::jsonb ORDER BY "dayEndAt",id LIMIT 1000 FOR UPDATE SKIP LOCKED)
+          UPDATE "NativeAnalyticsStateDay" d SET hourly='[]'::jsonb FROM compact WHERE d.id=compact.id`;
+      }
       const expiredDailyDeleted = await db.$executeRaw`
         WITH doomed AS (SELECT summary.id FROM "NativeAnalyticsDay" summary
           JOIN "NativeDevice" device ON device.id=summary."deviceId"

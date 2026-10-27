@@ -1,5 +1,6 @@
 generator client {
   provider      = "prisma-client-js"
+  output        = "../src/generated/prisma"
   // Vercel's production functions run on Linux ARM64 while release builds may
   // be produced on macOS ARM64. Include both engines in prebuilt deployments.
   binaryTargets = ["native", "linux-arm64-openssl-3.0.x"]
@@ -97,6 +98,11 @@ enum DeviceAnalyticsCategory {
   LIGHT
   BOILER
   RADIATOR
+  SOCKET
+  TV
+  BLIND
+  AC
+  WASHING_MACHINE
 }
 
 enum DeviceOnlineState {
@@ -621,6 +627,7 @@ model Home {
   usageBuckets               NativeDeviceUsageBucket[]
   temperatureSamples         NativeTemperatureSample[]
   analyticsDays              NativeAnalyticsDay[]
+  analyticsStateDays         NativeAnalyticsStateDay[]
   analyticsRetention         NativeAnalyticsRetention[]
   automations                NativeAutomation[]
   alexaHomeScopes            AlexaNativeHomeScope[]
@@ -705,6 +712,7 @@ model Area {
   usageBuckets              NativeDeviceUsageBucket[]
   temperatureSamples        NativeTemperatureSample[]
   analyticsDays             NativeAnalyticsDay[]
+  analyticsStateDays        NativeAnalyticsStateDay[]
   automationActions         NativeAutomationAction[]
   alexaEndpoints            AlexaNativeEndpointProjection[]
   alexaAreaSelections       AlexaNativeAreaSelection[]
@@ -807,6 +815,7 @@ model NativeDevice {
   usageBuckets         NativeDeviceUsageBucket[]
   temperatureSamples   NativeTemperatureSample[]
   analyticsDays        NativeAnalyticsDay[]
+  analyticsStateDays   NativeAnalyticsStateDay[]
   automationActions    NativeAutomationAction[]
   alexaEndpoints       AlexaNativeEndpointProjection[]
   outageIncidents      NativeDeviceOutageIncident[]
@@ -898,6 +907,7 @@ model CompanyOperationalWorkItem {
 }
 
 model HubInstallation {
+  analyticsContractAck Json?
   analyticsWriterEnabled Boolean @default(false)
   analyticsCollectionEnabled Boolean @default(false)
   id                               String                   @id @default(uuid()) @db.Uuid
@@ -2118,6 +2128,42 @@ model NativeAnalyticsDay {
   @@unique([deviceId, areaId, kind, analyticsCategory, controlId, sourceGeneration, bindingRevision, dayStartAt, writerFrom, assignmentEpochAt, origin], map:"NativeAnalyticsDay_source_key")
   @@index([homeId, kind, dayStartAt])
   @@index([purgeAt])
+}
+
+model NativeAnalyticsStateDay {
+  id String @id @db.VarChar(64)
+  homeId String @db.Uuid
+  hubInstallationId String @db.Uuid
+  deviceId String @db.Uuid
+  areaId String @db.Uuid
+  analyticsCategory String @db.VarChar(24)
+  dimension String @db.VarChar(24)
+  controlId String @db.VarChar(160)
+  sourceGeneration Int
+  bindingRevision Int
+  analyticsIntervalId String @db.Uuid
+  analyticsPolicyVersion Int
+  timezone String @db.VarChar(64)
+  writerFrom DateTime
+  dayStartAt DateTime
+  dayEndAt DateTime
+  assignmentEpochAt DateTime
+  revision Int
+  coverageStartAt DateTime
+  coverageEndAt DateTime
+  closedAt DateTime?
+  durationsSeconds Json
+  hourly Json @default("[]")
+  payloadDigest String @db.VarChar(64)
+  purgeAt DateTime
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  home Home @relation(fields:[homeId],references:[id],onDelete:Cascade)
+  device NativeDevice @relation(fields:[deviceId],references:[id],onDelete:Restrict)
+  area Area @relation(fields:[areaId],references:[id],onDelete:Restrict)
+  @@index([homeId,analyticsCategory,dayStartAt])
+  @@index([purgeAt])
+  @@index([deviceId,coverageStartAt,coverageEndAt])
 }
 
 model NativeAutomation {

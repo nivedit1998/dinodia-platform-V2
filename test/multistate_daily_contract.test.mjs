@@ -97,3 +97,20 @@ test('aggregate identity separates assignments, channels and unambiguous string 
     { assignmentEpochAt: '2026-01-02T00:00:00.000Z' }]) assert.notEqual(id(p), id({ ...p, ...change }));
   assert.notEqual(id({ ...p, osDeviceId: 'a|b', osAreaId: 'c' }), id({ ...p, osDeviceId: 'a', osAreaId: 'b|c' }));
 });
+
+test('hourly detail exactly partitions daily coverage without duplicate hours or state substitution', () => {
+  const p = payload('TV');
+  p.coverageEndAt = iso(Date.parse(p.coverageStartAt) + 7200000);
+  p.closedAt = null;
+  p.durationsSeconds = {on: 3600, off: 0, unknown: 3600};
+  p.hourly = [0, 1].map(i => ({hourStartAt: iso(Date.parse(p.coverageStartAt) + i*3600000),
+    coverageStartAt: iso(Date.parse(p.coverageStartAt) + i*3600000),
+    coverageEndAt: iso(Date.parse(p.coverageStartAt) + (i+1)*3600000),
+    durationsSeconds: {on: i ? 0 : 3600, off: 0, unknown: i ? 3600 : 0}}));
+  assert.equal(valid(p), true);
+  assert.equal(valid({...p, hourly: []}), true);
+  assert.equal(valid({...p, hourly: [p.hourly[0], p.hourly[0]]}), false);
+  assert.equal(valid({...p, hourly: [p.hourly[0]]}), false);
+  assert.equal(valid({...p, hourly: p.hourly.map(h => ({...h, durationsSeconds: {on:0, off:0, unknown:3600}}))}), false);
+  assert.equal(valid({...p, bindingRevision:0}), false);
+});

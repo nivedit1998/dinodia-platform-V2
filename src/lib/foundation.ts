@@ -12,6 +12,9 @@ export const STAGE1_MODEL_COUNT = 40;
 export const REQUIRED_MIGRATION = '20261003000000_native_v2_stage3_domain_schema';
 export const REQUIRED_MODEL_COUNT = 65;
 export const COMPATIBLE_ADDITIVE_MIGRATIONS: Readonly<Record<string, string>> = Object.freeze({
+  '20261027010000_universal_analytics_compatibility': 'b06262703ab969364dc2ebf2a40de11976211d6fc8bbaa10760a2fa9b653c1eb',
+  '20261027011000_universal_analytics_categories': '020fd9d0eca32895fd2c9871ac559bfc22bed11f9b5c3a296514e9496e83bc76',
+  '20261027012000_universal_state_history': 'd533d7f193eac057a84c7e9e4f4ab304b4798f2c44478282d6a82b94c1599a84',
   '20261025140000_calendar_daily_analytics': '9d1c37dc41f45758e84c2505210300f93e66cc42fde53f80a067e29c933b5cf0',
   '20261025010000_logical_device_parents': 'eacd06daaf9eac7f77beffd233b9f553c61c632c5717e08df3ddda641584864c',
   '20261024103000_state_evidence_policy': '905d3c72ea537e6e015743e8ba7bcc85e7353c5868053244f58ff4b272ed40da',
@@ -65,9 +68,12 @@ export function isSchemaReady(migrations: readonly CompletedMigration[], modelCo
   const hasRoomPlaques = newer.some(migration => migration.migration_name === '20261023210000_room_qr_plaques');
   const hasLogicalDevices = newer.some(migration => migration.migration_name === '20261025010000_logical_device_parents');
   const hasCalendarDays = newer.some(migration => migration.migration_name === '20261025140000_calendar_daily_analytics');
+  const hasStateDays = newer.some(migration => migration.migration_name === '20261027012000_universal_state_history');
+  if (hasStateDays && (!hasCalendarDays || !newer.some(m => m.migration_name === '20261027010000_universal_analytics_compatibility')
+    || !newer.some(m => m.migration_name === '20261027011000_universal_analytics_categories'))) return false;
   if (hasCalendarDays && !hasLogicalDevices) return false;
   if (hasLogicalDevices && (!hasStage8 || !hasAnalyticsIntervals || !hasRoomPlaques
     || !newer.some(migration => migration.migration_name === '20261024103000_state_evidence_policy'))) return false;
   if (newer.some(migration => migration.migration_name === '20261024103000_state_evidence_policy') && !hasAnalyticsIntervals) return false;
-  return modelCount === REQUIRED_MODEL_COUNT + (hasStage5 ? 1 : 0) + (hasProspectiveRoomAccess ? 1 : 0) + (hasStage12Alexa ? 8 : 0) + (hasAnalyticsIntervals ? 2 : 0) + (hasRoomPlaques ? 2 : 0) + (hasLogicalDevices ? 1 : 0) + (hasCalendarDays ? 2 : 0);
+  return modelCount === REQUIRED_MODEL_COUNT + (hasStage5 ? 1 : 0) + (hasProspectiveRoomAccess ? 1 : 0) + (hasStage12Alexa ? 8 : 0) + (hasAnalyticsIntervals ? 2 : 0) + (hasRoomPlaques ? 2 : 0) + (hasLogicalDevices ? 1 : 0) + (hasCalendarDays ? 2 : 0) + (hasStateDays ? 1 : 0);
 }
