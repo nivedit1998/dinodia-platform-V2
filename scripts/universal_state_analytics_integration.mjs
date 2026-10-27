@@ -59,6 +59,17 @@ export async function universalStateAnalyticsIntegration({prisma,fixture:f,osRoo
   const query=new URLSearchParams({category:'tv',level:'hour',from:new Date(start).toISOString(),to:new Date(start+61000).toISOString(),deviceIds:device.id});
   const endpoint=`${base}/api/v2/homes/${f.homeOneId}/analytics/states?${query}`;
   const headers={authorization:`Bearer ${owner.body.accessToken}`,'x-dinodia-home-id':f.homeOneId};
+  const bootstrapUrl=`${base}/api/v2/homes/${f.homeOneId}/analytics/bootstrap`;
+  const legacyBootstrap=await fetchJson(bootstrapUrl,{headers});assert.equal(legacyBootstrap.response.status,200);
+  assert.equal(Object.hasOwn(legacyBootstrap.body,'stateCategories'),false,'old clients keep the legacy response shape');
+  assert.ok(legacyBootstrap.body.devices.every(d=>['light','radiator','boiler'].includes(d.category)),'old catalogue never gains new category enums');
+  const extendedBootstrap=await fetchJson(bootstrapUrl,{headers:{...headers,'X-Dinodia-Analytics-Contract':'1'}});
+  assert.equal(extendedBootstrap.response.status,200);assert.ok(extendedBootstrap.body.stateCategories.includes('tv'));
+  assert.ok(extendedBootstrap.body.stateCategories.every(c=>['socket','tv','blind','ac','washing_machine'].includes(c)));
+  assert.match(extendedBootstrap.response.headers.get('vary'),/X-Dinodia-Analytics-Contract/i);
+  assert.match(extendedBootstrap.response.headers.get('cache-control'),/no-store/);
+  const unrecognizedBootstrap=await fetchJson(bootstrapUrl,{headers:{...headers,'X-Dinodia-Analytics-Contract':'99'}});
+  assert.equal(Object.hasOwn(unrecognizedBootstrap.body,'stateCategories'),false);
   const history=await fetchJson(endpoint,{headers});assert.equal(history.response.status,200,JSON.stringify(history.body));
   assert.equal(history.body.buckets[0].durationsSeconds.off,60);assert.equal(history.body.buckets[0].durationsSeconds.on,1);
   assert.notEqual((await fetchJson(endpoint)).response.status,200,'unauthenticated callers cannot read state history');
