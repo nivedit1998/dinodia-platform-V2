@@ -139,6 +139,8 @@ export const stage1RouteInventory = [
   ['PUT', '/api/v2/homes/:homeId/preferences', 'customer'],
   ['GET', '/api/v2/me/profile', 'customer'],
   ['PATCH', '/api/v2/me/profile', 'customer'],
+  ['GET', '/api/v2/me/avatar', 'customer'],
+  ['PUT', '/api/v2/me/avatar', 'customer'],
   ['PATCH', '/api/v2/me/username', 'customer'],
   ['PUT', '/api/v2/me/push-registration', 'customer'],
   ['DELETE', '/api/v2/me/push-registration', 'customer'],

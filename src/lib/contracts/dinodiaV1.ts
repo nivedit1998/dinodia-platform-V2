@@ -41,6 +41,9 @@ export interface CustomerProfileReceipt {
   schemaVersion: typeof DINODIA_V1; ok: true; accountId: OpaqueId; displayName: string; username: string;
   phoneNumber: string|null; email: string; emailVerified: boolean; profileRevision: string;
 }
+export interface CustomerAvatar { icon: string|null; colour: string }
+export interface CustomerAvatarRequest { icon: string|null; colour: string }
+export interface CustomerAvatarReceipt { schemaVersion: typeof DINODIA_V1; ok: true; avatar: CustomerAvatar }
 export interface CustomerProfileUpdateRequest { displayName: string; username: string; phoneNumber: string|null; expectedProfileRevision: string; proof: string }
 export interface TenantMembershipRemovalRequest {
   expectedAccessRevision: number; expectedManagementRevision: number; confirmFinalAccountDeletion: boolean;
@@ -288,6 +291,17 @@ export function validateCustomerProfileReceipt(value: unknown): value is Custome
     && (value.phoneNumber === null || typeof value.phoneNumber === 'string' && /^[+() .0-9-]{7,40}$/.test(value.phoneNumber))
     && typeof value.email === 'string' && value.email.length <= 320 && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value.email)
     && typeof value.emailVerified === 'boolean' && utcTimestamp(value.profileRevision);
+}
+const AVATAR_TEXT = /^[a-z]{2,24}$/;
+export function validateCustomerAvatarRequest(value: unknown): value is CustomerAvatarRequest {
+  return object(value) && Object.keys(value).length === 2 && hasOnlyKeys(value, ['icon','colour'])
+    && (value.icon === null || typeof value.icon === 'string' && AVATAR_TEXT.test(value.icon))
+    && typeof value.colour === 'string' && AVATAR_TEXT.test(value.colour);
+}
+export function validateCustomerAvatarReceipt(value: unknown): value is CustomerAvatarReceipt {
+  return object(value) && Object.keys(value).length === 3 && hasOnlyKeys(value, ['schemaVersion','ok','avatar'])
+    && value.schemaVersion === DINODIA_V1 && value.ok === true
+    && validateCustomerAvatarRequest(value.avatar);
 }
 export function validateCustomerProfileUpdateRequest(value: unknown): value is CustomerProfileUpdateRequest {
   return object(value) && Object.keys(value).length === 5 && hasOnlyKeys(value, ['displayName','username','phoneNumber','expectedProfileRevision','proof'])

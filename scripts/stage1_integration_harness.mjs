@@ -3877,6 +3877,119 @@ async function customerAuthorizationChecks(deliveryEnv) {
   await installationRequestRouteChecks(deliveryEnv);
 }
 
+// D21: other tenants who share a granted Area are always shown; nothing else about anyone is disclosed.
+async function sharedAreaAvatarChecks({ base, inviter, viewerMembershipId, viewerAccountId, viewerHeaders, foreignMembership, foreignAccount, sharedAreaId, privateAreaId, otherHomeId, ownerHeaders }) {
+  const homeId = inviter.homeId;
+  const read = () => fetchJson(`${base}/api/v2/homes/${homeId}/tenant-device-context`, { headers: viewerHeaders });
+  const membersOf = (body, areaId) => (body?.areaMembers ?? []).find((row) => row.areaId === areaId)?.members ?? [];
+  const created = { accounts: [], memberships: [] };
+  const newAccount = async (label, data = {}) => {
+    const suffix = crypto.randomUUID();
+    const account = await prisma.customerAccount.create({ data: { displayName: label, username: `avatar-${suffix.slice(0, 12)}`, usernameNormalized: `avatar-${suffix.slice(0, 12)}`,
+      email: `avatar-${suffix}@invalid.test`, emailNormalized: `avatar-${suffix}@invalid.test`, passwordHash: 'disposable-integration-only', emailVerifiedAt: new Date(), ...data } });
+    created.accounts.push(account.id);
+    return account;
+  };
+  const newMembership = async (account, data = {}) => {
+    const membership = await prisma.homeMembership.create({ data: { customerAccountId: account.id, homeId, role: 'TENANT', status: 'ACTIVE', ...data } });
+    created.memberships.push(membership.id);
+    return membership;
+  };
+  try {
+    await prisma.customerAccount.update({ where: { id: foreignAccount.id }, data: { displayName: 'Sam Shared', avatarIcon: 'tortoise', avatarColour: 'mint' } });
+    // Every one of these must stay invisible to the viewer.
+    // The database refuses an ACTIVE grant for anyone who is not an active tenant, so these members are made tenants with active
+    // grants first and then changed behind the API's back (the "stale grant" situation the query must still never list).
+    const manager = await newAccount('Manager Must Not Show');
+    const managerMembership = await newMembership(manager);
+    const removed = await newAccount('Removed Tenant');
+    const removedMembership = await newMembership(removed);
+    const revoked = await newAccount('Revoked Tenant');
+    const revokedMembership = await newMembership(revoked);
+    const suspended = await newAccount('Suspended Tenant', { status: 'SUSPENDED' });
+    const suspendedMembership = await newMembership(suspended);
+    const privateOnly = await newAccount('Private Area Tenant');
+    const privateOnlyMembership = await newMembership(privateOnly);
+    const otherHome = await newAccount('Other Home Tenant');
+    const otherHomeMembership = await prisma.homeMembership.create({ data: { customerAccountId: otherHome.id, homeId: otherHomeId, role: 'TENANT', status: 'ACTIVE' } });
+    created.accounts.push(otherHome.id); created.memberships.push(otherHomeMembership.id);
+    await prisma.tenantAreaGrant.createMany({ data: [
+      { membershipId: managerMembership.id, areaId: sharedAreaId, homeId },
+      { membershipId: removedMembership.id, areaId: sharedAreaId, homeId },
+      { membershipId: revokedMembership.id, areaId: sharedAreaId, homeId },
+      { membershipId: suspendedMembership.id, areaId: sharedAreaId, homeId },
+      { membershipId: privateOnlyMembership.id, areaId: privateAreaId, homeId },
+    ] });
+    await prisma.tenantAreaGrant.updateMany({ where: { membershipId: revokedMembership.id }, data: { revokedAt: new Date(), revokeReason: 'avatar_harness' } });
+    await prisma.homeMembership.update({ where: { id: managerMembership.id }, data: { role: 'PROPERTY_MANAGER' } });
+    await prisma.homeMembership.update({ where: { id: removedMembership.id }, data: { status: 'REMOVED', removedAt: new Date(), removalReason: 'avatar_harness' } });
+    const shown = await read();
+    const shared = membersOf(shown.body, sharedAreaId);
+    const sharedNames = shared.map((member) => member.displayName);
+    const serialized = JSON.stringify(shown.body?.areaMembers ?? []);
+    const forbidden = [foreignAccount.email, foreignAccount.username, foreignAccount.id, foreignMembership.id, viewerMembershipId, viewerAccountId,
+      ...[manager, removed, revoked, suspended, privateOnly, otherHome].flatMap((a) => [a.email, a.username, a.id])];
+    if (shown.response.status !== 200 || shared.length !== 1 || sharedNames[0] !== 'Sam Shared' || shared[0].avatar?.icon !== 'tortoise' || shared[0].avatar?.colour !== 'mint'
+      || !/^[0-9a-f]{32}$/.test(shared[0].memberKey) || Object.keys(shared[0]).sort().join() !== 'avatar,displayName,memberKey'
+      || membersOf(shown.body, privateAreaId).length !== 0 || (shown.body?.areaMembers ?? []).some((row) => row.areaId === privateAreaId)
+      || forbidden.some((value) => value && serialized.includes(String(value)))) {
+      fail(`Shared-area visibility disclosed or hid the wrong people (${JSON.stringify({ status: shown.response.status, names: sharedNames, rows: shown.body?.areaMembers?.length })})`);
+    }
+    // Revocation: removing the co-tenant's grant removes them on the next read; a new tenant appears with a stable default colour.
+    await prisma.tenantAreaGrant.updateMany({ where: { membershipId: foreignMembership.id, areaId: sharedAreaId }, data: { revokedAt: new Date(), revokeReason: 'avatar_harness' } });
+    const afterRevoke = await read();
+    const newcomer = await newAccount('Newcomer Tenant');
+    const newcomerMembership = await newMembership(newcomer);
+    await prisma.tenantAreaGrant.create({ data: { membershipId: newcomerMembership.id, areaId: sharedAreaId, homeId } });
+    const afterJoin = await read();
+    const joined = membersOf(afterJoin.body, sharedAreaId);
+    const again = membersOf((await read()).body, sharedAreaId);
+    await prisma.tenantAreaGrant.updateMany({ where: { membershipId: foreignMembership.id, areaId: sharedAreaId }, data: { revokedAt: null, revokeReason: null } });
+    if (membersOf(afterRevoke.body, sharedAreaId).length !== 0 || joined.length !== 1 || joined[0].displayName !== 'Newcomer Tenant' || joined[0].avatar.icon !== null
+      || !['tangerine', 'lemon', 'mint', 'teal', 'sky', 'indigo', 'grape', 'bubblegum', 'coral', 'slate'].includes(joined[0].avatar.colour)
+      || again[0]?.avatar?.colour !== joined[0].avatar.colour || again[0]?.memberKey !== joined[0].memberKey) {
+      fail('Revoked co-tenants were still listed, or a newcomer did not get a stable default avatar and key');
+    }
+    // The owner's own tenant-context read (not a tenant) never lists co-tenants, and anonymous access is denied.
+    const anonymous = await fetchJson(`${base}/api/v2/homes/${homeId}/tenant-device-context`, { headers: { 'x-dinodia-home-id': homeId } });
+    const ownerRead = await fetchJson(`${base}/api/v2/homes/${homeId}/tenant-device-context`, { headers: ownerHeaders });
+    if (anonymous.response.status !== 401 || ownerRead.response.status === 200 && ownerRead.body?.areaMembers) fail('Co-tenant visibility reached an anonymous caller or a non-tenant principal');
+
+    // The avatar API: authenticated, allow-listed, idempotent, cosmetic (the profile revision must not move).
+    const url = `${base}/api/v2/me/avatar`;
+    const json = { ...viewerHeaders, 'content-type': 'application/json' };
+    const profileBefore = await fetchJson(`${base}/api/v2/me/profile`, { headers: viewerHeaders });
+    const anonymousPut = await fetchJson(url, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ icon: 'cat', colour: 'sky' }) });
+    const anonymousGet = await fetchJson(url);
+    const badIcon = await fetchJson(url, { method: 'PUT', headers: json, body: JSON.stringify({ icon: 'skull', colour: 'sky' }) });
+    const freeText = await fetchJson(url, { method: 'PUT', headers: json, body: JSON.stringify({ icon: '<b>hi</b>', colour: 'sky' }) });
+    const badColour = await fetchJson(url, { method: 'PUT', headers: json, body: JSON.stringify({ icon: 'cat', colour: '#ff0000' }) });
+    const extraField = await fetchJson(url, { method: 'PUT', headers: json, body: JSON.stringify({ icon: 'cat', colour: 'sky', name: 'x' }) });
+    const saved = await fetchJson(url, { method: 'PUT', headers: json, body: JSON.stringify({ icon: 'party', colour: 'bubblegum' }) });
+    const savedAgain = await fetchJson(url, { method: 'PUT', headers: json, body: JSON.stringify({ icon: 'party', colour: 'bubblegum' }) });
+    const read2 = await fetchJson(url, { headers: viewerHeaders });
+    const initials = await fetchJson(url, { method: 'PUT', headers: json, body: JSON.stringify({ icon: null, colour: 'slate' }) });
+    const profileAfter = await fetchJson(`${base}/api/v2/me/profile`, { headers: viewerHeaders });
+    const rowAudits = await prisma.auditEvent.count({ where: { actorId: viewerAccountId, action: 'customer_avatar_changed' } });
+    if (anonymousPut.response.status !== 401 || anonymousGet.response.status !== 401
+      || [badIcon, freeText, badColour, extraField].some((result) => result.response.status !== 400 || result.body?.error?.code !== 'VALIDATION_FAILED')
+      || saved.response.status !== 200 || saved.body?.avatar?.icon !== 'party' || saved.body?.avatar?.colour !== 'bubblegum'
+      || savedAgain.response.status !== 200 || read2.body?.avatar?.icon !== 'party' || initials.response.status !== 200 || initials.body?.avatar?.icon !== null
+      || profileBefore.body?.profileRevision !== profileAfter.body?.profileRevision || Object.hasOwn(profileAfter.body ?? {}, 'avatar')
+      || rowAudits !== 2) {
+      fail(`The avatar API did not enforce authentication, the allow-list, idempotency or the unchanged profile revision (${JSON.stringify({ anonymous: [anonymousPut.response.status, anonymousGet.response.status],
+        rejected: [badIcon, freeText, badColour, extraField].map((r) => r.response.status), saved: saved.response.status, audits: rowAudits })})`);
+    }
+    console.log('[shared-avatars:integration] PASS: co-tenants of a granted Area are always listed with name and icon only; managers, removed, revoked or suspended members, other Homes and ungranted Areas never are, revocation is immediate, no identifiers leak, and the avatar API is authenticated, allow-listed, idempotent and leaves the profile revision unchanged');
+  } finally {
+        await prisma.tenantAreaGrant.deleteMany({ where: { membershipId: { in: created.memberships } } });
+    await prisma.homeMembership.deleteMany({ where: { id: { in: created.memberships } } });
+    await prisma.customerAccount.deleteMany({ where: { id: { in: created.accounts } } });
+    await prisma.customerAccount.update({ where: { id: foreignAccount.id }, data: { displayName: 'Other disposable tenant', avatarIcon: null, avatarColour: null } });
+    await prisma.customerAccount.update({ where: { id: viewerAccountId }, data: { avatarIcon: null, avatarColour: null } });
+  }
+}
+
 async function installationRequestRouteChecks(deliveryEnv) {
   const fixture = customerFixture;
   if (!fixture) fail('Stage 8 installation-request checks require the disposable customer/employee fixture');
@@ -8630,6 +8743,10 @@ async function pendingInvitationRouteChecks(deliveryEnv) {
   const foreignHomeTenantContext = await fetchJson(`${base}/api/v2/homes/${customerFixture.homeOneId}/tenant-device-context`, { headers: { ...tenantDashboardHeaders, 'x-dinodia-home-id': customerFixture.homeOneId } });
   const ownerDashboardContext = await fetchJson(`${base}/api/v2/homes/${inviter.homeId}/tenant-device-context`, { headers: { cookie: `dinodia_customer_session=${encodeURIComponent(customerFixture.customerSessionSecret)}`, 'x-dinodia-home-id': inviter.homeId } });
   const anonymousDashboardContext = await fetchJson(`${base}/api/v2/homes/${inviter.homeId}/tenant-device-context`, { headers: { 'x-dinodia-home-id': inviter.homeId } });
+  await sharedAreaAvatarChecks({ base, inviter, viewerMembershipId: newTenantMembershipAfterAccept.id, viewerAccountId: newTenantAccount.id,
+    viewerHeaders: tenantDashboardHeaders, foreignMembership, foreignAccount, sharedAreaId: bedroomAreas[0].id, privateAreaId: bedroomAreas[2].id,
+    otherHomeId: customerFixture.homeOneId, ownerHeaders: { cookie: `dinodia_customer_session=${encodeURIComponent(customerFixture.customerSessionSecret)}`, 'x-dinodia-home-id': inviter.homeId } });
+  if (process.env.SHARED_AVATARS_ONLY === '1') return;
   const dashboardLayout = { version: 1, tiles: [{ deviceId: dashboardDevices[0].id, size: 'STANDARD', position: 0, label: 'My light' }], labelColours: { Lights: '#f2c94c' } };
   const layoutWrite = await fetchJson(`${base}/api/v2/homes/${inviter.homeId}/preferences`, { method: 'PUT', headers: { ...tenantDashboardHeaders, 'content-type': 'application/json' }, body: JSON.stringify({ kind: 'DASHBOARD_LAYOUT', expectedRevision: 0, document: dashboardLayout }) });
   const layoutFourSizeWrites = [];
@@ -12652,14 +12769,15 @@ try {
   const stage9RemovalEncryptionOnly = process.env.STAGE9_HOMEOWNER_TENANT_REMOVAL_ONLY === '1';
   const stage6InvitationLockOnly = process.env.STAGE6_INVITATION_LOCK_ONLY === '1';
   const stage6TenantInvitationDecisionOnly = process.env.STAGE6_TENANT_INVITATION_DECISION_ONLY === '1';
-  if (!roomPlaquesOnly && !stage5SyncRecoveryOnly && !stage9RemovalEncryptionOnly && !stage6InvitationLockOnly && !stage6TenantInvitationDecisionOnly
+  const sharedAvatarsOnly = process.env.SHARED_AVATARS_ONLY === '1';
+  if (!roomPlaquesOnly && !stage5SyncRecoveryOnly && !stage9RemovalEncryptionOnly && !stage6InvitationLockOnly && !stage6TenantInvitationDecisionOnly && !sharedAvatarsOnly
     && process.env.STAGE10_SKIP_ALEXA !== '1'
     && (stage12AlexaOnly || (process.env.STAGE6_TRANSFER_ONLY !== '1' && process.env.STAGE6_TENANT_REMOVAL_ONLY !== '1'))) {
     await nativeAlexaOAuthChecks(deliveryEnv);
   }
   if (roomPlaquesOnly) {
     console.log('[room-plaques:integration] Focused mode completed real authentication and plaque HTTP/database acceptance. Other harness scenarios were not run in this mode.');
-  } else if (stage6TenantInvitationDecisionOnly) {
+  } else if (stage6TenantInvitationDecisionOnly || sharedAvatarsOnly) {
     await pendingInvitationRouteChecks(deliveryEnv);
   } else if (stage5SyncRecoveryOnly) {
     await pendingInvitationRouteChecks(deliveryEnv);

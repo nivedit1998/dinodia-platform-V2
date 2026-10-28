@@ -403,6 +403,9 @@ model CustomerAccount {
   securityVersion           Int            @default(1)
   lastUsedHomeId            String?        @db.Uuid
   deletedAt                 DateTime?
+  avatarIcon                String?        @db.VarChar(24)
+  avatarColour              String?        @db.VarChar(16)
+  avatarUpdatedAt           DateTime?
   createdAt                 DateTime       @default(now())
   updatedAt                 DateTime       @updatedAt
 

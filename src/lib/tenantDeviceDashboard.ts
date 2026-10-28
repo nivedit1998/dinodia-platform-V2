@@ -1,4 +1,5 @@
 import type { Prisma } from '@prisma/client';
+import { publicAvatar, sharedMemberKey } from './avatarCatalogue';
 
 export class TenantDeviceDashboardDenied extends Error {
   constructor(readonly code: 'MEMBERSHIP_REQUIRED' | 'TENANT_ROLE_REQUIRED' | 'SESSION_REVOKED') { super(code); }
@@ -112,6 +113,33 @@ export async function readTenantDeviceDashboard(db: Prisma.TransactionClient, in
     },
   });
 
+  // Shared-area visibility (D21): for every Area THIS tenant is currently granted, the other active TENANTS who also
+  // hold an active grant on it. Owners and property managers are never listed, nothing outside the viewer's own
+  // Areas is disclosed, and only a display name and the chosen icon leave this function.
+  const coTenantGrants = grantedAreaIds.length === 0 ? [] : await db.tenantAreaGrant.findMany({
+    where: {
+      homeId: membership.homeId, areaId: { in: grantedAreaIds }, revokedAt: null, area: { status: 'ACTIVE' },
+      membershipId: { not: membership.id },
+      membership: { homeId: membership.homeId, role: 'TENANT', status: 'ACTIVE', customerAccount: { status: 'ACTIVE' } },
+    },
+    select: { areaId: true, membershipId: true,
+      membership: { select: { customerAccount: { select: { id: true, displayName: true, avatarIcon: true, avatarColour: true } } } } },
+  });
+  const membersByArea = new Map<string, Array<{ memberKey: string; displayName: string; avatar: ReturnType<typeof publicAvatar> }>>();
+  for (const grant of coTenantGrants) {
+    const account = grant.membership.customerAccount;
+    const list = membersByArea.get(grant.areaId) ?? [];
+    list.push({ memberKey: sharedMemberKey(membership.id, grant.membershipId),
+      displayName: Array.from(account.displayName.trim()).slice(0, 40).join('') || 'Tenant', avatar: publicAvatar(account) });
+    membersByArea.set(grant.areaId, list);
+  }
+  const areaMembers = grantedAreaIds.flatMap((areaId) => {
+    const members = (membersByArea.get(areaId) ?? [])
+      .sort((left, right) => left.displayName.localeCompare(right.displayName, 'en-GB') || left.memberKey.localeCompare(right.memberKey))
+      .slice(0, 50);
+    return members.length ? [{ areaId, members }] : [];
+  });
+
   const deviceOverrides = devices.flatMap((device) => {
     const owner = device.managementClass === 'TENANT_DEVICE' && device.ownerMembershipId === membership.id;
     if (device.managementClass === 'TENANT_DEVICE' && !owner) return [];
@@ -180,6 +208,7 @@ export async function readTenantDeviceDashboard(db: Prisma.TransactionClient, in
     areaAccess: grantedAreaIds.map((areaId) => ({ areaId })),
     areaOverrides: membership.tenantAreaGrants.map(({ area }) => ({ areaId: area.id, originalName: area.originalName, overrideName: area.overrideName })),
     areaGroups,
+    areaMembers,
     deviceOverrides,
     preferences: { layoutRevision: layout?.revision ?? 0 },
     layout: layout ? { revision: layout.revision, document: safeLayoutDocument, updatedAt: layout.updatedAt.toISOString() } : { revision: 0, document: { version: 1, tiles: [], labelColours: {} }, updatedAt: null },
