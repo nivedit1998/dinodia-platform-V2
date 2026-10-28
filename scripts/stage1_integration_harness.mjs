@@ -440,6 +440,8 @@ function loadNativeAnalyticsIntegrityCheck() {
     if (specifier === './installationRequestDelivery') return { dispatchInstallationRequestNotifications: async () => ({}) };
     if (specifier === './homeDeregistrationCleanup') return { resumeHomeDeregistrationAccountCleanup: async () => ({}) };
     if (specifier === './nativeAlexaEvents') return { dispatchNativeAlexaChangeReports: async () => ({ processed: 0 }) };
+    // The integrity inspection never prunes; the retention helper is not part of what this loader exercises.
+    if (specifier === './nativeEphemeralRetention') return { cleanEphemeralRecords: async () => ({}) };
     return require(specifier);
   };
   new Function('require', 'module', 'exports', compiled)(localRequire, loaded, loaded.exports);

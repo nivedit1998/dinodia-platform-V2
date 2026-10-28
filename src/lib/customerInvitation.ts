@@ -1,5 +1,5 @@
 import { Stage1AuthError } from './stage1Auth';
-import { serializableTransaction } from './serializableTransaction';
+import { isRetryableSerializationConflict, serializableTransaction } from './serializableTransaction';
 
 type DecisionInput = {
   invitationId: string; decision: 'ACCEPT'|'DECLINE'; expectedUpdatedAt: string;
@@ -135,11 +135,17 @@ export async function decideCustomerInvitation(input: DecisionInput, onPhase?: (
     await tx.auditEvent.create({ data: { homeId: invitation.homeId, actorType: 'CUSTOMER', actorId: account.id, category: 'ACCESS', action: 'membership_invitation_accepted', targetType: 'MembershipInvitation', targetId: invitation.id, metadata: { role: invitation.role, areaGrantCount: invitedAreaIds.length, managementRevision: nextPolicyRevision }, occurredAt: now, purgeAt: new Date(now.getTime() + 365 * 24 * 60 * 60 * 1000) } });
     return { schemaVersion: 'dinodia.v1' as const, ok: true as const, invitationId: invitation.id,
       decision: input.decision, state: stateForDecision, homeMembershipId: membership.id, idempotentReplay: false };
-  }, 2, { maxWaitMs: 2000, timeoutMs: 8000 });
+  }, 3, { maxWaitMs: 2000, timeoutMs: 8000 });
   } catch (error) {
     if (isPostgresLockTimeout(error)) {
       setPhase(`lock_timeout_after_${currentPhase}`);
       throw new Stage1AuthError(503, 'internal_error', 'The invitation service is temporarily busy');
+    }
+    // Two decisions on one invitation at the same moment can both abort on a serialization conflict even after
+    // the retries. That is a lost race, not a server fault: the other decision won, so report the current state.
+    if (isRetryableSerializationConflict(error)) {
+      setPhase(`serialization_conflict_after_${currentPhase}`);
+      throw new Stage1AuthError(409, 'REVISION_CONFLICT', 'The invitation decision is no longer current');
     }
     throw error;
   }
