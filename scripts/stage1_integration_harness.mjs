@@ -5473,12 +5473,48 @@ async function mobileSessionContractChecks() {
     || !oldSession.revokedAt || oldSession.revokeReason !== 'refresh_token_rotated' || oldSession.accessTokenHash
     || !newSession || newSession.sessionFamilyId !== sessionBeforeExpiry.sessionFamilyId || !newSession.accessTokenHash
     || refreshedInventory.response.status !== 200) fail(`Mobile access expiry did not require one cookie-free family rotation to a fresh authorized session (expired=${expiredAccess.response.status}/${expiredAccess.body.error?.code ?? 'none'}; refresh=${refresh.response.status}/${refresh.body.error?.code ?? 'none'}/cookie=${refresh.response.headers.has('set-cookie')}/valid=${nativeV1Contract.validateMobileCustomerSessionReceipt(refresh.body)}/rotated=${refresh.body?.refreshToken !== receipt.refreshToken}; oldRevoked=${Boolean(oldSession.revokedAt)}/${oldSession.revokeReason ?? 'none'}/accessCleared=${!oldSession.accessTokenHash}; new=${Boolean(newSession)}/family=${newSession?.sessionFamilyId === sessionBeforeExpiry.sessionFamilyId}/accessBound=${Boolean(newSession?.accessTokenHash)}; inventory=${refreshedInventory.response.status})`);
+  // A just-rotated token may be presented ONCE more inside the leeway (a lost reply), retiring the unseen successor.
+  const retryReplay = await fetchJson(`${base}/api/v2/mobile/session`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ refreshToken: receipt.refreshToken }) });
+  const retryRows = await prisma.customerSession.findMany({ where: { sessionFamilyId: sessionBeforeExpiry.sessionFamilyId }, select: { id: true, revokedAt: true, revokeReason: true, accessTokenHash: true } });
+  const unseenSuccessor = retryRows.find((row) => row.id === refresh.body.sessionId);
+  const retryHead = retryReplay.body?.sessionId ? retryRows.find((row) => row.id === retryReplay.body.sessionId) : null;
+  const unseenAccess = await fetchJson(`${base}/api/v2/trusted-devices`, { headers: { authorization: `Bearer ${refresh.body.accessToken}` } });
+  const retryAccess = await fetchJson(`${base}/api/v2/trusted-devices`, { headers: { authorization: `Bearer ${retryReplay.body?.accessToken ?? ''}` } });
+  if (retryReplay.response.status !== 200 || !nativeV1Contract.validateMobileCustomerSessionReceipt(retryReplay.body)
+    || retryReplay.body.refreshToken === refresh.body.refreshToken || retryReplay.body.refreshToken === receipt.refreshToken
+    || retryRows.length !== 3 || !unseenSuccessor?.revokedAt || unseenSuccessor.revokeReason !== 'refresh_token_rotated_retry' || unseenSuccessor.accessTokenHash
+    || !retryHead || retryHead.revokedAt || !retryHead.accessTokenHash
+    || unseenAccess.response.status !== 401 || retryAccess.response.status !== 200) {
+    fail(`A lost-reply retry inside the leeway did not issue one fresh session from the unseen successor (${retryReplay.response.status}/${retryReplay.body?.error?.code ?? 'none'}; rows=${retryRows.length})`);
+  }
+  // A second presentation of the same spent token is real reuse: the whole family and its bearer end.
   const oldRefreshReplay = await fetchJson(`${base}/api/v2/mobile/session`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ refreshToken: receipt.refreshToken }) });
-  const familySession = await prisma.customerSession.findUniqueOrThrow({ where: { id: refresh.body.sessionId }, select: { revokedAt: true, revokeReason: true, accessTokenHash: true } });
-  const familyAccessReplay = await fetchJson(`${base}/api/v2/trusted-devices`, { headers: { authorization: `Bearer ${refresh.body.accessToken}` } });
+  const familySession = await prisma.customerSession.findUniqueOrThrow({ where: { id: retryReplay.body.sessionId }, select: { revokedAt: true, revokeReason: true, accessTokenHash: true } });
+  const familyAccessReplay = await fetchJson(`${base}/api/v2/trusted-devices`, { headers: { authorization: `Bearer ${retryReplay.body.accessToken}` } });
   if (oldRefreshReplay.response.status !== 401 || !familySession.revokedAt || familySession.revokeReason !== 'refresh_token_reuse'
     || familySession.accessTokenHash || familyAccessReplay.response.status !== 401) fail('Reused mobile refresh credential did not revoke the current family and its access bearer');
-  console.log('[stage6:integration] PASS: actual mobile login returns account-global memberships without cookies; bearer reaches protected routes, tenant-only hub authority is enforced, expiry rotates one refresh family, and replay revokes its access token');
+  // The token the unseen successor held is also spent: presenting it is reuse, never a second retry.
+  const retiredSuccessorReplay = await fetchJson(`${base}/api/v2/mobile/session`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ refreshToken: refresh.body.refreshToken }) });
+  if (retiredSuccessorReplay.response.status !== 401) fail('A retired unseen successor credential was accepted');
+
+  // Outside the leeway a replay is reuse straight away. Fresh family, rotation backdated past the window.
+  const lateLogin = await fetchJson(`${base}/api/v2/mobile/session`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ ...payload, deviceInstallationId: `leeway-late-${crypto.randomUUID()}` }) });
+  const lateRotate = await fetchJson(`${base}/api/v2/mobile/session`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ refreshToken: lateLogin.body.refreshToken }) });
+  await prisma.customerSession.updateMany({ where: { refreshTokenHash: sha256(lateLogin.body.refreshToken) }, data: { revokedAt: new Date(Date.now() - 3 * 60 * 1000) } });
+  const lateReplay = await fetchJson(`${base}/api/v2/mobile/session`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ refreshToken: lateLogin.body.refreshToken }) });
+  const lateHead = await prisma.customerSession.findUniqueOrThrow({ where: { id: lateRotate.body.sessionId }, select: { revokedAt: true, revokeReason: true } });
+  if (lateLogin.response.status !== 200 || lateRotate.response.status !== 200 || lateReplay.response.status !== 401
+    || !lateHead.revokedAt || lateHead.revokeReason !== 'refresh_token_reuse') fail('A replay outside the retry leeway was not treated as refresh-token reuse');
+
+  // The successor already rotated (the phone DID receive it): replaying the older token is reuse, not a retry.
+  const usedLogin = await fetchJson(`${base}/api/v2/mobile/session`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ ...payload, deviceInstallationId: `leeway-used-${crypto.randomUUID()}` }) });
+  const usedFirst = await fetchJson(`${base}/api/v2/mobile/session`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ refreshToken: usedLogin.body.refreshToken }) });
+  const usedSecond = await fetchJson(`${base}/api/v2/mobile/session`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ refreshToken: usedFirst.body.refreshToken }) });
+  const usedReplay = await fetchJson(`${base}/api/v2/mobile/session`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ refreshToken: usedLogin.body.refreshToken }) });
+  const usedHead = await prisma.customerSession.findUniqueOrThrow({ where: { id: usedSecond.body.sessionId }, select: { revokedAt: true, revokeReason: true } });
+  if (usedFirst.response.status !== 200 || usedSecond.response.status !== 200 || usedReplay.response.status !== 401
+    || !usedHead.revokedAt || usedHead.revokeReason !== 'refresh_token_reuse') fail('Replaying a token whose successor already rotated was not treated as refresh-token reuse');
+  console.log('[stage6:integration] PASS: actual mobile login returns account-global memberships without cookies; bearer reaches protected routes, tenant-only hub authority is enforced, expiry rotates one refresh family, one lost-reply retry inside the leeway recovers, and any other replay revokes the family and its access token');
 }
 
 async function tenantMembershipRemovalChecks() {
@@ -12770,13 +12806,16 @@ try {
   const stage6InvitationLockOnly = process.env.STAGE6_INVITATION_LOCK_ONLY === '1';
   const stage6TenantInvitationDecisionOnly = process.env.STAGE6_TENANT_INVITATION_DECISION_ONLY === '1';
   const sharedAvatarsOnly = process.env.SHARED_AVATARS_ONLY === '1';
-  if (!roomPlaquesOnly && !stage5SyncRecoveryOnly && !stage9RemovalEncryptionOnly && !stage6InvitationLockOnly && !stage6TenantInvitationDecisionOnly && !sharedAvatarsOnly
+  const mobileRefreshOnly = process.env.MOBILE_REFRESH_ONLY === '1';
+  if (!roomPlaquesOnly && !stage5SyncRecoveryOnly && !stage9RemovalEncryptionOnly && !stage6InvitationLockOnly && !stage6TenantInvitationDecisionOnly && !sharedAvatarsOnly && !mobileRefreshOnly
     && process.env.STAGE10_SKIP_ALEXA !== '1'
     && (stage12AlexaOnly || (process.env.STAGE6_TRANSFER_ONLY !== '1' && process.env.STAGE6_TENANT_REMOVAL_ONLY !== '1'))) {
     await nativeAlexaOAuthChecks(deliveryEnv);
   }
   if (roomPlaquesOnly) {
     console.log('[room-plaques:integration] Focused mode completed real authentication and plaque HTTP/database acceptance. Other harness scenarios were not run in this mode.');
+  } else if (mobileRefreshOnly) {
+    await mobileSessionContractChecks();
   } else if (stage6TenantInvitationDecisionOnly || sharedAvatarsOnly) {
     await pendingInvitationRouteChecks(deliveryEnv);
   } else if (stage5SyncRecoveryOnly) {

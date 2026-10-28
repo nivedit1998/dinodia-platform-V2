@@ -75,6 +75,15 @@ export async function buildMobileSessionReceipt(input: {
   };
 }
 
+/**
+ * A rotated refresh token may be presented once more for a short window, and only while the session
+ * it produced is still the active head of its family. This recovers a reply that was lost on a slow
+ * connection (the server committed the rotation, the phone never saw the new credential) without
+ * signing the person out. Any later or second presentation is still treated as reuse.
+ */
+export const MOBILE_REFRESH_RETRY_LEEWAY_MS = 2 * 60 * 1000;
+export const MOBILE_REFRESH_RETRY_REVOKE_REASON = 'refresh_token_rotated_retry';
+
 export async function rotateMobileRefreshToken(rawRefreshToken: string) {
   const tokenHash = sha256(rawRefreshToken);
   const result = await prisma.$transaction(async (tx) => {
@@ -85,24 +94,40 @@ export async function rotateMobileRefreshToken(rawRefreshToken: string) {
     } });
     const now = new Date();
     if (!prior) return { error: 'invalid' as const };
+    const revokeFamilyAsReused = async () => {
+      await tx.customerSession.updateMany({ where: { sessionFamilyId: prior.sessionFamilyId, revokedAt: null }, data: { revokedAt: now, revokeReason: 'refresh_token_reuse', accessTokenHash: null, accessTokenExpiresAt: null } });
+      return { error: 'reused' as const };
+    };
+    // The still-active session this token's rotation produced, when a single retry is permitted.
+    let retryHead: { id: string } | null = null;
     if (prior.revokedAt) {
-      if (prior.revokeReason === 'refresh_token_rotated') {
-        await tx.customerSession.updateMany({ where: { sessionFamilyId: prior.sessionFamilyId, revokedAt: null }, data: { revokedAt: now, revokeReason: 'refresh_token_reuse', accessTokenHash: null, accessTokenExpiresAt: null } });
-        return { error: 'reused' as const };
+      if (prior.revokeReason !== 'refresh_token_rotated' && prior.revokeReason !== MOBILE_REFRESH_RETRY_REVOKE_REASON) return { error: 'invalid' as const };
+      if (prior.revokeReason === 'refresh_token_rotated' && now.getTime() - prior.revokedAt.getTime() <= MOBILE_REFRESH_RETRY_LEEWAY_MS) {
+        // The successor was created in the same transaction as the rotation, so it shares the exact timestamp.
+        retryHead = await tx.customerSession.findFirst({ where: {
+          sessionFamilyId: prior.sessionFamilyId, revokedAt: null, issuedAt: prior.revokedAt, refreshTokenHash: { not: tokenHash },
+        }, select: { id: true } });
+        if (retryHead) await tx.$queryRaw`SELECT "id" FROM "CustomerSession" WHERE "id" = ${retryHead.id}::uuid FOR UPDATE`;
       }
-      return { error: 'invalid' as const };
+      if (!retryHead) return revokeFamilyAsReused();
     }
     if (prior.expiresAt <= now || prior.absoluteExpiresAt <= now) return { error: 'expired' as const };
     const [account, device] = await Promise.all([
       tx.customerAccount.findUnique({ where: { id: prior.customerAccountId }, select: { id: true, status: true, securityVersion: true, mustChangePassword: true } }),
       tx.trustedDevice.findUnique({ where: { id: prior.trustedDeviceId }, select: { id: true, customerAccountId: true, revokedAt: true, sessionVersion: true } }),
     ]);
-    if (!account || account.status !== 'ACTIVE' || account.securityVersion !== prior.securityVersion || !device || device.customerAccountId !== account.id || device.revokedAt || device.sessionVersion !== prior.trustedDeviceSessionVersion) return { error: 'invalid' as const };
+    if (!account || account.status !== 'ACTIVE' || account.securityVersion !== prior.securityVersion || !device || device.customerAccountId !== account.id || device.revokedAt || device.sessionVersion !== prior.trustedDeviceSessionVersion) {
+      // A password/security change or revoked phone ends the family; a retry must not outlive that.
+      return retryHead ? revokeFamilyAsReused() : { error: 'invalid' as const };
+    }
     const refreshToken = newMobileRefreshToken();
     const accessToken = newMobileAccessToken();
     const expiresAt = new Date(Math.min(now.getTime() + MOBILE_IDLE_LIFETIME_MS, prior.absoluteExpiresAt.getTime()));
     const accessTokenExpiresAt = new Date(Math.min(now.getTime() + MOBILE_ACCESS_LIFETIME_MS, expiresAt.getTime()));
-    await tx.customerSession.update({ where: { id: prior.id }, data: { revokedAt: now, revokeReason: 'refresh_token_rotated', lastUsedAt: now, accessTokenHash: null, accessTokenExpiresAt: null } });
+    // Normal rotation retires the presented session. A permitted retry retires the unseen successor instead.
+    await tx.customerSession.update({ where: { id: retryHead ? retryHead.id : prior.id }, data: {
+      revokedAt: now, revokeReason: retryHead ? MOBILE_REFRESH_RETRY_REVOKE_REASON : 'refresh_token_rotated', lastUsedAt: now, accessTokenHash: null, accessTokenExpiresAt: null,
+    } });
     const next = await tx.customerSession.create({ data: {
       customerAccountId: account.id, trustedDeviceId: device.id, sessionFamilyId: prior.sessionFamilyId,
       refreshTokenHash: sha256(refreshToken), accessTokenHash: sha256(accessToken), accessTokenExpiresAt,
