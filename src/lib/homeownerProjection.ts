@@ -1,35 +1,10 @@
 import type { Prisma } from '@prisma/client';
 import { currentNativeDisplayName } from './nativeDisplayNames';
 import { nativeDisplayGroups } from './nativeDisplayGroups';
+import { completeFloorplan } from './homeFloorplan';
 import { currentCloudflareTunnelStatus } from './hubSyncTelemetry';
 
 const HEARTBEAT_ONLINE_SECONDS = 420;
-function defaultFloorplan(areaIds: string[]) {
-  const columns = 6;
-  const rows = Math.max(1, Math.ceil(areaIds.length / columns));
-  const cellHeight = Math.max(1, Math.floor(64 / rows));
-  return areaIds.map((areaId, index) => ({ areaId, x: (index % columns) * 8, y: Math.floor(index / columns) * cellHeight, width: 8, height: cellHeight }));
-}
-
-function completeFloorplan(areaIds: string[], document: unknown) {
-  const root = document && typeof document === 'object' && !Array.isArray(document) ? document as { version?: unknown; areas?: unknown } : null;
-  if (root?.version !== 1 || !Array.isArray(root.areas) || root.areas.length !== areaIds.length) return defaultFloorplan(areaIds);
-  const current = new Set(areaIds);
-  const areas: Array<{ areaId: string; x: number; y: number; width: number; height: number }> = [];
-  for (const item of root.areas) {
-    if (!item || typeof item !== 'object' || Array.isArray(item)) return defaultFloorplan(areaIds);
-    const row = item as Record<string, unknown>;
-    if (typeof row.areaId !== 'string' || !current.has(row.areaId) || ![row.x, row.y, row.width, row.height].every(Number.isInteger)
-      || Number(row.x) < 0 || Number(row.y) < 0 || Number(row.width) < 1 || Number(row.height) < 1
-      || Number(row.x) + Number(row.width) > 48 || Number(row.y) + Number(row.height) > 64
-      || areas.some((other) => Number(row.x) < other.x + other.width && other.x < Number(row.x) + Number(row.width)
-        && Number(row.y) < other.y + other.height && other.y < Number(row.y) + Number(row.height))) return defaultFloorplan(areaIds);
-    areas.push({ areaId: row.areaId, x: Number(row.x), y: Number(row.y), width: Number(row.width), height: Number(row.height) });
-  }
-  if (new Set(areas.map((area) => area.areaId)).size !== current.size) return defaultFloorplan(areaIds);
-  return areas;
-}
-
 export class HomeownerProjectionError extends Error {
   constructor(readonly code: 'MEMBERSHIP_FORBIDDEN' | 'HOME_UNAVAILABLE') { super(code); }
 }

@@ -234,7 +234,7 @@ export default function HomeSupportPage() {
         <p className="mt-2 text-sm">Home: {exceptionalPreview.home?.retainedAddress || "Address unavailable"}</p>
         <p className="text-sm">Current owner: {exceptionalPreview.currentOwner ? `${exceptionalPreview.currentOwner.displayName} · ${exceptionalPreview.currentOwner.email}` : "Unavailable"}</p>
         <p className="mt-2 text-sm">Areas preserved: {exceptionalPreview.preserved.canonicalAreas} · Permanent devices preserved: {exceptionalPreview.preserved.permanentDevices} · Active tenants retained: {exceptionalPreview.preserved.activeTenantMemberships} · In-progress installation work preserved: {exceptionalPreview.preserved.inProgressInstallationWork}</p>
-        <p className="mt-2 text-sm">Private tenant devices removed on completion: {exceptionalPreview.home?.privateDevicesRemoved ?? 0} · Floorplan available for clean successor generation: {exceptionalPreview.home?.floorplanRegeneratedForSuccessor ? "Yes" : "No"}</p>
+        <p className="mt-2 text-sm">Private tenant devices removed on completion: {exceptionalPreview.home?.privateDevicesRemoved ?? 0} · Floorplan kept for the successor: {exceptionalPreview.home?.floorplanRegeneratedForSuccessor ? "Yes" : "No"}</p>
         <h4 className="mt-4 font-semibold">Managers and outgoing notification recipients</h4>
         {exceptionalPreview.removedManagers.length ? <ul className="list-disc pl-5 text-sm">{exceptionalPreview.removedManagers.map((manager) => <li key={manager.membershipId}>{manager.displayName} · {manager.email}</li>)}</ul> : <p className="text-sm">No active managers.</p>}
         <h4 className="mt-4 font-semibold">Account cleanup preview</h4>

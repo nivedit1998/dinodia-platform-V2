@@ -3,6 +3,7 @@ import type { Prisma } from '@prisma/client';
 import { prisma } from './prisma';
 import { Stage1AuthError, type CustomerAccountSessionPrincipal } from './stage1Auth';
 import { consumeSignedClaimResolverProof } from './stage1ClaimResolver';
+import { starterFloorplan } from './homeFloorplan';
 import { serializableTransaction } from './serializableTransaction';
 
 const RESERVATION_MS = 30 * 60 * 1000;
@@ -383,9 +384,9 @@ export async function completeClaimSetup(reservationId: string, customerAccountI
         throw new Stage1AuthError(409, 'claim_installation_incomplete', 'The completed installation is not yet eligible for owner activation');
       }
       await tx.homeMembership.create({ data: { homeId: reference.homeId, customerAccountId, role: 'OWNER', status: 'ACTIVE' } });
-      const columns = Math.ceil(Math.sqrt(areas.length)); const rows = Math.ceil(areas.length / columns);
+      // A Home that already has a plan keeps it (update is empty); only a Home with none gets a starter layout.
       await tx.homeDocument.upsert({ where: { homeId_kind: { homeId: reference.homeId, kind: 'FLOORPLAN' } },
-        create: { homeId: reference.homeId, kind: 'FLOORPLAN', document: { version: 1, areas: areas.map((area, index) => ({ areaId: area.id, x: (index % columns) * 100 / columns, y: Math.floor(index / columns) * 100 / rows, width: 100 / columns, height: 100 / rows })) }, createdByAccountId: customerAccountId }, update: {} });
+        create: { homeId: reference.homeId, kind: 'FLOORPLAN', document: { version: 1, areas: starterFloorplan(areas.map((area) => area.id)) }, createdByAccountId: customerAccountId }, update: {} });
       await tx.homeClaimReservation.update({ where: { id: reservation.id }, data: { state: 'CONVERTED_TO_PENDING_INSTALLATION', updatedAt: now } });
       // requiredStep is non-null in the durable row. The customer projection
       // deliberately maps an ACTIVATED setup to no next step.
@@ -426,11 +427,9 @@ export async function activatePendingInitialClaim(reservationId: string, custome
     if (pending.state !== 'PENDING_INSTALLATION' || !completeAddress(home) || pending.retainedAddressRevision !== home.managementRevision || pending.retainedAddressDigest !== addressDigest(home) || pending.retainedAddressConfirmedByAccountId !== customerAccountId) throw new Stage1AuthError(409, 'claim_address_confirmation_required', 'Confirm the current registered address before activation');
     if (await tx.homeMembership.count({ where: { homeId: claim.homeId, status: 'ACTIVE', role: 'OWNER' } })) throw new Stage1AuthError(409, 'claim_owner_exists', 'This property already has an owner');
     await tx.homeMembership.create({ data: { homeId: claim.homeId, customerAccountId, role: 'OWNER', status: 'ACTIVE' } });
-    const columns = Math.ceil(Math.sqrt(areas.length));
-    const rows = Math.ceil(areas.length / columns);
-    const width = 100 / columns;
-    const height = 100 / rows;
-    await tx.homeDocument.upsert({ where: { homeId_kind: { homeId: claim.homeId, kind: 'FLOORPLAN' } }, create: { homeId: claim.homeId, kind: 'FLOORPLAN', document: { version: 1, areas: areas.map((area, index) => ({ areaId: area.id, x: (index % columns) * width, y: Math.floor(index / columns) * height, width, height })) }, createdByAccountId: customerAccountId }, update: {} });
+    // A Home that already has a plan keeps it (update is empty); only a Home with none gets a starter layout.
+    await tx.homeDocument.upsert({ where: { homeId_kind: { homeId: claim.homeId, kind: 'FLOORPLAN' } },
+      create: { homeId: claim.homeId, kind: 'FLOORPLAN', document: { version: 1, areas: starterFloorplan(areas.map((area) => area.id)) }, createdByAccountId: customerAccountId }, update: {} });
     await tx.homeClaimReference.update({ where: { id: claim.id }, data: { state: 'CONSUMED', consumedAt: now } });
     await tx.pendingHomeSetup.update({ where: { reservationId }, data: { state: 'ACTIVATED' } });
     await tx.home.update({ where: { id: claim.homeId }, data: { lifecycle: 'ACTIVE', addressStatus: 'VERIFIED' } });

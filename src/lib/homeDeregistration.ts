@@ -248,7 +248,9 @@ export async function deregisterFullHome(input: {
     await tx.nativeDeviceOutageIncident.updateMany({ where: { homeId, causedByHubIncidentId: { not: null } }, data: { causedByHubIncidentId: null } });
     await tx.nativeDeviceOutageIncident.deleteMany({ where: { homeId } });
     await tx.nativeNotificationDeliveryReceipt.deleteMany({ where: { homeId } });
-    await tx.homeDocument.deleteMany({ where: { homeId } });
+    // The floor plan is the property's layout, not the owner's data: it stays for whoever registers the Home next.
+    // Room and device names (overrides) and every other document are still cleared.
+    await tx.homeDocument.deleteMany({ where: { homeId, kind: { not: 'FLOORPLAN' } } });
     await tx.area.updateMany({ where: { homeId }, data: { overrideName: null, revision: { increment: 1 } } });
     await tx.nativeDevice.updateMany({ where: { homeId, managementClass: 'PROPERTY_DEVICE' }, data: { overrideName: null, inventoryRevision: { increment: 1 } } });
 

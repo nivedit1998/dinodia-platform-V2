@@ -6594,7 +6594,7 @@ async function fullHomeDeregistrationChecks(deliveryEnv) {
     || closedTickets < 1
     || (fullHomeDeregistrationAudit?.metadata && fullHomeDeregistrationAudit.metadata.purgedExceptionalTransferCaseCount !== exceptionalTransferCasesBeforeDeregistration)
     || !permanentAfter || permanentAfter.managementClass !== 'PROPERTY_DEVICE' || permanentAfter.overrideName !== null
-    || privateAfter !== null || floorplanAfter !== null || areaAfter.overrideName !== null || areaAfter.status !== 'ACTIVE'
+    || privateAfter !== null || floorplanAfter === null || areaAfter.overrideName !== null || areaAfter.status !== 'ACTIVE'
     || otherHomeMembership.status !== 'ACTIVE' || otherHomeMembership.role !== 'PROPERTY_MANAGER'
     || ownerOtherHomeContext.response.status !== 200 || inaccessibleDeregisteredHome.response.status !== 404
     || inProgressAfter.length !== inProgressBefore.length || inProgressAfter.some((item, index) => item.id !== inProgressBefore[index]?.id || item.state !== 'IN_PROGRESS')) {
@@ -6603,7 +6603,7 @@ async function fullHomeDeregistrationChecks(deliveryEnv) {
       state: committed.body?.state, lifecycle: homeAfter.lifecycle, hubCleanup: hubAfter.cleanupState, owner: ownerAfter.status,
       manager: managerAfter.status, tenant: tenantAfter?.status ?? 'account-cleanup-removed-row', redactedSupportTickets: closedTickets,
       permanentPreserved: Boolean(permanentAfter), privateRemoved: privateAfter === null,
-      floorplanCleared: floorplanAfter === null, otherHome: `${otherHomeMembership.status}/${otherHomeMembership.role}`, otherHomeRead: ownerOtherHomeContext.response.status,
+      floorplanKept: floorplanAfter !== null, otherHome: `${otherHomeMembership.status}/${otherHomeMembership.role}`, otherHomeRead: ownerOtherHomeContext.response.status,
       otherHomeError: ownerOtherHomeContext.body?.error?.code, blockedOriginalHomeRead: inaccessibleDeregisteredHome.response.status,
       inProgressPreserved: inProgressAfter.length === inProgressBefore.length })})`);
   }

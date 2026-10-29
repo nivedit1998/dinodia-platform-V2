@@ -6,6 +6,7 @@ import { Stage1AuthError } from '@/lib/stage1Auth';
 import { serializableTransaction } from '@/lib/serializableTransaction';
 import { compareAndSetHomeDocument, NativeHomeDocumentError } from '@/lib/nativeHomeDocuments';
 import { sha256 } from '@/lib/stage1Crypto';
+import { completeFloorplan } from '@/lib/homeFloorplan';
 import type { Prisma } from '@prisma/client';
 
 export const dynamic = 'force-dynamic';
@@ -37,14 +38,6 @@ function validateDocument(value: unknown): value is { version: 1; areas: Array<{
   return true;
 }
 
-function defaultDocument(areaIds: string[]) {
-  const columns = 6;
-  const rows = Math.max(1, Math.ceil(areaIds.length / columns));
-  const cellHeight = Math.max(1, Math.floor(64 / rows));
-  return { version: 1 as const, areas: areaIds.map((areaId, index) => ({ areaId,
-    x: (index % columns) * 8, y: Math.floor(index / columns) * cellHeight, width: 8, height: cellHeight })) };
-}
-
 function canonical(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(canonical).join(',')}]`;
   if (value && typeof value === 'object') return `{${Object.entries(value as Record<string, unknown>).sort(([a], [b]) => a.localeCompare(b)).map(([k, v]) => `${JSON.stringify(k)}:${canonical(v)}`).join(',')}}`;
@@ -69,16 +62,8 @@ export async function GET(request: Request, context: { params: Promise<{ homeId:
       prisma.homeDocument.findUnique({ where: { homeId_kind: { homeId, kind: 'FLOORPLAN' } }, select: { revision: true, document: true } }),
       prisma.area.findMany({ where: { homeId, status: 'ACTIVE' }, orderBy: [{ createdAt: 'asc' }, { id: 'asc' }], take: 64, select: { id: true } }),
     ]);
-    const active = new Set(activeRows.map((area) => area.id));
-    const raw = row?.document && typeof row.document === 'object' && !Array.isArray(row.document) ? row.document as { version?: unknown; areas?: unknown } : null;
-    const storedDocument = raw?.version === 1 && Array.isArray(raw.areas)
-      ? { version: 1, areas: raw.areas.filter((item) => Boolean(item && typeof item === 'object' && !Array.isArray(item) && typeof (item as Record<string, unknown>).areaId === 'string' && active.has((item as Record<string, unknown>).areaId as string))) }
-      : null;
-    const storedIds = new Set(storedDocument?.areas.flatMap((item) => item && typeof item === 'object' && typeof (item as Record<string, unknown>).areaId === 'string'
-      ? [(item as Record<string, unknown>).areaId as string] : []) ?? []);
-    const isComplete = storedDocument !== null && storedIds.size === active.size
-      && [...active].every((id) => storedIds.has(id)) && validateDocument(storedDocument);
-    const document = isComplete ? storedDocument : defaultDocument(activeRows.map((area) => area.id));
+    // The saved plan is kept: rooms added since are placed beside it, rooms removed are dropped.
+    const document = { version: 1, areas: completeFloorplan(activeRows.map((area) => area.id), row?.document) };
     return NextResponse.json({ schemaVersion: 'dinodia.v1', ok: true, homeId, revision: row?.revision ?? 0, document }, { headers: { 'Cache-Control': 'no-store', Pragma: 'no-cache' } });
   } catch (error) { return nativeV1ErrorResponse(error); }
 }
