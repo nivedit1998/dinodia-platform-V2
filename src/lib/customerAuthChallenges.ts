@@ -10,7 +10,10 @@ export async function issueCustomerAuthChallenge(input: {
   purpose: CustomerAuthChallengePurpose;
 }): Promise<{ id: string; expiresAt: Date; deliveryStatus: 'PENDING' | 'ACCEPTED' | 'FAILED' }> {
   const now = new Date();
-  const expiresAt = new Date(now.getTime() + 10 * 60 * 1000);
+  // A new person's verification email often waits in a spam folder, so it stays valid for a day; password-reset and
+  // email-change links remain short-lived.
+  const lifetimeMs = input.purpose === 'CUSTOMER_EMAIL_VERIFY' ? 24 * 60 * 60 * 1000 : 10 * 60 * 1000;
+  const expiresAt = new Date(now.getTime() + lifetimeMs);
   const secret = randomSecret(32);
   const challenge = await prisma.$transaction(async (tx) => {
     await tx.authChallenge.updateMany({

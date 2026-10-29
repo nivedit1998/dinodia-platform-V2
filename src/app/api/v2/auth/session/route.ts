@@ -165,9 +165,14 @@ export async function POST(request: Request) {
       const invitedAccountId = await consumeInvitedTenantCredentialForLogin({ email, password });
       if (invitedAccountId) account = await prisma.customerAccount.findUnique({ where: { id: invitedAccountId }, select: { id: true, status: true, emailVerifiedAt: true, passwordHash: true, securityVersion: true } });
     }
-    if (!account || account.status !== 'ACTIVE' || !account.emailVerifiedAt || !(await verifyPassword(password, account.passwordHash))) {
+    if (!account || account.status !== 'ACTIVE' || !(await verifyPassword(password, account.passwordHash))) {
       await recordFailedAuthentication('customer_login_failed', email);
       throw new Stage1AuthError(401, 'customer_credentials_invalid', 'The customer credentials are invalid');
+    }
+    // Only someone who knows the password is told the email is unverified, so this reveals nothing to a stranger
+    // and a new person is not left thinking they typed it wrong.
+    if (!account.emailVerifiedAt) {
+      throw new Stage1AuthError(403, 'EMAIL_VERIFICATION_REQUIRED', 'Verify your email address before signing in');
     }
     const thumbprint = crypto.createHash('sha256').update(crypto.createPublicKey(publicKey).export({ type: 'spki', format: 'der' })).digest('hex');
     const rawSession = `dno-customer-session-${randomSecret(32)}`;

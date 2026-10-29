@@ -10301,6 +10301,58 @@ async function browserSessionRefreshChecks({ base, loginPayload, accountId }) {
   await assertExpiredWithoutEffects({ label: 'browser refresh queued across absolute expiry', path: '/api/v2/session', absolute: true, locked: true });
 }
 
+/**
+ * A brand-new person who has no Home yet: register, try to sign in before verifying, verify, sign in, and make
+ * every request the phone makes next. None of it may fail, and the unverified attempt must say so (only to someone
+ * who knows the password) instead of looking like a wrong password.
+ */
+async function newAccountOnboardingChecks(deliveryEnv) {
+  const base = `http://127.0.0.1:${appPort}`;
+  sesShouldFail = false;
+  capturedCustomerVerification = null;
+  const email = `new-account-${crypto.randomUUID()}@invalid.test`;
+  const username = `new-account-${crypto.randomUUID().slice(0, 12)}`;
+  const password = `new-account-password-${crypto.randomUUID()}`;
+  const registration = await fetchJson(`${base}/api/v2/auth/register`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ displayName: 'Emily Rose Petrie', username, email, password }) });
+  if (registration.response.status !== 202 || !capturedCustomerVerification) fail('New-account registration did not issue a verification email');
+  const phone = keyPair();
+  const login = (pw) => fetchJson(`${base}/api/v2/mobile/session`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({
+    email, password: pw, deviceInstallationId: `new-account-phone-${email}`.slice(0, 120), publicKey: phone.publicKey,
+    deviceName: 'Disposable new-account phone', model: 'integration-test', osFamily: 'test', osVersion: 'test' }) });
+  const unverifiedRight = await login(password);
+  const unverifiedWrong = await login(`${password}-wrong`);
+  if (unverifiedRight.response.status !== 403 || unverifiedRight.body?.error?.code !== 'EMAIL_VERIFICATION_REQUIRED'
+    || unverifiedWrong.response.status !== 401 || unverifiedWrong.body?.error?.code !== 'AUTH_REQUIRED') {
+    fail(`Unverified sign-in must say the email is unverified only with the right password (${JSON.stringify({ right: [unverifiedRight.response.status, unverifiedRight.body?.error?.code], wrong: [unverifiedWrong.response.status, unverifiedWrong.body?.error?.code] })})`);
+  }
+  const verified = await fetchJson(`${base}/api/v2/auth/email/verify`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(capturedCustomerVerification) });
+  if (verified.response.status !== 200) fail('New-account email verification failed');
+  const signedIn = await login(password);
+  const receipt = signedIn.body;
+  if (signedIn.response.status !== 200 || !receipt?.accessToken || !Array.isArray(receipt.memberships) || receipt.memberships.length !== 0 || receipt.nextAction !== 'ACCEPT_POLICY') {
+    fail(`New-account sign-in did not return an empty, policy-gated mobile session (${signedIn.response.status} ${JSON.stringify(signedIn.body).slice(0, 300)})`);
+  }
+  const bearer = { authorization: `Bearer ${receipt.accessToken}` };
+  const requirements = await fetchJson(`${base}/api/v2/auth/requirements`, { headers: bearer });
+  if (requirements.response.status !== 200 || requirements.body.nextAction !== 'ACCEPT_POLICY' || !requirements.body.policy) fail(`New-account requirements failed (${requirements.response.status} ${JSON.stringify(requirements.body).slice(0, 300)})`);
+  const policyAccepted = await fetchJson(`${base}/api/v2/auth/policy/acceptance`, { method: 'POST', headers: { ...bearer, 'content-type': 'application/json' },
+    body: JSON.stringify({ version: requirements.body.policy.version, contentSha256: requirements.body.policy.contentSha256, accepted: true }) });
+  if (policyAccepted.response.status !== 200) fail(`New-account policy acceptance failed (${policyAccepted.response.status} ${JSON.stringify(policyAccepted.body).slice(0, 300)})`);
+  const refreshed = await fetchJson(`${base}/api/v2/mobile/session`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ refreshToken: receipt.refreshToken }) });
+  if (refreshed.response.status !== 200 || refreshed.body.memberships.length !== 0 || refreshed.body.nextAction !== 'PENDING_RELATIONSHIPS') fail(`New-account session refresh failed (${refreshed.response.status} ${JSON.stringify(refreshed.body).slice(0, 300)})`);
+  const pending = await fetchJson(`${base}/api/v2/me/pending-relationships`, { headers: { authorization: `Bearer ${refreshed.body.accessToken}` } });
+  if (pending.response.status !== 200 || !Array.isArray(pending.body.pendingRelationships) || pending.body.pendingRelationships.length !== 0) fail(`New-account pending relationships failed (${pending.response.status} ${JSON.stringify(pending.body).slice(0, 300)})`);
+  const policyNow = Date.now();
+  if (process.env.NEW_ACCOUNT_DUMP_DIR) {
+    const redact = (value) => JSON.parse(JSON.stringify(value).replace(/dno-customer-(access|session)-[A-Za-z0-9_-]+/g, 'dno-customer-$1-REDACTED0000000000000000000000000'));
+    await fs.promises.mkdir(process.env.NEW_ACCOUNT_DUMP_DIR, { recursive: true });
+    for (const [name, value] of Object.entries({ signIn: signedIn.body, requirements: requirements.body, refreshed: refreshed.body, pending: pending.body })) {
+      await fs.promises.writeFile(path.join(process.env.NEW_ACCOUNT_DUMP_DIR, `${name}.json`), JSON.stringify(redact(value), null, 2));
+    }
+  }
+  console.log(`[onboarding:integration] PASS: a new account with no Home registers, is told its email is unverified (right password only), verifies, signs in, accepts the terms and loads an empty Home list (asOf skew ${Date.parse(pending.body.asOf) - policyNow}ms); sample ${JSON.stringify({ user: refreshed.body.user, nextAction: refreshed.body.nextAction })}`);
+}
+
 async function customerAuthenticationLifecycleChecks(deliveryEnv) {
   const base = `http://127.0.0.1:${appPort}`;
   sesShouldFail = false;
@@ -10323,7 +10375,7 @@ async function customerAuthenticationLifecycleChecks(deliveryEnv) {
   const installId = `customer-auth-install-${crypto.randomUUID()}`;
   const loginPayload = { email, password, deviceInstallationId: installId, publicKey: loginPhone.publicKey, deviceName: 'Disposable customer phone', model: 'integration-test', osFamily: 'test', osVersion: 'test' };
   const unverifiedLogin = await fetchJson(`${base}/api/v2/session`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(loginPayload) });
-  if (unverifiedLogin.response.status !== 401 || await prisma.customerSession.count({ where: { customerAccountId: account.id } })) fail('Unverified registration received an authenticated customer session');
+  if (unverifiedLogin.response.status !== 403 || unverifiedLogin.body?.error?.code !== 'EMAIL_VERIFICATION_REQUIRED' || await prisma.customerSession.count({ where: { customerAccountId: account.id } })) fail('Unverified registration received an authenticated customer session');
   const verified = await fetchJson(`${base}/api/v2/auth/email/verify`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(capturedCustomerVerification) });
   const verifiedAccount = await prisma.customerAccount.findUniqueOrThrow({ where: { id: account.id }, select: { emailVerifiedAt: true } });
   const verifiedPoll = await fetchJson(`${base}/api/v2/auth/challenges/${registration.body.challengeId}`);
@@ -12827,13 +12879,16 @@ try {
   const stage6TenantInvitationDecisionOnly = process.env.STAGE6_TENANT_INVITATION_DECISION_ONLY === '1';
   const sharedAvatarsOnly = process.env.SHARED_AVATARS_ONLY === '1';
   const mobileRefreshOnly = process.env.MOBILE_REFRESH_ONLY === '1';
-  if (!roomPlaquesOnly && !stage5SyncRecoveryOnly && !stage9RemovalEncryptionOnly && !stage6InvitationLockOnly && !stage6TenantInvitationDecisionOnly && !sharedAvatarsOnly && !mobileRefreshOnly
+  const newAccountOnly = process.env.NEW_ACCOUNT_ONBOARDING_ONLY === '1';
+  if (!roomPlaquesOnly && !stage5SyncRecoveryOnly && !stage9RemovalEncryptionOnly && !stage6InvitationLockOnly && !stage6TenantInvitationDecisionOnly && !sharedAvatarsOnly && !mobileRefreshOnly && !newAccountOnly
     && process.env.STAGE10_SKIP_ALEXA !== '1'
     && (stage12AlexaOnly || (process.env.STAGE6_TRANSFER_ONLY !== '1' && process.env.STAGE6_TENANT_REMOVAL_ONLY !== '1'))) {
     await nativeAlexaOAuthChecks(deliveryEnv);
   }
   if (roomPlaquesOnly) {
     console.log('[room-plaques:integration] Focused mode completed real authentication and plaque HTTP/database acceptance. Other harness scenarios were not run in this mode.');
+  } else if (newAccountOnly) {
+    await newAccountOnboardingChecks(deliveryEnv);
   } else if (mobileRefreshOnly) {
     await mobileSessionContractChecks();
   } else if (stage6TenantInvitationDecisionOnly || sharedAvatarsOnly) {
