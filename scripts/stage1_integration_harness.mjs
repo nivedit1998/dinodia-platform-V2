@@ -3878,7 +3878,7 @@ async function customerAuthorizationChecks(deliveryEnv) {
 }
 
 // D21: other tenants who share a granted Area are always shown; nothing else about anyone is disclosed.
-async function sharedAreaAvatarChecks({ base, inviter, viewerMembershipId, viewerAccountId, viewerHeaders, foreignMembership, foreignAccount, sharedAreaId, privateAreaId, otherHomeId, ownerHeaders }) {
+async function sharedAreaAvatarChecks({ base, inviter, viewerMembershipId, viewerAccountId, viewerHeaders, foreignMembership, foreignAccount, sharedAreaId, privateAreaId, otherHomeId, ownerHeaders, homeownerHeaders }) {
   const homeId = inviter.homeId;
   const read = () => fetchJson(`${base}/api/v2/homes/${homeId}/tenant-device-context`, { headers: viewerHeaders });
   const membersOf = (body, areaId) => (body?.areaMembers ?? []).find((row) => row.areaId === areaId)?.members ?? [];
@@ -3954,6 +3954,15 @@ async function sharedAreaAvatarChecks({ base, inviter, viewerMembershipId, viewe
     const anonymous = await fetchJson(`${base}/api/v2/homes/${homeId}/tenant-device-context`, { headers: { 'x-dinodia-home-id': homeId } });
     const ownerRead = await fetchJson(`${base}/api/v2/homes/${homeId}/tenant-device-context`, { headers: ownerHeaders });
     if (anonymous.response.status !== 401 || ownerRead.response.status === 200 && ownerRead.body?.areaMembers) fail('Co-tenant visibility reached an anonymous caller or a non-tenant principal');
+    // The homeowner's own Home data carries each member's avatar (icon and colour keys only) beside their room grants, so the Home plan can show who holds each room.
+    const ownerProjection = await fetchJson(`${base}/api/v2/homes/${homeId}/homeowner-context`, { headers: homeownerHeaders });
+    const projectedMembers = ownerProjection.body?.members ?? [];
+    const projectedSam = projectedMembers.find((member) => member.membershipId === foreignMembership.id);
+    if (ownerProjection.response.status !== 200 || projectedSam?.avatar?.icon !== 'tortoise' || projectedSam?.avatar?.colour !== 'mint'
+      || !projectedSam.areaGrants?.some((grant) => grant.areaId === sharedAreaId) || Object.keys(projectedSam.avatar).sort().join() !== 'colour,icon'
+      || projectedMembers.some((member) => !member.avatar || typeof member.avatar.colour !== 'string' || !(member.avatar.icon === null || typeof member.avatar.icon === 'string'))) {
+      fail(`The homeowner Home data did not carry each member's avatar (${JSON.stringify({ status: ownerProjection.response.status, members: projectedMembers.length })})`);
+    }
 
     // The avatar API: authenticated, allow-listed, idempotent, cosmetic (the profile revision must not move).
     const url = `${base}/api/v2/me/avatar`;
@@ -8781,7 +8790,8 @@ async function pendingInvitationRouteChecks(deliveryEnv) {
   const anonymousDashboardContext = await fetchJson(`${base}/api/v2/homes/${inviter.homeId}/tenant-device-context`, { headers: { 'x-dinodia-home-id': inviter.homeId } });
   await sharedAreaAvatarChecks({ base, inviter, viewerMembershipId: newTenantMembershipAfterAccept.id, viewerAccountId: newTenantAccount.id,
     viewerHeaders: tenantDashboardHeaders, foreignMembership, foreignAccount, sharedAreaId: bedroomAreas[0].id, privateAreaId: bedroomAreas[2].id,
-    otherHomeId: customerFixture.homeOneId, ownerHeaders: { cookie: `dinodia_customer_session=${encodeURIComponent(customerFixture.customerSessionSecret)}`, 'x-dinodia-home-id': inviter.homeId } });
+    otherHomeId: customerFixture.homeOneId, ownerHeaders: { cookie: `dinodia_customer_session=${encodeURIComponent(customerFixture.customerSessionSecret)}`, 'x-dinodia-home-id': inviter.homeId },
+    homeownerHeaders: selectedHomeHeaders });
   if (process.env.SHARED_AVATARS_ONLY === '1') return;
   const dashboardLayout = { version: 1, tiles: [{ deviceId: dashboardDevices[0].id, size: 'STANDARD', position: 0, label: 'My light' }], labelColours: { Lights: '#f2c94c' } };
   const layoutWrite = await fetchJson(`${base}/api/v2/homes/${inviter.homeId}/preferences`, { method: 'PUT', headers: { ...tenantDashboardHeaders, 'content-type': 'application/json' }, body: JSON.stringify({ kind: 'DASHBOARD_LAYOUT', expectedRevision: 0, document: dashboardLayout }) });

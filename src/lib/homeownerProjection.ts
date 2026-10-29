@@ -2,6 +2,7 @@ import type { Prisma } from '@prisma/client';
 import { currentNativeDisplayName } from './nativeDisplayNames';
 import { nativeDisplayGroups } from './nativeDisplayGroups';
 import { completeFloorplan } from './homeFloorplan';
+import { publicAvatar } from './avatarCatalogue';
 import { currentCloudflareTunnelStatus } from './hubSyncTelemetry';
 
 const HEARTBEAT_ONLINE_SECONDS = 420;
@@ -66,7 +67,7 @@ export async function readHomeownerProjection(db: Prisma.TransactionClient, inpu
       where: { homeId: home.id, status: 'ACTIVE', role: { in: ['TENANT', 'PROPERTY_MANAGER'] }, customerAccount: { status: 'ACTIVE' } },
       select: {
         id: true, role: true, accessRevision: true, activatedAt: true,
-        customerAccount: { select: { id: true, displayName: true, username: true, email: true, emailVerifiedAt: true } },
+        customerAccount: { select: { id: true, displayName: true, username: true, email: true, emailVerifiedAt: true, avatarIcon: true, avatarColour: true } },
         tenantAreaGrants: { where: { revokedAt: null, area: { status: 'ACTIVE' } }, select: { areaId: true, policyRevision: true, area: { select: { originalName: true, overrideName: true } } }, orderBy: { areaId: 'asc' } },
       },
       orderBy: [{ role: 'asc' }, { activatedAt: 'asc' }, { id: 'asc' }], take: 250,
@@ -153,6 +154,7 @@ export async function readHomeownerProjection(db: Prisma.TransactionClient, inpu
         username: row.customerAccount.username, email: row.customerAccount.email,
         emailVerified: row.customerAccount.emailVerifiedAt !== null,
       },
+      avatar: publicAvatar(row.customerAccount),
       areaGrants: row.tenantAreaGrants.map((grant) => ({ areaId: grant.areaId, policyRevision: grant.policyRevision,
         originalName: grant.area.originalName, overrideName: grant.area.overrideName,
         displayName: currentNativeDisplayName(grant.area.originalName, grant.area.overrideName) })),
