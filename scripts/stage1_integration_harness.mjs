@@ -11598,15 +11598,25 @@ async function osChecks() {
   let dispatchClaimIntercepted = false;
   const queuedDispatchReached = new Promise((resolve) => { signalQueuedDispatch = resolve; });
   const queuedDispatchGate = new Promise((resolve) => { releaseQueuedDispatch = resolve; });
-  const saveSecurityMethod = hub.store.saveSecurity;
-  const saveSecurityBound = saveSecurityMethod.bind(hub.store);
-  hub.store.saveSecurity = async (patch = {}) => {
-    if (!dispatchClaimIntercepted && patch.nativeCommandResults?.[queuedRaceHash]?.status === 'dispatching') {
+  // The Hub persists its dispatch claim with mutateAtomically (it used to use saveSecurity). Pause the request
+  // right after the claim is stored, before the Hub re-resolves authority and the live descriptor at the final
+  // effect boundary, so the control can be made read-only while the request waits there.
+  const mutateAtomicallyMethod = hub.store.mutateAtomically;
+  const mutateAtomicallyBound = mutateAtomicallyMethod.bind(hub.store);
+  hub.store.mutateAtomically = async (mutator, ...rest) => {
+    let claimedQueuedRace = false;
+    const observed = async (state, ...args) => {
+      const result = await mutator(state, ...args);
+      if (state?.security?.nativeCommandResults?.[queuedRaceHash]?.status === 'dispatching') claimedQueuedRace = true;
+      return result;
+    };
+    const outcome = await mutateAtomicallyBound(observed, ...rest);
+    if (claimedQueuedRace && !dispatchClaimIntercepted) {
       dispatchClaimIntercepted = true;
       signalQueuedDispatch();
       await queuedDispatchGate;
     }
-    return saveSecurityBound(patch);
+    return outcome;
   };
   const raceFakeEffectsBefore = fakePhysicalCommandCount;
   const queuedRaceRequest = fetchJson(`${base}/api/dinodia/v1/commands`, { method: 'POST', headers: { authorization: `Bearer ${freshNativeSession.body.token}`, 'content-type': 'application/json', 'idempotency-key': queuedRaceCommand.idempotencyKey }, body: JSON.stringify(queuedRaceCommand) });
@@ -11628,7 +11638,7 @@ async function osChecks() {
   } finally {
     clearTimeout(dispatchPauseTimeout);
     releaseQueuedDispatch();
-    hub.store.saveSecurity = saveSecurityMethod;
+    hub.store.mutateAtomically = mutateAtomicallyMethod;
     await queuedRaceRequest.catch(() => {});
     await hub.store.upsertDevice(queuedRaceSnapshot);
   }
