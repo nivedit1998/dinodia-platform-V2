@@ -638,6 +638,35 @@ export async function executeNativeAlexaDirective(input: unknown): Promise<objec
   }
 }
 
+/**
+ * What Alexa is told for ReportState. Current readings are reported as such. A setting with no current reading (a radiator's
+ * target, a light's on/off) is reported at its last confirmed value with its true sample time and an uncertainty equal to its
+ * age, never as current. Alexa shows a device as "not responding" when the report is an error or carries no connectivity, so the
+ * report always says whether the device is known to be unreachable: UNREACHABLE only on explicit offline evidence from the Hub.
+ */
+export function stateReportProperties(endpoint: AuthorizedEndpoint, controls: JsonObject[], states: unknown[], now = Date.now()): AlexaProperty[] {
+  const properties = alexaPropertiesFromStates(endpoint, controls, states, now);
+  const keyOf = (property: AlexaProperty) => `${property.namespace}|${property.name}|${property.instance ?? ''}`;
+  const covered = new Set(properties.filter((property) => property.name !== 'connectivity').map(keyOf));
+  const baselines: JsonObject[] = [];
+  for (const raw of states) {
+    const state = record(raw);
+    const last = record(state?.lastSetting);
+    if (!state || !last || state.quality === 'fresh' || last.revision !== state.revision
+      || !(typeof last.value === 'boolean' || (typeof last.value === 'number' && Number.isFinite(last.value)))
+      || typeof last.observedAt !== 'string' || !Number.isFinite(Date.parse(last.observedAt)) || Date.parse(last.observedAt) > now) continue;
+    baselines.push({ ...state, quality: 'fresh', value: last.value, observedAt: last.observedAt, validUntil: new Date(now + 60_000).toISOString() });
+  }
+  for (const property of alexaPropertiesFromStates(endpoint, controls, baselines, now)) {
+    if (property.name === 'connectivity' || covered.has(keyOf(property))) continue;
+    properties.push({ ...property, uncertaintyInMilliseconds: Math.min(86_400_000, Math.max(0, now - Date.parse(property.timeOfSample))) });
+  }
+  if (!properties.some((property) => property.name === 'connectivity')) {
+    properties.push({ namespace: 'Alexa.EndpointHealth', name: 'connectivity', value: { value: 'OK' }, timeOfSample: new Date(now).toISOString(), uncertaintyInMilliseconds: 0 });
+  }
+  return properties;
+}
+
 async function reportNativeAlexaState(directive: AlexaDirective): Promise<object> {
   const token = bearerFromDirective(directive);
   const endpoint = await lockAndAuthorizeEndpoint(sha256(token), directive.endpoint.endpointId);
@@ -660,11 +689,7 @@ async function reportNativeAlexaState(directive: AlexaDirective): Promise<object
     || result.descriptorRevision !== endpoint.descriptorRevision || !Array.isArray(result.states)) {
     throw new Stage1AuthError(503, 'alexa_hub_response_invalid', 'Dinodia OS returned an invalid state response');
   }
-  const properties = alexaPropertiesFromStates(endpoint, controls, result.states);
-  if (!properties.some((property) => property.name !== 'connectivity')) {
-    return alexaError(directive, 'ENDPOINT_UNREACHABLE', 'The current device state is unknown or out of date. Try again when the device is available.');
-  }
-  return alexaStateReport(directive, properties);
+  return alexaStateReport(directive, stateReportProperties(endpoint, controls, result.states));
 }
 
 export async function handleNativeAlexaDirective(request: Request): Promise<object> {

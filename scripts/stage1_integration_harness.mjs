@@ -4807,11 +4807,14 @@ async function nativeAlexaOAuthChecks(deliveryEnv) {
     const reportedPower = reportState.body.context?.properties?.find((property) => property.namespace === 'Alexa.PowerController' && property.name === 'powerState');
     const reportedPosition = reportState.body.context?.properties?.find((property) => property.namespace === 'Alexa.RangeController' && property.name === 'rangeValue' && property.instance === 'Dinodia.Position');
     const reportedOpening = reportState.body.context?.properties?.find((property) => property.namespace === 'Alexa.RangeController' && property.name === 'rangeValue' && property.instance === 'Dinodia.OpeningPercentage');
-    if (reportState.response.status !== 200 || reportState.body.event?.header?.name !== 'ErrorResponse'
+    // Unverified state is never reported as a current reading; the device is reported reachable (no offline evidence) so Alexa
+    // does not show it as "not responding".
+    const reportedConnectivity = reportState.body.context?.properties?.find((property) => property.namespace === 'Alexa.EndpointHealth' && property.name === 'connectivity');
+    if (reportState.response.status !== 200 || reportState.body.event?.header?.name !== 'StateReport'
       || reportState.body.event?.header?.namespace !== 'Alexa' || reportState.body.event?.header?.payloadVersion !== '3'
       || reportState.body.event?.header?.correlationToken !== `corr-${reportStateMessageId}`
-      || reportState.body.event?.endpoint?.endpointId !== ownPrivateProjection.endpointId || reportState.body.event?.payload?.type !== 'ENDPOINT_UNREACHABLE'
-      || reportedPower || reportedPosition || reportedOpening) fail('Unverified private virtual state was advertised as current by Alexa ReportState');
+      || reportState.body.event?.endpoint?.endpointId !== ownPrivateProjection.endpointId || reportedConnectivity?.value?.value !== 'OK'
+      || reportedPower || reportedPosition || reportedOpening) fail(`Unverified private virtual state was advertised as current by Alexa ReportState, or the device was reported as not responding (${reportState.body.event?.header?.name}/${reportState.body.event?.payload?.type ?? 'none'})`);
 
     // Keep every advertised retrievable property stale for this endpoint-wide
     // unknown case. Other tests separately assert the exact per-range sample
@@ -4828,8 +4831,11 @@ async function nativeAlexaOAuthChecks(deliveryEnv) {
     const staleAdjustmentEffectsAfter = hub.store.listEvents(1000).filter((event) => event.type === 'device_command' && event.deviceId === osFixtureDeviceId).length;
     if (staleAdjustment.body.event?.header?.name !== 'ErrorResponse' || staleAdjustmentEffectsAfter !== staleAdjustmentEffectsBefore) fail('A relative Alexa adjustment used an expired observation or caused a stale-state command effect');
     const staleReport = await fetchJsonLoopback(`${base}/api/v2/alexa/report-state`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(reportStateDirective(`stage12-stale-${crypto.randomUUID()}`)) });
-    if (staleReport.response.status !== 200 || staleReport.body.event?.header?.name !== 'ErrorResponse'
-      || staleReport.body.event?.payload?.type !== 'ENDPOINT_UNREACHABLE' || staleReport.body.context?.properties?.some((property) => property.name === 'powerState')) {
+    // A stale observation is never reported as a current sample: anything carried over is a labelled last setting with an uncertainty
+    // equal to its age (never the 60 s of a live sample).
+    if (staleReport.response.status !== 200 || staleReport.body.event?.header?.name !== 'StateReport'
+      || staleReport.body.context?.properties?.some((property) => property.name !== 'connectivity' && property.uncertaintyInMilliseconds <= 60_000)
+      || staleReport.body.context?.properties?.find((property) => property.name === 'connectivity')?.value?.value !== 'OK') {
       fail(`Stale OS observation was reported as a current Alexa state instead of a truthful unavailable result (${staleReport.response.status}/${staleReport.body.event?.header?.name || 'none'}/${staleReport.body.event?.payload?.type || 'none'})`);
     }
 
