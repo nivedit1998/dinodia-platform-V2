@@ -2,7 +2,7 @@ import { NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
 import { serializableTransaction } from '@/lib/serializableTransaction';
 import {
-  alexaOAuthApprovalPage, alexaOAuthConfig, authorizationCodeChallenge, alexaOAuthEntryPage, alexaOAuthErrorPage, alexaOAuthWaitingPage,
+  alexaOAuthApprovalPage, alexaOAuthConfig, alexaOAuthRequestProblem, authorizationCodeChallenge, alexaOAuthEntryPage, alexaOAuthErrorPage, alexaOAuthWaitingPage,
   isAlexaOAuthEnabled, lockAndValidateAlexaConnectIntent, parseAlexaOAuthForm,
   parseAlexaOAuthRequest,
 } from '@/lib/nativeAlexaOAuth';
@@ -28,6 +28,7 @@ export async function GET(request: Request) {
     const oauth = parseAlexaOAuthRequest(new URL(request.url).searchParams, config);
     return alexaOAuthEntryPage(oauth);
   } catch {
+    console.warn(`[alexa-authorize] rejected ${alexaOAuthRequestProblem(new URL(request.url).searchParams, config)}`);
     return alexaOAuthErrorPage(400);
   }
 }

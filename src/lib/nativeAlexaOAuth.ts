@@ -280,3 +280,18 @@ export function providerSubjectHash(clientId: string, accountId: string): string
   // link per Dinodia account without persisting an email or voice identity.
   return sha256(`dinodia-native-alexa-v1\u0000${clientId}\u0000${accountId}`);
 }
+
+
+/** Names the first check an authorize request fails, for an operator log. Never includes a parameter value. */
+export function alexaOAuthRequestProblem(values: URLSearchParams, config: AlexaOAuthConfig): string {
+  const names = [...new Set(values.keys())].sort().join(',');
+  const get = (key: string) => values.get(key) ?? '';
+  let reason = 'ok';
+  if (get('client_id') !== config.clientId) reason = 'client_id_mismatch';
+  else if (!config.redirectUris.has(get('redirect_uri'))) reason = 'redirect_uri_not_allowed';
+  else if (get('response_type') !== 'code') reason = 'response_type';
+  else if (get('scope') !== config.scope) reason = 'scope_mismatch';
+  else if (!/^[A-Za-z0-9._~+/=-]{1,1024}$/.test(get('state'))) reason = `state_invalid_len${get('state').length}`;
+  else if (values.has('code_challenge') !== values.has('code_challenge_method')) reason = 'pkce_pair';
+  return `reason=${reason} params=${names}`;
+}
