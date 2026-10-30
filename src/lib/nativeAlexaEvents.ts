@@ -378,8 +378,11 @@ export async function dispatchAlexaDiscoveryReports(now = new Date()) {
           body: JSON.stringify({ event: { header: { namespace: 'Alexa.Discovery', name, messageId: `dinodia-${randomUUID()}`, payloadVersion: '3' },
             payload: { endpoints, scope: { type: 'BearerToken', token: accessToken } } } }),
           signal: AbortSignal.timeout(GATEWAY_TIMEOUT_MS), redirect: 'manual' });
-        await response.body?.cancel().catch(() => {});
-        return response.ok;
+        if (response.ok) { await response.body?.cancel().catch(() => {}); return true; }
+        // Operator log: Amazon's status and error code only, never the body, token or endpoint ids.
+        const code = await response.text().then((text) => /"code"\s*:\s*"([A-Z_]{3,60})"/.exec(text)?.[1] ?? '').catch(() => '');
+        console.warn(`[alexa-gateway] ${name} refused status=${response.status}${code ? ` code=${code}` : ''}`);
+        return false;
       };
       const rememberAnnounced = (change: (known: string[]) => string[]) => serializableTransaction(async (tx) => {
         await tx.$queryRaw`SELECT "id" FROM "AlexaNativeLink" WHERE "id" = ${link.id}::uuid FOR UPDATE`;
