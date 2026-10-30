@@ -380,8 +380,11 @@ export async function dispatchAlexaDiscoveryReports(now = new Date()) {
           signal: AbortSignal.timeout(GATEWAY_TIMEOUT_MS), redirect: 'manual' });
         if (response.ok) { await response.body?.cancel().catch(() => {}); return true; }
         // Operator log: Amazon's status and error code only, never the body, token or endpoint ids.
-        const code = await response.text().then((text) => /"code"\s*:\s*"([A-Z_]{3,60})"/.exec(text)?.[1] ?? '').catch(() => '');
-        console.warn(`[alexa-gateway] ${name} refused status=${response.status}${code ? ` code=${code}` : ''}`);
+        const text = await response.text().catch(() => '');
+        const code = /"code"\s*:\s*"([A-Z_]{3,60})"/.exec(text)?.[1] ?? '';
+        // Amazon's validation message names the offending field; endpoint ids and any token-like value are stripped first.
+        const description = (/"description"\s*:\s*"([^"]{1,300})"/.exec(text)?.[1] ?? '').replace(/dos_[A-Za-z0-9_-]+/g, 'dos_<id>').replace(/(Atza\|)[A-Za-z0-9_\-|.]+/g, '$1<token>').slice(0, 240);
+        console.warn(`[alexa-gateway] ${name} refused status=${response.status}${code ? ` code=${code}` : ''}${description ? ` description=${description}` : ''}`);
         return false;
       };
       const rememberAnnounced = (change: (known: string[]) => string[]) => serializableTransaction(async (tx) => {
