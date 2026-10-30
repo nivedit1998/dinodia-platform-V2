@@ -62,7 +62,6 @@ export async function startAlexaSignIn(input: { email: unknown; password: unknow
   if (!email || email.length > 320 || !password || password.length > 1024) return { ok: false, reason: 'INVALID' };
   try {
     await enforcePersistentRateLimit(`alexa-signin:${sha256(email)}`, 8, 15 * 60 * 1000);
-    await enforcePersistentRateLimit('alexa-signin:all', 1200, 60 * 60 * 1000);
   } catch (error) {
     if (error instanceof Stage1AuthError && error.status === 429) return { ok: false, reason: 'RATE_LIMITED' };
     return { ok: false, reason: 'UNAVAILABLE' };
@@ -75,6 +74,9 @@ export async function startAlexaSignIn(input: { email: unknown; password: unknow
     await recordFailedAuthentication('alexa_signin_failed', email);
     return { ok: false, reason: 'INVALID' };
   }
+  // Charged only after the password is right, so anonymous junk cannot exhaust it for everyone.
+  try { await enforcePersistentRateLimit('alexa-signin:linked', 1200, 60 * 60 * 1000); }
+  catch (error) { return { ok: false, reason: error instanceof Stage1AuthError && error.status === 429 ? 'RATE_LIMITED' : 'UNAVAILABLE' }; }
   const policy = currentCustomerPolicy();
   const accepted = policy ? await prisma.policyAcceptance.findUnique({ where: { customerAccountId_policyKind_policyVersion: {
     customerAccountId: account.id, policyKind: 'DINODIA_NATIVE', policyVersion: policy.version,
@@ -108,7 +110,7 @@ export async function startAlexaSignIn(input: { email: unknown; password: unknow
 async function findSignInIntent(rawIntent: string, request: AlexaOAuthRequest) {
   if (!/^[A-Za-z0-9_-]{40,128}$/.test(rawIntent)) return null;
   const intent = await prisma.alexaNativeConnectIntent.findUnique({ where: { intentHash: sha256(rawIntent) }, select: {
-    id: true, kind: true, approvalNumber: true, approvedAt: true, declinedAt: true, consumedAt: true, revokedAt: true, expiresAt: true, oauthRequestHash: true,
+    id: true, customerAccountId: true, kind: true, approvalNumber: true, approvedAt: true, declinedAt: true, consumedAt: true, revokedAt: true, expiresAt: true, oauthRequestHash: true,
   } });
   if (!intent || intent.kind !== 'SIGN_IN' || intent.oauthRequestHash !== alexaRequestHash(request)) return null;
   return intent;
@@ -128,6 +130,8 @@ export async function completeAlexaSignIn(rawIntent: string, request: AlexaOAuth
   const rawCode = randomSecret(32);
   try {
     await serializableTransaction(async (tx) => {
+      // Same order as starting a sign-in and as the token exchange: account first, then the intent.
+      await tx.$queryRaw`SELECT "id" FROM "CustomerAccount" WHERE "id" = ${hint.customerAccountId}::uuid FOR UPDATE`;
       await tx.$queryRaw`SELECT "id" FROM "AlexaNativeConnectIntent" WHERE "id" = ${hint.id}::uuid FOR UPDATE`;
       const intent = await tx.alexaNativeConnectIntent.findUnique({ where: { id: hint.id }, select: {
         id: true, customerAccountId: true, kind: true, approvedAt: true, declinedAt: true, consumedAt: true, revokedAt: true, expiresAt: true,

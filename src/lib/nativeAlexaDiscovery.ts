@@ -47,6 +47,8 @@ async function currentAlexaActor(tx: Prisma.TransactionClient, tokenHash: string
 }
 
 /** Re-authorized, multi-property Alexa discovery from current Platform-owned inventory. */
+const DISCOVERY_ENDPOINT_LIMIT = 300;
+
 export async function discoverNativeAlexa(request: Request) {
   if (!nativeAlexaEnabled()) throw new Stage1AuthError(501, 'NATIVE_FEATURE_NOT_ENABLED', 'Native Alexa is not yet activated');
   const token = readBearer(request);
@@ -65,7 +67,10 @@ export async function discoverNativeAlexa(request: Request) {
     if (link.autoScope) await ensureAutoScopes(tx, link, now);
     const projection = await projectAlexaLinkEndpoints(tx, link, now);
     // Discovery tells Alexa everything it needs: remember that, so later changes are announced as differences.
-    await markAnnounced(tx, link.id, now);
-    return { schemaVersion: 'dinodia.v1', properties: projection.properties, endpoints: projection.endpoints };
+    // Alexa accepts at most 300 endpoints in one discovery response. Only those sent are remembered as told; the rest are
+    // announced by the periodic sweep as AddOrUpdateReports.
+    const sent = projection.endpoints.slice(0, DISCOVERY_ENDPOINT_LIMIT);
+    await markAnnounced(tx, link.id, now, sent.map((endpoint) => String(endpoint.endpointId)));
+    return { schemaVersion: 'dinodia.v1', properties: projection.properties, endpoints: sent };
   }, 3);
 }

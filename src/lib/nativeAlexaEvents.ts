@@ -381,17 +381,21 @@ export async function dispatchAlexaDiscoveryReports(now = new Date()) {
         await response.body?.cancel().catch(() => {});
         return response.ok;
       };
-      const rememberAnnounced = async (change: (known: string[]) => string[]) => {
-        const fresh = await prisma.alexaNativeLink.findUnique({ where: { id: link.id }, select: { announcedEndpointIds: true } });
+      const rememberAnnounced = (change: (known: string[]) => string[]) => serializableTransaction(async (tx) => {
+        await tx.$queryRaw`SELECT "id" FROM "AlexaNativeLink" WHERE "id" = ${link.id}::uuid FOR UPDATE`;
+        const fresh = await tx.alexaNativeLink.findUnique({ where: { id: link.id }, select: { announcedEndpointIds: true } });
         const current = Array.isArray(fresh?.announcedEndpointIds) ? fresh.announcedEndpointIds.filter((item): item is string => typeof item === 'string') : [];
         const next = [...new Set(change(current))].slice(-5000);
-        await prisma.alexaNativeLink.update({ where: { id: link.id }, data: { announcedEndpointIds: next.length ? (next as Prisma.InputJsonValue) : Prisma.DbNull } });
-      };
+        await tx.alexaNativeLink.update({ where: { id: link.id }, data: { announcedEndpointIds: next.length ? (next as Prisma.InputJsonValue) : Prisma.DbNull } });
+      }, 2, { timeoutMs: 6000, maxWaitMs: 2000 });
       const addBatch = pending.adds.slice(0, MAX_ENDPOINTS_PER_REPORT);
       if (addBatch.length && await post('AddOrUpdateReport', addBatch.map((row) => row.endpoint))) {
-        for (const row of addBatch) await prisma.alexaNativeEndpointProjection.updateMany({ where: { id: row.id, payloadHash: row.hash, status: 'ACTIVE' }, data: { announcedHash: row.hash, announcedAt: now } });
         const addedIds = addBatch.map((row) => String(row.endpoint.endpointId ?? '')).filter(Boolean);
         await rememberAnnounced((known) => [...known, ...addedIds]);
+        for (const row of addBatch) {
+          // Bookkeeping only: one row that changed in the meantime is simply re-announced on the next tick.
+          await prisma.alexaNativeEndpointProjection.updateMany({ where: { id: row.id, payloadHash: row.hash, status: 'ACTIVE' }, data: { announcedHash: row.hash, announcedAt: now } }).catch(() => undefined);
+        }
         result.added += addBatch.length;
       } else if (addBatch.length) result.failed += 1;
       const removeBatch = pending.removes.slice(0, MAX_ENDPOINTS_PER_REPORT);
@@ -403,6 +407,9 @@ export async function dispatchAlexaDiscoveryReports(now = new Date()) {
     } catch (error) {
       if (error instanceof PlatformDataEncryptionKeyError) throw error;
       result.failed += 1; // never log identifiers or the gateway body
+    } finally {
+      // Rotate this link to the back of the queue even when its sync failed, so one broken link cannot starve the others.
+      await prisma.alexaNativeLink.updateMany({ where: { id: link.id }, data: { updatedAt: new Date() } }).catch(() => undefined);
     }
   }
   return result;

@@ -81,9 +81,11 @@ export async function ensureAutoScopes(tx: Prisma.TransactionClient, link: { id:
 }
 
 /** Discovery tells Alexa about every active endpoint: remember that, so later removals can be reported whichever way they happen. */
-export async function markAnnounced(tx: Prisma.TransactionClient, linkId: string, now: Date): Promise<void> {
-  await tx.$executeRaw`UPDATE "AlexaNativeEndpointProjection" SET "announcedHash" = "payloadHash", "announcedAt" = ${now} WHERE "linkId" = ${linkId}::uuid AND "status" = 'ACTIVE' AND "payloadHash" IS NOT NULL`;
-  const active = await tx.alexaNativeEndpointProjection.findMany({ where: { linkId, status: 'ACTIVE' }, select: { endpointId: true } });
+export async function markAnnounced(tx: Prisma.TransactionClient, linkId: string, now: Date, endpointIds?: string[]): Promise<void> {
+  if (endpointIds && endpointIds.length === 0) return;
+  if (endpointIds) await tx.$executeRaw`UPDATE "AlexaNativeEndpointProjection" SET "announcedHash" = "payloadHash", "announcedAt" = ${now} WHERE "linkId" = ${linkId}::uuid AND "status" = 'ACTIVE' AND "payloadHash" IS NOT NULL AND "endpointId" = ANY(${endpointIds}::text[])`;
+  else await tx.$executeRaw`UPDATE "AlexaNativeEndpointProjection" SET "announcedHash" = "payloadHash", "announcedAt" = ${now} WHERE "linkId" = ${linkId}::uuid AND "status" = 'ACTIVE' AND "payloadHash" IS NOT NULL`;
+  const active = await tx.alexaNativeEndpointProjection.findMany({ where: { linkId, status: 'ACTIVE', ...(endpointIds ? { endpointId: { in: endpointIds } } : {}) }, select: { endpointId: true } });
   if (active.length === 0) return;
   const link = await tx.alexaNativeLink.findUnique({ where: { id: linkId }, select: { announcedEndpointIds: true } });
   const known = Array.isArray(link?.announcedEndpointIds) ? link.announcedEndpointIds.filter((item): item is string => typeof item === 'string') : [];
