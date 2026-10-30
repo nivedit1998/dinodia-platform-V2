@@ -174,13 +174,11 @@ async function lockAndAuthorizeEndpoint(tokenHash: string, endpointId: string): 
       || projection.membership.id !== projection.membershipId || projection.membership.homeId !== projection.homeId
       || projection.membership.customerAccountId !== access.family.link.customerAccountId
       || projection.membership.role !== 'TENANT' || projection.membership.status !== 'ACTIVE'
-      || projection.area.homeId !== projection.homeId || projection.area.status !== 'ACTIVE'
       || projection.device.homeId !== projection.homeId || projection.device.hubInstallationId !== projection.home.activeHubInstallationId
       || projection.device.lifecycle !== 'INSTALLED' || projection.device.descriptorRevision !== projection.descriptorRevision
       || !projection.device.osDeviceId || projection.device.managementClass === 'TENANT_DEVICE' && projection.device.ownerMembershipId !== projection.membershipId
       || projection.device.managementClass === 'PROPERTY_DEVICE' && projection.device.ownerMembershipId !== null
-      || !projection.device.assignments.some((assignment) => assignment.homeId === projection.homeId && assignment.areaId === projection.areaId)
-      || !projection.membership.tenantAreaGrants.some((grant) => grant.areaId === projection.areaId)) {
+      ) {
       throw new Stage1AuthError(404, 'alexa_endpoint_unavailable', 'The selected Alexa endpoint is no longer available');
     }
     const hubHint = projection.home.activeHubInstallationId;
@@ -192,13 +190,22 @@ async function lockAndAuthorizeEndpoint(tokenHash: string, endpointId: string): 
     }, select: { id: true, cloudUrl: true, reservedHostname: true, cloudUrlVerifiedAt: true, remoteVerificationAt: true, accessPolicyRevision: true } });
     const scope = await tx.alexaNativeHomeScope.findUnique({ where: { linkId_membershipId: {
       linkId: projection.linkId, membershipId: projection.membershipId,
-    } }, select: { id: true, homeId: true, revokedAt: true, areaSelections: { where: { areaId: projection.areaId, revokedAt: null }, select: { areaId: true, exposureGeneration: true } } } });
-    const selection = scope?.areaSelections[0];
+    } }, select: { id: true, homeId: true, revokedAt: true, areaSelections: { where: { revokedAt: null, area: { status: 'ACTIVE', homeId: projection.homeId } }, select: { areaId: true, exposureGeneration: true } } } });
     if (!hub || !hub.cloudUrl || !hub.reservedHostname || !hub.cloudUrlVerifiedAt || !hub.remoteVerificationAt
       || hub.cloudUrlVerifiedAt > now || hub.remoteVerificationAt > now || !scope || scope.revokedAt
-      || scope.homeId !== projection.homeId || !selection || selection.exposureGeneration !== projection.exposureGeneration) {
+      || scope.homeId !== projection.homeId) {
       throw new Stage1AuthError(404, 'alexa_endpoint_unavailable', 'The selected Alexa endpoint is no longer available');
     }
+    // The device keeps working in whichever of its rooms the tenant may currently use: its pinned room while that stays
+    // assigned, granted and selected, otherwise any other room that is (a device moved to another room still works).
+    const grantedAreaIds = new Set(projection.membership.tenantAreaGrants.map((grant) => grant.areaId));
+    const assignedAreaIds = new Set(projection.device.assignments.filter((assignment) => assignment.homeId === projection.homeId).map((assignment) => assignment.areaId));
+    const usableSelections = scope.areaSelections.filter((selection) => grantedAreaIds.has(selection.areaId) && assignedAreaIds.has(selection.areaId));
+    const pinned = usableSelections.find((selection) => selection.areaId === projection.areaId && selection.exposureGeneration === projection.exposureGeneration
+      && projection.area.status === 'ACTIVE' && projection.area.homeId === projection.homeId);
+    const effective = pinned ?? [...usableSelections].sort((a, b) => a.areaId.localeCompare(b.areaId))[0];
+    if (!effective) throw new Stage1AuthError(404, 'alexa_endpoint_unavailable', 'The selected Alexa endpoint is no longer available');
+    const effectiveAreaId = effective.areaId;
     const summary = record(projection.device.capabilitySummary);
     const catalog = record(summary?.controlCatalog);
     const rawControls = Array.isArray(catalog?.controls) ? catalog.controls : [];
@@ -215,7 +222,7 @@ async function lockAndAuthorizeEndpoint(tokenHash: string, endpointId: string): 
     }
     return {
       accountId: access.family.link.customerAccountId, linkId: projection.linkId, endpointId,
-      homeId: projection.homeId, membershipId: projection.membershipId, areaId: projection.areaId,
+      homeId: projection.homeId, membershipId: projection.membershipId, areaId: effectiveAreaId,
       hubId: hub.id, osDeviceId: projection.device.osDeviceId, descriptorRevision: projection.descriptorRevision,
       accessRevision: projection.membership.accessRevision, hubPolicyRevision: hub.accessPolicyRevision,
       cloudUrl: hub.cloudUrl, reservedHostname: hub.reservedHostname, controls, displayName: projection.displayName,

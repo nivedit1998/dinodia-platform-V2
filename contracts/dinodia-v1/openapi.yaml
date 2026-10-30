@@ -1132,6 +1132,77 @@ paths:
         "403": { $ref: "#/components/responses/Forbidden" }
         "409": { $ref: "#/components/responses/Conflict" }
         "503": { description: Native Alexa is intentionally held until its approved activation stage }
+  /api/v2/alexa/link-approvals:
+    get:
+      summary: "List Pending Alexa Sign-In Approvals for This Phone's Account"
+      operationId: listNativeAlexaLinkApprovals
+      tags: [Devices]
+      security: [{ CustomerSessionCookie: [] }, { MobileAccessBearer: [] }]
+      description: Alexa-side account linking asks the tenant to confirm on a signed-in phone by choosing the number shown on the Alexa page. Each prompt carries three candidate numbers and never the correct one.
+      responses:
+        "200":
+          description: Pending approval prompts (possibly empty)
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [schemaVersion, ok, approvals]
+                properties:
+                  schemaVersion: { type: string, const: dinodia.v1 }
+                  ok: { type: boolean }
+                  approvals:
+                    type: array
+                    items:
+                      type: object
+                      required: [id, createdAt, expiresAt, choices]
+                      properties:
+                        id: { type: string, format: uuid }
+                        createdAt: { type: string, format: date-time }
+                        expiresAt: { type: string, format: date-time }
+                        choices: { type: array, minItems: 3, maxItems: 3, items: { type: integer, minimum: 10, maximum: 99 } }
+                      additionalProperties: false
+                additionalProperties: false
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "503": { description: Native Alexa is intentionally held until its approved activation stage }
+  /api/v2/alexa/link-approvals/{approvalId}:
+    post:
+      summary: "Approve or Decline an Alexa Sign-In"
+      operationId: decideNativeAlexaLinkApproval
+      tags: [Devices]
+      security: [{ CustomerSessionCookie: [] }, { MobileAccessBearer: [] }]
+      parameters:
+        - { name: approvalId, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - type: object
+                  required: [choice]
+                  properties: { choice: { type: integer, minimum: 10, maximum: 99 } }
+                  additionalProperties: false
+                - type: object
+                  required: [decline]
+                  properties: { decline: { type: boolean, const: true } }
+                  additionalProperties: false
+      responses:
+        "200":
+          description: The outcome. A wrong number or a decline ends the request.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [schemaVersion, ok, outcome]
+                properties:
+                  schemaVersion: { type: string, const: dinodia.v1 }
+                  ok: { type: boolean }
+                  outcome: { type: string, enum: [APPROVED, DECLINED, WRONG_NUMBER, EXPIRED] }
+                additionalProperties: false
+        "400": { description: Invalid request }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { description: Not available }
+        "503": { description: Native Alexa is intentionally held until its approved activation stage }
   /api/v2/alexa/home-scope:
     post:
       summary: "Save Exact Current Tenant Alexa Area Selection"

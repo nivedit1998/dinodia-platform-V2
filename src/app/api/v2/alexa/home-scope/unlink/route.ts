@@ -50,7 +50,7 @@ export async function POST(request: Request) {
           home: { lifecycle: 'ACTIVE', installationStatus: 'COMPLETE', activeHubInstallationId: membershipHint.home.activeHubInstallationId } },
           select: { id: true, accessRevision: true, home: { select: { activeHubInstallationId: true,
             activeHubInstallation: { select: { id: true, accessPolicyRevision: true } } } } } }),
-        tx.alexaNativeLink.findFirst({ where: { id: connectionId, customerAccountId: actor.id, status: 'ACTIVE', revokedAt: null }, select: { id: true, revision: true } }),
+        tx.alexaNativeLink.findFirst({ where: { id: connectionId, customerAccountId: actor.id, status: 'ACTIVE', revokedAt: null }, select: { id: true, revision: true, autoScope: true } }),
         tx.alexaNativeHomeScope.findUnique({ where: { linkId_membershipId: { linkId: connectionId, membershipId: membershipHint.id } },
           select: { id: true, homeId: true, membershipId: true, exposureGeneration: true, revokedAt: true } }),
       ]);
@@ -69,6 +69,12 @@ export async function POST(request: Request) {
       await tx.alexaNativeAreaSelection.updateMany({ where: { homeScopeId: scope.id, revokedAt: null }, data: { revokedAt: now, updatedAt: now } });
       await tx.alexaNativeHomeScope.update({ where: { id: scope.id }, data: { revokedAt: now, updatedAt: now } });
       await tx.alexaNativeEndpointProjection.updateMany({ where: { linkId: link.id, homeId, membershipId: membership.id, status: { not: 'REVOKED' } }, data: { status: 'REVOKED', updatedAt: now } });
+      // An automatic link follows every granted room, so unlinking it from any Home disconnects Alexa for the whole account;
+      // otherwise the next sync would simply add the Home back.
+      if (link.autoScope) {
+        await tx.alexaNativeAreaSelection.updateMany({ where: { homeScope: { linkId: link.id }, revokedAt: null }, data: { revokedAt: now, updatedAt: now } });
+        await tx.alexaNativeHomeScope.updateMany({ where: { linkId: link.id, revokedAt: null }, data: { revokedAt: now, updatedAt: now } });
+      }
       const otherScopes = await tx.alexaNativeHomeScope.count({ where: { linkId: link.id, revokedAt: null } });
       if (otherScopes === 0) {
         await tx.alexaNativeLink.update({ where: { id: link.id }, data: { status: 'REVOKED', revokedAt: now, revision: { increment: 1 }, updatedAt: now } });

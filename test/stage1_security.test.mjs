@@ -148,7 +148,8 @@ function loadTypeScriptModule(relativePath, overrides = {}) {
   const module = { exports: {} };
   const isolatedInstallationDelivery = { dispatchInstallationRequestNotifications: async () => ({ operationsAccepted: 0, operationsDeferred: 0, operationsFailed: 0, completionAccepted: 0, completionDeferred: 0, completionSuppressed: 0 }) };
   const isolatedHomeDeregistrationCleanup = { resumeHomeDeregistrationAccountCleanup: async () => ({ evaluated: 0, deferred: 0, failed: 0, pending: 0 }) };
-  const isolatedNativeAlexaEvents = { dispatchNativeAlexaChangeReports: async () => ({ enabled: false, scanned: 0, delivered: 0, cancelled: 0, expired: 0, retried: 0, failed: 0 }) };
+  const isolatedNativeAlexaEvents = { dispatchNativeAlexaChangeReports: async () => ({ enabled: false, scanned: 0, delivered: 0, cancelled: 0, expired: 0, retried: 0, failed: 0 }),
+    dispatchAlexaDiscoveryReports: async () => ({ enabled: false, links: 0, added: 0, removed: 0, failed: 0 }) };
   const localRequire = (specifier) => overrides[specifier] ?? require(specifier);
   const taskRequire = (specifier) => overrides[specifier] ?? (specifier === './installationRequestDelivery'
     ? isolatedInstallationDelivery : specifier === './homeDeregistrationCleanup' ? isolatedHomeDeregistrationCleanup

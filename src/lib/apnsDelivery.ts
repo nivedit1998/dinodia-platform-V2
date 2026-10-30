@@ -86,6 +86,13 @@ export async function sendHomeAccessChangedPush(input: {
   return sendBoundedApnsAlert(input, { title: 'Home access changed', body: 'Access to a Dinodia Smart Living home has changed. Sign in to review your homes.' }, poster);
 }
 
+/** Time-critical, content-minimal prompt to approve an Alexa sign-in. It names no Home, device or person. */
+export async function sendAlexaLinkApprovalPush(input: {
+  config: ApnsConfig; environment: ApnsEnvironment; deviceToken: string; requestId: string; expiresAt: Date;
+}, poster: ApnsPoster = postHttp2): Promise<ApnsResult> {
+  return sendBoundedApnsAlert(input, { title: 'Approve Alexa sign-in?', body: 'Someone is linking Alexa to your Dinodia account. Open the app to approve or decline.' }, poster);
+}
+
 /** Mandatory, content-minimal automation intervention notice. */
 export async function sendTenantAutomationManagementPush(input: {
   config: ApnsConfig; environment: ApnsEnvironment; deviceToken: string; requestId: string; expiresAt: Date;

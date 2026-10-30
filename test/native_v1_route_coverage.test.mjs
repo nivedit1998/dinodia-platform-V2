@@ -173,6 +173,8 @@ test('customer-facing Alexa management routes preserve the canonical Native V1 e
   const customerRoutes = [
     ['src/app/api/v2/alexa/home-scope/route.ts', 1],
     ['src/app/api/v2/alexa/home-scope/unlink/route.ts', 1],
+    ['src/app/api/v2/alexa/link-approvals/route.ts', 1],
+    ['src/app/api/v2/alexa/link-approvals/[approvalId]/route.ts', 1],
     ['src/app/api/v2/alexa/link-status/route.ts', 2],
   ];
   for (const [file, expectedCatches] of customerRoutes) {

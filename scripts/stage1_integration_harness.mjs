@@ -56,6 +56,7 @@ let sesServer;
 let sesShouldFail = false;
 let lwaExchangeCount = 0;
 let alexaEventDeliveries = [];
+let alexaDiscoveryDeliveries = [];
 let capturedInvitation;
 let capturedCustomerInvitation;
 let capturedCustomerInvitationTempPassword;
@@ -902,6 +903,18 @@ async function startFakeSes() {
         const eventBody = JSON.parse(body || '{}');
         const event = eventBody?.event;
         const header = event?.header;
+        if (header?.namespace === 'Alexa.Discovery') {
+          alexaDiscoveryDeliveries.push({
+            name: header.name ?? null,
+            token: event?.payload?.scope?.token ?? null,
+            endpointIds: (event?.payload?.endpoints ?? []).map((item) => item?.endpointId ?? null),
+            endpoints: event?.payload?.endpoints ?? [],
+          });
+          response.statusCode = 202;
+          response.setHeader('content-type', 'application/json');
+          response.end('{}');
+          return;
+        }
         const properties = event?.payload?.change?.properties;
         alexaEventDeliveries.push({
           authorized: request.headers.authorization === 'Bearer stage12-disposable-lwa-access-token',
@@ -1272,6 +1285,7 @@ async function protectedRouteDenialChecks(base) {
       .replaceAll(':tenantId', '00000000-0000-4000-8000-000000000005')
       .replaceAll(':areaId', '00000000-0000-4000-8000-000000000006')
       .replaceAll(':deviceId', '00000000-0000-4000-8000-000000000007')
+      .replaceAll(':approvalId', '00000000-0000-4000-8000-000000000008')
       .replaceAll(':trustedDeviceId', '00000000-0000-4000-8000-000000000001');
     const response = await fetch(`${base}${route}`, {
       method,
@@ -4372,9 +4386,9 @@ async function nativeAlexaOAuthChecks(deliveryEnv) {
     for (const [key, value] of Object.entries(oauth)) authorizationUrl.searchParams.set(key, value);
     const entry = await fetchJsonLoopback(authorizationUrl.toString());
     const entryHtml = await entry.response.text();
-    if (entry.response.status !== 200 || !entryHtml.includes('Connect your tenant account to Alexa')
-      || !entryHtml.includes('one-time Alexa connection code') || !entry.response.headers.get('content-security-policy')?.includes("default-src 'none'")) {
-      fail(`Real OAuth authorize route entry differed from its contract (status=${entry.response.status}; heading=${entryHtml.includes('Connect your tenant account to Alexa')}; copy=${entryHtml.includes('one-time Alexa connection code')}; csp=${entry.response.headers.get('content-security-policy') ?? 'missing'})`);
+    if (entry.response.status !== 200 || !entryHtml.includes('Connect Dinodia to Alexa')
+      || !entryHtml.includes('approve this on your phone') || !entry.response.headers.get('content-security-policy')?.includes("default-src 'none'")) {
+      fail(`Real OAuth authorize route entry differed from its contract (status=${entry.response.status}; heading=${entryHtml.includes('Connect Dinodia to Alexa')}; copy=${entryHtml.includes('approve this on your phone')}; csp=${entry.response.headers.get('content-security-policy') ?? 'missing'})`);
     }
 
     const preview = await fetchJsonLoopback(`${base}/api/v2/alexa/oauth/authorize`, {
@@ -5355,6 +5369,140 @@ async function nativeAlexaOAuthChecks(deliveryEnv) {
     await prisma.customerAccount.delete({ where: { id: secondTenant.id } });
     await prisma.area.delete({ where: { id: unselectedArea.id } });
 
+    // ---- Tenant-wide auto-sync: every granted room, kept current without any Alexa-side choices ----
+    const discoverAll = () => fetchJsonLoopback(`${base}/api/v2/alexa/discovery`, { headers: { authorization: `Bearer ${tokenBody.access_token}` } });
+    const runOperations = () => fetchJson(`${base}/api/cron/native-operations`, { method: 'POST', headers: { authorization: `Bearer ${deliveryEnv.CRON_SECRET}` } });
+    const gatewayToken = 'stage12-disposable-lwa-access-token';
+    const effectsOnHub = () => hub.store.listEvents(1000).filter((event) => event.type === 'device_command').length;
+    await prisma.tenantAreaGrant.updateMany({ where: { membershipId: fixture.tenantMembershipId, areaId: fixture.areaOneId }, data: { revokedAt: null, revokeReason: null } });
+    await prisma.alexaNativeLink.update({ where: { id: link.id }, data: { autoScope: true } });
+    const syncTag = crypto.randomUUID().slice(0, 8);
+    const syncAreaRow = await prisma.area.create({ data: { homeId: fixture.homeOneId, osAreaId: `stage12-sync-${syncTag}`, originalName: 'Study', status: 'ACTIVE' }, select: { id: true } });
+    const makeSyncDevice = async (name, areaId, ownerMembershipId = null, label = 'Light') => {
+      const row = await prisma.nativeDevice.create({ data: {
+        homeId: fixture.homeOneId, hubInstallationId: fixture.hubOneId, osDeviceId: `stage12-sync-${crypto.randomUUID()}`, originalName: name,
+        customerLabel: label, technicalLabel: ownerMembershipId ? 'tenant_device' : 'property_device',
+        managementClass: ownerMembershipId ? 'TENANT_DEVICE' : 'PROPERTY_DEVICE', ownerMembershipId,
+        deviceType: 'light', descriptorRevision: 1, lifecycle: 'INSTALLED', capabilitySummary: capabilitySummary(crypto.randomUUID(), []),
+        assignments: { create: { homeId: fixture.homeOneId, areaId, source: 'STAGE12_DISPOSABLE_TEST', actorType: 'SYSTEM' } },
+      }, select: { id: true } });
+      const digest = sha256(`stage12-sync-descriptor:${row.id}`);
+      await prisma.nativeDevice.update({ where: { id: row.id }, data: { descriptorDigest: digest, capabilitySummary: capabilitySummary(row.id, [powerControl(row.id)], digest) } });
+      return row.id;
+    };
+    const strangerTag = crypto.randomUUID();
+    const stranger = await prisma.customerAccount.create({ data: {
+      displayName: 'Disposable stranger tenant', username: `stage12s-${strangerTag.slice(0, 10)}`, usernameNormalized: `stage12s-${strangerTag.slice(0, 10)}`,
+      email: `stage12s-${strangerTag}@invalid.test`, emailNormalized: `stage12s-${strangerTag}@invalid.test`,
+      emailVerifiedAt: new Date(), passwordHash: hashPassword(crypto.randomBytes(32).toString('hex')),
+    }, select: { id: true } });
+    const strangerMembership = await prisma.homeMembership.create({ data: { customerAccountId: stranger.id, homeId: fixture.homeOneId, role: 'TENANT', status: 'ACTIVE' }, select: { id: true } });
+    await prisma.tenantAreaGrant.create({ data: { membershipId: strangerMembership.id, homeId: fixture.homeOneId, areaId: fixture.areaOneId } });
+    const strangerDeviceId = await makeSyncDevice('Stranger private lamp', fixture.areaOneId, strangerMembership.id);
+
+    // A newly granted room appears with no Alexa-side choice, named "<Room> <device>" with the right category.
+    await prisma.tenantAreaGrant.create({ data: { membershipId: fixture.tenantMembershipId, homeId: fixture.homeOneId, areaId: syncAreaRow.id } });
+    const deskDeviceId = await makeSyncDevice('Desk lamp', syncAreaRow.id);
+    const firstAuto = await discoverAll();
+    const autoEndpoints = firstAuto.body?.endpoints ?? [];
+    const deskEndpoint = autoEndpoints.find((item) => /study/i.test(item.friendlyName) && /desk lamp/i.test(item.friendlyName));
+    const deskProjection = await prisma.alexaNativeEndpointProjection.findFirst({ where: { linkId: link.id, deviceId: deskDeviceId, status: 'ACTIVE' }, select: { endpointId: true, areaId: true, payloadHash: true, announcedHash: true } });
+    if (firstAuto.response.status !== 200 || !deskEndpoint || deskEndpoint.displayCategories?.[0] !== 'LIGHT'
+      || !deskProjection || deskProjection.endpointId !== deskEndpoint.endpointId || deskProjection.areaId !== syncAreaRow.id
+      || !deskProjection.payloadHash || deskProjection.payloadHash !== deskProjection.announcedHash
+      || !firstAuto.body.properties?.find((item) => item.homeId === fixture.homeOneId)?.selectedAreaIds?.includes(syncAreaRow.id)
+      || autoEndpoints.some((item) => /stranger/i.test(item.friendlyName))
+      || JSON.stringify(firstAuto.body).includes('Stranger private lamp')
+      || autoEndpoints.length !== new Set(autoEndpoints.map((item) => item.endpointId)).size
+      || autoEndpoints.length !== new Set(autoEndpoints.map((item) => item.friendlyName.toLowerCase())).size) {
+      fail(`An auto-synced tenant link did not expose a newly granted room with a "<Room> <device>" name, LIGHT category, no other tenant's private device and unique names (${firstAuto.response.status}; endpoints=${autoEndpoints.length})`);
+    }
+    console.log('[stage12:integration] PASS: an auto-sync tenant link exposes every granted room by itself with unique "<Room> <device>" names and categories and never another tenant\'s private device');
+
+    // Changes made after discovery are pushed to Alexa by the periodic operations sweep (additions, renames, removals).
+    alexaDiscoveryDeliveries = [];
+    const readingDeviceId = await makeSyncDevice('Reading light', syncAreaRow.id);
+    const sweepAdd = await runOperations();
+    const addReport = alexaDiscoveryDeliveries.find((item) => item.name === 'AddOrUpdateReport');
+    const readingProjection = await prisma.alexaNativeEndpointProjection.findFirst({ where: { linkId: link.id, deviceId: readingDeviceId, status: 'ACTIVE' }, select: { endpointId: true, payloadHash: true, announcedHash: true } });
+    if (sweepAdd.response.status !== 200 || !addReport || addReport.token !== gatewayToken || !readingProjection
+      || !addReport.endpointIds.includes(readingProjection.endpointId)
+      || addReport.endpointIds.length !== 1 || readingProjection.payloadHash !== readingProjection.announcedHash
+      || !/study.*reading light/i.test(addReport.endpoints[0]?.friendlyName ?? '')) {
+      fail(`A device added to a granted room was not announced to Alexa by the sweep (${sweepAdd.response.status}; reports=${alexaDiscoveryDeliveries.length})`);
+    }
+    alexaDiscoveryDeliveries = [];
+    await runOperations();
+    if (alexaDiscoveryDeliveries.length !== 0) fail('The sweep re-announced an unchanged endpoint');
+
+    await prisma.nativeDevice.update({ where: { id: deskDeviceId }, data: { originalName: 'Standing lamp' } });
+    await runOperations();
+    const renameReport = alexaDiscoveryDeliveries.find((item) => item.name === 'AddOrUpdateReport');
+    if (!renameReport || renameReport.endpointIds.length !== 1 || renameReport.endpointIds[0] !== deskProjection.endpointId
+      || !/study.*standing lamp/i.test(renameReport.endpoints[0]?.friendlyName ?? '')) fail('A renamed device was not re-announced under the same endpoint id with its new name');
+
+    alexaDiscoveryDeliveries = [];
+    await prisma.nativeDevice.update({ where: { id: readingDeviceId }, data: { lifecycle: 'REMOVED' } });
+    const sweepRemove = await runOperations();
+    const removeReport = alexaDiscoveryDeliveries.find((item) => item.name === 'DeleteReport');
+    const readingAfter = await prisma.alexaNativeEndpointProjection.findFirst({ where: { linkId: link.id, deviceId: readingDeviceId }, select: { status: true, announcedHash: true } });
+    const effectsBeforeGone = effectsOnHub();
+    const goneDirective = await fetchJsonLoopback(`${base}/api/v2/alexa/directives`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ directive: {
+      header: { namespace: 'Alexa.PowerController', name: 'TurnOn', messageId: `stage12-gone-${crypto.randomUUID()}`, payloadVersion: '3' },
+      endpoint: { endpointId: readingProjection.endpointId, scope: { type: 'BearerToken', token: tokenBody.access_token } }, payload: {},
+    } }) });
+    if (!removeReport || removeReport.endpointIds.length !== 1 || removeReport.endpointIds[0] !== readingProjection.endpointId
+      || readingAfter?.status !== 'REVOKED' || readingAfter.announcedHash !== null
+      || goneDirective.body.event?.header?.name !== 'ErrorResponse' || effectsOnHub() !== effectsBeforeGone) {
+      fail(`A removed device was not deleted from Alexa and denied before reaching the hub (${JSON.stringify({ report: removeReport ? { n: removeReport.name, ids: removeReport.endpointIds.length, match: removeReport.endpointIds[0] === readingProjection.endpointId } : null, status: readingAfter?.status, announced: readingAfter?.announcedHash, directive: goneDirective.body.event?.header?.name, effects: effectsOnHub() - effectsBeforeGone, deliveries: alexaDiscoveryDeliveries.length, sweep: JSON.stringify({ reports: sweepRemove.body.alexaDiscoveryReports, failed: sweepRemove.body.failedTasks }), rows: JSON.stringify(await prisma.alexaNativeEndpointProjection.findMany({ where: { linkId: link.id, deviceId: readingDeviceId }, select: { status: true, announcedHash: true, payloadHash: true, announcedAt: true, updatedAt: true } })) })})`);
+    }
+
+    // Revoking the room's access removes its devices from Alexa and stops their control.
+    alexaDiscoveryDeliveries = [];
+    await prisma.tenantAreaGrant.update({ where: { membershipId_areaId: { membershipId: fixture.tenantMembershipId, areaId: syncAreaRow.id } }, data: { revokedAt: new Date(), revokeReason: 'stage12 test' } });
+    const afterRevoke = await discoverAll();
+    const revokedDirective = await fetchJsonLoopback(`${base}/api/v2/alexa/directives`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ directive: {
+      header: { namespace: 'Alexa.PowerController', name: 'TurnOn', messageId: `stage12-revoked-${crypto.randomUUID()}`, payloadVersion: '3' },
+      endpoint: { endpointId: deskProjection.endpointId, scope: { type: 'BearerToken', token: tokenBody.access_token } }, payload: {},
+    } }) });
+    const deskAfter = await prisma.alexaNativeEndpointProjection.findFirst({ where: { linkId: link.id, deviceId: deskDeviceId }, select: { status: true } });
+    if (afterRevoke.response.status !== 200 || (afterRevoke.body.endpoints ?? []).some((item) => item.endpointId === deskProjection.endpointId)
+      || deskAfter?.status !== 'REVOKED' || revokedDirective.body.event?.header?.name !== 'ErrorResponse' || effectsOnHub() !== effectsBeforeGone) {
+      fail('Revoking a room did not remove its devices from discovery and block their control');
+    }
+    await runOperations();
+    const revokeDelete = alexaDiscoveryDeliveries.find((item) => item.name === 'DeleteReport');
+    // Discovery already marks the removal as seen by Alexa, so the sweep need not repeat it.
+    if (revokeDelete && revokeDelete.endpointIds.some((id) => id !== deskProjection.endpointId)) fail('The sweep reported an unexpected endpoint removal');
+
+    // A granted room that is re-granted returns with its previous endpoint identity.
+    await prisma.tenantAreaGrant.update({ where: { membershipId_areaId: { membershipId: fixture.tenantMembershipId, areaId: syncAreaRow.id } }, data: { revokedAt: null, revokeReason: null } });
+    const regrant = await discoverAll();
+    if (!(regrant.body.endpoints ?? []).some((item) => /study.*standing lamp/i.test(item.friendlyName))) fail('A re-granted room did not return to Alexa');
+    console.log('[stage12:integration] PASS: the periodic sweep announces added, renamed and removed devices to the Event Gateway once each, and revoked rooms or removed devices vanish from discovery and are refused before the hub');
+
+    // A tenant whose room access ends entirely loses everything on the next sync, and gets it all back with the access.
+    const heldGrants = await prisma.tenantAreaGrant.findMany({ where: { membershipId: fixture.tenantMembershipId, revokedAt: null }, select: { id: true } });
+    await prisma.tenantAreaGrant.updateMany({ where: { id: { in: heldGrants.map((row) => row.id) } }, data: { revokedAt: new Date(), revokeReason: 'stage12 test' } });
+    let noAccess;
+    try { noAccess = await discoverAll(); }
+    finally { await prisma.tenantAreaGrant.updateMany({ where: { id: { in: heldGrants.map((row) => row.id) } }, data: { revokedAt: null, revokeReason: null } }); }
+    const leftover = await prisma.alexaNativeEndpointProjection.count({ where: { linkId: link.id, status: 'ACTIVE' } });
+    if (noAccess.response.status !== 200 || (noAccess.body.endpoints ?? []).length !== 0 || leftover !== 0) fail(`Ending all room access did not clear every Alexa endpoint (${noAccess.response.status}; endpoints=${(noAccess.body.endpoints ?? []).length}; active=${leftover})`);
+    const returned = await discoverAll();
+    if ((returned.body.endpoints ?? []).length < 2) fail(`Restoring room access did not restore the Alexa endpoints (${returned.response.status}; ${JSON.stringify(returned.body).slice(0, 400)})`);
+    console.log('[stage12:integration] PASS: ending all of a tenant\'s room access clears every Alexa endpoint and restoring it brings them back');
+
+    await prisma.alexaNativeLink.update({ where: { id: link.id }, data: { autoScope: false } });
+    await prisma.tenantAreaGrant.deleteMany({ where: { areaId: syncAreaRow.id } });
+    await prisma.alexaNativeEndpointProjection.deleteMany({ where: { areaId: syncAreaRow.id } });
+    await prisma.alexaNativeAreaSelection.deleteMany({ where: { areaId: syncAreaRow.id } });
+    await prisma.nativeDevice.deleteMany({ where: { id: { in: [deskDeviceId, readingDeviceId, strangerDeviceId] } } });
+    await prisma.homeMembership.delete({ where: { id: strangerMembership.id } });
+    await prisma.customerAccount.delete({ where: { id: stranger.id } });
+    await prisma.area.delete({ where: { id: syncAreaRow.id } });
+
+
     const replayedCode = await exchange({ grant_type: 'authorization_code', client_id: clientId, code, redirect_uri: redirectUri, code_verifier: verifier });
     if (replayedCode.response.status !== 400 || replayedCode.body.error !== 'invalid_grant'
       || await prisma.alexaOAuthTokenFamily.count({ where: { linkId: link.id } }) !== 1) fail('Authorization code replay was not single-use or created a duplicate token family');
@@ -5381,6 +5529,92 @@ async function nativeAlexaOAuthChecks(deliveryEnv) {
       || finalLink.homeScopes.some((row) => !row.revokedAt || row.areaSelections.some((area) => !area.revokedAt))
       || finalLink.endpoints.some((row) => row.status !== 'REVOKED')
       || finalLink.oauthFamilies.some((row) => !row.revokedAt)) fail(`OAuth revocation did not revoke the link, selected Areas, endpoint projections and token families (status=${revoke.response.status}; outcome=${revoke.body.revoked === true}; link=${finalLink.status}; scopesRevoked=${finalLink.homeScopes.every((row) => Boolean(row.revokedAt))}; familiesRevoked=${finalLink.oauthFamilies.every((row) => Boolean(row.revokedAt))})`);
+
+    // ---- Linking from the Alexa side: email + password, then number-matching approval on the tenant's phone ----
+    const signInVerifier = crypto.randomBytes(48).toString('base64url');
+    const signInOauth = requestParameters('stage12-signin-state', signInVerifier);
+    const authorizeUrl = `${base}/api/v2/alexa/oauth/authorize`;
+    const postForm = (fields) => fetchJsonLoopback(authorizeUrl, { method: 'POST', headers: formHeaders, body: form(fields) });
+    const signIn = (email, password, oauthFields = signInOauth) => postForm({ ...oauthFields, action: 'signin', email, password });
+    const signInIntentRows = () => prisma.alexaNativeConnectIntent.count({ where: { kind: 'SIGN_IN' } });
+    const signInBefore = await signInIntentRows();
+    const ownerSignIn = await signIn(fixture.propertyEmail, fixture.propertyPassword);
+    const wrongPassword = await signIn(fixture.loginEmail, `${fixture.loginPassword}-wrong`);
+    const unknownEmail = await signIn(`nobody-${crypto.randomUUID()}@invalid.test`, 'irrelevant-password-value');
+    const ownerHtml = await ownerSignIn.response.text();
+    const wrongHtml = await wrongPassword.response.text();
+    const unknownHtml = await unknownEmail.response.text();
+    if (!ownerHtml.includes('Alexa is available to tenants') || !wrongHtml.includes('not right') || !unknownHtml.includes('not right')
+      || wrongHtml.replace(/value="[^"]*"/g, '') !== unknownHtml.replace(/value="[^"]*"/g, '')
+      || await signInIntentRows() !== signInBefore) fail('Alexa sign-in did not refuse a homeowner or wrong credentials without creating an approval request');
+
+    const firstSignIn = await signIn(fixture.loginEmail, fixture.loginPassword);
+    const firstHtml = await firstSignIn.response.text();
+    const shownNumber = Number(firstHtml.match(/class="number"[^>]*>(\d{2})</)?.[1]);
+    const firstIntent = firstHtml.match(/name="connect_intent" value="([A-Za-z0-9_-]{40,128})"/)?.[1];
+    const firstRow = firstIntent ? await prisma.alexaNativeConnectIntent.findUnique({ where: { intentHash: sha256(firstIntent) }, select: { id: true, kind: true, approvalNumber: true, approvedAt: true, customerAccountId: true } }) : null;
+    if (firstSignIn.response.status !== 200 || !firstRow || firstRow.kind !== 'SIGN_IN' || firstRow.approvalNumber !== shownNumber
+      || firstRow.approvedAt !== null || firstRow.customerAccountId !== fixture.accountId || shownNumber < 10 || shownNumber > 99) {
+      fail('A correct Alexa sign-in did not create a pending number-matching approval for the account');
+    }
+    const pendingStatus = await postForm({ ...signInOauth, action: 'status', connect_intent: firstIntent });
+    const earlyComplete = await postForm({ ...signInOauth, action: 'complete', connect_intent: firstIntent });
+    const earlyBody = await earlyComplete.response.text();
+    const foreignState = await postForm({ ...requestParameters('another-state', signInVerifier), action: 'status', connect_intent: firstIntent });
+    if ((await pendingStatus.response.json()).status !== 'PENDING' || earlyComplete.response.status === 303 || !earlyBody.includes('class="number"')
+      || (await foreignState.response.json()).status !== 'EXPIRED') fail('The Alexa page continued before phone approval or accepted a different OAuth request');
+
+    const phonePrompts = await fetchJson(`${base}/api/v2/alexa/link-approvals`, { headers: { cookie: tenantCookie } });
+    const strangerPrompts = await fetchJson(`${base}/api/v2/alexa/link-approvals`, { headers: { cookie: ownerCookie } });
+    const promptItem = phonePrompts.body.approvals?.[0];
+    if (phonePrompts.response.status !== 200 || phonePrompts.body.approvals?.length !== 1 || promptItem.id !== firstRow.id
+      || promptItem.choices.length !== 3 || !promptItem.choices.includes(shownNumber) || new Set(promptItem.choices).size !== 3
+      || JSON.stringify(promptItem).includes('approvalNumber') || strangerPrompts.body.approvals?.length !== 0) {
+      fail('The phone did not see exactly its own pending Alexa approval with three number choices and no answer');
+    }
+    const decide = (id, body, sessionCookie = tenantCookie) => fetchJson(`${base}/api/v2/alexa/link-approvals/${id}`, { method: 'POST', headers: { cookie: sessionCookie, 'content-type': 'application/json' }, body: JSON.stringify(body) });
+    const strangerDecision = await decide(firstRow.id, { choice: shownNumber }, ownerCookie);
+    const stillPending = await prisma.alexaNativeConnectIntent.findUniqueOrThrow({ where: { id: firstRow.id }, select: { approvedAt: true, declinedAt: true } });
+    if (stillPending.approvedAt || stillPending.declinedAt || strangerDecision.body.outcome === 'APPROVED') fail('Another account approved someone else\'s Alexa sign-in');
+    const wrongChoice = promptItem.choices.find((value) => value !== shownNumber);
+    const wrongDecision = await decide(firstRow.id, { choice: wrongChoice });
+    const declinedStatus = await postForm({ ...signInOauth, action: 'status', connect_intent: firstIntent });
+    const declinedComplete = await postForm({ ...signInOauth, action: 'complete', connect_intent: firstIntent });
+    const codesBeforeDecline = await prisma.alexaOAuthAuthorizationCode.count({ where: { customerAccountId: fixture.accountId, consumedAt: null } });
+    if (wrongDecision.body.outcome !== 'WRONG_NUMBER' || (await declinedStatus.response.json()).status !== 'DECLINED'
+      || declinedComplete.response.status === 303 || codesBeforeDecline !== 0) fail('Choosing the wrong number did not end the Alexa sign-in request without a code');
+    const malformed = await decide(firstRow.id, { choice: 5 });
+    if (malformed.response.status !== 400) fail('A malformed approval decision was accepted');
+
+    const secondSignIn = await signIn(fixture.loginEmail, fixture.loginPassword);
+    const secondHtml = await secondSignIn.response.text();
+    const secondNumber = Number(secondHtml.match(/class="number"[^>]*>(\d{2})</)?.[1]);
+    const secondIntent = secondHtml.match(/name="connect_intent" value="([A-Za-z0-9_-]{40,128})"/)?.[1];
+    const secondRow = await prisma.alexaNativeConnectIntent.findUniqueOrThrow({ where: { intentHash: sha256(secondIntent) }, select: { id: true } });
+    const approve = await decide(secondRow.id, { choice: secondNumber });
+    const approvedStatus = await postForm({ ...signInOauth, action: 'status', connect_intent: secondIntent });
+    if (approve.body.outcome !== 'APPROVED' || (await approvedStatus.response.json()).status !== 'APPROVED') fail('The matching number did not approve the Alexa sign-in');
+    const complete = await postForm({ ...signInOauth, action: 'complete', connect_intent: secondIntent });
+    const signInCallback = new URL(complete.response.headers.get('location') ?? 'https://invalid.example/');
+    const signInCode = signInCallback.searchParams.get('code') ?? '';
+    if (complete.response.status !== 303 || signInCallback.origin !== new URL(redirectUri).origin || signInCallback.searchParams.get('state') !== signInOauth.state
+      || !/^[A-Za-z0-9_-]{40,128}$/.test(signInCode)) fail('An approved Alexa sign-in did not redirect once with a code and the exact state');
+    const replayComplete = await postForm({ ...signInOauth, action: 'complete', connect_intent: secondIntent });
+    if (replayComplete.response.status === 303) fail('An Alexa sign-in produced a second authorization code');
+    const signInTokens = await exchange({ grant_type: 'authorization_code', client_id: clientId, code: signInCode, redirect_uri: redirectUri, code_verifier: signInVerifier });
+    const signInLink = await prisma.alexaNativeLink.findFirst({ where: { customerAccountId: fixture.accountId, status: 'ACTIVE', revokedAt: null }, select: {
+      id: true, autoScope: true, homeScopes: { where: { revokedAt: null }, select: { membershipId: true, areaSelections: { where: { revokedAt: null }, select: { areaId: true } } } },
+    } });
+    if (signInTokens.response.status !== 200 || !signInTokens.body.access_token || !signInLink?.autoScope
+      || signInLink.homeScopes.length !== 1 || signInLink.homeScopes[0].membershipId !== fixture.tenantMembershipId
+      || !signInLink.homeScopes[0].areaSelections.some((row) => row.areaId === fixture.areaOneId)) fail('The Alexa sign-in link was not created as a tenant-only automatic link covering every granted room');
+    const signInDiscovery = await fetchJsonLoopback(`${base}/api/v2/alexa/discovery`, { headers: { authorization: `Bearer ${signInTokens.body.access_token}` } });
+    if (signInDiscovery.response.status !== 200 || (signInDiscovery.body.endpoints ?? []).length < 1) fail('A freshly linked automatic Alexa account discovered no devices');
+    const signInReplay = await exchange({ grant_type: 'authorization_code', client_id: clientId, code: signInCode, redirect_uri: redirectUri, code_verifier: signInVerifier });
+    if (signInReplay.response.status !== 400) fail('A sign-in authorization code was reusable');
+    await fetchJsonLoopback(`${base}/api/v2/alexa/oauth/revoke`, { method: 'POST', headers: { ...formHeaders, authorization: `Basic ${Buffer.from(`${clientId}:${clientSecret}`).toString('base64')}` },
+      body: form({ token: signInTokens.body.access_token, token_type_hint: 'access_token', client_id: clientId }) });
+    console.log('[stage12:integration] PASS: Alexa-side sign-in refuses homeowners and wrong credentials, requires number-matching approval on the account\'s own phone (wrong number ends the request), is bound to the exact OAuth request, issues one code, and links a tenant-only automatic account');
 
     console.log('[stage12:integration] PASS: actual OAuth routes enforce tenant-only account linking, explicit one-time scope consent, exact callback/state, PKCE, hashed tokens, single-use code, refresh rotation/reuse revocation and full unlink');
   } finally {

@@ -1,12 +1,14 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { prisma } from '@/lib/prisma';
-import type { Prisma } from '@prisma/client';
+import { Prisma } from '@prisma/client';
 import { currentCustomerPolicy } from '@/lib/customerPolicyConfig';
 import { decryptPlatformEnvelope, encryptPlatformEnvelope } from '@/lib/hubOperatorCredentials';
 import { PlatformDataEncryptionKeyError } from '@/lib/platformDataEncryptionKey';
 import { serializableTransaction } from '@/lib/serializableTransaction';
 import { refreshNativeAlexaEventToken } from '@/lib/nativeAlexaGrant';
 import { alexaPropertiesFromStates, type AuthorizedEndpoint } from '@/lib/nativeAlexaExecution';
+import { ensureAutoScopes } from '@/lib/alexa/syncAlexa';
+import { projectAlexaLinkEndpoints } from '@/lib/alexa/projection';
 
 const MAX_CHANGE_REPORTS_PER_TICK = 4;
 const GATEWAY_TIMEOUT_MS = 4000;
@@ -310,6 +312,93 @@ export async function dispatchNativeAlexaChangeReports(now = new Date()) {
     else if (outcome === 'EXPIRED') result.expired += 1;
     else if (outcome === 'FAILED') result.failed += 1;
     else if (outcome === 'RETRY' || outcome === 'REFRESH') result.retried += 1;
+  }
+  return result;
+}
+
+// ---- Proactive "devices added / changed / removed" reports ------------------------------------------------------
+
+const MAX_LINKS_PER_SWEEP = 3;
+const MAX_ENDPOINTS_PER_REPORT = 100;
+
+/**
+ * Keeps every auto-scope link in step with the tenant's real access and tells Alexa what changed: AddOrUpdateReport for
+ * new, renamed or changed devices and DeleteReport for devices that are gone. The truth is the endpoint projection rows
+ * (payloadHash against announcedHash), so a missed run, a failed delivery or a restart simply catches up on the next
+ * two-minute tick. Bounded per tick; links rotate by their last sweep time.
+ */
+export async function dispatchAlexaDiscoveryReports(now = new Date()) {
+  const empty = { enabled: false, links: 0, added: 0, removed: 0, failed: 0 };
+  if (process.env.DINODIA_NATIVE_ALEXA_ENABLED !== 'true') return empty;
+  const links = await prisma.alexaNativeLink.findMany({ where: { status: 'ACTIVE', revokedAt: null, autoScope: true },
+    orderBy: [{ updatedAt: 'asc' }, { id: 'asc' }], take: MAX_LINKS_PER_SWEEP, select: { id: true, customerAccountId: true } });
+  const result = { enabled: true, links: links.length, added: 0, removed: 0, failed: 0 };
+  for (const link of links) {
+    try {
+      const pending = await serializableTransaction(async (tx) => {
+        await tx.$queryRaw`SELECT "id" FROM "CustomerAccount" WHERE "id" = ${link.customerAccountId}::uuid FOR UPDATE`;
+        await tx.$queryRaw`SELECT "id" FROM "AlexaNativeLink" WHERE "id" = ${link.id}::uuid FOR UPDATE`;
+        const current = await tx.alexaNativeLink.findUnique({ where: { id: link.id }, select: {
+          id: true, customerAccountId: true, status: true, revokedAt: true, autoScope: true, pendingDeleteEndpointIds: true,
+          customerAccount: { select: { status: true, emailVerifiedAt: true, mustChangePassword: true, usernameSelectionRequired: true } },
+        } });
+        const swept = new Date();
+        if (!current || current.status !== 'ACTIVE' || current.revokedAt || !current.autoScope) return null;
+        const account = current.customerAccount;
+        if (account.status !== 'ACTIVE' || !account.emailVerifiedAt || account.mustChangePassword || account.usernameSelectionRequired) {
+          await tx.alexaNativeEndpointProjection.updateMany({ where: { linkId: link.id, status: { not: 'REVOKED' } }, data: { status: 'REVOKED', updatedAt: swept } });
+        } else {
+          await ensureAutoScopes(tx, current, swept);
+          await projectAlexaLinkEndpoints(tx, current, swept);
+        }
+        await tx.alexaNativeLink.update({ where: { id: link.id }, data: { updatedAt: swept } });
+        const rows = await tx.alexaNativeEndpointProjection.findMany({ where: { linkId: link.id, OR: [
+          { status: 'ACTIVE', payloadHash: { not: null } }, { status: 'REVOKED', announcedHash: { not: null } },
+        ] }, orderBy: { id: 'asc' }, select: { id: true, endpointId: true, status: true, payloadHash: true, announcedHash: true, capabilities: true } });
+        const adds = rows.filter((row) => row.status === 'ACTIVE' && row.payloadHash !== row.announcedHash)
+          .map((row) => ({ id: row.id, hash: row.payloadHash as string, endpoint: object(object(row.capabilities)?.alexaEndpoint) }))
+          .filter((row): row is { id: string; hash: string; endpoint: JsonObject } => row.endpoint !== null);
+        const removes = rows.filter((row) => row.status === 'REVOKED' && row.announcedHash).map((row) => ({ id: row.id, endpointId: row.endpointId }));
+        const replaced = Array.isArray(current.pendingDeleteEndpointIds)
+          ? current.pendingDeleteEndpointIds.filter((item): item is string => typeof item === 'string' && /^dos_[A-Za-z0-9_-]{16,80}$/.test(item)) : [];
+        return { adds, removes, replaced };
+      }, 2, { timeoutMs: 6000, maxWaitMs: 2000 });
+      if (!pending || (pending.adds.length === 0 && pending.removes.length === 0 && pending.replaced.length === 0)) continue;
+      if (!(await refreshLinkToken(link.id))) { result.failed += 1; continue; }
+      const token = await prisma.alexaNativeLink.findUnique({ where: { id: link.id }, select: { accessTokenCiphertext: true } });
+      let accessToken = '';
+      try { accessToken = token?.accessTokenCiphertext ? decryptPlatformEnvelope(token.accessTokenCiphertext) : ''; }
+      catch (error) { if (error instanceof PlatformDataEncryptionKeyError) throw error; }
+      if (!accessToken || accessToken.length < 16 || accessToken.length > 8192) { result.failed += 1; continue; }
+      const post = async (name: 'AddOrUpdateReport' | 'DeleteReport', endpoints: JsonObject[]) => {
+        const response = await fetch(eventGatewayEndpoint(), { method: 'POST', headers: { 'content-type': 'application/json', accept: 'application/json' },
+          body: JSON.stringify({ event: { header: { namespace: 'Alexa.Discovery', name, messageId: `dinodia-${randomUUID()}`, payloadVersion: '3' },
+            payload: { endpoints, scope: { type: 'BearerToken', token: accessToken } } } }),
+          signal: AbortSignal.timeout(GATEWAY_TIMEOUT_MS), redirect: 'manual' });
+        await response.body?.cancel().catch(() => {});
+        return response.ok;
+      };
+      const addBatch = pending.adds.slice(0, MAX_ENDPOINTS_PER_REPORT);
+      if (addBatch.length && await post('AddOrUpdateReport', addBatch.map((row) => row.endpoint))) {
+        for (const row of addBatch) await prisma.alexaNativeEndpointProjection.updateMany({ where: { id: row.id, payloadHash: row.hash }, data: { announcedHash: row.hash, announcedAt: now } });
+        result.added += addBatch.length;
+      } else if (addBatch.length) result.failed += 1;
+      const removeBatch = pending.removes.slice(0, MAX_ENDPOINTS_PER_REPORT);
+      const removeIds = [...new Set([...removeBatch.map((row) => row.endpointId), ...pending.replaced])].slice(0, MAX_ENDPOINTS_PER_REPORT);
+      if (removeIds.length && await post('DeleteReport', removeIds.map((endpointId) => ({ endpointId })))) {
+        for (const row of removeBatch) await prisma.alexaNativeEndpointProjection.updateMany({ where: { id: row.id, status: 'REVOKED' }, data: { announcedHash: null, announcedAt: now } });
+        const sent = new Set(removeIds);
+        if (pending.replaced.some((endpointId) => sent.has(endpointId))) {
+          const fresh = await prisma.alexaNativeLink.findUnique({ where: { id: link.id }, select: { pendingDeleteEndpointIds: true } });
+          const left = (Array.isArray(fresh?.pendingDeleteEndpointIds) ? fresh.pendingDeleteEndpointIds : []).filter((item) => typeof item === 'string' && !sent.has(item));
+          await prisma.alexaNativeLink.update({ where: { id: link.id }, data: { pendingDeleteEndpointIds: left.length ? (left as Prisma.InputJsonValue) : Prisma.DbNull } });
+        }
+        result.removed += removeIds.length;
+      } else if (removeIds.length) result.failed += 1;
+    } catch (error) {
+      if (error instanceof PlatformDataEncryptionKeyError) throw error;
+      result.failed += 1; // never log identifiers or the gateway body
+    }
   }
   return result;
 }

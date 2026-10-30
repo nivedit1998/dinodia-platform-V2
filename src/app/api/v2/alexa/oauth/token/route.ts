@@ -8,6 +8,8 @@ import {
   makeAlexaOpaqueToken, pkceChallenge, providerSubjectHash,
 } from '@/lib/nativeAlexaOAuth';
 import { sha256 } from '@/lib/stage1Crypto';
+import { lockAndValidateAlexaSignInIntent } from '@/lib/alexa/signInLinking';
+import { ensureAutoScopes } from '@/lib/alexa/syncAlexa';
 
 export const dynamic = 'force-dynamic';
 
@@ -44,14 +46,23 @@ async function issueTokens(tx: Parameters<Parameters<typeof serializableTransact
   return { accessToken, refreshToken, expiresIn: Math.max(1, Math.floor((accessExpiresAt.getTime() - now.getTime()) / 1000)) };
 }
 
+/** Shapes a sign-in intent like the app-code validation result so the shared exchange logic stays one path. */
+async function signInIntentAsCurrent(tx: Parameters<Parameters<typeof serializableTransaction>[0]>[0], intentId: string) {
+  const { intent, now } = await lockAndValidateAlexaSignInIntent(tx, intentId);
+  return { intent: { id: intent.id, customerAccountId: intent.customerAccountId, membershipId: '', homeId: '' }, selectedAreas: [] as string[], now };
+}
+
 async function exchangeAuthorizationCode(input: { code: string; clientId: string; redirectUri: string; verifier: string }): Promise<ExchangeResult> {
   const codeHash = sha256(input.code);
   const hint = await prisma.alexaOAuthAuthorizationCode.findUnique({ where: { codeHash }, select: {
-    id: true, customerAccountId: true, intents: { select: { intentId: true } },
+    id: true, customerAccountId: true, intents: { select: { intentId: true, intent: { select: { kind: true } } } },
   } });
   if (!hint || hint.intents.length !== 1) return { error: 'invalid_grant' };
+  const signIn = hint.intents[0].intent.kind === 'SIGN_IN';
   return serializableTransaction(async (tx) => {
-    const currentIntent = await lockAndValidateAlexaConnectIntent(tx, hint.intents[0].intentId, 'consumed');
+    const currentIntent = signIn
+      ? await signInIntentAsCurrent(tx, hint.intents[0].intentId)
+      : await lockAndValidateAlexaConnectIntent(tx, hint.intents[0].intentId, 'consumed');
     await tx.$queryRaw`SELECT "id" FROM "AlexaOAuthAuthorizationCode" WHERE "id" = ${hint.id}::uuid FOR UPDATE`;
     const code = await tx.alexaOAuthAuthorizationCode.findUnique({ where: { id: hint.id }, select: {
       id: true, customerAccountId: true, clientId: true, redirectUri: true, codeChallenge: true,
@@ -68,7 +79,7 @@ async function exchangeAuthorizationCode(input: { code: string; clientId: string
     const subjectHash = providerSubjectHash(input.clientId, code.customerAccountId);
     await tx.$queryRaw`SELECT "id" FROM "AlexaNativeLink" WHERE "providerSubjectHash" = ${subjectHash} FOR UPDATE`;
     let link = await tx.alexaNativeLink.findUnique({ where: { providerSubjectHash: subjectHash }, select: {
-      id: true, customerAccountId: true, status: true, revokedAt: true,
+      id: true, customerAccountId: true, status: true, revokedAt: true, autoScope: true,
     } });
     if (link && link.customerAccountId !== code.customerAccountId) return { error: 'invalid_grant' as const };
     if (link && (link.status !== 'ACTIVE' || link.revokedAt)) {
@@ -82,11 +93,18 @@ async function exchangeAuthorizationCode(input: { code: string; clientId: string
         encryptionKeyVersion: 1,
         status: 'ACTIVE',
         revision: 1,
-      }, select: { id: true, customerAccountId: true, status: true, revokedAt: true } });
+        autoScope: signIn,
+      }, select: { id: true, customerAccountId: true, status: true, revokedAt: true, autoScope: true } });
     }
-    await applyAlexaIntentScope(tx, { linkId: link.id, intentId: currentIntent.intent.id,
-      membershipId: currentIntent.intent.membershipId, homeId: currentIntent.intent.homeId,
-      selectedAreaIds: currentIntent.selectedAreas, now });
+    if (signIn) {
+      // Sign-in links follow the tenant's real access: every granted room in every tenant Home, kept in step automatically.
+      if (!link.autoScope) await tx.alexaNativeLink.update({ where: { id: link.id }, data: { autoScope: true } });
+      await ensureAutoScopes(tx, { id: link.id, customerAccountId: code.customerAccountId }, now);
+    } else {
+      await applyAlexaIntentScope(tx, { linkId: link.id, intentId: currentIntent.intent.id,
+        membershipId: currentIntent.intent.membershipId, homeId: currentIntent.intent.homeId,
+        selectedAreaIds: currentIntent.selectedAreas, now });
+    }
     const consumed = await tx.alexaOAuthAuthorizationCode.updateMany({
       where: { id: code.id, consumedAt: null, expiresAt: { gt: now } }, data: { consumedAt: now },
     });

@@ -22,6 +22,8 @@ export const stage1RouteInventory = [
   ['GET', '/api/v2/alexa/discovery', 'public-disabled-feature'],
   ['POST', '/api/v2/alexa/home-scope', 'customer'],
   ['POST', '/api/v2/alexa/home-scope/unlink', 'customer'],
+  ['GET', '/api/v2/alexa/link-approvals', 'customer'],
+  ['POST', '/api/v2/alexa/link-approvals/:approvalId', 'customer'],
   ['GET', '/api/v2/alexa/link-status', 'customer'],
   ['POST', '/api/v2/alexa/link-status', 'customer'],
   ['GET', '/api/v2/alexa/oauth/authorize', 'public-oauth-intent'],
