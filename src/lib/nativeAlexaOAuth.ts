@@ -86,7 +86,7 @@ export function parseAlexaOAuthRequest(values: URLSearchParams, config: AlexaOAu
   };
   if (request.clientId !== config.clientId || !config.redirectUris.has(request.redirectUri)
     || request.responseType !== 'code' || request.scope !== config.scope
-    || !/^[A-Za-z0-9._~+/=-]{1,1024}$/.test(request.state)
+    || !/^[A-Za-z0-9._~+/=-]{1,4096}$/.test(request.state)
     || (request.codeChallenge !== null && !/^[A-Za-z0-9_-]{43}$/.test(request.codeChallenge))
     || (request.codeChallengeMethod !== null && request.codeChallengeMethod !== 'S256')) {
     throw new Stage1AuthError(400, 'alexa_oauth_request_invalid', 'The Alexa account-link request is invalid');
@@ -291,7 +291,7 @@ export function alexaOAuthRequestProblem(values: URLSearchParams, config: AlexaO
   else if (!config.redirectUris.has(get('redirect_uri'))) reason = 'redirect_uri_not_allowed';
   else if (get('response_type') !== 'code') reason = 'response_type';
   else if (get('scope') !== config.scope) reason = 'scope_mismatch';
-  else if (!/^[A-Za-z0-9._~+/=-]{1,1024}$/.test(get('state'))) reason = `state_invalid_len${get('state').length}`;
+  else if (!/^[A-Za-z0-9._~+/=-]{1,4096}$/.test(get('state'))) reason = `state_invalid_len${get('state').length}`;
   else if (values.has('code_challenge') !== values.has('code_challenge_method')) reason = 'pkce_pair';
   return `reason=${reason} params=${names}`;
 }
