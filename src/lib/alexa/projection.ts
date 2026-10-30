@@ -110,7 +110,7 @@ export async function projectAlexaLinkEndpoints(tx: Prisma.TransactionClient, li
 
   // Keep a device's room stable while it stays valid; re-pin to another granted room when the old one is gone.
   const existingRows = await tx.alexaNativeEndpointProjection.findMany({ where: { linkId: link.id }, select: {
-    id: true, deviceId: true, endpointId: true, exposureGeneration: true, status: true, homeId: true, membershipId: true, areaId: true, payloadHash: true, announcedHash: true,
+    id: true, deviceId: true, endpointId: true, exposureGeneration: true, status: true, homeId: true, membershipId: true, areaId: true, payloadHash: true,
   } });
   const existingByDevice = new Map(existingRows.map((row) => [row.deviceId, row]));
   const roomNames = new Map<string, string>();
@@ -130,12 +130,11 @@ export async function projectAlexaLinkEndpoints(tx: Prisma.TransactionClient, li
   const properties = new Map<string, { scope: Candidate['scope']; data: JsonObject[] }>();
   const endpoints: AlexaEndpoint[] = [];
   const seenDeviceIds = new Set<string>();
-  const replacedEndpointIds: string[] = [];
   for (const candidate of candidates) {
     const { scope, device, controls, areaIds, areaId } = candidate;
     const existing = existingByDevice.get(device.id);
     // A live endpoint keeps its id for as long as it stays exposed (it may move to another granted room). Anything
-    // retired and later exposed again is a new endpoint with a new id, and the old id is reported as removed.
+    // retired and later exposed again is a new endpoint with a new id; the old id is reported as removed by the sweep.
     const live = existing?.status === 'ACTIVE' && existing.homeId === scope.homeId && existing.membershipId === scope.membershipId;
     const exposureGeneration = live && existing.areaId === areaId ? existing.exposureGeneration : candidate.areaGeneration;
     let endpointId = live ? existing.endpointId : endpointIdentity(link.id, device.id, exposureGeneration);
@@ -152,7 +151,6 @@ export async function projectAlexaLinkEndpoints(tx: Prisma.TransactionClient, li
       } });
     } else {
       if (existing) {
-        if (existing.announcedHash) replacedEndpointIds.push(existing.endpointId);
         await tx.alexaNativeEndpointProjection.delete({ where: { id: existing.id } });
       }
       await tx.alexaNativeEndpointProjection.create({ data: {
@@ -178,12 +176,6 @@ export async function projectAlexaLinkEndpoints(tx: Prisma.TransactionClient, li
   // Revoke cached projections that no longer have a current selected-room, membership, device, hub or supported path.
   const staleIds = existingRows.filter((row) => row.status !== 'REVOKED' && !seenDeviceIds.has(row.deviceId)).map((row) => row.id);
   if (staleIds.length) await tx.alexaNativeEndpointProjection.updateMany({ where: { id: { in: staleIds }, status: { not: 'REVOKED' } }, data: { status: 'REVOKED', updatedAt: now } });
-
-  if (replacedEndpointIds.length) {
-    const current = await tx.alexaNativeLink.findUnique({ where: { id: link.id }, select: { pendingDeleteEndpointIds: true } });
-    const known = Array.isArray(current?.pendingDeleteEndpointIds) ? current.pendingDeleteEndpointIds.filter((item): item is string => typeof item === 'string') : [];
-    await tx.alexaNativeLink.update({ where: { id: link.id }, data: { pendingDeleteEndpointIds: [...new Set([...known, ...replacedEndpointIds])].slice(-200) } });
-  }
 
   return {
     endpoints,

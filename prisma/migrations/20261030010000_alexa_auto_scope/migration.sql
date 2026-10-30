@@ -3,7 +3,7 @@
 -- No backfill: the Alexa tables are empty and every new column is nullable or has a safe default.
 ALTER TABLE "AlexaNativeLink"
   ADD COLUMN "autoScope" BOOLEAN NOT NULL DEFAULT false,
-  ADD COLUMN "pendingDeleteEndpointIds" JSONB;
+  ADD COLUMN "announcedEndpointIds" JSONB;
 
 ALTER TABLE "AlexaNativeEndpointProjection"
   ADD COLUMN "payloadHash" VARCHAR(64),
@@ -17,21 +17,11 @@ ALTER TABLE "AlexaNativeConnectIntent"
   ADD COLUMN "declinedAt" TIMESTAMP(3),
   ADD COLUMN "oauthRequestHash" VARCHAR(64);
 
--- Two narrow relaxations of the endpoint guard (everything else in it is unchanged and still enforced):
---  1. a retired endpoint may have its "announced" bookkeeping updated (nothing that grants access can change);
---  2. a live endpoint may move to another room that is still granted, selected and assigned, keeping its endpoint id.
+-- One narrow relaxation of the endpoint guard (everything else in it is unchanged and still enforced): a live endpoint may
+-- move to another room that is still granted, selected and assigned, keeping its endpoint id.
 CREATE OR REPLACE FUNCTION "enforce_native_alexa_endpoint_scope"() RETURNS trigger LANGUAGE plpgsql AS $$
 DECLARE link_account UUID; link_account_status "CustomerStatus"; link_email_verified TIMESTAMP(3); member_account UUID; member_role "MembershipRole"; member_status "MembershipStatus"; device_class "DeviceManagementClass"; owner_membership UUID;
 BEGIN
-  IF TG_OP = 'UPDATE' AND OLD."status" <> 'ACTIVE' AND NEW."status" = OLD."status"
-    AND NEW."id" = OLD."id" AND NEW."linkId" = OLD."linkId" AND NEW."homeId" = OLD."homeId" AND NEW."membershipId" = OLD."membershipId"
-    AND NEW."deviceId" = OLD."deviceId" AND NEW."areaId" = OLD."areaId" AND NEW."endpointId" = OLD."endpointId"
-    AND NEW."exposureGeneration" = OLD."exposureGeneration" AND NEW."descriptorRevision" = OLD."descriptorRevision"
-    AND NEW."displayName" = OLD."displayName" AND NEW."capabilities" = OLD."capabilities"
-    AND NEW."payloadHash" IS NOT DISTINCT FROM OLD."payloadHash" THEN
-    -- Only the record of what Alexa has been told ("announced*") may change on a retired endpoint; it grants nothing.
-    RETURN NEW;
-  END IF;
   IF TG_OP = 'UPDATE' AND NEW."status" <> 'ACTIVE' THEN
     IF OLD."status" <> 'ACTIVE' OR NEW."id" <> OLD."id" OR NEW."linkId" <> OLD."linkId" OR NEW."homeId" <> OLD."homeId"
       OR NEW."membershipId" <> OLD."membershipId" OR NEW."deviceId" <> OLD."deviceId" OR NEW."areaId" <> OLD."areaId"

@@ -5452,10 +5452,24 @@ async function nativeAlexaOAuthChecks(deliveryEnv) {
       endpoint: { endpointId: readingProjection.endpointId, scope: { type: 'BearerToken', token: tokenBody.access_token } }, payload: {},
     } }) });
     if (!removeReport || removeReport.endpointIds.length !== 1 || removeReport.endpointIds[0] !== readingProjection.endpointId
-      || readingAfter?.status !== 'REVOKED' || readingAfter.announcedHash !== null
+      || readingAfter?.status !== 'REVOKED' || (await prisma.alexaNativeLink.findUniqueOrThrow({ where: { id: link.id }, select: { announcedEndpointIds: true } })).announcedEndpointIds?.includes?.(readingProjection.endpointId)
       || goneDirective.body.event?.header?.name !== 'ErrorResponse' || effectsOnHub() !== effectsBeforeGone) {
       fail(`A removed device was not deleted from Alexa and denied before reaching the hub (${JSON.stringify({ report: removeReport ? { n: removeReport.name, ids: removeReport.endpointIds.length, match: removeReport.endpointIds[0] === readingProjection.endpointId } : null, status: readingAfter?.status, announced: readingAfter?.announcedHash, directive: goneDirective.body.event?.header?.name, effects: effectsOnHub() - effectsBeforeGone, deliveries: alexaDiscoveryDeliveries.length, sweep: JSON.stringify({ reports: sweepRemove.body.alexaDiscoveryReports, failed: sweepRemove.body.failedTasks }), rows: JSON.stringify(await prisma.alexaNativeEndpointProjection.findMany({ where: { linkId: link.id, deviceId: readingDeviceId }, select: { status: true, announcedHash: true, payloadHash: true, announcedAt: true, updatedAt: true } })) })})`);
     }
+
+    // A projection row removed by another Platform path (area deletion, tenant removal...) is still reported as removed.
+    const strayDeviceId = await makeSyncDevice('Stray light', syncAreaRow.id);
+    await discoverAll();
+    const strayRow = await prisma.alexaNativeEndpointProjection.findFirstOrThrow({ where: { linkId: link.id, deviceId: strayDeviceId, status: 'ACTIVE' }, select: { id: true, endpointId: true } });
+    alexaDiscoveryDeliveries = [];
+    await prisma.nativeDevice.update({ where: { id: strayDeviceId }, data: { lifecycle: 'REMOVED' } });
+    await prisma.alexaNativeEndpointProjection.delete({ where: { id: strayRow.id } });
+    await runOperations();
+    const strayReport = alexaDiscoveryDeliveries.find((item) => item.name === 'DeleteReport');
+    if (!strayReport || !strayReport.endpointIds.includes(strayRow.endpointId)) fail('A projection deleted by another Platform path was never reported to Alexa as removed');
+    alexaDiscoveryDeliveries = [];
+    await runOperations();
+    if (alexaDiscoveryDeliveries.length !== 0) fail('The sweep repeated a removal Alexa had already confirmed');
 
     // Revoking the room's access removes its devices from Alexa and stops their control.
     alexaDiscoveryDeliveries = [];
@@ -5497,7 +5511,7 @@ async function nativeAlexaOAuthChecks(deliveryEnv) {
     await prisma.tenantAreaGrant.deleteMany({ where: { areaId: syncAreaRow.id } });
     await prisma.alexaNativeEndpointProjection.deleteMany({ where: { areaId: syncAreaRow.id } });
     await prisma.alexaNativeAreaSelection.deleteMany({ where: { areaId: syncAreaRow.id } });
-    await prisma.nativeDevice.deleteMany({ where: { id: { in: [deskDeviceId, readingDeviceId, strangerDeviceId] } } });
+    await prisma.nativeDevice.deleteMany({ where: { id: { in: [deskDeviceId, readingDeviceId, strangerDeviceId, strayDeviceId] } } });
     await prisma.homeMembership.delete({ where: { id: strangerMembership.id } });
     await prisma.customerAccount.delete({ where: { id: stranger.id } });
     await prisma.area.delete({ where: { id: syncAreaRow.id } });

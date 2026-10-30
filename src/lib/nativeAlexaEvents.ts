@@ -339,7 +339,7 @@ export async function dispatchAlexaDiscoveryReports(now = new Date()) {
         await tx.$queryRaw`SELECT "id" FROM "CustomerAccount" WHERE "id" = ${link.customerAccountId}::uuid FOR UPDATE`;
         await tx.$queryRaw`SELECT "id" FROM "AlexaNativeLink" WHERE "id" = ${link.id}::uuid FOR UPDATE`;
         const current = await tx.alexaNativeLink.findUnique({ where: { id: link.id }, select: {
-          id: true, customerAccountId: true, status: true, revokedAt: true, autoScope: true, pendingDeleteEndpointIds: true,
+          id: true, customerAccountId: true, status: true, revokedAt: true, autoScope: true, announcedEndpointIds: true,
           customerAccount: { select: { status: true, emailVerifiedAt: true, mustChangePassword: true, usernameSelectionRequired: true } },
         } });
         const swept = new Date();
@@ -352,18 +352,21 @@ export async function dispatchAlexaDiscoveryReports(now = new Date()) {
           await projectAlexaLinkEndpoints(tx, current, swept);
         }
         await tx.alexaNativeLink.update({ where: { id: link.id }, data: { updatedAt: swept } });
-        const rows = await tx.alexaNativeEndpointProjection.findMany({ where: { linkId: link.id, OR: [
-          { status: 'ACTIVE', payloadHash: { not: null } }, { status: 'REVOKED', announcedHash: { not: null } },
-        ] }, orderBy: { id: 'asc' }, select: { id: true, endpointId: true, status: true, payloadHash: true, announcedHash: true, capabilities: true } });
-        const adds = rows.filter((row) => row.status === 'ACTIVE' && row.payloadHash !== row.announcedHash)
+        // Adds: active endpoints whose Alexa-ready form differs from what Alexa was last told.
+        // Removes: ids Alexa is known to have that are no longer active, however they stopped being active (revoked,
+        // re-created under a new id, or deleted by another Platform path such as area deletion or tenant removal).
+        const rows = await tx.alexaNativeEndpointProjection.findMany({ where: { linkId: link.id, status: 'ACTIVE', payloadHash: { not: null } },
+          orderBy: { id: 'asc' }, select: { id: true, endpointId: true, payloadHash: true, announcedHash: true, capabilities: true } });
+        const adds = rows.filter((row) => row.payloadHash !== row.announcedHash)
           .map((row) => ({ id: row.id, hash: row.payloadHash as string, endpoint: object(object(row.capabilities)?.alexaEndpoint) }))
           .filter((row): row is { id: string; hash: string; endpoint: JsonObject } => row.endpoint !== null);
-        const removes = rows.filter((row) => row.status === 'REVOKED' && row.announcedHash).map((row) => ({ id: row.id, endpointId: row.endpointId }));
-        const replaced = Array.isArray(current.pendingDeleteEndpointIds)
-          ? current.pendingDeleteEndpointIds.filter((item): item is string => typeof item === 'string' && /^dos_[A-Za-z0-9_-]{16,80}$/.test(item)) : [];
-        return { adds, removes, replaced };
+        const activeIds = new Set(rows.map((row) => row.endpointId));
+        const known = Array.isArray(current.announcedEndpointIds)
+          ? current.announcedEndpointIds.filter((item): item is string => typeof item === 'string' && /^dos_[A-Za-z0-9_-]{16,80}$/.test(item)) : [];
+        const removes = known.filter((endpointId) => !activeIds.has(endpointId));
+        return { adds, removes, known };
       }, 2, { timeoutMs: 6000, maxWaitMs: 2000 });
-      if (!pending || (pending.adds.length === 0 && pending.removes.length === 0 && pending.replaced.length === 0)) continue;
+      if (!pending || (pending.adds.length === 0 && pending.removes.length === 0)) continue;
       if (!(await refreshLinkToken(link.id))) { result.failed += 1; continue; }
       const token = await prisma.alexaNativeLink.findUnique({ where: { id: link.id }, select: { accessTokenCiphertext: true } });
       let accessToken = '';
@@ -378,23 +381,25 @@ export async function dispatchAlexaDiscoveryReports(now = new Date()) {
         await response.body?.cancel().catch(() => {});
         return response.ok;
       };
+      const rememberAnnounced = async (change: (known: string[]) => string[]) => {
+        const fresh = await prisma.alexaNativeLink.findUnique({ where: { id: link.id }, select: { announcedEndpointIds: true } });
+        const current = Array.isArray(fresh?.announcedEndpointIds) ? fresh.announcedEndpointIds.filter((item): item is string => typeof item === 'string') : [];
+        const next = [...new Set(change(current))].slice(-5000);
+        await prisma.alexaNativeLink.update({ where: { id: link.id }, data: { announcedEndpointIds: next.length ? (next as Prisma.InputJsonValue) : Prisma.DbNull } });
+      };
       const addBatch = pending.adds.slice(0, MAX_ENDPOINTS_PER_REPORT);
       if (addBatch.length && await post('AddOrUpdateReport', addBatch.map((row) => row.endpoint))) {
-        for (const row of addBatch) await prisma.alexaNativeEndpointProjection.updateMany({ where: { id: row.id, payloadHash: row.hash }, data: { announcedHash: row.hash, announcedAt: now } });
+        for (const row of addBatch) await prisma.alexaNativeEndpointProjection.updateMany({ where: { id: row.id, payloadHash: row.hash, status: 'ACTIVE' }, data: { announcedHash: row.hash, announcedAt: now } });
+        const addedIds = addBatch.map((row) => String(row.endpoint.endpointId ?? '')).filter(Boolean);
+        await rememberAnnounced((known) => [...known, ...addedIds]);
         result.added += addBatch.length;
       } else if (addBatch.length) result.failed += 1;
       const removeBatch = pending.removes.slice(0, MAX_ENDPOINTS_PER_REPORT);
-      const removeIds = [...new Set([...removeBatch.map((row) => row.endpointId), ...pending.replaced])].slice(0, MAX_ENDPOINTS_PER_REPORT);
-      if (removeIds.length && await post('DeleteReport', removeIds.map((endpointId) => ({ endpointId })))) {
-        for (const row of removeBatch) await prisma.alexaNativeEndpointProjection.updateMany({ where: { id: row.id, status: 'REVOKED' }, data: { announcedHash: null, announcedAt: now } });
-        const sent = new Set(removeIds);
-        if (pending.replaced.some((endpointId) => sent.has(endpointId))) {
-          const fresh = await prisma.alexaNativeLink.findUnique({ where: { id: link.id }, select: { pendingDeleteEndpointIds: true } });
-          const left = (Array.isArray(fresh?.pendingDeleteEndpointIds) ? fresh.pendingDeleteEndpointIds : []).filter((item) => typeof item === 'string' && !sent.has(item));
-          await prisma.alexaNativeLink.update({ where: { id: link.id }, data: { pendingDeleteEndpointIds: left.length ? (left as Prisma.InputJsonValue) : Prisma.DbNull } });
-        }
-        result.removed += removeIds.length;
-      } else if (removeIds.length) result.failed += 1;
+      if (removeBatch.length && await post('DeleteReport', removeBatch.map((endpointId) => ({ endpointId })))) {
+        const gone = new Set(removeBatch);
+        await rememberAnnounced((known) => known.filter((endpointId) => !gone.has(endpointId)));
+        result.removed += removeBatch.length;
+      } else if (removeBatch.length) result.failed += 1;
     } catch (error) {
       if (error instanceof PlatformDataEncryptionKeyError) throw error;
       result.failed += 1; // never log identifiers or the gateway body

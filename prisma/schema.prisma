@@ -2263,8 +2263,9 @@ model AlexaNativeLink {
   status                 AlexaNativeLinkStatus @default(ACTIVE)
   /// True: every granted room of every active tenant membership is exposed; selections are kept in step automatically.
   autoScope              Boolean               @default(false)
-  /// Endpoint ids Alexa was told about that were re-created under a new id; reported once as removed, then cleared.
-  pendingDeleteEndpointIds Json?
+  /// Endpoint ids Alexa has been told about (announced or pulled by discovery). Whatever is in here but no longer active is
+  /// reported to Alexa as removed, however the endpoint disappeared; confirmed removals leave the set.
+  announcedEndpointIds   Json?
   accessTokenExpiresAt   DateTime?
   revokedAt              DateTime?
   revision               Int                   @default(1)

@@ -80,8 +80,13 @@ export async function ensureAutoScopes(tx: Prisma.TransactionClient, link: { id:
   return { changed };
 }
 
-/** Discovery told Alexa about every active endpoint (and Alexa drops the rest): remember it. */
+/** Discovery tells Alexa about every active endpoint: remember that, so later removals can be reported whichever way they happen. */
 export async function markAnnounced(tx: Prisma.TransactionClient, linkId: string, now: Date): Promise<void> {
   await tx.$executeRaw`UPDATE "AlexaNativeEndpointProjection" SET "announcedHash" = "payloadHash", "announcedAt" = ${now} WHERE "linkId" = ${linkId}::uuid AND "status" = 'ACTIVE' AND "payloadHash" IS NOT NULL`;
-  await tx.$executeRaw`UPDATE "AlexaNativeEndpointProjection" SET "announcedHash" = NULL, "announcedAt" = ${now} WHERE "linkId" = ${linkId}::uuid AND "status" = 'REVOKED' AND "announcedHash" IS NOT NULL`;
+  const active = await tx.alexaNativeEndpointProjection.findMany({ where: { linkId, status: 'ACTIVE' }, select: { endpointId: true } });
+  if (active.length === 0) return;
+  const link = await tx.alexaNativeLink.findUnique({ where: { id: linkId }, select: { announcedEndpointIds: true } });
+  const known = Array.isArray(link?.announcedEndpointIds) ? link.announcedEndpointIds.filter((item): item is string => typeof item === 'string') : [];
+  const merged = [...new Set([...known, ...active.map((row) => row.endpointId)])].slice(-5000);
+  if (merged.length !== known.length) await tx.alexaNativeLink.update({ where: { id: linkId }, data: { announcedEndpointIds: merged } });
 }
