@@ -10353,6 +10353,53 @@ async function newAccountOnboardingChecks(deliveryEnv) {
   console.log(`[onboarding:integration] PASS: a new account with no Home registers, is told its email is unverified (right password only), verifies, signs in, accepts the terms and loads an empty Home list (asOf skew ${Date.parse(pending.body.asOf) - policyNow}ms); sample ${JSON.stringify({ user: refreshed.body.user, nextAction: refreshed.body.nextAction })}`);
 }
 
+async function emailFirstChecks() {
+  const base = `http://127.0.0.1:${appPort}`;
+  sesShouldFail = false;
+  capturedCustomerVerification = null;
+  const post = (route, body) => fetchJson(`${base}${route}`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+  const email = `email-first-${crypto.randomUUID()}@invalid.test`;
+  const password = `email-first-password-${crypto.randomUUID()}`;
+  const unknown = await post('/api/v2/auth/identify', { email: `  ${email.toUpperCase()}  ` });
+  if (unknown.response.status !== 200 || Object.keys(unknown.body).sort().join(',') !== 'ok,schemaVersion,state' || unknown.body.state !== 'CREATE_ACCOUNT') {
+    fail(`Identify of an unknown email must answer CREATE_ACCOUNT with only schemaVersion, ok and state (${unknown.response.status} ${JSON.stringify(unknown.body)})`);
+  }
+  for (const bad of [{}, { email: 'not-an-email' }, { email, extra: true }, { email: 42 }, { email: `${'a'.repeat(330)}@invalid.test` }]) {
+    const rejected = await post('/api/v2/auth/identify', bad);
+    if (rejected.response.status !== 400) fail(`Identify accepted an invalid body ${JSON.stringify(bad).slice(0, 60)} (${rejected.response.status})`);
+  }
+  const registration = await post('/api/v2/auth/register', { displayName: 'Emily Rose Petrie', email, password });
+  if (registration.response.status !== 202 || !capturedCustomerVerification) fail(`Registration without a username failed (${registration.response.status} ${JSON.stringify(registration.body).slice(0, 200)})`);
+  const firstVerification = capturedCustomerVerification;
+  const created = await prisma.customerAccount.findUniqueOrThrow({ where: { emailNormalized: email }, select: { username: true, displayName: true } });
+  if (!/^emily\.rose\.petrie\d*$/.test(created.username) || created.displayName !== 'Emily Rose Petrie') fail(`A generated username must come from the name (${created.username})`);
+  const second = `email-first-${crypto.randomUUID()}@invalid.test`;
+  const sameName = await post('/api/v2/auth/register', { displayName: 'Emily Rose Petrie', email: second, password });
+  const secondAccount = await prisma.customerAccount.findUniqueOrThrow({ where: { emailNormalized: second }, select: { username: true } });
+  if (sameName.response.status !== 202 || secondAccount.username === created.username || !/^emily\.rose\.petrie\d+$/.test(secondAccount.username)) fail(`Two people with one name must get different usernames (${created.username}, ${secondAccount.username})`);
+  const chosen = await post('/api/v2/auth/register', { displayName: 'Chosen Name', username: `chosen-${crypto.randomUUID().slice(0, 10)}`, email: `email-first-${crypto.randomUUID()}@invalid.test`, password });
+  const taken = await post('/api/v2/auth/register', { displayName: 'Chosen Name', username: created.username, email: `email-first-${crypto.randomUUID()}@invalid.test`, password });
+  if (chosen.response.status !== 202 || taken.response.status !== 409) fail(`A chosen username must still be honoured and checked (${chosen.response.status}, ${taken.response.status})`);
+  for (const bad of [{ email, password }, { displayName: 'No Email', password }, { displayName: 'Short', email: `short-${crypto.randomUUID()}@invalid.test`, password: 'short' }, { displayName: 'X', email, password, role: 'OWNER' }]) {
+    const rejected = await post('/api/v2/auth/register', bad);
+    if (rejected.response.status !== 400) fail(`Registration accepted an invalid body ${JSON.stringify(Object.keys(bad))} (${rejected.response.status})`);
+  }
+  const unverified = await post('/api/v2/auth/identify', { email });
+  if (unverified.body.state !== 'VERIFY_EMAIL') fail(`An unverified account must answer VERIFY_EMAIL (${JSON.stringify(unverified.body)})`);
+  const verified = await post('/api/v2/auth/email/verify', firstVerification);
+  if (verified.response.status !== 200) fail('Email-first verification failed');
+  const signIn = await post('/api/v2/auth/identify', { email });
+  if (signIn.body.state !== 'SIGN_IN') fail(`A verified account must answer SIGN_IN (${JSON.stringify(signIn.body)})`);
+  await prisma.customerAccount.update({ where: { emailNormalized: email }, data: { mustChangePassword: true } });
+  const oneTime = await post('/api/v2/auth/identify', { email });
+  if (oneTime.body.state !== 'ONE_TIME_PASSWORD') fail(`An account still on a one-time password must answer ONE_TIME_PASSWORD (${JSON.stringify(oneTime.body)})`);
+  const limited = `email-first-limit-${crypto.randomUUID()}@invalid.test`;
+  const statuses = [];
+  for (let attempt = 0; attempt < 12; attempt += 1) statuses.push((await post('/api/v2/auth/identify', { email: limited })).response.status);
+  if (statuses.slice(0, 10).some((status) => status !== 200) || statuses[10] !== 429 || statuses[11] !== 429) fail(`Identify must allow 10 tries per email then rate limit (${statuses.join(',')})`);
+  console.log('[email-first:integration] PASS: identify answers CREATE_ACCOUNT, VERIFY_EMAIL, SIGN_IN and ONE_TIME_PASSWORD with a minimal body, rejects bad input, rate limits per email; registration needs no username and generates distinct readable ones while still honouring a chosen one');
+}
+
 async function customerAuthenticationLifecycleChecks(deliveryEnv) {
   const base = `http://127.0.0.1:${appPort}`;
   sesShouldFail = false;
@@ -12815,6 +12862,7 @@ try {
   await startPlatform(deliveryEnv);
   await bootstrapDeliveryChecks(deliveryEnv);
   await customerAuthenticationLifecycleChecks(deliveryEnv);
+  await emailFirstChecks();
   await customerAuthorizationChecks(deliveryEnv);
   if (process.env.UNIVERSAL_STATE_ANALYTICS_ONLY === '1') {
     await universalStateAnalyticsIntegration({prisma,fixture:customerFixture,osRoot,base:`http://127.0.0.1:${appPort}`,machineRequest,fetchJson});
@@ -12889,6 +12937,7 @@ try {
     console.log('[room-plaques:integration] Focused mode completed real authentication and plaque HTTP/database acceptance. Other harness scenarios were not run in this mode.');
   } else if (newAccountOnly) {
     await newAccountOnboardingChecks(deliveryEnv);
+    await emailFirstChecks();
   } else if (mobileRefreshOnly) {
     await mobileSessionContractChecks();
   } else if (stage6TenantInvitationDecisionOnly || sharedAvatarsOnly) {

@@ -551,7 +551,10 @@
     },
     "invitedTenantUsernameRequest": {
       "type": "object", "required": ["username"],
-      "properties": { "username": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{2,79}$" } },
+      "properties": {
+        "username": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{2,79}$" },
+        "displayName": { "type": "string", "minLength": 1, "maxLength": 160 }
+      },
       "additionalProperties": false
     },
     "invitedTenantUsernameReceipt": {

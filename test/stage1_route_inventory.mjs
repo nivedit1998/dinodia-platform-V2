@@ -94,6 +94,7 @@ export const stage1RouteInventory = [
   ['POST', '/api/v2/auth/password/change', 'customer'],
   ['POST', '/api/v2/auth/password/forgot', 'public-login'],
   ['POST', '/api/v2/auth/password/reset', 'public-login'],
+  ['POST', '/api/v2/auth/identify', 'public-login'],
   ['POST', '/api/v2/auth/register', 'public-login'],
   ['GET', '/api/v2/auth/requirements', 'customer'],
   ['POST', '/api/v2/auth/policy/acceptance', 'customer'],

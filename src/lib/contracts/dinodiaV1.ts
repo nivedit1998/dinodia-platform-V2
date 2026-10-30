@@ -32,7 +32,7 @@ export interface CustomerRequirementsReceipt {
   policy: CustomerPolicyProjection|null;
 }
 export interface InvitedTenantRegistrationRequest { invitationId: OpaqueId; email: string; password: string }
-export interface InvitedTenantUsernameRequest { username: string }
+export interface InvitedTenantUsernameRequest { username: string; displayName?: string }
 export interface InvitedTenantUsernameReceipt { schemaVersion: typeof DINODIA_V1; ok: true; username: string; usernameNormalized: string; nextAction: 'CONTINUE' }
 export interface CustomerPolicyAcceptanceRequest { version: string; contentSha256: string; accepted: true }
 export interface CustomerPolicyAcceptanceReceipt { schemaVersion: typeof DINODIA_V1; ok: true; policyVersion: string; contentSha256: string; idempotentReplay: boolean }
@@ -256,8 +256,11 @@ export function validateInvitedTenantRegistrationRequest(value: unknown): value 
     && typeof value.password === 'string' && codePointLength(value.password) >= 12 && codePointLength(value.password) <= 1024;
 }
 export function validateInvitedTenantUsernameRequest(value: unknown): value is InvitedTenantUsernameRequest {
-  return object(value) && hasOnlyKeys(value, ['username']) && typeof value.username === 'string'
-    && value.username === value.username.trim() && /^[A-Za-z0-9][A-Za-z0-9._-]{2,79}$/.test(value.username);
+  // displayName is optional: the email-first flow asks an invited person for their name instead of a username.
+  return object(value) && hasOnlyKeys(value, ['username', 'displayName']) && typeof value.username === 'string'
+    && value.username === value.username.trim() && /^[A-Za-z0-9][A-Za-z0-9._-]{2,79}$/.test(value.username)
+    && (value.displayName === undefined || (typeof value.displayName === 'string' && value.displayName === value.displayName.trim()
+      && value.displayName.length > 0 && codePointLength(value.displayName) <= 160));
 }
 export function validateInvitedTenantUsernameReceipt(value: unknown, expectedUsername: string): value is InvitedTenantUsernameReceipt {
   return object(value) && hasOnlyKeys(value, ['schemaVersion','ok','username','usernameNormalized','nextAction'])

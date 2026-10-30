@@ -47,6 +47,13 @@ function configuredSesClient(): { client: SESv2Client; source: string } {
   return { client: new SESv2Client({ region, ...(testEndpoint ? { endpoint: testEndpoint } : {}) }), source };
 }
 
+/** "in 24 hours" or "in 10 minutes": a plain-language expiry instead of a timestamp. */
+function friendlyExpiry(expiresAt: Date, now = new Date()): string {
+  const minutes = Math.max(1, Math.round((expiresAt.getTime() - now.getTime()) / 60000));
+  if (minutes >= 90) return `in ${Math.round(minutes / 60)} hours`;
+  return `in ${minutes} ${minutes === 1 ? 'minute' : 'minutes'}`;
+}
+
 /**
  * Sends a one-use customer verification or password-reset link through the
  * existing SES authority. The bearer stays in a URL fragment (not an HTTP
@@ -74,17 +81,16 @@ export async function sendCustomerAuthEmail(input: {
   const emailChange = input.purpose === 'change';
   const ownershipTransfer = input.purpose === 'ownership-transfer';
   const action = verification ? 'verify-email' : emailChange ? 'change-email' : ownershipTransfer ? 'ownership-transfer' : 'reset-password';
-  const title = verification ? 'Verify your Dinodia Smart Living email' : emailChange ? 'Confirm your new Dinodia Smart Living email' : ownershipTransfer ? 'Accept a Dinodia Smart Living home transfer' : 'Reset your Dinodia Smart Living password';
+  const title = verification ? 'Confirm your email for Dinodia' : emailChange ? 'Confirm your new Dinodia Smart Living email' : ownershipTransfer ? 'Accept a Dinodia Smart Living home transfer' : 'Reset your Dinodia password';
   const explanation = verification
-    ? 'Confirm this email address to finish setting up your Dinodia account.'
+    ? 'Tap the button to confirm your email, then open the Dinodia app to continue.'
     : emailChange ? 'Confirm this new email address to update your Dinodia account. Your current address remains active until confirmation.'
       : ownershipTransfer ? 'The current homeowner has invited this verified email address to receive the home. Review and accept only if you expected this transfer.'
-        : 'Choose a new password to restore access to your Dinodia account.';
+        : 'Tap the button to choose a new password for your Dinodia account.';
   // /app/* is the V2-only Associated Domains namespace. iOS handles the
   // fragment in-app (without sending the bearer to a request/referrer); the
   // canonical web route remains the safe fallback when the app is absent.
   const link = `${CANONICAL_ORIGIN}/app/auth#${action}=${encodeURIComponent(input.token)}&challenge=${encodeURIComponent(input.challengeId)}`;
-  const expires = input.expiresAt.toISOString();
   try {
     const result = await client.send(new SendEmailCommand({
       FromEmailAddress: source,
@@ -92,8 +98,8 @@ export async function sendCustomerAuthEmail(input: {
       Content: { Simple: {
         Subject: { Data: title, Charset: 'UTF-8' },
         Body: {
-          Text: { Data: `${explanation}\n\nContinue securely: ${link}\n\n${ownershipTransfer ? 'The transfer does not expire automatically, but this link is disabled if the homeowner cancels or completes the transfer.' : `This one-use link expires at ${expires}.`} If you did not request it, ignore this message.`, Charset: 'UTF-8' },
-          Html: { Data: `<p>${html(explanation)}</p><p><a href="${html(link)}">${verification ? 'Verify email address' : emailChange ? 'Confirm new email address' : ownershipTransfer ? 'Review home transfer' : 'Choose a new password'}</a></p><p>${ownershipTransfer ? 'The transfer does not expire automatically, but this link is disabled if the homeowner cancels or completes the transfer.' : `This one-use link expires at ${html(expires)}.`} If you did not request this, ignore this message.</p>`, Charset: 'UTF-8' },
+          Text: { Data: `${explanation}\n\nContinue securely: ${link}\n\n${ownershipTransfer ? 'The transfer does not expire automatically, but this link is disabled if the homeowner cancels or completes the transfer.' : `This link works once and expires ${friendlyExpiry(input.expiresAt)}.`} If you did not request it, ignore this message.`, Charset: 'UTF-8' },
+          Html: { Data: `<p>${html(explanation)}</p><p><a href="${html(link)}">${verification ? 'Verify email address' : emailChange ? 'Confirm new email address' : ownershipTransfer ? 'Review home transfer' : 'Choose a new password'}</a></p><p>${ownershipTransfer ? 'The transfer does not expire automatically, but this link is disabled if the homeowner cancels or completes the transfer.' : `This one-use link expires ${html(friendlyExpiry(input.expiresAt))}.`} If you did not request this, ignore this message.</p>`, Charset: 'UTF-8' },
         },
       } },
     }));

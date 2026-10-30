@@ -25,6 +25,7 @@ export async function PATCH(request: Request) {
       const now = new Date();
       const updated = await tx.customerAccount.update({ where: { id: principal.id }, data: {
         username, usernameNormalized, usernameSelectionRequired: false, updatedAt: now,
+        ...(body.displayName ? { displayName: body.displayName } : {}),
       }, select: { username: true, usernameNormalized: true } });
       await tx.auditEvent.create({ data: {
         actorType: 'CUSTOMER', actorId: principal.id, category: 'SECURITY', action: 'invited_tenant_username_selected',

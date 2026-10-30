@@ -196,6 +196,10 @@ test('invited tenant cannot choose a username until the invitation credential, e
   const username = { username: 'tenant.new' };
   assert.equal(native.validateInvitedTenantUsernameRequest(username), true);
   assert.equal(native.validateInvitedTenantUsernameRequest({ ...username, accountId: 'caller-authority' }), false);
+  assert.equal(native.validateInvitedTenantUsernameRequest({ ...username, displayName: 'Emily Parker' }), true, 'the email-first flow sends the invited person\'s name with the username');
+  assert.equal(native.validateInvitedTenantUsernameRequest({ ...username, displayName: '' }), false);
+  assert.equal(native.validateInvitedTenantUsernameRequest({ ...username, displayName: ' padded ' }), false);
+  assert.equal(native.validateInvitedTenantUsernameRequest({ ...username, displayName: 'x'.repeat(161) }), false);
   const receipt = { schemaVersion: 'dinodia.v1', ok: true, username: 'tenant.new', usernameNormalized: 'tenant.new', nextAction: 'CONTINUE' };
   assert.equal(native.validateInvitedTenantUsernameReceipt(receipt, username.username), true);
   assert.equal(native.validateInvitedTenantUsernameReceipt({ ...receipt, usernameNormalized: 'someone-else' }, username.username), false);

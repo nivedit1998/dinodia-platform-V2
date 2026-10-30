@@ -6,6 +6,7 @@ import { Stage1AuthError } from '@/lib/stage1Auth';
 import { nativeV1ErrorResponse } from '@/lib/contracts/nativeV1Error';
 import { enforcePersistentRateLimit } from '@/lib/rateLimit';
 import { issueCustomerAuthChallenge } from '@/lib/customerAuthChallenges';
+import { generateAvailableUsername } from '@/lib/customerUsername';
 
 export const dynamic = 'force-dynamic';
 
@@ -14,25 +15,26 @@ function record(value: unknown): value is Record<string, unknown> { return !!val
 export async function POST(request: Request) {
   try {
     const body = await request.json().catch(() => null);
+    // The username is optional: the email-first sign-up asks only for a name and a password, and one is generated.
     const allowed = new Set(['displayName', 'username', 'email', 'password']);
-    if (!record(body) || Object.keys(body).some((key) => !allowed.has(key)) || Object.keys(body).length !== allowed.size) {
-      throw new Stage1AuthError(400, 'customer_registration_invalid', 'Name, username, email and password are required');
+    const required = ['displayName', 'email', 'password'];
+    if (!record(body) || Object.keys(body).some((key) => !allowed.has(key)) || required.some((key) => !(key in body))) {
+      throw new Stage1AuthError(400, 'customer_registration_invalid', 'Name, email and password are required');
     }
-    if (![body.displayName, body.username, body.email, body.password].every((value) => typeof value === 'string')) {
-      throw new Stage1AuthError(400, 'customer_registration_invalid', 'Name, username, email and password are required');
+    if (![body.displayName, body.email, body.password].every((value) => typeof value === 'string') || ('username' in body && typeof body.username !== 'string')) {
+      throw new Stage1AuthError(400, 'customer_registration_invalid', 'Name, email and password are required');
     }
     const displayName = String(body.displayName).trim();
-    const username = String(body.username).trim();
-    const usernameNormalized = username.toLowerCase();
+    const chosenUsername = 'username' in body ? String(body.username).trim() : null;
     const email = String(body.email).trim().toLowerCase();
     const password = String(body.password);
-    if (!displayName || Array.from(displayName).length > 160 || !username || Array.from(username).length > 80
+    if (!displayName || Array.from(displayName).length > 160 || (chosenUsername !== null && (!chosenUsername || Array.from(chosenUsername).length > 80))
       || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 320
       || password.length < 12 || Array.from(password).length > 1024) {
       throw new Stage1AuthError(400, 'customer_registration_invalid', 'Check the required account details and password length');
     }
     await enforcePersistentRateLimit(`customer-register:${sha256(email)}`, 3, 60 * 60 * 1000);
-    if (await prisma.customerAccount.findUnique({ where: { usernameNormalized }, select: { id: true } })) {
+    if (chosenUsername !== null && await prisma.customerAccount.findUnique({ where: { usernameNormalized: chosenUsername.toLowerCase() }, select: { id: true } })) {
       throw new Stage1AuthError(409, 'customer_username_unavailable', 'Choose a different username');
     }
     let accountId: string | null = null;
@@ -49,7 +51,10 @@ export async function POST(request: Request) {
         throw new Stage1AuthError(400, 'customer_registration_invalid', 'Use the invitation link to sign in with the one-time password.');
       }
       const passwordHash = hashPassword(password);
-      try {
+      for (let attempt = 0; attempt < 4 && !accountId; attempt += 1) try {
+        const username = chosenUsername ?? await generateAvailableUsername(displayName, email,
+          async (normalized) => !!(await prisma.customerAccount.findUnique({ where: { usernameNormalized: normalized }, select: { id: true } })));
+        const usernameNormalized = username.toLowerCase();
         const created = await prisma.customerAccount.create({ data: {
           displayName,
           username,
@@ -69,6 +74,8 @@ export async function POST(request: Request) {
         if (!(error && typeof error === 'object' && 'code' in error && String((error as { code?: unknown }).code) === 'P2002')) throw error;
         // Concurrent registration for the same normalized email remains an
         // indistinguishable accepted response; it never creates a second account.
+        // A generated username that was taken in the meantime is simply generated again.
+        if (chosenUsername !== null || await prisma.customerAccount.findUnique({ where: { emailNormalized: email }, select: { id: true } })) break;
       }
     }
     const challenge = await issueCustomerAuthChallenge({ accountId, email, purpose: 'CUSTOMER_EMAIL_VERIFY' });

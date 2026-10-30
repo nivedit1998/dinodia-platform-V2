@@ -248,6 +248,17 @@ paths:
         "200": { description: One-use reset consumed and other sessions revoked. A device-bound completion may return a rotated current-session receipt; a browser completion requires sign-in., content: { application/json: { schema: { oneOf: [{ $ref: "#/components/schemas/CustomerPasswordResetReceipt" }, { $ref: "#/components/schemas/CustomerPasswordResetSessionReceipt" }] } } } }
         "400": { $ref: "#/components/responses/BadRequest" }
         "409": { $ref: "#/components/responses/Conflict" }
+  /api/v2/auth/identify:
+    post:
+      summary: "Identify the Next Sign-In Step for an Email"
+      operationId: identifyCustomerEmail
+      tags: [Session]
+      security: []
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "#/components/schemas/CustomerIdentifyRequest" } } } }
+      responses:
+        "200": { description: Which screen to show next. Reveals nothing about Homes, roles or invitations; rate limited per email and per source., content: { application/json: { schema: { $ref: "#/components/schemas/CustomerIdentifyReceipt" } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "429": { $ref: "#/components/responses/RateLimited" }
   /api/v2/auth/register:
     post:
       summary: "Register Customer Account"
@@ -2887,9 +2898,23 @@ components:
         osVersion: { type: string, maxLength: 80 }
         publicKey: { type: string, maxLength: 4096 }
       additionalProperties: false
+    CustomerIdentifyRequest:
+      type: object
+      required: [email]
+      properties:
+        email: { type: string, format: email, maxLength: 320 }
+      additionalProperties: false
+    CustomerIdentifyReceipt:
+      type: object
+      required: [schemaVersion, ok, state]
+      properties:
+        schemaVersion: { const: dinodia.v1 }
+        ok: { const: true }
+        state: { type: string, enum: [CREATE_ACCOUNT, SIGN_IN, VERIFY_EMAIL, ONE_TIME_PASSWORD] }
+      additionalProperties: false
     CustomerRegistrationRequest:
       type: object
-      required: [displayName, username, email, password]
+      required: [displayName, email, password]
       properties:
         displayName: { type: string, minLength: 1, maxLength: 160 }
         username: { type: string, minLength: 1, maxLength: 80 }
