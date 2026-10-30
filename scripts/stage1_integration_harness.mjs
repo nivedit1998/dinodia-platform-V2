@@ -4387,7 +4387,8 @@ async function nativeAlexaOAuthChecks(deliveryEnv) {
     const entry = await fetchJsonLoopback(authorizationUrl.toString());
     const entryHtml = await entry.response.text();
     if (entry.response.status !== 200 || !entryHtml.includes('Connect Dinodia to Alexa')
-      || !entryHtml.includes('approve this on your phone') || !entry.response.headers.get('content-security-policy')?.includes("default-src 'none'")) {
+      || !entryHtml.includes('approve this on your phone') || !entry.response.headers.get('content-security-policy')?.includes("default-src 'none'")
+      || !entry.response.headers.get('content-security-policy')?.includes(`form-action 'self' ${new URL(redirectUri).origin}`)) {
       fail(`Real OAuth authorize route entry differed from its contract (status=${entry.response.status}; heading=${entryHtml.includes('Connect Dinodia to Alexa')}; copy=${entryHtml.includes('approve this on your phone')}; csp=${entry.response.headers.get('content-security-policy') ?? 'missing'})`);
     }
 

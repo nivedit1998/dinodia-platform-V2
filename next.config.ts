@@ -63,20 +63,15 @@ const nextConfig: NextConfig = {
         ],
       },
       {
-        source: '/:path*',
+        source: '/:path((?!api/v2/alexa/oauth/authorize$).*)',
         headers,
       },
       {
-        // The OAuth consent document is deliberately static and has no
-        // scripts. Next's catch-all header above would otherwise replace the
-        // stricter Response CSP with the site's general inline-script policy.
+        // The Alexa sign-in document sets its own, stricter Content-Security-Policy in the route (script nonce, and the
+        // Alexa return addresses in form-action so the hand-back to Alexa is not blocked). It must be the only CSP on that
+        // response, so it gets every other security header but not the site-wide CSP.
         source: '/api/v2/alexa/oauth/authorize',
-        headers: [
-          {
-            key: 'Content-Security-Policy',
-            value: "default-src 'none'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
-          },
-        ],
+        headers: headers.filter((header) => header.key !== 'Content-Security-Policy'),
       },
     ];
   },

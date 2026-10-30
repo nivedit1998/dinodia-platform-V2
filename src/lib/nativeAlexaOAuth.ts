@@ -146,9 +146,13 @@ const PAGE_STYLE = ':root{color-scheme:light dark}body{margin:0;font:16px/1.45 -
 function page(content: string, status = 200, script?: string): Response {
   const nonce = script ? crypto.randomBytes(16).toString('base64') : '';
   const scriptPolicy = script ? `; script-src 'nonce-${nonce}'; connect-src 'self'` : '';
+  // Browsers also apply form-action to the redirect that follows a form post, so the Alexa return addresses must be listed
+  // or the final hand-back to Alexa is silently blocked and the page just stays where it is.
+  const configured = alexaOAuthConfig();
+  const returnOrigins = configured ? [...new Set([...configured.redirectUris].map((uri) => new URL(uri).origin))].join(' ') : '';
   return new Response(`<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="referrer" content="no-referrer"><title>Connect Alexa — Dinodia Smart Living</title><style>${PAGE_STYLE}</style></head><body><main>${content}</main>${script ? `<script nonce="${nonce}">${script}</script>` : ''}</body></html>`, {
     status,
-    headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store, private', Pragma: 'no-cache', 'Referrer-Policy': 'no-referrer', 'X-Content-Type-Options': 'nosniff', 'Content-Security-Policy': `default-src 'none'; style-src 'unsafe-inline'; form-action 'self'${scriptPolicy}; base-uri 'none'; frame-ancestors 'none'` },
+    headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store, private', Pragma: 'no-cache', 'Referrer-Policy': 'no-referrer', 'X-Content-Type-Options': 'nosniff', 'Content-Security-Policy': `default-src 'none'; style-src 'unsafe-inline'; form-action 'self'${returnOrigins ? ` ${returnOrigins}` : ''}${scriptPolicy}; base-uri 'none'; frame-ancestors 'none'` },
   });
 }
 
