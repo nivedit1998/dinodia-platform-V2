@@ -689,7 +689,20 @@ async function reportNativeAlexaState(directive: AlexaDirective): Promise<object
     || result.descriptorRevision !== endpoint.descriptorRevision || !Array.isArray(result.states)) {
     throw new Stage1AuthError(503, 'alexa_hub_response_invalid', 'Dinodia OS returned an invalid state response');
   }
-  return alexaStateReport(directive, stateReportProperties(endpoint, controls, result.states));
+  const reported = stateReportProperties(endpoint, controls, result.states);
+  // Operator diagnostic: shapes and ages only, never identifiers or values.
+  try {
+    const nowMs = Date.now();
+    const rows = (result.states as unknown[]).map((raw) => {
+      const state = record(raw) ?? {};
+      const control = controls.find((item) => item.controlId === state.controlId);
+      const observed = typeof state.observedAt === 'string' ? Date.parse(state.observedAt) : NaN;
+      const until = typeof state.validUntil === 'string' ? Date.parse(state.validUntil) : NaN;
+      return `${String(control?.semanticRole ?? '?')}:q=${String(state.quality)}:v=${state.value === null || state.value === undefined ? 'none' : typeof state.value}:age=${Number.isFinite(observed) ? Math.round((nowMs - observed) / 1000) : 'na'}s:left=${Number.isFinite(until) ? Math.round((until - nowMs) / 1000) : 'na'}s:av=${String(state.deviceAvailability)}:rev=${state.descriptorRevision === endpoint.descriptorRevision ? 'ok' : 'diff'}:dev=${state.deviceId === endpoint.osDeviceId ? 'ok' : 'diff'}:last=${record(state.lastSetting) ? 'y' : 'n'}`;
+    });
+    console.warn(`[alexa-state] controls=${controls.length} states=${rows.length} [${rows.join(' | ')}] -> ${reported.map((property) => `${property.name}${property.name === 'connectivity' ? `=${String((record(property.value) ?? {}).value)}` : ''}`).join(',')}`);
+  } catch { /* diagnostics must never affect the response */ }
+  return alexaStateReport(directive, reported);
 }
 
 export async function handleNativeAlexaDirective(request: Request): Promise<object> {
