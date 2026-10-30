@@ -16,8 +16,9 @@ export type AlexaOAuthRequest = {
   responseType: 'code';
   state: string;
   scope: string;
-  codeChallenge: string;
-  codeChallengeMethod: 'S256';
+  /** Alexa's plain authorization-code grant sends no PKCE; the confidential client secret protects the code exchange then. */
+  codeChallenge: string | null;
+  codeChallengeMethod: 'S256' | null;
 };
 
 export type AlexaOAuthConfig = { clientId: string; clientSecret: string; redirectUris: Set<string>; scope: string };
@@ -66,9 +67,12 @@ function isSafeRedirectUri(value: string): boolean {
 }
 
 export function parseAlexaOAuthRequest(values: URLSearchParams, config: AlexaOAuthConfig): AlexaOAuthRequest {
-  const allowed = new Set(['client_id', 'redirect_uri', 'response_type', 'state', 'scope', 'code_challenge', 'code_challenge_method']);
-  if ([...values.keys()].some((key) => !allowed.has(key))
-    || [...allowed].some((key) => values.getAll(key).length !== 1)) {
+  const required = ['client_id', 'redirect_uri', 'response_type', 'state', 'scope'];
+  const optional = ['code_challenge', 'code_challenge_method'];
+  // Amazon may add parameters of its own; only the known ones are read and carried forward.
+  if (required.some((key) => values.getAll(key).length !== 1)
+    || optional.some((key) => values.getAll(key).length > 1)
+    || values.has('code_challenge') !== values.has('code_challenge_method')) {
     throw new Stage1AuthError(400, 'alexa_oauth_request_invalid', 'The Alexa account-link request is invalid');
   }
   const request = {
@@ -77,17 +81,26 @@ export function parseAlexaOAuthRequest(values: URLSearchParams, config: AlexaOAu
     responseType: values.get('response_type') ?? '',
     state: values.get('state') ?? '',
     scope: values.get('scope') ?? '',
-    codeChallenge: values.get('code_challenge') ?? '',
-    codeChallengeMethod: values.get('code_challenge_method') ?? '',
+    codeChallenge: values.get('code_challenge'),
+    codeChallengeMethod: values.get('code_challenge_method'),
   };
   if (request.clientId !== config.clientId || !config.redirectUris.has(request.redirectUri)
     || request.responseType !== 'code' || request.scope !== config.scope
-    || !/^[A-Za-z0-9._~-]{1,512}$/.test(request.state)
-    || !/^[A-Za-z0-9_-]{43}$/.test(request.codeChallenge)
-    || request.codeChallengeMethod !== 'S256') {
+    || !/^[A-Za-z0-9._~+/=-]{1,1024}$/.test(request.state)
+    || (request.codeChallenge !== null && !/^[A-Za-z0-9_-]{43}$/.test(request.codeChallenge))
+    || (request.codeChallengeMethod !== null && request.codeChallengeMethod !== 'S256')) {
     throw new Stage1AuthError(400, 'alexa_oauth_request_invalid', 'The Alexa account-link request is invalid');
   }
   return request as AlexaOAuthRequest;
+}
+
+/** Stored in place of a PKCE challenge when the client used the plain code grant; derivable only from the code itself. */
+export function noPkceChallenge(rawCode: string): string {
+  return crypto.createHash('sha256').update(`dinodia-alexa-no-pkce\0${rawCode}`).digest('base64url');
+}
+
+export function authorizationCodeChallenge(request: AlexaOAuthRequest, rawCode: string): string {
+  return request.codeChallenge ?? noPkceChallenge(rawCode);
 }
 
 export function parseAlexaOAuthForm(raw: string, config: AlexaOAuthConfig): { request: AlexaOAuthRequest; connectIntent: string; approve: boolean } {
@@ -118,9 +131,11 @@ export function escapeAlexaHtml(value: unknown): string {
 function hiddenFields(request: AlexaOAuthRequest, connectIntent?: string, approve = false): string {
   const fields: Array<[string, string]> = [
     ['client_id', request.clientId], ['redirect_uri', request.redirectUri], ['response_type', request.responseType],
-    ['state', request.state], ['scope', request.scope], ['code_challenge', request.codeChallenge],
-    ['code_challenge_method', request.codeChallengeMethod],
+    ['state', request.state], ['scope', request.scope],
   ];
+  if (request.codeChallenge !== null && request.codeChallengeMethod !== null) {
+    fields.push(['code_challenge', request.codeChallenge], ['code_challenge_method', request.codeChallengeMethod]);
+  }
   if (connectIntent !== undefined) fields.push(['connect_intent', connectIntent]);
   if (approve) fields.push(['approve', 'authorize']);
   return fields.map(([name, value]) => `<input type="hidden" name="${name}" value="${escapeAlexaHtml(value)}">`).join('');

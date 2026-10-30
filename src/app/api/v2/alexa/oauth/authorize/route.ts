@@ -2,7 +2,7 @@ import { NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
 import { serializableTransaction } from '@/lib/serializableTransaction';
 import {
-  alexaOAuthApprovalPage, alexaOAuthConfig, alexaOAuthEntryPage, alexaOAuthErrorPage, alexaOAuthWaitingPage,
+  alexaOAuthApprovalPage, alexaOAuthConfig, authorizationCodeChallenge, alexaOAuthEntryPage, alexaOAuthErrorPage, alexaOAuthWaitingPage,
   isAlexaOAuthEnabled, lockAndValidateAlexaConnectIntent, parseAlexaOAuthForm,
   parseAlexaOAuthRequest,
 } from '@/lib/nativeAlexaOAuth';
@@ -102,8 +102,8 @@ export async function POST(request: Request) {
         customerAccountId: current.intent.customerAccountId,
         clientId: parsed.request.clientId,
         redirectUri: parsed.request.redirectUri,
-        codeChallenge: parsed.request.codeChallenge,
-        codeChallengeMethod: parsed.request.codeChallengeMethod,
+        codeChallenge: authorizationCodeChallenge(parsed.request, rawCode),
+        codeChallengeMethod: 'S256',
         codeHash,
         expiresAt,
       }, select: { id: true } });

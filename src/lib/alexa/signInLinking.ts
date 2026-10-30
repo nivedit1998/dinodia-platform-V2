@@ -9,7 +9,7 @@ import { currentCustomerPolicy } from '@/lib/customerPolicyConfig';
 import { randomSecret, sha256 } from '@/lib/stage1Crypto';
 import { decryptPlatformEnvelope } from '@/lib/hubOperatorCredentials';
 import { readApnsConfig, sendAlexaLinkApprovalPush, type ApnsEnvironment } from '@/lib/apnsDelivery';
-import type { AlexaOAuthRequest } from '@/lib/nativeAlexaOAuth';
+import { authorizationCodeChallenge, type AlexaOAuthRequest } from '@/lib/nativeAlexaOAuth';
 
 /**
  * Account linking started from the Alexa side. The person signs in on the Alexa-hosted page with their Dinodia email and
@@ -142,7 +142,7 @@ export async function completeAlexaSignIn(rawIntent: string, request: AlexaOAuth
       }
       const code = await tx.alexaOAuthAuthorizationCode.create({ data: {
         customerAccountId: intent.customerAccountId, clientId, redirectUri: request.redirectUri,
-        codeChallenge: request.codeChallenge, codeChallengeMethod: request.codeChallengeMethod,
+        codeChallenge: authorizationCodeChallenge(request, rawCode), codeChallengeMethod: 'S256',
         codeHash: sha256(rawCode), expiresAt: new Date(now.getTime() + 5 * 60 * 1000),
       }, select: { id: true } });
       await tx.alexaOAuthAuthorizationCodeIntent.create({ data: { authorizationCodeId: code.id, intentId: intent.id } });

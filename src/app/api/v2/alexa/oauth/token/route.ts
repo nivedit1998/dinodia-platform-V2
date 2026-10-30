@@ -5,7 +5,7 @@ import {
   ALEXA_OAUTH_ABSOLUTE_MS, ALEXA_OAUTH_ACCESS_SECONDS,
   ALEXA_OAUTH_INACTIVITY_MS, alexaOAuthClientAuthenticated, alexaOAuthConfig, alexaOAuthJsonError,
   applyAlexaIntentScope, isAlexaOAuthEnabled, lockAndValidateAlexaConnectIntent,
-  makeAlexaOpaqueToken, pkceChallenge, providerSubjectHash,
+  makeAlexaOpaqueToken, noPkceChallenge, pkceChallenge, providerSubjectHash,
 } from '@/lib/nativeAlexaOAuth';
 import { sha256 } from '@/lib/stage1Crypto';
 import { lockAndValidateAlexaSignInIntent } from '@/lib/alexa/signInLinking';
@@ -52,7 +52,7 @@ async function signInIntentAsCurrent(tx: Parameters<Parameters<typeof serializab
   return { intent: { id: intent.id, customerAccountId: intent.customerAccountId, membershipId: '', homeId: '' }, selectedAreas: [] as string[], now };
 }
 
-async function exchangeAuthorizationCode(input: { code: string; clientId: string; redirectUri: string; verifier: string }): Promise<ExchangeResult> {
+async function exchangeAuthorizationCode(input: { code: string; clientId: string; redirectUri: string; verifier: string | null }): Promise<ExchangeResult> {
   const codeHash = sha256(input.code);
   const hint = await prisma.alexaOAuthAuthorizationCode.findUnique({ where: { codeHash }, select: {
     id: true, customerAccountId: true, intents: { select: { intentId: true, intent: { select: { kind: true } } } },
@@ -72,7 +72,7 @@ async function exchangeAuthorizationCode(input: { code: string; clientId: string
     const now = new Date();
     if (!code || code.consumedAt || code.expiresAt <= now || code.customerAccountId !== currentIntent.intent.customerAccountId
       || code.clientId !== input.clientId || code.redirectUri !== input.redirectUri || code.codeChallengeMethod !== 'S256'
-      || code.codeChallenge !== pkceChallenge(input.verifier) || code.intents.length !== 1 || code.intents[0].intentId !== currentIntent.intent.id) {
+      || code.codeChallenge !== (input.verifier === null ? noPkceChallenge(input.code) : pkceChallenge(input.verifier)) || code.intents.length !== 1 || code.intents[0].intentId !== currentIntent.intent.id) {
       return { error: 'invalid_grant' as const };
     }
 
@@ -173,12 +173,12 @@ export async function POST(request: Request) {
     let result: ExchangeResult;
     if (grantType === 'authorization_code') {
       if ([...values.keys()].some((key) => !['grant_type', 'client_id', 'code', 'redirect_uri', 'code_verifier'].includes(key))
-        || [...['code', 'redirect_uri', 'code_verifier']].some((key) => values.getAll(key).length !== 1)) return alexaOAuthJsonError('invalid_request', 400);
+        || [...['code', 'redirect_uri']].some((key) => values.getAll(key).length !== 1) || values.getAll('code_verifier').length > 1) return alexaOAuthJsonError('invalid_request', 400);
       const code = values.get('code') ?? '';
       const redirectUri = values.get('redirect_uri') ?? '';
-      const verifier = values.get('code_verifier') ?? '';
+      const verifier = values.has('code_verifier') ? (values.get('code_verifier') ?? '') : null;
       if (!/^[A-Za-z0-9_-]{40,128}$/.test(code) || !config.redirectUris.has(redirectUri)
-        || !/^[A-Za-z0-9._~-]{43,128}$/.test(verifier)) return alexaOAuthJsonError('invalid_grant', 400);
+        || (verifier !== null && !/^[A-Za-z0-9._~-]{43,128}$/.test(verifier))) return alexaOAuthJsonError('invalid_grant', 400);
       result = await exchangeAuthorizationCode({ code, clientId: config.clientId, redirectUri, verifier });
     } else if (grantType === 'refresh_token') {
       if ([...values.keys()].some((key) => !['grant_type', 'client_id', 'refresh_token'].includes(key)) || values.getAll('refresh_token').length !== 1) return alexaOAuthJsonError('invalid_request', 400);

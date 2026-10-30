@@ -5628,6 +5628,30 @@ async function nativeAlexaOAuthChecks(deliveryEnv) {
     if (signInReplay.response.status !== 400) fail('A sign-in authorization code was reusable');
     await fetchJsonLoopback(`${base}/api/v2/alexa/oauth/revoke`, { method: 'POST', headers: { ...formHeaders, authorization: `Basic ${Buffer.from(`${clientId}:${clientSecret}`).toString('base64')}` },
       body: form({ token: signInTokens.body.access_token, token_type_hint: 'access_token', client_id: clientId }) });
+    // Alexa's plain authorization-code grant sends no PKCE; a PKCE-flow code must still never be redeemable without its verifier.
+    const plainOauth = { client_id: clientId, redirect_uri: redirectUri, response_type: 'code', state: 'AAEA+odd/state=chars', scope };
+    const plainEntry = await fetchJsonLoopback(`${authorizeUrl}?${new URLSearchParams(plainOauth)}`);
+    if (plainEntry.response.status !== 200 || !(await plainEntry.response.text()).includes('Connect Dinodia to Alexa')) fail('The Alexa page did not open for a plain authorization-code request without PKCE');
+    const finishSignIn = async (oauthFields) => {
+      const started = await signIn(fixture.loginEmail, fixture.loginPassword, oauthFields);
+      const html = await started.response.text();
+      const number = Number(html.match(/class="number"[^>]*>(\d{2})</)?.[1]);
+      const intent = html.match(/name="connect_intent" value="([A-Za-z0-9_-]{40,128})"/)?.[1];
+      const row = await prisma.alexaNativeConnectIntent.findUniqueOrThrow({ where: { intentHash: sha256(intent) }, select: { id: true } });
+      if ((await decide(row.id, { choice: number })).body.outcome !== 'APPROVED') fail('The matching number did not approve the sign-in');
+      const done = await postForm({ ...oauthFields, action: 'complete', connect_intent: intent });
+      return new URL(done.response.headers.get('location') ?? 'https://invalid.example/').searchParams.get('code') ?? '';
+    };
+    const plainCode = await finishSignIn(plainOauth);
+    const pkceVerifier = crypto.randomBytes(48).toString('base64url');
+    const pkceCode = await finishSignIn(requestParameters('stage12-pkce-state', pkceVerifier));
+    const pkceWithoutVerifier = await exchange({ grant_type: 'authorization_code', client_id: clientId, code: pkceCode, redirect_uri: redirectUri });
+    const plainExchange = await exchange({ grant_type: 'authorization_code', client_id: clientId, code: plainCode, redirect_uri: redirectUri });
+    if (!plainCode || !pkceCode || pkceWithoutVerifier.response.status !== 400 || plainExchange.response.status !== 200 || !plainExchange.body.access_token) {
+      fail(`Plain (non-PKCE) code grant did not work, or a PKCE code was redeemable without its verifier (${pkceWithoutVerifier.response.status}/${plainExchange.response.status})`);
+    }
+    await fetchJsonLoopback(`${base}/api/v2/alexa/oauth/revoke`, { method: 'POST', headers: { ...formHeaders, authorization: `Basic ${Buffer.from(`${clientId}:${clientSecret}`).toString('base64')}` },
+      body: form({ token: plainExchange.body.access_token, token_type_hint: 'access_token', client_id: clientId }) });
     console.log('[stage12:integration] PASS: Alexa-side sign-in refuses homeowners and wrong credentials, requires number-matching approval on the account\'s own phone (wrong number ends the request), is bound to the exact OAuth request, issues one code, and links a tenant-only automatic account');
 
     console.log('[stage12:integration] PASS: actual OAuth routes enforce tenant-only account linking, explicit one-time scope consent, exact callback/state, PKCE, hashed tokens, single-use code, refresh rotation/reuse revocation and full unlink');
