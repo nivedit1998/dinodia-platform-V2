@@ -111,7 +111,9 @@ export function buildAlexaEndpoint(input: { endpointId: string; friendlyName: st
   const has = (role: string, valueType: string) => writable.some((control) => control.semanticRole === role && control.valueType === valueType);
   if (has('power', 'boolean')) capabilities.push({ type: 'AlexaInterface', interface: 'Alexa.PowerController', version: '3', properties: { proactivelyReported: true, retrievable: true, supported: [{ name: 'powerState' }] } });
   if (has('brightness', 'number')) capabilities.push({ type: 'AlexaInterface', interface: 'Alexa.BrightnessController', version: '3', properties: { proactivelyReported: true, retrievable: true, supported: [{ name: 'brightness' }] } });
-  if (has('target_temperature', 'number')) capabilities.push({ type: 'AlexaInterface', interface: 'Alexa.ThermostatController', version: '3', properties: { proactivelyReported: true, retrievable: true, supported: [{ name: 'targetSetpoint' }] } });
+  if (has('target_temperature', 'number')) capabilities.push({ type: 'AlexaInterface', interface: 'Alexa.ThermostatController', version: '3', properties: { proactivelyReported: true, retrievable: true, supported: [{ name: 'targetSetpoint' }, { name: 'thermostatMode' }] },
+    // A radiator or boiler only heats: one fixed mode, no scheduling, so Alexa's thermostat screen has a mode to show.
+    configuration: { supportedModes: ['HEAT'], supportsScheduling: false } });
   if (controls.some((control) => control.semanticRole === 'ambient_temperature' && control.observable === true && control.writable !== true)) {
     capabilities.push({ type: 'AlexaInterface', interface: 'Alexa.TemperatureSensor', version: '3', properties: { proactivelyReported: true, retrievable: true, supported: [{ name: 'temperature' }] } });
   }

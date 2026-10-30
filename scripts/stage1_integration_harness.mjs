@@ -4834,7 +4834,7 @@ async function nativeAlexaOAuthChecks(deliveryEnv) {
     // A stale observation is never reported as a current sample: anything carried over is a labelled last setting with an uncertainty
     // equal to its age (never the 60 s of a live sample).
     if (staleReport.response.status !== 200 || staleReport.body.event?.header?.name !== 'StateReport'
-      || staleReport.body.context?.properties?.some((property) => property.name !== 'connectivity' && property.uncertaintyInMilliseconds <= 60_000)
+      || staleReport.body.context?.properties?.some((property) => !['connectivity', 'thermostatMode'].includes(property.name) && property.uncertaintyInMilliseconds <= 60_000)
       || staleReport.body.context?.properties?.find((property) => property.name === 'connectivity')?.value?.value !== 'OK') {
       fail(`Stale OS observation was reported as a current Alexa state instead of a truthful unavailable result (${staleReport.response.status}/${staleReport.body.event?.header?.name || 'none'}/${staleReport.body.event?.payload?.type || 'none'})`);
     }
