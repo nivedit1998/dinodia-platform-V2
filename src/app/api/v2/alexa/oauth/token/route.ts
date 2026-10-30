@@ -160,20 +160,26 @@ async function refreshTokens(input: { refreshToken: string; clientId: string }):
   }, 2);
 }
 
+/** Operator log for a refused token request: names only, never a value. */
+function logRefusal(stage: string, request: Request, values: URLSearchParams | null) {
+  const scheme = (request.headers.get('authorization') ?? 'none').split(' ')[0].toLowerCase();
+  console.warn(`[alexa-token] ${stage} grant=${values?.get('grant_type') ?? '-'} auth=${scheme} params=${values ? [...new Set(values.keys())].sort().join(',') : '-'}`);
+}
+
 export async function POST(request: Request) {
   const config = alexaOAuthConfig();
   if (!config) return alexaOAuthJsonError('temporarily_unavailable', 503);
   if (!isAlexaOAuthEnabled()) return alexaOAuthJsonError('temporarily_unavailable', 503);
   if (!String(request.headers.get('content-type') ?? '').toLowerCase().startsWith('application/x-www-form-urlencoded')) return alexaOAuthJsonError('invalid_request', 400);
   const values = formFields(await request.text());
-  if (!values) return alexaOAuthJsonError('invalid_request', 400);
-  if (!alexaOAuthClientAuthenticated(request, values, config)) return alexaOAuthJsonError('invalid_client', 401);
+  if (!values) { logRefusal('unreadable_body', request, null); return alexaOAuthJsonError('invalid_request', 400); }
+  if (!alexaOAuthClientAuthenticated(request, values, config)) { logRefusal('client_auth_failed', request, values); return alexaOAuthJsonError('invalid_client', 401); }
   const grantType = values.get('grant_type') ?? '';
   try {
     let result: ExchangeResult;
     if (grantType === 'authorization_code') {
       if ([...values.keys()].some((key) => !['grant_type', 'client_id', 'code', 'redirect_uri', 'code_verifier'].includes(key))
-        || [...['code', 'redirect_uri']].some((key) => values.getAll(key).length !== 1) || values.getAll('code_verifier').length > 1) return alexaOAuthJsonError('invalid_request', 400);
+        || [...['code', 'redirect_uri']].some((key) => values.getAll(key).length !== 1) || values.getAll('code_verifier').length > 1) { logRefusal('invalid_request', request, values); return alexaOAuthJsonError('invalid_request', 400); }
       const code = values.get('code') ?? '';
       const redirectUri = values.get('redirect_uri') ?? '';
       const verifier = values.has('code_verifier') ? (values.get('code_verifier') ?? '') : null;
@@ -181,15 +187,17 @@ export async function POST(request: Request) {
         || (verifier !== null && !/^[A-Za-z0-9._~-]{43,128}$/.test(verifier))) return alexaOAuthJsonError('invalid_grant', 400);
       result = await exchangeAuthorizationCode({ code, clientId: config.clientId, redirectUri, verifier });
     } else if (grantType === 'refresh_token') {
-      if ([...values.keys()].some((key) => !['grant_type', 'client_id', 'refresh_token'].includes(key)) || values.getAll('refresh_token').length !== 1) return alexaOAuthJsonError('invalid_request', 400);
+      if ([...values.keys()].some((key) => !['grant_type', 'client_id', 'refresh_token'].includes(key)) || values.getAll('refresh_token').length !== 1) { logRefusal('invalid_request', request, values); return alexaOAuthJsonError('invalid_request', 400); }
       const refreshToken = values.get('refresh_token') ?? '';
       if (!/^dno-alexa-refresh-[A-Za-z0-9_-]{40,128}$/.test(refreshToken)) return alexaOAuthJsonError('invalid_grant', 400);
       result = await refreshTokens({ refreshToken, clientId: config.clientId });
     } else {
       return alexaOAuthJsonError('unsupported_grant_type', 400);
     }
+    if (!('tokens' in result)) logRefusal('invalid_grant', request, values);
     return 'tokens' in result ? reply(result.tokens) : alexaOAuthJsonError('invalid_grant', 400);
-  } catch {
+  } catch (error) {
+    console.warn(`[alexa-token] server_error ${error instanceof Error ? error.constructor.name : 'unknown'} ${(error as { code?: string })?.code ?? ''}`);
     return alexaOAuthJsonError('server_error', 500);
   }
 }
