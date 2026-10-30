@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import { rangeControllerInstances } from '@/lib/alexa/endpointBuilder';
 import { prisma } from '@/lib/prisma';
 import { Stage1AuthError } from '@/lib/stage1Auth';
 import { currentCustomerPolicy } from '@/lib/customerPolicyConfig';
@@ -63,34 +64,6 @@ function parseDirective(value: unknown): AlexaDirective {
     throw new Stage1AuthError(400, 'alexa_directive_invalid', 'The Alexa request is not a valid Native V2 directive');
   }
   return { header: header as AlexaDirective['header'], endpoint: endpoint as AlexaDirective['endpoint'], payload };
-}
-
-function validRangeControl(control: JsonObject): boolean {
-  const constraints = record(control.constraints);
-  return RANGE_ROLES.has(String(control.semanticRole)) && control.valueType === 'number'
-    && control.readable === true && control.writable === true && control.automatable === true
-    && control.idempotency === 'set_value' && control.stepUpPolicy !== 'required'
-    && constraints !== null && typeof constraints.minimum === 'number' && Number.isFinite(constraints.minimum)
-    && typeof constraints.maximum === 'number' && Number.isFinite(constraints.maximum)
-    && constraints.minimum <= constraints.maximum && typeof constraints.step === 'number'
-    && Number.isFinite(constraints.step) && constraints.step > 0 && typeof control.controlId === 'string';
-}
-
-/** A single control keeps the established instance; duplicate same-role channels get stable opaque IDs. */
-function rangeControllerInstances(controls: JsonObject[]): Map<string, string> {
-  const eligible = controls.filter(validRangeControl);
-  const roleCounts = new Map<string, number>();
-  for (const control of eligible) roleCounts.set(String(control.semanticRole), (roleCounts.get(String(control.semanticRole)) ?? 0) + 1);
-  const result = new Map<string, string>();
-  for (const control of eligible) {
-    const role = String(control.semanticRole);
-    const base = role === 'position' ? 'Dinodia.Position' : 'Dinodia.OpeningPercentage';
-    const instance = roleCounts.get(role) === 1
-      ? base
-      : `${base}.${crypto.createHash('sha256').update(String(control.controlId), 'utf8').digest('base64url')}`;
-    result.set(String(control.controlId), instance);
-  }
-  return result;
 }
 
 function cloudOrigin(endpoint: AuthorizedEndpoint): string {
