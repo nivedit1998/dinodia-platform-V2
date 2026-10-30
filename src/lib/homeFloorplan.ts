@@ -101,3 +101,146 @@ export function completeFloorplan(areaIds: string[], document: unknown): Floorpl
   }
   return kept;
 }
+
+
+// ---- Floors -------------------------------------------------------------------------------------------------------
+// A Home's plan can have several floors, each its own grid. Presentation only, like the rest of the plan. Stored as
+// { version: 2, floors: [{ level, areas }] }; a plan saved before floors (version 1) is read as the Ground floor alone.
+// The document sent to clients keeps version 1 and its `areas` list so apps built before floors still draw and save the
+// Home exactly as they did; apps that know floors read `floors`.
+
+/** Basement, Ground, then 1st to 5th. A fixed set, so a floor never needs a name. */
+export const FLOOR_LEVELS: readonly number[] = [-1, 0, 1, 2, 3, 4, 5];
+
+export type FloorplanFloor = { level: number; areas: FloorplanRoom[] };
+export type FloorplanDocument = { version: 1; areas: FloorplanRoom[]; floors: FloorplanFloor[] };
+
+const isLevel = (level: unknown): level is number => typeof level === 'number' && FLOOR_LEVELS.includes(level);
+
+/** Rooms of one floor: valid places only, no room twice, no overlaps. */
+function parseFloorRooms(items: unknown, known: ReadonlySet<string>, taken: Set<string>): FloorplanRoom[] {
+  if (!Array.isArray(items)) return [];
+  const kept: FloorplanRoom[] = [];
+  for (const item of items) {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) continue;
+    const row = item as Record<string, unknown>;
+    if (typeof row.areaId !== 'string' || !known.has(row.areaId) || taken.has(row.areaId)) continue;
+    if (![row.x, row.y, row.width, row.height].every(Number.isInteger)) continue;
+    const room: FloorplanRoom = { areaId: row.areaId, x: Number(row.x), y: Number(row.y), width: Number(row.width), height: Number(row.height) };
+    if (!inGrid(room) || kept.some((other) => overlaps(room, other))) continue;
+    kept.push(room);
+    taken.add(room.areaId);
+  }
+  return kept;
+}
+
+function storedFloors(document: unknown, known: ReadonlySet<string>): FloorplanFloor[] {
+  const root = document && typeof document === 'object' && !Array.isArray(document) ? document as { version?: unknown; areas?: unknown; floors?: unknown } : null;
+  const taken = new Set<string>();
+  const floors: FloorplanFloor[] = [];
+  if (root?.version === 2 && Array.isArray(root.floors)) {
+    const seenLevels = new Set<number>();
+    for (const raw of root.floors) {
+      const floor = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw as { level?: unknown; areas?: unknown } : null;
+      if (!floor || !isLevel(floor.level) || seenLevels.has(floor.level)) continue;
+      seenLevels.add(floor.level);
+      floors.push({ level: floor.level, areas: parseFloorRooms(floor.areas, known, taken) });
+    }
+  } else if (root?.version === 1 && Array.isArray(root.areas)) {
+    floors.push({ level: 0, areas: parseFloorRooms(root.areas, known, taken) });
+  }
+  return floors;
+}
+
+/**
+ * Every active room on exactly one floor. Saved places are kept; a room with no place (added since, or invalid) goes onto the
+ * Ground floor next to the rest. A Home with nothing usable saved gets the starter layout on the Ground floor.
+ */
+export function completeFloors(areaIds: string[], document: unknown): FloorplanFloor[] {
+  const known = new Set(areaIds);
+  const floors = storedFloors(document, known);
+  if (!floors.some((floor) => floor.level === 0)) floors.push({ level: 0, areas: [] });
+  const placed = new Set(floors.flatMap((floor) => floor.areas.map((room) => room.areaId)));
+  const missing = areaIds.filter((areaId) => !placed.has(areaId));
+  const ground = floors.find((floor) => floor.level === 0)!;
+  if (!placed.size) {
+    ground.areas = starterFloorplan(areaIds);
+  } else {
+    for (const areaId of missing) {
+      const spot = place(ground.areas, areaId);
+      // The Ground floor has no space left: start it over rather than lose or overlap a room (other floors are untouched).
+      if (!spot) { ground.areas = starterFloorplan([...ground.areas.map((room) => room.areaId), areaId]); continue; }
+      ground.areas.push(spot);
+    }
+  }
+  return floors.sort((a, b) => a.level - b.level);
+}
+
+/** What older apps see: the Ground floor as it is, and every room from other floors placed beside it, so nothing overlaps. */
+export function legacyAreas(floors: FloorplanFloor[]): FloorplanRoom[] {
+  const ground = floors.find((floor) => floor.level === 0)?.areas ?? [];
+  const flat = ground.map((room) => ({ ...room }));
+  for (const floor of floors) {
+    if (floor.level === 0) continue;
+    for (const room of floor.areas) {
+      const spot = place(flat, room.areaId);
+      if (spot) flat.push(spot);
+    }
+  }
+  return flat;
+}
+
+/** The document clients receive, for the Home's active rooms. */
+export function floorplanDocument(areaIds: string[], document: unknown): FloorplanDocument {
+  const floors = completeFloors(areaIds, document);
+  return { version: 1, areas: legacyAreas(floors), floors };
+}
+
+/** Whether a stored plan has any room on a floor other than the Ground floor. */
+export function hasUpperFloors(document: unknown): boolean {
+  const root = document && typeof document === 'object' && !Array.isArray(document) ? document as { version?: unknown; floors?: unknown } : null;
+  if (root?.version !== 2 || !Array.isArray(root.floors)) return false;
+  return root.floors.some((raw) => {
+    const floor = raw && typeof raw === 'object' ? raw as { level?: unknown; areas?: unknown } : null;
+    return !!floor && floor.level !== 0 && Array.isArray(floor.areas) && floor.areas.length > 0;
+  });
+}
+
+export type FloorplanSubmission = { ok: true; stored: { version: 2; floors: FloorplanFloor[] } } | { ok: false; reason: 'INVALID' | 'FLOORS_NEED_NEW_APP' };
+
+/**
+ * Validates a plan saved by a client against the Home's current rooms and returns what to store. Either the new form
+ * (`floors`) or the form older apps send (`areas`, which means the Ground floor). An older app may not overwrite a plan that
+ * has rooms on other floors: that would silently drop them.
+ */
+export function submittedFloorplan(areaIds: string[], body: unknown, stored: unknown): FloorplanSubmission {
+  const root = body && typeof body === 'object' && !Array.isArray(body) ? body as { version?: unknown; areas?: unknown; floors?: unknown } : null;
+  if (!root || root.version !== 1) return { ok: false, reason: 'INVALID' };
+  const known = new Set(areaIds);
+  let floors: FloorplanFloor[];
+  if (root.floors !== undefined) {
+    if (!Array.isArray(root.floors) || root.floors.length < 1 || root.floors.length > FLOOR_LEVELS.length) return { ok: false, reason: 'INVALID' };
+    floors = [];
+    const levels = new Set<number>();
+    const seen = new Set<string>();
+    for (const raw of root.floors) {
+      const floor = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw as { level?: unknown; areas?: unknown } : null;
+      if (!floor || Object.keys(floor).sort().join(',') !== 'areas,level' || !isLevel(floor.level) || levels.has(floor.level) || !Array.isArray(floor.areas)) return { ok: false, reason: 'INVALID' };
+      levels.add(floor.level);
+      const rooms = parseFloorRooms(floor.areas, known, seen);
+      if (rooms.length !== floor.areas.length) return { ok: false, reason: 'INVALID' };
+      floors.push({ level: floor.level, areas: rooms });
+    }
+    if (!levels.has(0)) return { ok: false, reason: 'INVALID' };
+  } else {
+    if (hasUpperFloors(stored)) return { ok: false, reason: 'FLOORS_NEED_NEW_APP' };
+    const seen = new Set<string>();
+    const rooms = parseFloorRooms(root.areas, known, seen);
+    if (!Array.isArray(root.areas) || rooms.length !== root.areas.length) return { ok: false, reason: 'INVALID' };
+    floors = [{ level: 0, areas: rooms }];
+  }
+  const placed = floors.flatMap((floor) => floor.areas.map((room) => room.areaId)).sort();
+  const wanted = [...areaIds].sort();
+  if (placed.length !== wanted.length || placed.some((id, index) => id !== wanted[index])) return { ok: false, reason: 'INVALID' };
+  return { ok: true, stored: { version: 2, floors: floors.sort((a, b) => a.level - b.level) } };
+}

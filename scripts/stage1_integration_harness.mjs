@@ -8379,6 +8379,44 @@ async function pendingInvitationRouteChecks(deliveryEnv) {
       writeCode: floorplanWrite.body?.error?.code, replayCode: floorplanReplay.body?.error?.code,
       conflictCode: floorplanConflict.body?.error?.code, afterRevision: floorplanAfter.body?.revision })})`);
   }
+  // Floors: stored per floor, older apps still see and save the Ground floor, and nothing is lost between the two.
+  {
+    const planUrl = `${base}/api/v2/homes/${inviter.homeId}/floorplan`;
+    const putPlan = (revision, document) => fetchJson(planUrl, { method: 'PUT', headers: { ...selectedHomeHeaders, 'idempotency-key': `s9-floors-${crypto.randomUUID()}` }, body: JSON.stringify({ expectedRevision: revision, document }) });
+    const overlapsRoom = (a, b) => a.x < b.x + b.width && b.x < a.x + a.width && a.y < b.y + b.height && b.y < a.y + a.height;
+    const start = floorplanAfter.body;
+    const everyArea = start.document.areas.map((area) => area.areaId);
+    if (start.document.version !== 1 || !Array.isArray(start.document.floors) || start.document.floors.length !== 1 || start.document.floors[0].level !== 0
+      || start.document.floors[0].areas.length !== everyArea.length) fail('A plan saved before floors was not read as the Ground floor');
+    const moved = everyArea[0];
+    const upper = { level: 1, areas: [{ areaId: moved, x: 0, y: 0, width: 10, height: 10 }] };
+    const ground = { level: 0, areas: start.document.areas.filter((area) => area.areaId !== moved) };
+    const split = await putPlan(start.revision, { version: 1, floors: [ground, upper] });
+    const splitRead = await fetchJson(planUrl, { headers: selectedHomeHeaders });
+    const flat = splitRead.body?.document?.areas ?? [];
+    if (split.response.status !== 200 || splitRead.response.status !== 200 || splitRead.body.document.floors.length !== 2
+      || splitRead.body.document.floors.find((floor) => floor.level === 1)?.areas[0]?.areaId !== moved
+      || [...flat.map((area) => area.areaId)].sort().join() !== [...everyArea].sort().join()
+      || flat.some((room, index) => flat.some((other, otherIndex) => otherIndex > index && overlapsRoom(room, other)))) {
+      fail(`A second floor was not saved and read back with every room once and a non-overlapping view for older apps (${split.response.status}/${splitRead.response.status}/${JSON.stringify(split.body?.error ?? null)})`);
+    }
+    const legacy = await putPlan(splitRead.body.revision, { version: 1, areas: flat });
+    const noGround = await putPlan(splitRead.body.revision, { version: 1, floors: [upper] });
+    const twice = await putPlan(splitRead.body.revision, { version: 1, floors: [{ level: 0, areas: start.document.areas }, upper] });
+    const badLevel = await putPlan(splitRead.body.revision, { version: 1, floors: [{ level: 0, areas: start.document.areas }, { level: 9, areas: [] }] });
+    const afterRejected = await fetchJson(planUrl, { headers: selectedHomeHeaders });
+    if (legacy.response.status !== 409 || legacy.body?.error?.code !== 'UPDATE_REQUIRED'
+      || noGround.response.status !== 400 || twice.response.status !== 400 || badLevel.response.status !== 400
+      || afterRejected.body.revision !== splitRead.body.revision) {
+      fail(`Floor plan rules were not enforced: older app overwrite=${legacy.response.status}, no Ground floor=${noGround.response.status}, room on two floors=${twice.response.status}, bad level=${badLevel.response.status}`);
+    }
+    const restored = await putPlan(afterRejected.body.revision, { version: 1, floors: [{ level: 0, areas: flat }] });
+    const restoredLegacy = await putPlan(restored.body?.revision, { version: 1, areas: restored.body?.document?.areas ?? [] });
+    if (restored.response.status !== 200 || restored.body.document.floors.length !== 1 || restoredLegacy.response.status !== 200) {
+      fail('Moving every room back to the Ground floor did not let an older app save the plan again');
+    }
+    console.log('[stage9:integration] PASS: floor plan floors are saved per floor, older apps keep seeing and saving the Ground floor without losing upper floors, and invalid or conflicting plans are refused');
+  }
   const areaBeforeOverride = await prisma.area.findUniqueOrThrow({ where: { id: areaId }, select: { revision: true, overrideName: true } });
   const homeBeforeOverride = await prisma.home.findUniqueOrThrow({ where: { id: inviter.homeId }, select: { managementRevision: true } });
   const ownerRoutePreconditions = {

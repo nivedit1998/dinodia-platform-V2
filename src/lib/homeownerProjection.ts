@@ -1,7 +1,7 @@
 import type { Prisma } from '@prisma/client';
 import { currentNativeDisplayName } from './nativeDisplayNames';
 import { nativeDisplayGroups } from './nativeDisplayGroups';
-import { completeFloorplan } from './homeFloorplan';
+import { floorplanDocument } from './homeFloorplan';
 import { publicAvatar } from './avatarCatalogue';
 import { currentCloudflareTunnelStatus } from './hubSyncTelemetry';
 
@@ -116,7 +116,7 @@ export async function readHomeownerProjection(db: Prisma.TransactionClient, inpu
   const heartbeatAge = hub.lastSeenAt ? (now.getTime() - hub.lastSeenAt.getTime()) / 1000 : null;
   const heartbeatState = heartbeatAge === null || heartbeatAge < -30 ? 'UNKNOWN'
     : heartbeatAge <= HEARTBEAT_ONLINE_SECONDS ? 'ONLINE' : 'OFFLINE';
-  const activeFloorplan = completeFloorplan(grouped.areas.map((area) => area.id), floorplanRow?.document);
+  const activeFloorplan = floorplanDocument(grouped.areas.map((area) => area.id), floorplanRow?.document);
   const capabilities = hub.capabilitySummary && typeof hub.capabilitySummary === 'object' && !Array.isArray(hub.capabilitySummary)
     ? hub.capabilitySummary as Record<string, unknown> : {};
   const cloudflareStatus = hub.manufacturingIdentity?.status === 'ACTIVE'
@@ -145,7 +145,7 @@ export async function readHomeownerProjection(db: Prisma.TransactionClient, inpu
     },
     areas: grouped.areas.map((area) => ({ id: area.id, originalName: area.originalName, overrideName: area.overrideName, displayName: area.displayName, revision: area.revision, displayGroupId: area.displayGroupId })),
     displayGroups: grouped.groups,
-    floorplan: { revision: floorplanRow?.revision ?? 0, document: { version: 1, areas: activeFloorplan } },
+    floorplan: { revision: floorplanRow?.revision ?? 0, document: activeFloorplan },
     devices,
     members: members.map((row) => ({
       membershipId: row.id, role: row.role, accessRevision: row.accessRevision,

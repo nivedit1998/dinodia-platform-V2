@@ -6,37 +6,13 @@ import { Stage1AuthError } from '@/lib/stage1Auth';
 import { serializableTransaction } from '@/lib/serializableTransaction';
 import { compareAndSetHomeDocument, NativeHomeDocumentError } from '@/lib/nativeHomeDocuments';
 import { sha256 } from '@/lib/stage1Crypto';
-import { completeFloorplan } from '@/lib/homeFloorplan';
+import { floorplanDocument, submittedFloorplan } from '@/lib/homeFloorplan';
 import type { Prisma } from '@prisma/client';
 
 export const dynamic = 'force-dynamic';
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const keyPattern = /^[A-Za-z0-9._:-]{16,160}$/;
 const namespace = 'homeowner-floorplan:v1';
-
-function validateDocument(value: unknown): value is { version: 1; areas: Array<{ areaId: string; x: number; y: number; width: number; height: number }> } {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
-  const root = value as Record<string, unknown>;
-  if (Object.keys(root).sort().join(',') !== 'areas,version' || root.version !== 1 || !Array.isArray(root.areas) || root.areas.length > 500) return false;
-  const seen = new Set<string>();
-  const occupied: Array<{ x: number; y: number; width: number; height: number }> = [];
-  for (const raw of root.areas) {
-    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return false;
-    const area = raw as Record<string, unknown>;
-    if (Object.keys(area).sort().join(',') !== 'areaId,height,width,x,y'
-      || typeof area.areaId !== 'string' || !uuid.test(area.areaId) || seen.has(area.areaId)
-      || ![area.x, area.y, area.width, area.height].every((n) => Number.isInteger(n))
-      || (area.x as number) < 0 || (area.x as number) >= 48 || (area.y as number) < 0 || (area.y as number) >= 64
-      || (area.width as number) < 1 || (area.width as number) > 48 || (area.height as number) < 1 || (area.height as number) > 64
-      || (area.x as number) + (area.width as number) > 48 || (area.y as number) + (area.height as number) > 64) return false;
-    const rect = { x: area.x as number, y: area.y as number, width: area.width as number, height: area.height as number };
-    if (occupied.some((other) => rect.x < other.x + other.width && other.x < rect.x + rect.width
-      && rect.y < other.y + other.height && other.y < rect.y + rect.height)) return false;
-    occupied.push(rect);
-    seen.add(area.areaId);
-  }
-  return true;
-}
 
 function canonical(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(canonical).join(',')}]`;
@@ -63,7 +39,7 @@ export async function GET(request: Request, context: { params: Promise<{ homeId:
       prisma.area.findMany({ where: { homeId, status: 'ACTIVE' }, orderBy: [{ createdAt: 'asc' }, { id: 'asc' }], take: 64, select: { id: true } }),
     ]);
     // The saved plan is kept: rooms added since are placed beside it, rooms removed are dropped.
-    const document = { version: 1, areas: completeFloorplan(activeRows.map((area) => area.id), row?.document) };
+    const document = floorplanDocument(activeRows.map((area) => area.id), row?.document);
     return NextResponse.json({ schemaVersion: 'dinodia.v1', ok: true, homeId, revision: row?.revision ?? 0, document }, { headers: { 'Cache-Control': 'no-store', Pragma: 'no-cache' } });
   } catch (error) { return nativeV1ErrorResponse(error); }
 }
@@ -77,7 +53,7 @@ export async function PUT(request: Request, context: { params: Promise<{ homeId:
     if (!uuid.test(homeId) || selected.homeId !== homeId || !['OWNER', 'PROPERTY_MANAGER'].includes(selected.role)
       || selected.credentialKind !== 'account_access') throw new Stage1AuthError(404, 'RESOURCE_NOT_FOUND', 'Floorplan is unavailable for this selected Home');
     if (!keyPattern.test(key) || !body || Object.keys(body).sort().join(',') !== 'document,expectedRevision'
-      || !Number.isSafeInteger(body.expectedRevision) || Number(body.expectedRevision) < 0 || !validateDocument(body.document)) {
+      || !Number.isSafeInteger(body.expectedRevision) || Number(body.expectedRevision) < 0 || !body.document || typeof body.document !== 'object') {
       throw new Stage1AuthError(400, 'VALIDATION_FAILED', 'A valid floorplan, revision and idempotency key are required');
     }
     const keyHash = sha256(`${selected.id}:${key}`);
@@ -93,17 +69,19 @@ export async function PUT(request: Request, context: { params: Promise<{ homeId:
         return prior.responseBody as Record<string, unknown>;
       }
       let saved: { revision: number; document: unknown };
-      const submitted = (body.document as { areas: Array<{ areaId: string }> }).areas.map((area) => area.areaId).sort();
-      const currentAreaIds = (await tx.area.findMany({ where: { homeId, status: 'ACTIVE' }, orderBy: { id: 'asc' }, select: { id: true } })).map((area) => area.id).sort();
-      if (submitted.length !== currentAreaIds.length || submitted.some((id, index) => id !== currentAreaIds[index])) {
-        throw new Stage1AuthError(400, 'VALIDATION_FAILED', 'The floorplan must include every current Area exactly once');
+      const currentAreaIds = (await tx.area.findMany({ where: { homeId, status: 'ACTIVE' }, orderBy: { id: 'asc' }, select: { id: true } })).map((area) => area.id);
+      const currentRow = await tx.homeDocument.findUnique({ where: { homeId_kind: { homeId, kind: 'FLOORPLAN' } }, select: { document: true } });
+      const submission = submittedFloorplan(currentAreaIds, body.document, currentRow?.document);
+      if (!submission.ok) {
+        if (submission.reason === 'FLOORS_NEED_NEW_APP') throw new Stage1AuthError(409, 'UPDATE_REQUIRED', 'This Home has several floors. Update the Dinodia app to edit its floor plan.');
+        throw new Stage1AuthError(400, 'VALIDATION_FAILED', 'The floorplan must include every current Area exactly once, with no overlaps on a floor');
       }
       try {
-        saved = await compareAndSetHomeDocument(tx, { customerAccountId: selected.id, membershipId: selected.membershipId, homeId, kind: 'FLOORPLAN', expectedRevision: Number(body.expectedRevision), document: body.document });
+        saved = await compareAndSetHomeDocument(tx, { customerAccountId: selected.id, membershipId: selected.membershipId, homeId, kind: 'FLOORPLAN', expectedRevision: Number(body.expectedRevision), document: submission.stored });
       } catch (error) { mapError(error); }
-      const receipt = { schemaVersion: 'dinodia.v1', ok: true, homeId, revision: saved.revision, document: saved.document };
+      const receipt = { schemaVersion: 'dinodia.v1', ok: true, homeId, revision: saved.revision, document: floorplanDocument(currentAreaIds, saved.document) };
       await tx.idempotencyRecord.create({ data: { namespace, keyHash, actorId: selected.id, homeId, requestHash, responseStatus: 200, responseBody: receipt as Prisma.InputJsonValue, responseDigest: sha256(canonical(receipt)), expiresAt: new Date(now.getTime() + 24 * 60 * 60 * 1000) } });
-      await tx.auditEvent.create({ data: { homeId, actorType: 'CUSTOMER', actorId: selected.id, category: 'MANAGEMENT', action: 'home_floorplan_changed', targetType: 'HomeDocument', targetId: homeId, metadata: { revision: saved.revision, areaCount: (body.document as { areas: unknown[] }).areas.length }, purgeAt: new Date(now.getTime() + 365 * 24 * 60 * 60 * 1000) } });
+      await tx.auditEvent.create({ data: { homeId, actorType: 'CUSTOMER', actorId: selected.id, category: 'MANAGEMENT', action: 'home_floorplan_changed', targetType: 'HomeDocument', targetId: homeId, metadata: { revision: saved.revision, areaCount: currentAreaIds.length, floorCount: submission.stored.floors.length }, purgeAt: new Date(now.getTime() + 365 * 24 * 60 * 60 * 1000) } });
       return receipt;
     });
     return NextResponse.json(response, { headers: { 'Cache-Control': 'no-store', Pragma: 'no-cache' } });

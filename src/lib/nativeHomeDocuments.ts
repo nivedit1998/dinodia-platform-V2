@@ -9,12 +9,30 @@ function exactKeys(value: Record<string, unknown>, keys: readonly string[]) {
   return Object.keys(value).length === keys.length && keys.every((key) => Object.hasOwn(value, key));
 }
 
-function floorplanAreas(document: unknown): Array<{ areaId: string; x: number; y: number; width: number; height: number }> | null {
+type FloorplanRect = { areaId: string; x: number; y: number; width: number; height: number };
+
+/** Every room of a stored plan: version 1 (rooms only) or version 2 (floors, each with rooms). Null if malformed. */
+function floorplanAreas(document: unknown): FloorplanRect[] | null {
   if (!document || typeof document !== 'object' || Array.isArray(document)) return null;
   const root = document as Record<string, unknown>;
+  if (exactKeys(root, ['version', 'floors']) && root.version === 2 && Array.isArray(root.floors) && root.floors.length >= 1 && root.floors.length <= 7) {
+    const levels = new Set<unknown>();
+    const all: FloorplanRect[] = [];
+    for (const raw of root.floors) {
+      if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+      const floor = raw as Record<string, unknown>;
+      if (!exactKeys(floor, ['level', 'areas']) || !Number.isInteger(floor.level) || (floor.level as number) < -1 || (floor.level as number) > 5 || levels.has(floor.level)) return null;
+      levels.add(floor.level);
+      const rooms = floorplanAreas({ version: 1, areas: floor.areas });
+      if (!rooms) return null;
+      all.push(...rooms);
+    }
+    if (!levels.has(0) || new Set(all.map((room) => room.areaId)).size !== all.length) return null;
+    return all;
+  }
   if (!exactKeys(root, ['version', 'areas']) || root.version !== 1 || !Array.isArray(root.areas) || root.areas.length > 500) return null;
   const seen = new Set<string>();
-  const areas: Array<{ areaId: string; x: number; y: number; width: number; height: number }> = [];
+  const areas: FloorplanRect[] = [];
   for (const raw of root.areas) {
     if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
     const area = raw as Record<string, unknown>;

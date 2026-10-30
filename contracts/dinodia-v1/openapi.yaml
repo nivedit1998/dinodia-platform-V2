@@ -2663,7 +2663,7 @@ paths:
       tags: [Home]
       security: [{ MobileAccessBearer: [] }, { CustomerSessionCookie: [] }]
       parameters: [{ $ref: "#/components/parameters/HomeId" }]
-      responses: { "200": { description: Revisioned canonical-Area layout for the selected Home. }, "401": { $ref: "#/components/responses/Unauthorized" }, "404": { $ref: "#/components/responses/Forbidden" } }
+      responses: { "200": { description: "Revisioned canonical-Area layout for the selected Home. The document keeps version 1 and its `areas` list (every room once, non-overlapping) for apps that predate floors, and adds `floors`: [{ level (-1 Basement, 0 Ground, 1 to 5), areas }]. A plan saved before floors is the Ground floor." }, "401": { $ref: "#/components/responses/Unauthorized" }, "404": { $ref: "#/components/responses/Forbidden" } }
     put:
       summary: Save the Home floorplan with compare-and-set revision
       operationId: updateHomeFloorplan
@@ -2671,7 +2671,7 @@ paths:
       security: [{ MobileAccessBearer: [] }, { CustomerSessionCookie: [] }]
       parameters: [{ $ref: "#/components/parameters/HomeId" }, { $ref: "#/components/parameters/IdempotencyKey" }]
       requestBody: { required: true, content: { application/json: { schema: { type: object, additionalProperties: false } } } }
-      responses: { "200": { description: Floorplan saved atomically for the selected Home. }, "401": { $ref: "#/components/responses/Unauthorized" }, "409": { $ref: "#/components/responses/Conflict" } }
+      responses: { "200": { description: "Floorplan saved atomically for the selected Home. The body document is either { version: 1, floors } (every current room on exactly one floor, a Ground floor required, no overlaps on a floor) or the older { version: 1, areas } (the Ground floor). An older-form save of a plan that has rooms on other floors is refused with 409 UPDATE_REQUIRED." }, "401": { $ref: "#/components/responses/Unauthorized" }, "409": { $ref: "#/components/responses/Conflict" } }
   /api/v2/homes/{homeId}/homeowner-context:
     get:
       summary: Read owner/property-manager Home projection
