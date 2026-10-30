@@ -906,6 +906,7 @@ async function startFakeSes() {
         if (header?.namespace === 'Alexa.Discovery') {
           alexaDiscoveryDeliveries.push({
             name: header.name ?? null,
+            authorized: request.headers.authorization === 'Bearer stage12-disposable-lwa-access-token',
             token: event?.payload?.scope?.token ?? null,
             endpointIds: (event?.payload?.endpoints ?? []).map((item) => item?.endpointId ?? null),
             endpoints: event?.payload?.endpoints ?? [],
@@ -5432,7 +5433,7 @@ async function nativeAlexaOAuthChecks(deliveryEnv) {
     const sweepAdd = await runOperations();
     const addReport = alexaDiscoveryDeliveries.find((item) => item.name === 'AddOrUpdateReport');
     const readingProjection = await prisma.alexaNativeEndpointProjection.findFirst({ where: { linkId: link.id, deviceId: readingDeviceId, status: 'ACTIVE' }, select: { endpointId: true, payloadHash: true, announcedHash: true } });
-    if (sweepAdd.response.status !== 200 || !addReport || addReport.token !== gatewayToken || !readingProjection
+    if (sweepAdd.response.status !== 200 || !addReport || addReport.token !== gatewayToken || addReport.authorized !== true || !readingProjection
       || !addReport.endpointIds.includes(readingProjection.endpointId)
       || addReport.endpointIds.length !== 1 || readingProjection.payloadHash !== readingProjection.announcedHash
       || !/study.*reading light/i.test(addReport.endpoints[0]?.friendlyName ?? '')) {

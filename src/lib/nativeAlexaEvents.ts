@@ -374,7 +374,7 @@ export async function dispatchAlexaDiscoveryReports(now = new Date()) {
       catch (error) { if (error instanceof PlatformDataEncryptionKeyError) throw error; }
       if (!accessToken || accessToken.length < 16 || accessToken.length > 8192) { result.failed += 1; continue; }
       const post = async (name: 'AddOrUpdateReport' | 'DeleteReport', endpoints: JsonObject[]) => {
-        const response = await fetch(eventGatewayEndpoint(), { method: 'POST', headers: { 'content-type': 'application/json', accept: 'application/json' },
+        const response = await fetch(eventGatewayEndpoint(), { method: 'POST', headers: { authorization: `Bearer ${accessToken}`, 'content-type': 'application/json', accept: 'application/json' },
           body: JSON.stringify({ event: { header: { namespace: 'Alexa.Discovery', name, messageId: `dinodia-${randomUUID()}`, payloadVersion: '3' },
             payload: { endpoints, scope: { type: 'BearerToken', token: accessToken } } } }),
           signal: AbortSignal.timeout(GATEWAY_TIMEOUT_MS), redirect: 'manual' });
