@@ -9,7 +9,7 @@ const compiled = ts.transpileModule(fs.readFileSync('src/lib/alexa/accountRemova
 }).outputText;
 const isolated = { exports: {} };
 new Function('module', 'exports', 'require', compiled)(isolated, isolated.exports, require);
-const { queueAlexaRemovalReportsForAccount, ALEXA_ACCOUNT_REMOVAL_AGGREGATE, ALEXA_ACCOUNT_REMOVAL_EVENT } = isolated.exports;
+const { queueAlexaRemovalReportsForAccount, retireAlexaLinksWithoutHomes, ALEXA_ACCOUNT_REMOVAL_AGGREGATE, ALEXA_ACCOUNT_REMOVAL_EVENT } = isolated.exports;
 
 const ID_A = 'dos_aaaaaaaaaaaaaaaaaaaa';
 const ID_B = 'dos_bbbbbbbbbbbbbbbbbbbb';
@@ -59,4 +59,45 @@ test('every link of the account is queued under its own key', async () => {
   ]);
   assert.equal(await queueAlexaRemovalReportsForAccount(tx, 'acct-1', now), 2);
   assert.deepEqual(tx.calls.upsert.map((c) => c.where.idempotencyKey), ['alexa-account-removal:l1', 'alexa-account-removal:l2']);
+});
+
+function retireTx({ homes, links }) {
+  const log = [];
+  const rec = (name) => async (args) => { log.push([name, args]); return { count: 0 }; };
+  const tx = { log,
+    $queryRaw: async (strings) => { log.push(['lock', String(strings[0]).includes('AlexaNativeLink') ? 'link' : 'account']); return []; },
+    homeMembership: { count: async (args) => { log.push(['homes', args]); return homes; } },
+    alexaNativeLink: { findMany: async (args) => { log.push(['findLinks', args]); return links; }, update: rec('linkUpdate') },
+    nativeDomainOutbox: { upsert: rec('outbox') },
+    alexaNativeAreaSelection: { updateMany: rec('selections') }, alexaNativeHomeScope: { updateMany: rec('scopes') },
+    alexaNativeEndpointProjection: { updateMany: rec('endpoints') }, alexaOAuthTokenFamily: { updateMany: rec('families') },
+    alexaOAuthAccessToken: { updateMany: rec('access') }, alexaOAuthRefreshToken: { updateMany: rec('refresh') } };
+  return tx;
+}
+
+test('a tenant who still has a Home keeps their Alexa link', async () => {
+  const tx = retireTx({ homes: 1, links: [{ id: 'l1' }] });
+  assert.equal(await retireAlexaLinksWithoutHomes(tx, 'acct-1', now), false);
+  assert.deepEqual(tx.log.find(([n]) => n === 'homes')[1].where, { customerAccountId: 'acct-1', role: 'TENANT', status: { in: ['ACTIVE', 'REMOVAL_PENDING'] } });
+  assert.equal(tx.log.some(([n]) => n === 'linkUpdate' || n === 'outbox'), false);
+});
+
+test('no Home and no link does nothing', async () => {
+  const tx = retireTx({ homes: 0, links: [] });
+  assert.equal(await retireAlexaLinksWithoutHomes(tx, 'acct-1', now), false);
+  assert.equal(tx.log.some(([n]) => n === 'linkUpdate'), false);
+});
+
+test('no Home retires the link: report parked first, then tokens wiped and everything revoked', async () => {
+  const tx = retireTx({ homes: 0, links: [{ id: 'l1' }] });
+  tx.alexaNativeLink.findMany = async (args) => { tx.log.push(['findLinks', args]); return args.select?.refreshTokenCiphertext ? [{ id: 'l1', refreshTokenCiphertext: '{"enc":"x"}', announcedEndpointIds: [ID_A] }] : [{ id: 'l1' }]; };
+  assert.equal(await retireAlexaLinksWithoutHomes(tx, 'acct-1', now), true);
+  const names = tx.log.map(([n]) => n);
+  assert.ok(names.indexOf('outbox') > -1 && names.indexOf('outbox') < names.indexOf('linkUpdate'), 'parks the DeleteReport before wiping the token');
+  const update = tx.log.find(([n]) => n === 'linkUpdate')[1];
+  assert.equal(update.where.id, 'l1');
+  assert.equal(update.data.status, 'REVOKED');
+  assert.equal(update.data.accessTokenCiphertext, null);
+  assert.equal(update.data.refreshTokenCiphertext, null);
+  for (const n of ['selections', 'scopes', 'endpoints', 'families', 'access', 'refresh']) assert.ok(names.includes(n), `${n} revoked`);
 });

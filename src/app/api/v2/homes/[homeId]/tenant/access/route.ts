@@ -12,6 +12,7 @@ import { validateTenantMembershipRemovalPreview, validateTenantMembershipRemoval
 import { deleteTenantPrivateDeviceCloudData } from '@/lib/nativeTenantDeviceCleanup';
 import { retireNativeAutomations } from '@/lib/nativeAutomations/lifecycle';
 import { refreshNativeAutomationCloudRevision } from '@/lib/nativeAutomations/delivery';
+import { retireAlexaLinksWithoutHomes } from '@/lib/alexa/accountRemovalReport';
 
 export const dynamic = 'force-dynamic';
 
@@ -210,6 +211,8 @@ export async function DELETE(request: Request, context: { params: Promise<{ home
       await tx.memberPreferenceDocument.deleteMany({ where: { membershipId: membership.id } });
       await tx.alexaNativeEndpointProjection.deleteMany({ where: { homeId, membershipId: membership.id } });
       await tx.alexaNativeHomeScope.deleteMany({ where: { homeId, membershipId: membership.id } });
+      // Their last Home: Alexa has nothing left to follow, so tell it the devices are gone and retire the link (the account stays).
+      await retireAlexaLinksWithoutHomes(tx, account.id, now);
 
       const stillRelated = await relationshipState(tx, account.id, account.emailNormalized, membership.id, now);
       await tx.auditEvent.create({ data: { homeId, actorType: 'CUSTOMER', actorId: account.id, category: 'ACCESS', action: 'tenant_membership_self_removed', targetType: 'HomeMembership', targetId: membership.id,

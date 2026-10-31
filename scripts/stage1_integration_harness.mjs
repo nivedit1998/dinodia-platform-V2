@@ -5569,6 +5569,37 @@ async function nativeAlexaOAuthChecks(deliveryEnv) {
       if (alexaDiscoveryDeliveries.some((item) => item.endpointIds.some((id) => leaverEndpoints.includes(id)))) fail('The final Alexa DeleteReport was sent more than once');
       await prisma.nativeDomainOutbox.delete({ where: { id: parked.id } });
       console.log('[stage12:integration] PASS: deleting a tenant account with its last access still tells Alexa to remove their devices, once, and wipes the stored token afterwards');
+
+      // A tenant with no Home left but a still-active link (it predates the rule, or the Home ended another way): the sweep retires it.
+      const idleTag = crypto.randomUUID();
+      const idle = await prisma.customerAccount.create({ data: {
+        displayName: 'Disposable homeless tenant', username: `stage12h-${idleTag.slice(0, 10)}`, usernameNormalized: `stage12h-${idleTag.slice(0, 10)}`,
+        email: `stage12h-${idleTag}@invalid.test`, emailNormalized: `stage12h-${idleTag}@invalid.test`,
+        emailVerifiedAt: new Date(), passwordHash: hashPassword(crypto.randomBytes(32).toString('hex')),
+      }, select: { id: true } });
+      const idleEndpoints = [`dos_stage12idle${crypto.randomBytes(8).toString('hex')}`];
+      const idleLink = await prisma.alexaNativeLink.create({ data: {
+        customerAccountId: idle.id, providerSubjectHash: sha256(`stage12-idle-${idleTag}`), status: 'ACTIVE', autoScope: true,
+        refreshTokenCiphertext: sourceLink.refreshTokenCiphertext, accessTokenCiphertext: sourceLink.accessTokenCiphertext,
+        encryptionKeyVersion: sourceLink.encryptionKeyVersion, announcedEndpointIds: idleEndpoints,
+      }, select: { id: true } });
+      alexaDiscoveryDeliveries = [];
+      for (let attempt = 0; attempt < 12; attempt += 1) {
+        await prisma.alexaNativeLink.updateMany({ where: { id: idleLink.id }, data: { updatedAt: new Date(0) } });
+        await runOperations();
+        if ((await prisma.alexaNativeLink.findUniqueOrThrow({ where: { id: idleLink.id }, select: { status: true } })).status === 'REVOKED') break;
+      }
+      await runOperations(); // the parked report is delivered by the following tick
+      const retiredIdle = await prisma.alexaNativeLink.findUniqueOrThrow({ where: { id: idleLink.id }, select: { status: true, revokedAt: true, refreshTokenCiphertext: true, announcedEndpointIds: true } });
+      const idleReports = alexaDiscoveryDeliveries.filter((item) => item.name === 'DeleteReport' && idleEndpoints.every((id) => item.endpointIds.includes(id)));
+      const idleRow = await prisma.nativeDomainOutbox.findUnique({ where: { idempotencyKey: `alexa-account-removal:${idleLink.id}` }, select: { id: true, state: true, payload: true } });
+      if (retiredIdle.status !== 'REVOKED' || !retiredIdle.revokedAt || retiredIdle.refreshTokenCiphertext !== null || retiredIdle.announcedEndpointIds !== null
+        || idleReports.length !== 1 || idleRow?.state !== 'DELIVERED' || JSON.stringify(idleRow.payload) !== '{}') {
+        fail(`The sweep did not retire an Alexa link whose tenant has no Home and tell Alexa once (${retiredIdle.status}; reports=${idleReports.length}; row=${idleRow?.state ?? 'none'})`);
+      }
+      if (idleRow) await prisma.nativeDomainOutbox.delete({ where: { id: idleRow.id } });
+      await prisma.customerAccount.delete({ where: { id: idle.id } });
+      console.log('[stage12:integration] PASS: an Alexa link whose tenant has no Home left is retired by the sweep with one final DeleteReport; the account is untouched');
     }
 
 
@@ -7080,11 +7111,16 @@ async function homeownerRemovalEncryptionConfigurationChecks(deliveryEnv) {
   });
   const committedReplay = await fetchJson(removalPath, { method: 'DELETE', headers: ownerHeaders, body: JSON.stringify(requestBody) });
   const removedAccount = await prisma.customerAccount.findUnique({ where: { id: tenant.id }, select: { id: true } });
-  // The account is kept (no homes left is a normal state), so its Alexa link stays and the sweep reports the removal.
-  if (committedRemoval.response.status !== 200 || !removedAccount || await prisma.alexaNativeLink.count({ where: { id: removalAlexaLink.id } }) !== 1
-    || await prisma.nativeDomainOutbox.count({ where: { idempotencyKey: `alexa-account-removal:${removalAlexaLink.id}` } }) !== 0) {
-    fail(`Owner removal of a tenant's last Home must keep their account and Alexa link (${committedRemoval.response.status}; account=${Boolean(removedAccount)})`);
+  // The account is kept (no homes left is a normal state), but with no Home left the Alexa link is retired in the same step:
+  // a final DeleteReport is parked for the announced devices and the stored Amazon tokens are wiped.
+  const retiredLink = await prisma.alexaNativeLink.findUnique({ where: { id: removalAlexaLink.id }, select: { status: true, revokedAt: true, refreshTokenCiphertext: true, accessTokenCiphertext: true, announcedEndpointIds: true } });
+  const parkedRemoval = await prisma.nativeDomainOutbox.findUnique({ where: { idempotencyKey: `alexa-account-removal:${removalAlexaLink.id}` }, select: { state: true, payload: true } });
+  if (committedRemoval.response.status !== 200 || !removedAccount || retiredLink?.status !== 'REVOKED' || !retiredLink.revokedAt
+    || retiredLink.refreshTokenCiphertext !== null || retiredLink.accessTokenCiphertext !== null || retiredLink.announcedEndpointIds !== null
+    || parkedRemoval?.state !== 'PENDING' || !parkedRemoval.payload?.endpointIds?.includes(removalAlexaEndpoint)) {
+    fail(`Owner removal of a tenant's last Home must keep their account and retire their Alexa link with a parked DeleteReport (${committedRemoval.response.status}; account=${Boolean(removedAccount)}; link=${retiredLink?.status ?? 'gone'}; parked=${parkedRemoval?.state ?? 'none'})`);
   }
+  await prisma.nativeDomainOutbox.delete({ where: { idempotencyKey: `alexa-account-removal:${removalAlexaLink.id}` } });
   await prisma.alexaNativeLink.delete({ where: { id: removalAlexaLink.id } });
   const removedMembership = await prisma.homeMembership.findUnique({ where: { id: membership.id }, select: { status: true } });
   const removedDevice = await prisma.nativeDevice.findUnique({ where: { id: tenantDevice.id }, select: { id: true } });

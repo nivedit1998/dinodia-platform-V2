@@ -12,6 +12,7 @@ import { queueHomeownerAccessRemovalNotices } from '@/lib/homeownerAccessRemoval
 import { deleteTenantPrivateDeviceCloudData } from '@/lib/nativeTenantDeviceCleanup';
 import { retireNativeAutomations } from '@/lib/nativeAutomations/lifecycle';
 import { refreshNativeAutomationCloudRevision } from '@/lib/nativeAutomations/delivery';
+import { retireAlexaLinksWithoutHomes } from '@/lib/alexa/accountRemovalReport';
 
 export const dynamic = 'force-dynamic';
 // Bounded per-route headroom for two rollback-safe serializable attempts.
@@ -165,6 +166,8 @@ export async function DELETE(request: Request, context: { params: Promise<{ home
       await tx.memberPreferenceDocument.deleteMany({ where: { membershipId: tenantId } });
       await tx.alexaNativeEndpointProjection.deleteMany({ where: { homeId, membershipId: tenantId } });
       await tx.alexaNativeHomeScope.deleteMany({ where: { homeId, membershipId: tenantId } });
+      // If this was their last Home, tell Alexa the devices are gone and retire their Alexa link; they can link again with a new Home.
+      await retireAlexaLinksWithoutHomes(tx, target.customerAccountId, now);
       // The tenant's account is deliberately kept even when this was their last Home: removing access to one property must not
       // erase their identity. They land on the "no homes" page and can be invited or scan a room code again; only their own
       // Delete My Account (or the last-relationship consent flow) deletes it.

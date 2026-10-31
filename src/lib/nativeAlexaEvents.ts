@@ -9,7 +9,7 @@ import { refreshNativeAlexaEventToken } from '@/lib/nativeAlexaGrant';
 import { alexaPropertiesFromStates, type AuthorizedEndpoint } from '@/lib/nativeAlexaExecution';
 import { ensureAutoScopes } from '@/lib/alexa/syncAlexa';
 import { projectAlexaLinkEndpoints } from '@/lib/alexa/projection';
-import { ALEXA_ACCOUNT_REMOVAL_AGGREGATE, ALEXA_ACCOUNT_REMOVAL_EVENT } from '@/lib/alexa/accountRemovalReport';
+import { ALEXA_ACCOUNT_REMOVAL_AGGREGATE, ALEXA_ACCOUNT_REMOVAL_EVENT, retireAlexaLinksWithoutHomes } from '@/lib/alexa/accountRemovalReport';
 
 const MAX_CHANGE_REPORTS_PER_TICK = 4;
 const GATEWAY_TIMEOUT_MS = 4000;
@@ -326,7 +326,7 @@ const MAX_ENDPOINTS_PER_REPORT = 100;
  * Keeps every auto-scope link in step with the tenant's real access and tells Alexa what changed: AddOrUpdateReport for
  * new, renamed or changed devices and DeleteReport for devices that are gone. The truth is the endpoint projection rows
  * (payloadHash against announcedHash), so a missed run, a failed delivery or a restart simply catches up on the next
- * two-minute tick. Bounded per tick; links rotate by their last sweep time.
+ * two-minute tick. Bounded per tick; links rotate by their last sweep time. A link whose tenant has no Home left is retired here.
  */
 export async function dispatchAlexaDiscoveryReports(now = new Date()) {
   const empty = { enabled: false, links: 0, added: 0, removed: 0, failed: 0 };
@@ -345,6 +345,8 @@ export async function dispatchAlexaDiscoveryReports(now = new Date()) {
         } });
         const swept = new Date();
         if (!current || current.status !== 'ACTIVE' || current.revokedAt || !current.autoScope) return null;
+        // A tenant with no Home left (however it ended, including links that predate this rule) has nothing for Alexa to follow.
+        if (await retireAlexaLinksWithoutHomes(tx, current.customerAccountId, swept)) return null;
         const account = current.customerAccount;
         if (account.status !== 'ACTIVE' || !account.emailVerifiedAt || account.mustChangePassword || account.usernameSelectionRequired) {
           await tx.alexaNativeEndpointProjection.updateMany({ where: { linkId: link.id, status: { not: 'REVOKED' } }, data: { status: 'REVOKED', updatedAt: swept } });

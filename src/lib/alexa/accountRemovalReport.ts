@@ -1,4 +1,4 @@
-import type { Prisma } from '@prisma/client';
+import { Prisma } from '@prisma/client';
 
 export const ALEXA_ACCOUNT_REMOVAL_AGGREGATE = 'AlexaAccountRemoval';
 export const ALEXA_ACCOUNT_REMOVAL_EVENT = 'ALEXA_ACCOUNT_REMOVAL_REPORT';
@@ -30,4 +30,32 @@ export async function queueAlexaRemovalReportsForAccount(tx: Prisma.TransactionC
     queued += 1;
   }
   return queued;
+}
+
+/**
+ * An Alexa link exists to follow a tenant's rooms. When the tenant no longer has any Home (removed by an owner, left on
+ * their own, a Home deregistered), the link only holds dead tokens, so it is retired: a final DeleteReport is parked for
+ * the devices Alexa still lists, then the link, its OAuth tokens, scopes and endpoints are revoked and the stored Amazon
+ * tokens are wiped. The account itself is untouched; once they have a Home again they simply link Alexa again.
+ * Call inside a transaction. Returns true when a link was retired.
+ */
+export async function retireAlexaLinksWithoutHomes(tx: Prisma.TransactionClient, accountId: string, now: Date): Promise<boolean> {
+  await tx.$queryRaw`SELECT "id" FROM "CustomerAccount" WHERE "id" = ${accountId}::uuid FOR UPDATE`;
+  const stillHasHome = await tx.homeMembership.count({ where: { customerAccountId: accountId, role: 'TENANT', status: { in: ['ACTIVE', 'REMOVAL_PENDING'] } } });
+  if (stillHasHome > 0) return false;
+  const links = await tx.alexaNativeLink.findMany({ where: { customerAccountId: accountId, status: 'ACTIVE', revokedAt: null }, select: { id: true } });
+  if (links.length === 0) return false;
+  for (const link of links) await tx.$queryRaw`SELECT "id" FROM "AlexaNativeLink" WHERE "id" = ${link.id}::uuid FOR UPDATE`;
+  await queueAlexaRemovalReportsForAccount(tx, accountId, now);
+  for (const link of links) {
+    await tx.alexaNativeAreaSelection.updateMany({ where: { homeScope: { linkId: link.id }, revokedAt: null }, data: { revokedAt: now, updatedAt: now } });
+    await tx.alexaNativeHomeScope.updateMany({ where: { linkId: link.id, revokedAt: null }, data: { revokedAt: now, updatedAt: now } });
+    await tx.alexaNativeEndpointProjection.updateMany({ where: { linkId: link.id, status: { not: 'REVOKED' } }, data: { status: 'REVOKED', updatedAt: now } });
+    await tx.alexaOAuthTokenFamily.updateMany({ where: { linkId: link.id, revokedAt: null }, data: { revokedAt: now, revokeReason: 'no_homes' } });
+    await tx.alexaOAuthAccessToken.updateMany({ where: { family: { linkId: link.id }, revokedAt: null }, data: { revokedAt: now } });
+    await tx.alexaOAuthRefreshToken.updateMany({ where: { family: { linkId: link.id }, revokedAt: null }, data: { revokedAt: now } });
+    await tx.alexaNativeLink.update({ where: { id: link.id }, data: { status: 'REVOKED', revokedAt: now, revision: { increment: 1 },
+      accessTokenCiphertext: null, refreshTokenCiphertext: null, announcedEndpointIds: Prisma.DbNull, updatedAt: now } });
+  }
+  return true;
 }
