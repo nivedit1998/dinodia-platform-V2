@@ -4411,6 +4411,8 @@ async function twoStepVerificationChecks(deliveryEnv) {
     await prisma.customerAccount.updateMany({ where: { id: tenantAccount.id }, data: { mfaEnabledAt: null, mfaPromptSnoozedUntil: null, mfaPromptDismissCount: 0 } });
     await prisma.customerAccount.delete({ where: { id: tenantAccount.id } }).catch(() => undefined);
     sesShouldFail = false;
+    // These scenarios sign the shared accounts in many times; later scenarios must not inherit the sign-in rate limit.
+    await prisma.authRateLimitBucket.deleteMany({ where: { OR: [{ bucketKey: { startsWith: 'customer-login:' } }, { bucketKey: { startsWith: 'mfa-' } }] } });
     await stopPlatform();
     await startPlatform(deliveryEnv);
   }
