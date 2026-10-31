@@ -6748,7 +6748,9 @@ async function exceptionalOwnershipTransferChecks(deliveryEnv) {
   const employeeHeaders = (jar) => ({ cookie: cookieHeader(jar), 'content-type': 'application/json' });
   const cxoHeaders = employeeHeaders(cxoLogin.jar);
   const installerHeaders = employeeHeaders(installerLogin.jar);
-  const activeTenant = await prisma.homeMembership.findFirstOrThrow({ where: { homeId, role: 'TENANT', status: 'ACTIVE' },
+  // A tenant who really holds a room: the check below proves transfers keep tenants and their grants (an unordered lookup could pick a
+  // grant-less tenant left behind by an earlier scenario, which made this depend on physical row order).
+  const activeTenant = await prisma.homeMembership.findFirstOrThrow({ where: { homeId, role: 'TENANT', status: 'ACTIVE', tenantAreaGrants: { some: { revokedAt: null } } }, orderBy: { createdAt: 'asc' },
     select: { id: true, customerAccount: { select: { email: true, emailNormalized: true } } } });
   const [currentOwner, initialCaseCount, initialClaimCount] = await Promise.all([
     prisma.homeMembership.findFirstOrThrow({ where: { homeId, role: 'OWNER', status: 'ACTIVE' }, select: { id: true, customerAccountId: true,
@@ -6920,8 +6922,8 @@ async function exceptionalOwnershipTransferChecks(deliveryEnv) {
     || homeAfter.managementRevision <= freshPreview.body.managementRevision) {
     fail(`Exceptional successor did not complete through the normal claim with scoped cleanup and notices (${JSON.stringify({ resolve: resolve.response.status,
       replay: resolveReplay.response.status, case: completedCase.status, claim: consumedClaim.state, successorRole: successorMembership.role,
-      outgoingOwner: outgoingOwner.status, outgoingManager: outgoingManager.status, tenant: tenantAfter.status,
-      tenantGrantCount: tenantGrantAfter.length, noticeCount: noticeRecipients.size })})`);
+      outgoingOwner: outgoingOwner.status, outgoingManager: outgoingManager?.status ?? 'deleted', tenant: tenantAfter.status,
+      tenantGrantCount: tenantGrantAfter.length, noticeCount: noticeRecipients.size, notices: notices.length, expectedNotices: expectedNoticeKeys.length, newNotices: newNotices.length })})`);
   }
   console.log('[stage9:integration] PASS: exceptional Company Portal preview/submit/cancel is CXO/SOM-only, disabled by default, tenant/current-owner successor blocked, idempotent and privacy-preserving; approved rehearsal resolves through the existing verified claim flow with scoped notices, tenant preservation and no direct ownership mutation');
 }
@@ -13524,8 +13526,8 @@ try {
     && (stage12AlexaOnly || (process.env.STAGE6_TRANSFER_ONLY !== '1' && process.env.STAGE6_TENANT_REMOVAL_ONLY !== '1'))) {
     await nativeAlexaOAuthChecks(deliveryEnv);
   }
-  if (process.env.TWO_STEP_ONLY === '1' || (!roomPlaquesOnly && !stage5SyncRecoveryOnly && !stage9RemovalEncryptionOnly && !stage6InvitationLockOnly && !stage6TenantInvitationDecisionOnly && !sharedAvatarsOnly && !mobileRefreshOnly && !newAccountOnly
-    && process.env.STAGE6_TRANSFER_ONLY !== '1' && process.env.STAGE6_TENANT_REMOVAL_ONLY !== '1' && !stage12AlexaOnly)) {
+  if (process.env.TWO_STEP_SKIP !== '1' && (process.env.TWO_STEP_ONLY === '1' || (!roomPlaquesOnly && !stage5SyncRecoveryOnly && !stage9RemovalEncryptionOnly && !stage6InvitationLockOnly && !stage6TenantInvitationDecisionOnly && !sharedAvatarsOnly && !mobileRefreshOnly && !newAccountOnly
+    && process.env.STAGE6_TRANSFER_ONLY !== '1' && process.env.STAGE6_TENANT_REMOVAL_ONLY !== '1' && !stage12AlexaOnly))) {
     await twoStepVerificationChecks(deliveryEnv);
   }
   if (roomPlaquesOnly) {
