@@ -6224,32 +6224,30 @@ async function tenantMembershipRemovalChecks() {
   await acceptConfiguredPolicy(finalTenant);
   const finalHeaders = { cookie: `dinodia_customer_session=${encodeURIComponent(finalTenant.rawSession)}`, 'x-dinodia-home-id': fixture.homeOneId, 'content-type': 'application/json' };
   const finalPreview = await fetchJson(`${base}/api/v2/homes/${fixture.homeOneId}/tenant/access`, { headers: finalHeaders });
-  if (finalPreview.response.status !== 200 || finalPreview.body.willDeleteAccount !== true || finalPreview.body.otherRelationshipsRemain !== false) fail('Final relationship preview omitted the account-deletion warning');
-  const noConfirmProof = await freshProof(finalTenant, fixture.homeOneId, finalTenant.memberships[0], finalPreview.body, false);
+  if (finalPreview.response.status !== 200 || finalPreview.body.willDeleteAccount !== false || finalPreview.body.otherRelationshipsRemain !== true) fail('Leaving the last Home must not warn of account deletion: the account is kept');
+  const finalProof = await freshProof(finalTenant, fixture.homeOneId, finalTenant.memberships[0], finalPreview.body, false);
   const finalKey = `tenant-final-${crypto.randomUUID()}`;
-  const noConfirm = await fetchJson(`${base}/api/v2/homes/${fixture.homeOneId}/tenant/access`, { method: 'DELETE', headers: noConfirmProof.headers,
+  const finalRemoval = await fetchJson(`${base}/api/v2/homes/${fixture.homeOneId}/tenant/access`, { method: 'DELETE', headers: finalProof.headers,
     body: JSON.stringify({ confirmFinalAccountDeletion: false, expectedAccessRevision: finalPreview.body.accessRevision,
-      expectedManagementRevision: finalPreview.body.homeManagementRevision, proof: noConfirmProof.proof, idempotencyKey: finalKey }) });
-  const finalStillExists = await prisma.customerAccount.findUnique({ where: { id: finalTenant.account.id }, select: { id: true, securityVersion: true } });
-  const finalMembershipBeforeConsent = await prisma.homeMembership.findUniqueOrThrow({ where: { id: finalTenant.memberships[0].id }, select: { status: true, accessRevision: true } });
-  const noConfirmProofRow = await prisma.stepUpAuthorization.findFirstOrThrow({ where: { customerAccountId: finalTenant.account.id, operationKind: 'tenant_membership_remove' }, orderBy: { issuedAt: 'desc' }, select: { consumedAt: true } });
-  if (noConfirm.response.status !== 409 || noConfirm.body.error?.code !== 'FINAL_RELATIONSHIP_CONFIRMATION_REQUIRED'
-    || !finalStillExists || finalMembershipBeforeConsent.status !== 'ACTIVE' || noConfirmProofRow.consumedAt) fail(`Final account deletion warning did not preserve authority before explicit consent (${JSON.stringify({ status: noConfirm.response.status, code: noConfirm.body.error?.code, accountStillExists: Boolean(finalStillExists), membership: finalMembershipBeforeConsent.status, proofConsumed: Boolean(noConfirmProofRow.consumedAt) })})`);
-  const consentPreview = await fetchJson(`${base}/api/v2/homes/${fixture.homeOneId}/tenant/access`, { headers: finalHeaders });
-  const consentProof = await freshProof(finalTenant, fixture.homeOneId, finalTenant.memberships[0], consentPreview.body, true);
-  const consent = await fetchJson(`${base}/api/v2/homes/${fixture.homeOneId}/tenant/access`, { method: 'DELETE', headers: consentProof.headers,
-    body: JSON.stringify({ confirmFinalAccountDeletion: true, expectedAccessRevision: consentPreview.body.accessRevision,
-      expectedManagementRevision: consentPreview.body.homeManagementRevision, proof: consentProof.proof, idempotencyKey: `tenant-final-confirmed-${crypto.randomUUID()}` }) });
-  const deletedAccount = await prisma.customerAccount.findUnique({ where: { id: finalTenant.account.id }, select: { id: true } });
-  const deletedSessionCount = await prisma.customerSession.count({ where: { customerAccountId: finalTenant.account.id } });
-  const deletedDeviceCount = await prisma.trustedDevice.count({ where: { customerAccountId: finalTenant.account.id } });
-  const remainingProofRows = await prisma.stepUpAuthorization.count({ where: { nonceHash: sha256(consentProof.proof) } });
-  const anonymousReceipt = consent.body?.anonymousReference ? await prisma.deletionSecurityReceipt.findUnique({ where: { anonymousReference: consent.body.anonymousReference }, select: { actionType: true } }) : null;
-  if (consent.response.status !== 200 || consent.body.accountDeleted !== true || consent.body.nextAction !== 'SIGN_IN'
-    || !/^del_[A-Za-z0-9_-]{32}$/.test(consent.body.anonymousReference || '') || deletedAccount || deletedSessionCount !== 0 || deletedDeviceCount !== 0
-    || remainingProofRows !== 0
-    || anonymousReceipt?.actionType !== 'TENANT_ACCESS_REMOVAL_AND_ACCOUNT_DELETION') fail(`Confirmed last-relationship removal did not delete account-scoped authority and retain only the bounded anonymous security receipt (${JSON.stringify({ status: consent.response.status, code: consent.body?.error?.code, accountDeleted: consent.body?.accountDeleted, nextAction: consent.body?.nextAction, referenceShapeValid: /^del_[A-Za-z0-9_-]{32}$/.test(consent.body?.anonymousReference || ''), accountStillExists: Boolean(deletedAccount), remainingSessions: deletedSessionCount, remainingDevices: deletedDeviceCount, receiptType: anonymousReceipt?.actionType ?? null })})`);
-  console.log('[stage6:integration] PASS: actual tenant-access route proves wrong-home/stale-revision zero-effect denial, fresh proof, selected-membership-only removal, other-home preservation, idempotent retry, final-account warning and account-wide cleanup');
+      expectedManagementRevision: finalPreview.body.homeManagementRevision, proof: finalProof.proof, idempotencyKey: finalKey }) });
+  const keptAccount = await prisma.customerAccount.findUnique({ where: { id: finalTenant.account.id }, select: { id: true, status: true } });
+  const keptMembership = await prisma.homeMembership.findUniqueOrThrow({ where: { id: finalTenant.memberships[0].id }, select: { status: true, removalReason: true } });
+  const keptSessions = await prisma.customerSession.count({ where: { customerAccountId: finalTenant.account.id, revokedAt: null } });
+  const keptDevices = await prisma.trustedDevice.count({ where: { customerAccountId: finalTenant.account.id, revokedAt: null } });
+  const finalProofRow = await prisma.stepUpAuthorization.findFirstOrThrow({ where: { customerAccountId: finalTenant.account.id, operationKind: 'tenant_membership_remove' }, orderBy: { issuedAt: 'desc' }, select: { consumedAt: true } });
+  const finalRetry = await fetchJson(`${base}/api/v2/homes/${fixture.homeOneId}/tenant/access`, { method: 'DELETE', headers: finalProof.headers,
+    body: JSON.stringify({ confirmFinalAccountDeletion: false, expectedAccessRevision: finalPreview.body.accessRevision,
+      expectedManagementRevision: finalPreview.body.homeManagementRevision, proof: finalProof.proof, idempotencyKey: finalKey }) });
+  if (finalRemoval.response.status !== 200 || finalRemoval.body.accountDeleted !== false || finalRemoval.body.otherRelationshipsRemain !== true
+    || finalRemoval.body.nextAction !== 'PENDING_RELATIONSHIPS' || finalRemoval.body.anonymousReference !== null
+    || keptAccount?.status !== 'ACTIVE' || keptMembership.status !== 'REMOVED' || keptMembership.removalReason !== 'tenant_self_removal'
+    || keptSessions < 1 || keptDevices < 1 || !finalProofRow.consumedAt
+    || finalRetry.response.status !== 200 || finalRetry.body.idempotentReplay !== true) {
+    fail(`Leaving the last Home did not keep the tenant's account and sign-in (${JSON.stringify({ status: finalRemoval.response.status, code: finalRemoval.body?.error?.code,
+      accountDeleted: finalRemoval.body?.accountDeleted, nextAction: finalRemoval.body?.nextAction, accountKept: Boolean(keptAccount), membership: keptMembership.status,
+      sessions: keptSessions, devices: keptDevices, proofConsumed: Boolean(finalProofRow.consumedAt), retry: finalRetry.response.status })})`);
+  }
+  console.log('[stage6:integration] PASS: actual tenant-access route proves wrong-home/stale-revision zero-effect denial, fresh proof, selected-membership-only removal, other-home preservation, idempotent retry, and that leaving the last Home keeps the account and its sign-in for the no-homes page');
 }
 
 async function ownershipTransferChecks(deliveryEnv) {

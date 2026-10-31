@@ -1,4 +1,3 @@
-import crypto from 'node:crypto';
 import { Prisma } from '@prisma/client';
 import { NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
@@ -11,7 +10,6 @@ import { sha256 } from '@/lib/stage1Crypto';
 import { serializableTransaction } from '@/lib/serializableTransaction';
 import { validateTenantMembershipRemovalPreview, validateTenantMembershipRemovalReceipt, validateTenantMembershipRemovalRequest } from '@/lib/contracts/dinodiaV1';
 import { deleteTenantPrivateDeviceCloudData } from '@/lib/nativeTenantDeviceCleanup';
-import { queueAlexaRemovalReportsForAccount } from '@/lib/alexa/accountRemovalReport';
 import { retireNativeAutomations } from '@/lib/nativeAutomations/lifecycle';
 import { refreshNativeAutomationCloudRevision } from '@/lib/nativeAutomations/delivery';
 
@@ -61,11 +59,12 @@ export async function GET(request: Request, context: { params: Promise<{ homeId:
       prisma.customerAccount.findUnique({ where: { id: customer.id }, select: { emailNormalized: true } }),
     ]);
     if (!membership || !home || !account) throw new Stage1AuthError(404, 'RESOURCE_NOT_FOUND', 'Tenant access removal is not available for this Home');
-    const relationships = await relationshipState(prisma, customer.id, account.emailNormalized, membership.id, new Date());
+    // Leaving a Home never deletes the account (DECISIONS D27): the tenant lands on the no-homes page and keeps their name and
+    // password. The contract still ties the two flags together, so the account itself is what "remains".
     const preview = { schemaVersion: 'dinodia.v1', homeMembershipId: membership.id,
       homePostcode: home.postcode, accessRevision: membership.accessRevision,
-      homeManagementRevision: home.managementRevision, willDeleteAccount: !relationships.remains,
-      otherRelationshipsRemain: relationships.remains };
+      homeManagementRevision: home.managementRevision, willDeleteAccount: false,
+      otherRelationshipsRemain: true };
     if (!validateTenantMembershipRemovalPreview(preview)) throw new Stage1AuthError(500, 'native_v1_contract_invalid', 'The tenant access removal preview failed validation');
     return NextResponse.json(preview, noStore());
   } catch (error) { return nativeV1ErrorResponse(error); }
@@ -146,23 +145,12 @@ export async function DELETE(request: Request, context: { params: Promise<{ home
       // serializable transaction retries if a concurrent writer changed that
       // account while this transaction waited, so final-account deletion is
       // decided from a consistent relationship snapshot.
-      const relationships = await relationshipState(tx, account.id, account.emailNormalized, membership.id, now);
-      if (!relationships.remains && body.confirmFinalAccountDeletion !== true) {
-        throw new Stage1AuthError(409, 'FINAL_RELATIONSHIP_CONFIRMATION_REQUIRED', 'This is the final valid Dinodia relationship. Review the whole-account deletion warning and confirm explicitly.');
-      }
-      const accountDeleted = !relationships.remains;
       const proofUse = await tx.stepUpAuthorization.updateMany({ where: {
         nonceHash: proofHash, customerAccountId: selected.id, customerSessionId: selected.sessionId,
         trustedDeviceId: selected.trustedDeviceId, homeId, membershipId, operationKind: OPERATION,
         targetDigest: targetDigest([membershipId, homeId]), normalizedValueDigest: digest,
         policyRevision: selected.policyRevision, consumedAt: null, revokedAt: null, expiresAt: { gt: now },
-      }, data: accountDeleted ? {
-        consumedAt: now,
-        // This is one update, not a later cleanup update: the deferred scope
-        // trigger must see the consumed proof detached before the account's
-        // session and membership rows are deleted at commit.
-        customerSessionId: null, trustedDeviceId: null, homeId: null, membershipId: null,
-      } : { consumedAt: now } });
+      }, data: { consumedAt: now } });
       if (proofUse.count !== 1) throw new Stage1AuthError(403, 'step_up_invalid', 'A fresh confirmation for this exact Home access removal is required');
 
       const nextAccessRevision = membership.accessRevision + 1;
@@ -224,36 +212,20 @@ export async function DELETE(request: Request, context: { params: Promise<{ home
       await tx.alexaNativeHomeScope.deleteMany({ where: { homeId, membershipId: membership.id } });
 
       const stillRelated = await relationshipState(tx, account.id, account.emailNormalized, membership.id, now);
-      const anonymousReference = accountDeleted ? `del_${crypto.randomBytes(24).toString('base64url')}` : null;
-      if (accountDeleted) {
-        await tx.supportTicket.updateMany({ where: { customerAccountId: account.id }, data: {
-          status: 'CLOSED', closedAt: now, selectedMembershipId: null, description: '[Closed and redacted after account deletion]',
-          title: null, areaId: null, deviceId: null, safeDiagnostics: Prisma.DbNull, customerResolution: null, revision: { increment: 1 },
-        } });
-        await tx.deletionSecurityReceipt.create({ data: { anonymousReference: anonymousReference!, actionType: 'TENANT_ACCESS_REMOVAL_AND_ACCOUNT_DELETION', actionAt: now, purgeAt: new Date(now.getTime() + RELATIONSHIP_MS) } });
-      } else {
-        await tx.auditEvent.create({ data: { homeId, actorType: 'CUSTOMER', actorId: account.id, category: 'ACCESS', action: 'tenant_membership_self_removed', targetType: 'HomeMembership', targetId: membership.id,
-          metadata: { outcome: 'removed', nextAccessRevision, decommissionTombstones: privateDevices.length, hubEnforcement: 'PENDING' }, purgeAt: new Date(now.getTime() + RELATIONSHIP_MS) } });
-      }
+      await tx.auditEvent.create({ data: { homeId, actorType: 'CUSTOMER', actorId: account.id, category: 'ACCESS', action: 'tenant_membership_self_removed', targetType: 'HomeMembership', targetId: membership.id,
+        metadata: { outcome: 'removed', nextAccessRevision, decommissionTombstones: privateDevices.length, hubEnforcement: 'PENDING' }, purgeAt: new Date(now.getTime() + RELATIONSHIP_MS) } });
       const result = {
         schemaVersion: 'dinodia.v1', ok: true, state: 'REMOVED', homeMembershipId: membership.id,
-        accountDeleted, otherRelationshipsRemain: stillRelated.remains,
-        nextAction: accountDeleted ? 'SIGN_IN' as const : stillRelated.activeMemberships > 0 ? 'SELECT_HOME' as const : 'PENDING_RELATIONSHIPS' as const,
-        hubEnforcement: 'PENDING' as const, anonymousReference, idempotentReplay: false,
+        accountDeleted: false, otherRelationshipsRemain: true,
+        nextAction: stillRelated.activeMemberships > 0 ? 'SELECT_HOME' as const : 'PENDING_RELATIONSHIPS' as const,
+        hubEnforcement: 'PENDING' as const, anonymousReference: null, idempotentReplay: false,
       };
       if (!validateTenantMembershipRemovalReceipt(result)) throw new Stage1AuthError(500, 'native_v1_contract_invalid', 'The tenant access removal receipt failed validation');
-      await tx.idempotencyRecord.create({ data: { namespace: IDEMPOTENCY_NAMESPACE, keyHash, actorId: accountDeleted ? null : account.id,
-        homeId: accountDeleted ? null : homeId, requestHash, responseStatus: 200, responseDigest: sha256(JSON.stringify(result)),
+      await tx.idempotencyRecord.create({ data: { namespace: IDEMPOTENCY_NAMESPACE, keyHash, actorId: account.id,
+        homeId, requestHash, responseStatus: 200, responseDigest: sha256(JSON.stringify(result)),
         responseBody: JSON.parse(JSON.stringify(result)) as Prisma.InputJsonValue, expiresAt: new Date(now.getTime() + 24 * 60 * 60 * 1000) } });
-      if (accountDeleted) {
-        await queueAlexaRemovalReportsForAccount(tx, account.id, now);
-        await tx.customerAccount.delete({ where: { id: account.id } });
-      }
       return result;
     });
-    return NextResponse.json(receipt, { ...noStore(), ...(receipt.accountDeleted ? { headers: {
-      ...noStore().headers,
-      'Set-Cookie': 'dinodia_customer_session=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax',
-    } } : {}) });
+    return NextResponse.json(receipt, noStore());
   } catch (error) { return nativeV1ErrorResponse(error); }
 }
