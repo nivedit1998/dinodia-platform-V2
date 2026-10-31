@@ -386,11 +386,6 @@ function loadInstallationPushDispatcher(platformDataEncryptionKey = '') {
     new Function('require', 'module', 'exports', moduleCompiled)(localRequire, moduleLoaded, moduleLoaded.exports);
     return moduleLoaded.exports;
   };
-  const notificationPolicy = loadLocalTypeScript('src/lib/nativeAutomations/notificationPolicy.ts');
-  const failureNotifications = loadLocalTypeScript('src/lib/nativeAutomations/failureNotifications.ts', (specifier) => {
-    if (specifier === './notificationPolicy') return notificationPolicy;
-    return require(specifier);
-  });
   const source = fs.readFileSync(path.join(root, 'src/lib/installationRequestDelivery.ts'), 'utf8');
   const compiled = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, esModuleInterop: true } }).outputText;
   const loaded = { exports: {} };
@@ -414,12 +409,9 @@ function loadInstallationPushDispatcher(platformDataEncryptionKey = '') {
         { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, esModuleInterop: true } }).outputText)(localRequire, roomNotices, roomNotices.exports);
       return roomNotices.exports;
     }
-    if (specifier === './nativeAutomations/notificationPolicy') return notificationPolicy;
-    if (specifier === './nativeAutomations/failureNotifications') return failureNotifications;
     if (specifier === './apnsDelivery') return {
       readApnsConfig: () => null,
       sendInstallationCompletePush: async () => ({ outcome: 'RETRY' }),
-      sendTenantAutomationFailurePush: async () => ({ outcome: 'RETRY' }),
     };
     if (specifier === '@aws-sdk/client-sesv2') return {
       SESv2Client: class { destroy() {} async send() { return { MessageId: 'stage8-test-message' }; } },
@@ -2232,10 +2224,10 @@ async function customerAuthorizationChecks(deliveryEnv) {
   if (disableResult.response.status !== 200 || !['disabled_waiting_for_hub', 'disabled'].includes(disableResult.body?.status)
     || disabledRow.status !== 'PAUSED' || disabledRow.revision !== propertyOnlyAutomation.revision + 1
     || revisionAfterDisable.managementRevision !== currentHomeManagementRevision + 1
-    || noticeAfterDisable.length <= beforeDeniedIntervention[2]
+    || noticeAfterDisable.length !== beforeDeniedIntervention[2]
     || noticeAfterDisable.some((notice) => JSON.stringify(notice.payload).includes('Private automation device label') || JSON.stringify(notice.payload).includes('Private bedtime mixed routine'))
     || disableRetry.response.status !== 200 || JSON.stringify(disabledAfterRetry) !== JSON.stringify(disabledRow)
-    || noticeAfterRetryCount !== noticeAfterDisable.length) fail('Property manager Disable was not proof-bound, idempotent, generic-notified and reflected in the durable full-Home revision');
+    || noticeAfterRetryCount !== noticeAfterDisable.length) fail('Property manager Disable was not proof-bound, idempotent, silent (no tenant automation notice) and reflected in the durable full-Home revision');
   const managerDeleteView = await fetchJson(`${base}/api/v2/homes/${homeOne.id}/property-automations/${mixedRule.body.automationId}`, { method: 'DELETE', headers: managerAutomationHeaders });
   if (managerDeleteView.response.status !== 400 && managerDeleteView.response.status !== 404 && managerDeleteView.response.status !== 405) fail('A direct unauthorised delete path unexpectedly mutated a property automation');
   const pendingOwnerOverview = await fetchJson(`${base}/api/v2/homes/${homeOne.id}/property-automations`, { headers: ownerAutomationHeaders });
@@ -3547,10 +3539,8 @@ async function customerAuthorizationChecks(deliveryEnv) {
     || tenantOutcomeProjection.response.status !== 200 || projectedOutcome?.status !== 'partial' || projectedOutcome?.actionCount !== 2
     || projectedOutcome?.actionStatuses?.applied !== 1 || projectedOutcome?.actionStatuses?.failed !== 1
     || projectedOutcome?.actionStatuses?.uncertain !== 0 || projectedOutcome?.actionStatuses?.skipped !== 0
-    || tenantFailureReceipts.length !== 1 || tenantFailureReceipts[0].customerAccountId !== account.id
-    || tenantFailureReceipts[0].membershipId !== tenantMembership.id || tenantFailureReceipts[0].trustedDeviceId !== automationPushDevice.id
-    || tenantFailureReceipts[0].status !== 'PENDING' || tenantFailureReceipts[0].expiresAt.getTime() <= Date.now()) {
-    fail(`The signed automation outcome did not create one bounded failure receipt for the owning tenant (${automationOutcomeResponse.response.status}/${acceptedAutomationExecution?.status || 'no-execution'}; receipts=${tenantFailureReceipts.length})`);
+    || tenantFailureReceipts.length !== 0) {
+    fail(`The signed automation outcome unexpectedly created a failure notice receipt for the owning tenant (${automationOutcomeResponse.response.status}/${acceptedAutomationExecution?.status || 'no-execution'}; receipts=${tenantFailureReceipts.length})`);
   }
   const ownerManagerFailureReceipts = await prisma.nativeNotificationDeliveryReceipt.count({ where: {
     homeId: homeOne.id, family: 'TENANT_AUTOMATION_FAILURE', customerAccountId: { in: [propertyAccount.id, managerAccount.id] },
@@ -3564,24 +3554,24 @@ async function customerAuthorizationChecks(deliveryEnv) {
     homeId: homeOne.id, family: 'TENANT_AUTOMATION_FAILURE', idempotencyKey: { startsWith: `automation-failure:${automationCreate.body.automationId}:` },
   } });
   if (automationOutcomeRetry.response.status !== 200 || automationOutcomeRetry.body?.duplicate !== true
-    || executionCountAfterOutcomeRetry !== 1 || failureReceiptCountAfterOutcomeRetry !== 1) {
+    || executionCountAfterOutcomeRetry !== 1 || failureReceiptCountAfterOutcomeRetry !== 0) {
     fail('An exact signed retry duplicated an automation outcome, execution, or tenant notice receipt');
   }
   await hub.store.acknowledgeSyncBatch({ streamId: automationOutcomeResponse.body.streamId,
     acceptedThroughSequence: Number(automationOutcomeResponse.body.acceptedThroughSequence), cloudRevision: Number(automationOutcomeResponse.body.cloudRevision),
     configurationAppliedRevision: Number(automationOutcomeResponse.body.configurationAppliedRevision), resnapshotRequired: automationOutcomeResponse.body.resnapshotRequired === true });
-  const deliveredAutomationTokens = [];
-  const automationPushDispatch = await loadInstallationPushDispatcher(deliveryEnv.PLATFORM_DATA_ENCRYPTION_KEY).dispatchTenantAutomationFailureNotifications(new Date(Date.now() + 1_000), {
-    config: { teamId: 'DISPOSABLE', keyId: 'DISPOSABLE', privateKey: 'not-used-by-the-injected-transport' },
-    send: async ({ deviceToken, requestId }) => { deliveredAutomationTokens.push({ deviceToken, requestId }); return { outcome: 'ACCEPTED' }; },
-  });
-  const deliveredAutomationReceipt = await prisma.nativeNotificationDeliveryReceipt.findUniqueOrThrow({ where: { id: tenantFailureReceipts[0].id }, select: { status: true, attemptCount: true, lastErrorCode: true } });
-  if (automationPushDispatch.accepted !== 1 || deliveredAutomationTokens.length !== 1
-    || deliveredAutomationTokens[0].deviceToken !== automationPushToken || deliveredAutomationTokens[0].requestId !== tenantFailureReceipts[0].id
-    || deliveredAutomationReceipt.status !== 'SENT' || deliveredAutomationReceipt.attemptCount !== 1 || deliveredAutomationReceipt.lastErrorCode !== null) {
-    fail(`The actual bounded notification dispatcher did not revalidate and send one opted-in tenant failure notice through the injected APNs transport (${JSON.stringify({ dispatch: automationPushDispatch, sends: deliveredAutomationTokens.length, matchingToken: deliveredAutomationTokens.length === 1 && deliveredAutomationTokens[0].deviceToken === automationPushToken, matchingReceipt: deliveredAutomationTokens.length === 1 && deliveredAutomationTokens[0].requestId === tenantFailureReceipts[0].id, receiptStatus: deliveredAutomationReceipt.status, attempts: deliveredAutomationReceipt.attemptCount, errorCode: deliveredAutomationReceipt.lastErrorCode })})`);
+  // A receipt queued before the notices were switched off must be retired, never sent.
+  const legacyAutomationReceipt = await prisma.nativeNotificationDeliveryReceipt.create({ data: {
+    customerAccountId: account.id, trustedDeviceId: automationPushDevice.id, membershipId: tenantMembership.id, homeId: homeOne.id,
+    family: 'TENANT_AUTOMATION_FAILURE', channel: 'PUSH', idempotencyKey: `automation-failure:${automationCreate.body.automationId}:${'a'.repeat(64)}:${automationPushDevice.id}`,
+    deliverAfter: new Date(Date.now() - 1_000), expiresAt: new Date(Date.now() + 60_000),
+  } });
+  await loadInstallationPushDispatcher(deliveryEnv.PLATFORM_DATA_ENCRYPTION_KEY).dispatchTenantAutomationFailureNotifications(new Date(Date.now() + 1_000));
+  const retiredAutomationReceipt = await prisma.nativeNotificationDeliveryReceipt.findUniqueOrThrow({ where: { id: legacyAutomationReceipt.id }, select: { status: true, attemptCount: true, lastErrorCode: true } });
+  if (retiredAutomationReceipt.status !== 'SUPPRESSED' || retiredAutomationReceipt.attemptCount !== 0 || retiredAutomationReceipt.lastErrorCode !== 'NOTICE_DISABLED') {
+    fail(`A leftover automation failure receipt was not retired without sending (${JSON.stringify(retiredAutomationReceipt)})`);
   }
-  console.log('[stage11:integration] PASS: durable OS outcome entered the actual signed sync route once; one bounded failure receipt went only to the owning opted-in tenant, exact replay had zero duplicate effects, and dispatcher acceptance is recorded without claiming device delivery');
+  console.log('[stage11:integration] PASS: durable OS outcome entered the actual signed sync route once; no failure notice was queued for the opted-in tenant, exact replay had zero duplicate effects, and a leftover receipt was retired unsent');
   console.log('[stage11:integration] PASS: actual tenant summary exposes the retained partial execution with bounded per-action outcome counts and genuine timestamps');
   // Reproduce the real installation backlog shape: multiple critical
   // integration incidents can retain successive revisions in one contiguous

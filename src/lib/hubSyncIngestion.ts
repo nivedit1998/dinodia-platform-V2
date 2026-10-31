@@ -3,7 +3,6 @@ import type { Prisma } from '@prisma/client';
 import { Stage1AuthError } from './stage1Auth';
 import { canonicalSyncJson, type HubSyncEvent } from './hubSyncEnvelope';
 import { isAutomationEligibilityUpgrade } from './catalogAutomationEligibility';
-import { queueAutomationFailureNotices } from './nativeAutomations/failureNotifications';
 import { suspendAutomationsForDeviceChange } from './nativeAutomations/revalidation';
 import { retireNativeAutomations } from './nativeAutomations/lifecycle';
 import { currentCustomerPolicy } from './customerPolicyConfig';
@@ -730,10 +729,6 @@ async function applyHubSyncEventInner(tx: Prisma.TransactionClient, input: SyncE
       startedAt: strictDate(payload.startedAt, now), completedAt: strictDate(payload.completedAt, now), safeOutcome,
       purgeAt: new Date(now.getTime() + 90 * 24 * 60 * 60 * 1000),
     } });
-    if (['PARTIAL', 'FAILED', 'SKIPPED', 'INTERRUPTED'].includes(execution.status)) {
-      await queueAutomationFailureNotices(tx, { homeId, automationId: automation.id,
-        membershipId: automation.createdByMembershipId, occurrenceKey: idempotencyKey, now });
-    }
     return;
   }
 

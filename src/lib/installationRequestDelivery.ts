@@ -2,16 +2,16 @@ import { SESv2Client, SendEmailCommand } from '@aws-sdk/client-sesv2';
 import { prisma } from './prisma';
 import { decryptPlatformEnvelope } from './hubOperatorCredentials';
 import { getPlatformDataEncryptionKey, PlatformDataEncryptionKeyError } from './platformDataEncryptionKey';
-import { readApnsConfig, sendHomeAccessChangedPush, sendInstallationCompletePush, sendRoomAccessApprovedPush, sendRoomAccessRequestPush, sendTenantAutomationFailurePush, sendTenantAutomationManagementPush, type ApnsConfig, type ApnsEnvironment, type ApnsResult } from './apnsDelivery';
-import { nextAllowedAutomationNotificationAt } from './nativeAutomations/notificationPolicy';
-import { isAutomationFailureDeviceToken } from './nativeAutomations/failureNotifications';
+import { readApnsConfig, sendHomeAccessChangedPush, sendInstallationCompletePush, sendRoomAccessApprovedPush, sendRoomAccessRequestPush, type ApnsConfig, type ApnsEnvironment, type ApnsResult } from './apnsDelivery';
 import { ROOM_ACCESS_NOTICE_CONTENT, ROOM_ACCESS_NOTICE_TYPES, isRoomAccessNoticeType, roomAccessEmail } from './roomAccessNotices';
 
 const PORTAL_QUEUE = 'https://dinodia-platform-v2.vercel.app/installer/installation-requests';
 const EMAIL = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const OUTBOX_LIMIT = 20;
 const RECEIPT_LIMIT = 20;
-const ACCESS_NOTICE_EVENT_TYPES = ['TENANT_ACCESS_REMOVAL_NOTICE', 'PROPERTY_MANAGER_ACCESS_REMOVAL_NOTICE', 'OWNERSHIP_TRANSFER_NOTICE', 'HOME_DEREGISTRATION_NOTICE', 'TENANT_AUTOMATION_MANAGEMENT_NOTICE', ...ROOM_ACCESS_NOTICE_TYPES];
+const ACCESS_NOTICE_EVENT_TYPES = ['TENANT_ACCESS_REMOVAL_NOTICE', 'PROPERTY_MANAGER_ACCESS_REMOVAL_NOTICE', 'OWNERSHIP_TRANSFER_NOTICE', 'HOME_DEREGISTRATION_NOTICE', ...ROOM_ACCESS_NOTICE_TYPES];
+/** Automation notices were switched off by the owner; anything still waiting from before is retired, never sent. */
+const RETIRED_AUTOMATION_NOTICE_TYPE = 'TENANT_AUTOMATION_MANAGEMENT_NOTICE';
 
 type DeliveryCounts = {
   operationsAccepted: number;
@@ -189,6 +189,9 @@ export async function dispatchHomeownerAccessRemovalNotices(now = new Date(), de
 } = {}) {
   const counts = { accepted: 0, deferred: 0, failed: 0, suppressed: 0, expired: 0 };
   const stale = new Date(now.getTime() - 5 * 60_000);
+  const retired = await prisma.nativeDomainOutbox.updateMany({ where: { aggregateType: 'HomeownerAccessRemovalNotice',
+    eventType: RETIRED_AUTOMATION_NOTICE_TYPE, state: { in: ['PENDING', 'PROCESSING'] } }, data: { state: 'FAILED' } });
+  counts.suppressed += retired.count;
   await prisma.nativeDomainOutbox.updateMany({ where: { aggregateType: 'HomeownerAccessRemovalNotice',
     eventType: { in: ACCESS_NOTICE_EVENT_TYPES }, state: 'PROCESSING',
     updatedAt: { lt: stale }, expiresAt: { gt: now }, attempts: { lt: 8 } }, data: { state: 'PENDING', nextAttemptAt: now } });
@@ -261,10 +264,8 @@ export async function dispatchHomeownerAccessRemovalNotices(now = new Date(), de
           : Boolean(configured && await (room
             ? sendTextEmail(configured.client, configured.source, decoded.recipient as string, room.subject, room.text, room.html)
             : sendTextEmail(configured.client, configured.source, decoded.recipient as string,
-              row.eventType === 'TENANT_AUTOMATION_MANAGEMENT_NOTICE' ? 'A Home automation was updated' : 'Dinodia Smart Living access changed',
-              row.eventType === 'TENANT_AUTOMATION_MANAGEMENT_NOTICE'
-                ? 'A property manager changed an automation. Sign in to review its current status. This message contains no Home, rule or device details.'
-                : 'Access to one of your Dinodia Smart Living homes has changed. Sign in to review your active homes. This message contains no property or device details.')));
+              'Dinodia Smart Living access changed',
+              'Access to one of your Dinodia Smart Living homes has changed. Sign in to review your active homes. This message contains no property or device details.')));
       } else {
         const result = dependencies.sendPush
           ? await dependencies.sendPush({ environment: decoded.environment as ApnsEnvironment, deviceToken: decoded.deviceToken as string, noticeId, expiresAt: row.expiresAt })
@@ -272,9 +273,6 @@ export async function dispatchHomeownerAccessRemovalNotices(now = new Date(), de
             ? await (row.eventType === 'ROOM_ACCESS_REQUEST_NOTICE' ? sendRoomAccessRequestPush : sendRoomAccessApprovedPush)({
               config: apns!, environment: decoded.environment as ApnsEnvironment, deviceToken: decoded.deviceToken as string,
               requestId: noticeId, expiresAt: row.expiresAt }, { title: ROOM_ACCESS_NOTICE_CONTENT[row.eventType].pushTitle, body: ROOM_ACCESS_NOTICE_CONTENT[row.eventType].pushBody })
-            : row.eventType === 'TENANT_AUTOMATION_MANAGEMENT_NOTICE'
-            ? await sendTenantAutomationManagementPush({ config: apns!, environment: decoded.environment as ApnsEnvironment,
-              deviceToken: decoded.deviceToken as string, requestId: noticeId, expiresAt: row.expiresAt })
             : await sendHomeAccessChangedPush({ config: apns!, environment: decoded.environment as ApnsEnvironment,
               deviceToken: decoded.deviceToken as string, requestId: noticeId, expiresAt: row.expiresAt });
         accepted = result.outcome === 'ACCEPTED';
@@ -435,105 +433,10 @@ export async function dispatchInstallationRequestNotifications(now = new Date())
   return counts;
 }
 
-/** Optional failure/skipped notices are delivered only to the active owning tenant's opted-in trusted installations. */
-export async function dispatchTenantAutomationFailureNotifications(now = new Date(), dependencies: {
-  config?: ApnsConfig | null;
-  send?: (input: { config: ApnsConfig; environment: ApnsEnvironment; deviceToken: string; requestId: string; expiresAt: Date }) => Promise<ApnsResult>;
-} = {}) {
-  const counts = { accepted: 0, deferred: 0, failed: 0, suppressed: 0 };
-  const expired = await prisma.nativeNotificationDeliveryReceipt.updateMany({ where: {
-    family: 'TENANT_AUTOMATION_FAILURE', channel: 'PUSH', status: 'PENDING', expiresAt: { lte: now },
-  }, data: { status: 'EXPIRED', lastErrorCode: 'NOTICE_EXPIRED' } });
-  counts.suppressed += expired.count;
-  const receipts = await prisma.nativeNotificationDeliveryReceipt.findMany({ where: {
-    family: 'TENANT_AUTOMATION_FAILURE', channel: 'PUSH', status: 'PENDING', deliverAfter: { lte: now }, expiresAt: { gt: now }, attemptCount: { lt: 8 },
-  }, orderBy: [{ deliverAfter: 'asc' }, { id: 'asc' }], take: RECEIPT_LIMIT,
-  select: { id: true, customerAccountId: true, trustedDeviceId: true, membershipId: true, homeId: true, idempotencyKey: true, attemptCount: true, expiresAt: true } });
-  const config = Object.hasOwn(dependencies, 'config') ? dependencies.config ?? null : readApnsConfig();
-  const send = dependencies.send ?? sendTenantAutomationFailurePush;
-  for (const receipt of receipts) {
-    const match = /^automation-failure:([0-9a-f-]{36}):([0-9a-f]{64}):([0-9a-f-]{36})$/i.exec(receipt.idempotencyKey);
-    if (!match || match[3] !== receipt.trustedDeviceId || !receipt.membershipId || !receipt.trustedDeviceId) {
-      await prisma.nativeNotificationDeliveryReceipt.updateMany({ where: { id: receipt.id, status: 'PENDING', attemptCount: receipt.attemptCount }, data: { status: 'SUPPRESSED', lastErrorCode: 'INVALID_REFERENCE' } });
-      counts.suppressed += 1;
-      continue;
-    }
-    const automation = await prisma.nativeAutomation.findFirst({ where: {
-      id: match[1], homeId: receipt.homeId, createdByMembershipId: receipt.membershipId, status: { not: 'RETIRED' },
-    }, select: { id: true } });
-    const membership = automation && await prisma.homeMembership.findFirst({ where: {
-      id: receipt.membershipId, homeId: receipt.homeId, customerAccountId: receipt.customerAccountId, role: 'TENANT', status: 'ACTIVE',
-      customerAccount: { status: 'ACTIVE' },
-    }, select: { id: true, preferences: { where: { kind: { in: ['NOTIFICATION_PREFERENCES', 'QUIET_HOURS'] } }, select: { kind: true, document: true } } } });
-    const preferences = membership?.preferences.find((row) => row.kind === 'NOTIFICATION_PREFERENCES')?.document;
-    if (!automation || !membership || !preferences || typeof preferences !== 'object' || Array.isArray(preferences)
-      || !Array.isArray((preferences as Record<string, unknown>).enabledFamilies)
-      || !(preferences as { enabledFamilies: unknown[] }).enabledFamilies.includes('automation_failure_or_skipped_run')) {
-      await prisma.nativeNotificationDeliveryReceipt.updateMany({ where: { id: receipt.id, status: 'PENDING', attemptCount: receipt.attemptCount }, data: { status: 'SUPPRESSED', lastErrorCode: 'NO_CURRENT_OPT_IN' } });
-      counts.suppressed += 1;
-      continue;
-    }
-    const quietHours = membership.preferences.find((row) => row.kind === 'QUIET_HOURS')?.document;
-    const deliverAfter = nextAllowedAutomationNotificationAt(now, quietHours);
-    if (!deliverAfter) {
-      await prisma.nativeNotificationDeliveryReceipt.updateMany({ where: { id: receipt.id, status: 'PENDING', attemptCount: receipt.attemptCount }, data: { status: 'SUPPRESSED', lastErrorCode: 'INVALID_QUIET_HOURS' } });
-      counts.suppressed += 1;
-      continue;
-    }
-    if (deliverAfter.getTime() > now.getTime()) {
-      await prisma.nativeNotificationDeliveryReceipt.updateMany({ where: { id: receipt.id, status: 'PENDING', attemptCount: receipt.attemptCount }, data: { deliverAfter } });
-      counts.deferred += 1;
-      continue;
-    }
-    if (!config && !dependencies.send) { counts.deferred += 1; continue; }
-    const device = await prisma.trustedDevice.findFirst({ where: {
-      id: receipt.trustedDeviceId, customerAccountId: receipt.customerAccountId, revokedAt: null,
-      pushEnabledAt: { not: null }, pushRevokedAt: null, apnsTokenCiphertext: { not: null }, apnsTokenDigest: { not: null },
-      apnsEnvironment: { not: null }, apnsKeyVersion: 1,
-    }, select: { id: true, apnsTokenCiphertext: true, apnsTokenDigest: true, apnsEnvironment: true, apnsTokenRevision: true } });
-    let token = '';
-    if (device?.apnsTokenCiphertext) {
-      getPlatformDataEncryptionKey();
-      try { token = decryptPlatformEnvelope(device.apnsTokenCiphertext); }
-      catch (error) {
-        if (error instanceof PlatformDataEncryptionKeyError) throw error;
-        token = '';
-      }
-    }
-    if (!device || !device.apnsEnvironment || !device.apnsTokenCiphertext || !device.apnsTokenDigest || !isAutomationFailureDeviceToken(token)) {
-      await prisma.nativeNotificationDeliveryReceipt.updateMany({ where: { id: receipt.id, status: 'PENDING', attemptCount: receipt.attemptCount }, data: { status: 'SUPPRESSED', lastErrorCode: 'NO_CURRENT_PUSH_AUTHORITY' } });
-      counts.suppressed += 1;
-      continue;
-    }
-    const claimed = await prisma.nativeNotificationDeliveryReceipt.updateMany({ where: { id: receipt.id, status: 'PENDING', attemptCount: receipt.attemptCount, deliverAfter: { lte: now }, expiresAt: { gt: now } }, data: { attemptCount: { increment: 1 } } });
-    if (claimed.count !== 1) continue;
-    let result: ApnsResult;
-    try { result = await send({ config: config!, environment: device.apnsEnvironment as ApnsEnvironment, deviceToken: token, requestId: receipt.id, expiresAt: receipt.expiresAt }); }
-    catch { result = { outcome: 'RETRY' }; }
-    const attempt = receipt.attemptCount + 1;
-    if (result.outcome === 'INVALID_TOKEN') {
-      await prisma.$transaction(async (tx) => {
-        await tx.trustedDevice.updateMany({ where: { id: device.id, customerAccountId: receipt.customerAccountId, revokedAt: null, apnsTokenDigest: device.apnsTokenDigest, apnsTokenRevision: device.apnsTokenRevision }, data: {
-          apnsTokenCiphertext: null, apnsTokenDigest: null, apnsEnvironment: null, apnsKeyVersion: null,
-          apnsTokenRevision: { increment: 1 }, pushEnabledAt: null, pushRevokedAt: now, lastDeliveryHealth: 'INVALID_TOKEN',
-        } });
-        await tx.nativeNotificationDeliveryReceipt.updateMany({ where: { id: receipt.id, status: 'PENDING', attemptCount: attempt }, data: { status: 'SUPPRESSED', lastErrorCode: 'APNS_TOKEN_INVALID' } });
-      });
-      counts.suppressed += 1;
-    } else if (result.outcome === 'ACCEPTED') {
-      await prisma.$transaction(async (tx) => {
-        await tx.trustedDevice.updateMany({ where: { id: device.id, customerAccountId: receipt.customerAccountId, revokedAt: null, apnsTokenDigest: device.apnsTokenDigest, apnsTokenRevision: device.apnsTokenRevision }, data: { lastDeliveryHealth: 'APNS_ACCEPTED' } });
-        await tx.nativeNotificationDeliveryReceipt.updateMany({ where: { id: receipt.id, status: 'PENDING', attemptCount: attempt }, data: { status: 'SENT', lastErrorCode: null } });
-      });
-      counts.accepted += 1;
-    } else {
-      const terminal = result.outcome === 'FAILED' || attempt >= 8;
-      await prisma.nativeNotificationDeliveryReceipt.updateMany({ where: { id: receipt.id, status: 'PENDING', attemptCount: attempt }, data: {
-        status: terminal ? 'FAILED' : 'PENDING', deliverAfter: terminal ? now : nextAttempt(now, attempt),
-        lastErrorCode: result.outcome === 'FAILED' ? 'APNS_REJECTED' : terminal ? 'APNS_RETRY_EXHAUSTED' : 'APNS_TEMPORARY_FAILURE',
-      } });
-      if (terminal) counts.failed += 1; else counts.deferred += 1;
-    }
-  }
-  return counts;
+/** Automation failure notices are switched off; receipts queued before that are retired and never sent. */
+export async function dispatchTenantAutomationFailureNotifications(_now = new Date()) {
+  const retired = await prisma.nativeNotificationDeliveryReceipt.updateMany({ where: {
+    family: 'TENANT_AUTOMATION_FAILURE', channel: 'PUSH', status: 'PENDING',
+  }, data: { status: 'SUPPRESSED', lastErrorCode: 'NOTICE_DISABLED' } });
+  return { accepted: 0, deferred: 0, failed: 0, suppressed: retired.count };
 }

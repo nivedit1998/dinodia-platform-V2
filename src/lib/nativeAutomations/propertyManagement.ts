@@ -4,7 +4,6 @@ import { consumeStepUpInTransaction } from '@/lib/sensitiveOperationStepUp';
 import { automationDefinitionChecksum, NativeAutomationError } from './validation';
 import { retireNativeAutomations } from './lifecycle';
 import { refreshNativeAutomationCloudRevision } from './delivery';
-import { queueTenantAutomationManagementNotice } from '@/lib/homeownerAccessRemovalNotices';
 import { Stage1AuthError } from '@/lib/stage1Auth';
 
 type SelectedActor = {
@@ -95,17 +94,15 @@ export async function mutatePropertyAutomation(input: {
       const changedHome = await tx.home.updateMany({ where: { id: actor.homeId, managementRevision: home.managementRevision }, data: { managementRevision: { increment: 1 } } });
       if (changedHome.count !== 1) throw new NativeAutomationError(409, 'AUTOMATION_REVISION_CONFLICT', 'The Home changed before the intervention was saved');
       const delivery = await refreshNativeAutomationCloudRevision(tx, { homeId: actor.homeId, hubInstallationId: hub.id });
-      const notice = await queueTenantAutomationManagementNotice(tx, { homeId: actor.homeId, automationId: automation.id,
-        membershipId: automation.createdByMembershipId, customerAccountId: automation.createdBy.customerAccountId, revision, now });
       await tx.auditEvent.create({ data: { homeId: actor.homeId, actorType: 'CUSTOMER', actorId: actor.id,
         category: 'ACCESS', action: action === 'disable' ? 'property_manager_disabled_tenant_automation' : 'property_manager_deleted_tenant_automation',
         targetType: 'NativeAutomation', targetId: automation.id,
         metadata: { operation: action, reason: input.reason, revision, managementRevision: home.managementRevision + 1,
-          deliveryPending: delivery.changed, tenantNoticeIntents: notice.queued },
+          deliveryPending: delivery.changed, tenantNoticeIntents: 0 },
         purgeAt: new Date(now.getTime() + 365 * 24 * 60 * 60 * 1000) } });
       return { ok: true, homeId: actor.homeId, automationId: automation.id, revision,
         status: action === 'disable' ? (delivery.changed ? 'disabled_waiting_for_hub' : 'disabled') : (delivery.changed ? 'removal_pending' : 'removed'),
-        managementRevision: home.managementRevision + 1, tenantNoticeQueued: notice.queued > 0 };
+        managementRevision: home.managementRevision + 1, tenantNoticeQueued: false };
     },
   }));
 }

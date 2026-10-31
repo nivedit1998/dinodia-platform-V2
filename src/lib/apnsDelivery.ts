@@ -93,20 +93,6 @@ export async function sendAlexaLinkApprovalPush(input: {
   return sendBoundedApnsAlert(input, { title: 'Approve Alexa sign-in?', body: 'Someone is linking Alexa to your Dinodia account. Open the app to approve or decline.' }, poster);
 }
 
-/** Mandatory, content-minimal automation intervention notice. */
-export async function sendTenantAutomationManagementPush(input: {
-  config: ApnsConfig; environment: ApnsEnvironment; deviceToken: string; requestId: string; expiresAt: Date;
-}, poster: ApnsPoster = postHttp2): Promise<ApnsResult> {
-  return sendBoundedApnsAlert(input, { title: 'Automation updated', body: 'A property manager changed an automation. Sign in to review its current status.' }, poster);
-}
-
-/** Optional, preference-controlled tenant-only execution result. No Home/rule/device detail is included. */
-export async function sendTenantAutomationFailurePush(input: {
-  config: ApnsConfig; environment: ApnsEnvironment; deviceToken: string; requestId: string; expiresAt: Date;
-}, poster: ApnsPoster = postHttp2): Promise<ApnsResult> {
-  return sendBoundedApnsAlert(input, { title: 'Automation update', body: 'An automation did not complete as expected. Sign in to review its status.' }, poster);
-}
-
 /** Banner for the people who can decide a new room request. Names no person, room or address. */
 export async function sendRoomAccessRequestPush(input: {
   config: ApnsConfig; environment: ApnsEnvironment; deviceToken: string; requestId: string; expiresAt: Date;
