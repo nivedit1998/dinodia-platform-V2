@@ -440,7 +440,7 @@ function loadNativeAnalyticsIntegrityCheck() {
     if (specifier === './supportNotifications') return { createPropertySupportNotifications: async () => undefined };
     if (specifier === './installationRequestDelivery') return { dispatchInstallationRequestNotifications: async () => ({}) };
     if (specifier === './homeDeregistrationCleanup') return { resumeHomeDeregistrationAccountCleanup: async () => ({}) };
-    if (specifier === './nativeAlexaEvents') return { dispatchNativeAlexaChangeReports: async () => ({ processed: 0 }) };
+    if (specifier === './nativeAlexaEvents') return { dispatchNativeAlexaChangeReports: async () => ({ processed: 0 }), dispatchAlexaDiscoveryReports: async () => ({}), dispatchAlexaAccountRemovalReports: async () => ({}) };
     // The integrity inspection never prunes; the retention helper is not part of what this loader exercises.
     if (specifier === './nativeEphemeralRetention') return { cleanEphemeralRecords: async () => ({}) };
     return require(specifier);
@@ -933,8 +933,9 @@ async function startFakeSes() {
       }
       if (request.url === '/oauth/token') {
         const fields = new URLSearchParams(body);
-        if (fields.get('grant_type') !== 'authorization_code'
-          || fields.get('code') !== 'stage12-disposable-acceptgrant-code'
+        const lwaRefreshGrant = fields.get('grant_type') === 'refresh_token' && fields.get('refresh_token') === 'stage12-disposable-lwa-refresh-token';
+        if (!lwaRefreshGrant && (fields.get('grant_type') !== 'authorization_code'
+          || fields.get('code') !== 'stage12-disposable-acceptgrant-code')
           || fields.get('client_id') !== 'stage12-disposable-lwa-client'
           || fields.get('client_secret') !== 'stage12-disposable-lwa-secret') {
           response.statusCode = 400;
@@ -5524,6 +5525,52 @@ async function nativeAlexaOAuthChecks(deliveryEnv) {
     await prisma.customerAccount.delete({ where: { id: stranger.id } });
     await prisma.area.delete({ where: { id: syncAreaRow.id } });
 
+    // A tenant whose account is deleted with its last access (the Production case) is still removed from Alexa: the link goes
+    // with the account, so the final DeleteReport is parked in the outbox first and sent by the next operations tick.
+    {
+      const compiledRemoval = createRequire(import.meta.url)('typescript').transpileModule(fs.readFileSync('src/lib/alexa/accountRemovalReport.ts', 'utf8'),
+        { compilerOptions: { module: 1, target: 9 } }).outputText;
+      const removalModule = { exports: {} };
+      new Function('module', 'exports', 'require', compiledRemoval)(removalModule, removalModule.exports, createRequire(import.meta.url));
+      const leaverTag = crypto.randomUUID();
+      const leaver = await prisma.customerAccount.create({ data: {
+        displayName: 'Disposable leaving tenant', username: `stage12l-${leaverTag.slice(0, 10)}`, usernameNormalized: `stage12l-${leaverTag.slice(0, 10)}`,
+        email: `stage12l-${leaverTag}@invalid.test`, emailNormalized: `stage12l-${leaverTag}@invalid.test`,
+        emailVerifiedAt: new Date(), passwordHash: hashPassword(crypto.randomBytes(32).toString('hex')),
+      }, select: { id: true } });
+      const leaverEndpoints = [`dos_stage12leaver${crypto.randomBytes(8).toString('hex')}`, `dos_stage12leaver${crypto.randomBytes(8).toString('hex')}`];
+      const sourceLink = await prisma.alexaNativeLink.findUniqueOrThrow({ where: { id: link.id }, select: { refreshTokenCiphertext: true, accessTokenCiphertext: true, encryptionKeyVersion: true } });
+      const leaverLink = await prisma.alexaNativeLink.create({ data: {
+        customerAccountId: leaver.id, providerSubjectHash: sha256(`stage12-leaver-${leaverTag}`), status: 'ACTIVE', autoScope: true,
+        refreshTokenCiphertext: sourceLink.refreshTokenCiphertext, accessTokenCiphertext: sourceLink.accessTokenCiphertext,
+        encryptionKeyVersion: sourceLink.encryptionKeyVersion, announcedEndpointIds: leaverEndpoints,
+      }, select: { id: true } });
+      const queuedCount = await prisma.$transaction(async (tx) => {
+        const queued = await removalModule.exports.queueAlexaRemovalReportsForAccount(tx, leaver.id, new Date());
+        await tx.customerAccount.delete({ where: { id: leaver.id } });
+        return queued;
+      });
+      const parked = await prisma.nativeDomainOutbox.findUnique({ where: { idempotencyKey: `alexa-account-removal:${leaverLink.id}` }, select: { id: true, state: true, payload: true, homeId: true, hubInstallationId: true } });
+      if (queuedCount !== 1 || !parked || parked.state !== 'PENDING' || parked.homeId !== null || parked.hubInstallationId !== null
+        || !leaverEndpoints.every((id) => parked.payload?.endpointIds?.includes(id)) || typeof parked.payload?.refreshTokenCiphertext !== 'string'
+        || await prisma.alexaNativeLink.count({ where: { id: leaverLink.id } }) !== 0) {
+        fail(`Deleting a tenant account did not park a final Alexa DeleteReport (${queuedCount}; ${parked?.state ?? 'no row'})`);
+      }
+      alexaDiscoveryDeliveries = [];
+      const removalTick = await runOperations();
+      const finalReport = alexaDiscoveryDeliveries.find((item) => item.name === 'DeleteReport' && leaverEndpoints.every((id) => item.endpointIds.includes(id)));
+      const doneRow = await prisma.nativeDomainOutbox.findUnique({ where: { id: parked.id }, select: { state: true, payload: true, attempts: true } });
+      if (removalTick.response.status !== 200 || !finalReport || finalReport.authorized !== true || finalReport.endpointIds.length !== leaverEndpoints.length
+        || doneRow?.state !== 'DELIVERED' || JSON.stringify(doneRow.payload) !== '{}') {
+        fail(`The final Alexa DeleteReport for a deleted tenant account was not delivered and wiped (${removalTick.response.status}; reports=${alexaDiscoveryDeliveries.map((item) => item.name).join(',')}; row=${doneRow?.state ?? 'none'})`);
+      }
+      alexaDiscoveryDeliveries = [];
+      await runOperations();
+      if (alexaDiscoveryDeliveries.some((item) => item.endpointIds.some((id) => leaverEndpoints.includes(id)))) fail('The final Alexa DeleteReport was sent more than once');
+      await prisma.nativeDomainOutbox.delete({ where: { id: parked.id } });
+      console.log('[stage12:integration] PASS: deleting a tenant account with its last access still tells Alexa to remove their devices, once, and wipes the stored token afterwards');
+    }
+
 
     const replayedCode = await exchange({ grant_type: 'authorization_code', client_id: clientId, code, redirect_uri: redirectUri, code_verifier: verifier });
     if (replayedCode.response.status !== 400 || replayedCode.body.error !== 'invalid_grant'
@@ -7025,6 +7072,10 @@ async function homeownerRemovalEncryptionConfigurationChecks(deliveryEnv) {
   // Reuse the exact settled operation identity and proof after restoring the
   // supported key representation. This proves failure did not consume proof
   // or create a conflicting receipt; it also exercises orphan cleanup.
+  // The removed tenant's Alexa link is deleted with the orphaned account, so the final DeleteReport must be parked first.
+  const removalAlexaEndpoint = `dos_stage9removal${crypto.randomBytes(8).toString('hex')}`;
+  const removalAlexaLink = await prisma.alexaNativeLink.create({ data: { customerAccountId: tenant.id, providerSubjectHash: sha256(`stage9-removal-${tenant.id}`),
+    status: 'ACTIVE', autoScope: true, refreshTokenCiphertext: '{"stage9":"opaque"}', encryptionKeyVersion: 1, announcedEndpointIds: [removalAlexaEndpoint] }, select: { id: true } });
   const committedRemoval = await fetchJson(removalPath, { method: 'DELETE', headers: ownerHeaders, body: JSON.stringify(requestBody) });
   const committedReceipt = await fetchJson(`${base}/api/v2/homes/${homeId}/tenants/${membership.id}/management-operation-receipt`, {
     method: 'POST', headers: ownerHeaders, body: JSON.stringify({ operationKind: 'home_tenant_remove', idempotencyKey,
@@ -7032,6 +7083,12 @@ async function homeownerRemovalEncryptionConfigurationChecks(deliveryEnv) {
   });
   const committedReplay = await fetchJson(removalPath, { method: 'DELETE', headers: ownerHeaders, body: JSON.stringify(requestBody) });
   const removedAccount = await prisma.customerAccount.findUnique({ where: { id: tenant.id }, select: { id: true } });
+  const parkedAlexaRemoval = await prisma.nativeDomainOutbox.findUnique({ where: { idempotencyKey: `alexa-account-removal:${removalAlexaLink.id}` }, select: { state: true, payload: true } });
+  if (committedRemoval.response.status !== 200 || removedAccount || await prisma.alexaNativeLink.count({ where: { id: removalAlexaLink.id } }) !== 0
+    || parkedAlexaRemoval?.state !== 'PENDING' || !parkedAlexaRemoval.payload?.endpointIds?.includes(removalAlexaEndpoint)) {
+    fail(`Tenant removal that deleted the account did not park the final Alexa DeleteReport (${committedRemoval.response.status}; ${parkedAlexaRemoval?.state ?? 'no row'})`);
+  }
+  await prisma.nativeDomainOutbox.deleteMany({ where: { idempotencyKey: `alexa-account-removal:${removalAlexaLink.id}` } });
   const removedMembership = await prisma.homeMembership.findUnique({ where: { id: membership.id }, select: { status: true } });
   const removedDevice = await prisma.nativeDevice.findUnique({ where: { id: tenantDevice.id }, select: { id: true } });
   const notice = await prisma.nativeDomainOutbox.findUnique({ where: { idempotencyKey: emailNoticeKey }, select: { state: true, payload: true } });

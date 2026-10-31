@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 import { Prisma } from '@prisma/client';
 import { hashClaimReference } from './stage1ClaimContract';
+import { queueAlexaRemovalReportsForAccount } from './alexa/accountRemovalReport';
 
 /**
  * Remove account-wide authority only after the final durable customer
@@ -101,6 +102,8 @@ export async function cleanupCustomerAccountIfOrphaned(
       if (detached.count !== minimalReceipts.length) throw new Error('Retired automation receipt changed during account cleanup');
     }
   }
+  cleanupPhase = 'queue_alexa_removal_report';
+  await queueAlexaRemovalReportsForAccount(tx, accountId, now);
   cleanupPhase = 'delete_orphaned_customer_account';
   await tx.customerAccount.delete({ where: { id: accountId } });
   return { deleted: true, anonymousReference };

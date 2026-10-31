@@ -6,7 +6,7 @@ import { releaseExpiredClaim } from './stage1ClaimContract';
 import { createPropertySupportNotifications } from './supportNotifications';
 import { dispatchInstallationRequestNotifications } from './installationRequestDelivery';
 import { resumeHomeDeregistrationAccountCleanup, type HomeDeregistrationCleanupResult } from './homeDeregistrationCleanup';
-import { dispatchNativeAlexaChangeReports, dispatchAlexaDiscoveryReports } from './nativeAlexaEvents';
+import { dispatchNativeAlexaChangeReports, dispatchAlexaDiscoveryReports, dispatchAlexaAccountRemovalReports } from './nativeAlexaEvents';
 import { cleanEphemeralRecords } from './nativeEphemeralRetention';
 
 export const NATIVE_OPERATION_BATCH_LIMIT = 100;
@@ -65,6 +65,7 @@ export async function runNativeOperations(now = new Date()) {
   let homeDeregistrationAccountCleanup: HomeDeregistrationCleanupResult = { evaluated: 0, deferred: 0, failed: 0, pending: 0 };
   let alexaChangeReports = { enabled: false, scanned: 0, delivered: 0, cancelled: 0, expired: 0, retried: 0, failed: 0 };
   let alexaDiscoveryReports = { enabled: false, links: 0, added: 0, removed: 0, failed: 0 };
+  let alexaAccountRemovalReports = { enabled: false, scanned: 0, delivered: 0, retried: 0, failed: 0 };
   const failures: string[] = [];
   const isolate = async (taskId: string, run: () => Promise<void>) => {
     try { await run(); } catch { if (!failures.includes(taskId)) failures.push(taskId); }
@@ -89,6 +90,7 @@ export async function runNativeOperations(now = new Date()) {
     installationDelivery = await dispatchInstallationRequestNotifications(now);
     alexaChangeReports = await dispatchNativeAlexaChangeReports(now);
     alexaDiscoveryReports = await dispatchAlexaDiscoveryReports(now);
+    alexaAccountRemovalReports = await dispatchAlexaAccountRemovalReports(now);
   });
   // Resume full-home cleanup under the existing two-minute operations task;
   // this introduces no additional cron or scheduler and remains isolated from
@@ -101,7 +103,7 @@ export async function runNativeOperations(now = new Date()) {
     for (const claim of claims) if ((await releaseExpiredClaim(claim.id, {}, now)).released) releasedClaims += 1;
   });
   return { tasks: taskIds, expiredSupport: expiredSupportCount, expiredRequests: expiredRequestCount, releasedClaims,
-    homeDeregistrationAccountCleanup, installationDelivery, alexaChangeReports, alexaDiscoveryReports, failedTasks: failures };
+    homeDeregistrationAccountCleanup, installationDelivery, alexaChangeReports, alexaDiscoveryReports, alexaAccountRemovalReports, failedTasks: failures };
 }
 
 export async function inspectNativeAnalyticsIntegrity(now = new Date()) {

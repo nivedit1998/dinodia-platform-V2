@@ -11,6 +11,7 @@ import { sha256 } from '@/lib/stage1Crypto';
 import { serializableTransaction } from '@/lib/serializableTransaction';
 import { validateTenantMembershipRemovalPreview, validateTenantMembershipRemovalReceipt, validateTenantMembershipRemovalRequest } from '@/lib/contracts/dinodiaV1';
 import { deleteTenantPrivateDeviceCloudData } from '@/lib/nativeTenantDeviceCleanup';
+import { queueAlexaRemovalReportsForAccount } from '@/lib/alexa/accountRemovalReport';
 import { retireNativeAutomations } from '@/lib/nativeAutomations/lifecycle';
 import { refreshNativeAutomationCloudRevision } from '@/lib/nativeAutomations/delivery';
 
@@ -245,6 +246,7 @@ export async function DELETE(request: Request, context: { params: Promise<{ home
         homeId: accountDeleted ? null : homeId, requestHash, responseStatus: 200, responseDigest: sha256(JSON.stringify(result)),
         responseBody: JSON.parse(JSON.stringify(result)) as Prisma.InputJsonValue, expiresAt: new Date(now.getTime() + 24 * 60 * 60 * 1000) } });
       if (accountDeleted) {
+        await queueAlexaRemovalReportsForAccount(tx, account.id, now);
         await tx.customerAccount.delete({ where: { id: account.id } });
       }
       return result;

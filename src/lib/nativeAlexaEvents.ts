@@ -9,6 +9,7 @@ import { refreshNativeAlexaEventToken } from '@/lib/nativeAlexaGrant';
 import { alexaPropertiesFromStates, type AuthorizedEndpoint } from '@/lib/nativeAlexaExecution';
 import { ensureAutoScopes } from '@/lib/alexa/syncAlexa';
 import { projectAlexaLinkEndpoints } from '@/lib/alexa/projection';
+import { ALEXA_ACCOUNT_REMOVAL_AGGREGATE, ALEXA_ACCOUNT_REMOVAL_EVENT } from '@/lib/alexa/accountRemovalReport';
 
 const MAX_CHANGE_REPORTS_PER_TICK = 4;
 const GATEWAY_TIMEOUT_MS = 4000;
@@ -417,6 +418,65 @@ export async function dispatchAlexaDiscoveryReports(now = new Date()) {
       // Rotate this link to the back of the queue even when its sync failed, so one broken link cannot starve the others.
       await prisma.alexaNativeLink.updateMany({ where: { id: link.id }, data: { updatedAt: new Date() } }).catch(() => undefined);
     }
+  }
+  return result;
+}
+
+/**
+ * Final DeleteReport for a customer account that no longer exists (its link was deleted with it). The outbox row holds the
+ * link's encrypted refresh token and the endpoint ids; once Amazon accepts the report, or the row gives up, the token is
+ * wiped from the payload. Bounded per tick, retried with backoff for up to seven days.
+ */
+export async function dispatchAlexaAccountRemovalReports(now = new Date()) {
+  const result = { enabled: false, scanned: 0, delivered: 0, retried: 0, failed: 0 };
+  if (process.env.DINODIA_NATIVE_ALEXA_ENABLED !== 'true') return result;
+  result.enabled = true;
+  await prisma.nativeDomainOutbox.updateMany({ where: { aggregateType: ALEXA_ACCOUNT_REMOVAL_AGGREGATE, state: 'PENDING', expiresAt: { lte: now } },
+    data: { state: 'EXPIRED', payload: {}, updatedAt: now } });
+  const rows = await prisma.nativeDomainOutbox.findMany({ where: { aggregateType: ALEXA_ACCOUNT_REMOVAL_AGGREGATE, eventType: ALEXA_ACCOUNT_REMOVAL_EVENT,
+    state: 'PENDING', nextAttemptAt: { lte: now }, expiresAt: { gt: now } }, orderBy: { createdAt: 'asc' }, take: MAX_LINKS_PER_SWEEP,
+    select: { id: true, attempts: true, payload: true } });
+  result.scanned = rows.length;
+  for (const row of rows) {
+    const payload = object(row.payload);
+    const endpointIds = Array.isArray(payload?.endpointIds)
+      ? payload.endpointIds.filter((item): item is string => typeof item === 'string' && /^dos_[A-Za-z0-9_-]{16,80}$/.test(item)) : [];
+    let delivered = false;
+    try {
+      if (typeof payload?.refreshTokenCiphertext !== 'string' || endpointIds.length === 0) {
+        await prisma.nativeDomainOutbox.updateMany({ where: { id: row.id, state: 'PENDING' }, data: { state: 'CANCELLED', payload: {}, updatedAt: now } });
+        continue;
+      }
+      const refreshToken = decryptPlatformEnvelope(payload.refreshTokenCiphertext);
+      const { accessToken } = await refreshNativeAlexaEventToken(refreshToken);
+      delivered = true;
+      for (let start = 0; start < endpointIds.length; start += MAX_ENDPOINTS_PER_REPORT) {
+        const response = await fetch(eventGatewayEndpoint(), { method: 'POST', headers: { authorization: `Bearer ${accessToken}`, 'content-type': 'application/json', accept: 'application/json' },
+          body: JSON.stringify({ event: { header: { namespace: 'Alexa.Discovery', name: 'DeleteReport', messageId: `dinodia-${randomUUID()}`, payloadVersion: '3' },
+            payload: { endpoints: endpointIds.slice(start, start + MAX_ENDPOINTS_PER_REPORT).map((endpointId) => ({ endpointId })), scope: { type: 'BearerToken', token: accessToken } } } }),
+          signal: AbortSignal.timeout(GATEWAY_TIMEOUT_MS), redirect: 'manual' });
+        if (response.ok) { await response.body?.cancel().catch(() => {}); continue; }
+        const text = await response.text().catch(() => '');
+        const code = /"code"\s*:\s*"([A-Z_]{3,60})"/.exec(text)?.[1] ?? '';
+        console.warn(`[alexa-gateway] account-removal DeleteReport refused status=${response.status}${code ? ` code=${code}` : ''}`);
+        delivered = false;
+        break;
+      }
+    } catch (error) {
+      if (error instanceof PlatformDataEncryptionKeyError) throw error;
+      delivered = false;
+    }
+    if (delivered) {
+      await prisma.nativeDomainOutbox.updateMany({ where: { id: row.id, state: 'PENDING' }, data: { state: 'DELIVERED', attempts: row.attempts + 1, payload: {}, updatedAt: now } });
+      result.delivered += 1;
+      continue;
+    }
+    const attempts = row.attempts + 1;
+    const giveUp = attempts >= MAX_OUTBOX_ATTEMPTS;
+    await prisma.nativeDomainOutbox.updateMany({ where: { id: row.id, state: 'PENDING' }, data: {
+      attempts, state: giveUp ? 'FAILED' : 'PENDING', ...(giveUp ? { payload: {} } : {}),
+      nextAttemptAt: new Date(now.getTime() + delayForAttempt(attempts)), updatedAt: now } });
+    if (giveUp) result.failed += 1; else result.retried += 1;
   }
   return result;
 }
