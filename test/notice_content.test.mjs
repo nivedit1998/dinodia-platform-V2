@@ -7,7 +7,7 @@ const ts = require('typescript');
 const compiled = ts.transpileModule(fs.readFileSync('src/lib/noticeContent.ts', 'utf8'), { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText;
 const loaded = { exports: {} };
 new Function('module', 'exports', 'require', compiled)(loaded, loaded.exports, require);
-const { composeNotice, noticeEmail, NOTICE_EVENT_KIND } = loaded.exports;
+const { composeNotice, noticeEmail, mfaCodeEmail, NOTICE_EVENT_KIND } = loaded.exports;
 
 const home = '12 High Street, London';
 const cases = {
@@ -81,4 +81,18 @@ test('Alexa and removal notices say what to do next', () => {
   assert.equal(removed.pushTitle, 'Your access has ended');
   assert.ok(noticeEmail(removed).text.includes('Your Dinodia account is still active'));
   assert.equal(composeNotice('OWNERSHIP_TRANSFER_NOTICE', { homeLabel: home, removal: 'OWNERSHIP_TRANSFER', role: 'PROPERTY_MANAGER' }).pushTitle, 'Your manager access has ended');
+});
+
+test('the two-step code email says what the code is for, warns not to share it, and is email only', () => {
+  for (const purpose of ['SIGN_IN', 'ALEXA_SIGN_IN', 'ENABLE', 'DISABLE']) {
+    const mail = mfaCodeEmail(purpose, '482913');
+    assert.ok(mail.subject.includes('code'), `${purpose} subject: ${mail.subject}`);
+    assert.ok(mail.text.includes('\n482913\n') && mail.html.includes('>482913<'), 'the code stands alone on its own line and in a large block');
+    assert.ok(mail.text.includes('10 minutes') && mail.text.includes('Never share it') && mail.text.includes('change your password'));
+    assert.ok(!mail.html.includes('href='), 'a code email has no link to click');
+  }
+  assert.ok(mfaCodeEmail('ALEXA_SIGN_IN', '000000').text.includes('Alexa'));
+  const changed = composeNotice('MFA_ENABLED_NOTICE', { at: '2026-10-31T14:05:00Z' });
+  assert.equal(changed.pushTitle, 'Two-step verification is on');
+  assert.ok(composeNotice('MFA_DISABLED_NOTICE', {}).paragraphs.join(' ').includes('turn two-step verification back on'));
 });
