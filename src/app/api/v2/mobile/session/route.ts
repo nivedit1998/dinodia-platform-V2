@@ -1,17 +1,12 @@
 import { NextResponse } from 'next/server';
 import { POST as createCookieSession } from '../../auth/session/route';
-import { validateMobileCustomerSessionReceipt } from '@/lib/contracts/dinodiaV1';
 import { nativeV1ErrorResponse } from '@/lib/contracts/nativeV1Error';
 import { Stage1AuthError } from '@/lib/stage1Auth';
-import { bindMobileAccessToken, buildMobileSessionReceipt, mobileTokenFormatIsValid, rotateMobileRefreshToken } from '@/lib/mobileCustomerSession';
+import { buildMobileSessionReceipt, mobileTokenFormatIsValid, rotateMobileRefreshToken } from '@/lib/mobileCustomerSession';
+import { validateMobileCustomerSessionReceipt } from '@/lib/contracts/dinodiaV1';
+import { mobileResponseFromSignIn } from '@/lib/mobileSignInReceipt';
 
 export const dynamic = 'force-dynamic';
-
-function refreshTokenFromCookie(header: string | null): string | null {
-  const value = header?.split(';').map((part) => part.trim()).find((part) => part.startsWith('dinodia_customer_session='))?.slice('dinodia_customer_session='.length);
-  if (!value) return null;
-  try { return decodeURIComponent(value); } catch { return null; }
-}
 
 export async function POST(request: Request) {
   try {
@@ -32,21 +27,6 @@ export async function POST(request: Request) {
       return NextResponse.json(receipt, { headers: { 'Cache-Control': 'no-store', Pragma: 'no-cache' } });
     }
 
-    const response = await createCookieSession(request);
-    if (!response.ok) return response;
-    const metadata = await response.clone().json().catch(() => null) as Record<string, unknown> | null;
-    const refreshToken = refreshTokenFromCookie(response.headers.get('set-cookie'));
-    if (!metadata || typeof metadata.accountId !== 'string' || typeof metadata.sessionId !== 'string'
-      || typeof metadata.trustedDeviceId !== 'string' || !refreshToken) {
-      throw new Stage1AuthError(500, 'mobile_session_unavailable', 'The mobile session could not be established');
-    }
-    const credentials = await bindMobileAccessToken(metadata.sessionId, refreshToken);
-    const receipt = await buildMobileSessionReceipt({
-      accountId: metadata.accountId, sessionId: metadata.sessionId, trustedDeviceId: metadata.trustedDeviceId,
-      accessToken: credentials.accessToken, refreshToken: credentials.refreshToken,
-      accessTokenExpiresAt: credentials.accessTokenExpiresAt, refreshTokenExpiresAt: credentials.refreshExpiresAt,
-    });
-    if (!validateMobileCustomerSessionReceipt(receipt)) throw new Stage1AuthError(500, 'native_v1_contract_invalid', 'The mobile session receipt failed contract validation');
-    return NextResponse.json(receipt, { headers: { 'Cache-Control': 'no-store', Pragma: 'no-cache' } });
+    return await mobileResponseFromSignIn(await createCookieSession(request));
   } catch (error) { return nativeV1ErrorResponse(error); }
 }

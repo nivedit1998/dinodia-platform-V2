@@ -10,6 +10,7 @@ import { randomSecret, sha256 } from '@/lib/stage1Crypto';
 import { decryptPlatformEnvelope } from '@/lib/hubOperatorCredentials';
 import { readApnsConfig, sendAlexaLinkApprovalPush, type ApnsEnvironment } from '@/lib/apnsDelivery';
 import { authorizationCodeChallenge, type AlexaOAuthRequest } from '@/lib/nativeAlexaOAuth';
+import { accountMfaRequirement, alexaBinding, issueMfaChallenge, mfaEnforced, MFA_PURPOSE, verifyMfaChallenge } from '@/lib/accountMfa';
 
 /**
  * Account linking started from the Alexa side. The person signs in on the Alexa-hosted page with their Dinodia email and
@@ -21,7 +22,9 @@ export const ALEXA_SIGN_IN_TTL_MS = 5 * 60 * 1000;
 const PUSH_BUDGET_MS = 4000;
 
 export type AlexaSignInFailure = 'INVALID' | 'SETUP_REQUIRED' | 'NOT_TENANT' | 'NO_PHONE' | 'RATE_LIMITED' | 'UNAVAILABLE';
-export type AlexaSignInStart = { ok: true; rawIntent: string; approvalNumber: number } | { ok: false; reason: AlexaSignInFailure };
+export type AlexaMfaPrompt = { challengeId: string; clientSecret: string; maskedEmail: string };
+/** Either the phone-approval number to show, or (two-step verification on) a code that was just emailed. */
+export type AlexaSignInStart = { ok: true; rawIntent: string; approvalNumber: number } | { ok: true; mfa: AlexaMfaPrompt } | { ok: false; reason: AlexaSignInFailure };
 export type AlexaSignInStatus = 'PENDING' | 'APPROVED' | 'DECLINED' | 'EXPIRED';
 
 export function alexaRequestHash(request: AlexaOAuthRequest): string {
@@ -67,7 +70,7 @@ export async function startAlexaSignIn(input: { email: unknown; password: unknow
     return { ok: false, reason: 'UNAVAILABLE' };
   }
   const account = await prisma.customerAccount.findUnique({ where: { emailNormalized: email }, select: {
-    id: true, status: true, emailVerifiedAt: true, passwordHash: true, mustChangePassword: true, usernameSelectionRequired: true,
+    id: true, email: true, status: true, emailVerifiedAt: true, passwordHash: true, mustChangePassword: true, usernameSelectionRequired: true,
   } });
   // Same single message for an unknown address and a wrong password.
   if (!account || account.status !== 'ACTIVE' || !(await verifyPassword(password, account.passwordHash))) {
@@ -84,6 +87,16 @@ export async function startAlexaSignIn(input: { email: unknown; password: unknow
   if (!account.emailVerifiedAt || account.mustChangePassword || account.usernameSelectionRequired || !policy || !accepted) return { ok: false, reason: 'SETUP_REQUIRED' };
 
   const instant = reviewAccountEmails().has(email);
+  // Two-step verification on: the emailed code is the second step and is enough, so no phone approval (and no signed-in phone) is needed.
+  if (!instant && mfaEnforced() && (await accountMfaRequirement(prisma, account.id)).requirement !== 'NONE') {
+    if ((await eligibleAlexaTenantMemberships(prisma, account.id)).length === 0) return { ok: false, reason: 'NOT_TENANT' };
+    try {
+      const issued = await issueMfaChallenge({ accountId: account.id, email: account.email, purpose: MFA_PURPOSE.ALEXA_SIGN_IN, bindingHash: alexaBinding(alexaRequestHash(input.request)) });
+      return { ok: true, mfa: { challengeId: issued.challengeId, clientSecret: issued.clientSecret, maskedEmail: issued.maskedEmail } };
+    } catch (error) {
+      return { ok: false, reason: error instanceof Stage1AuthError && error.status === 429 ? 'RATE_LIMITED' : 'UNAVAILABLE' };
+    }
+  }
   const rawIntent = randomSecret(32);
   const approvalNumber = 10 + crypto.randomInt(90);
   const result = await serializableTransaction(async (tx) => {
@@ -105,6 +118,35 @@ export async function startAlexaSignIn(input: { email: unknown; password: unknow
   if (result === 'NOT_TENANT' || result === 'NO_PHONE') return { ok: false, reason: result };
   if (!instant) await pushApprovalPrompt(account.id, result.id, result.expiresAt).catch(() => {});
   return { ok: true, rawIntent, approvalNumber };
+}
+
+export type AlexaMfaOutcome =
+  | { ok: true; rawIntent: string }
+  | { ok: false; reason: 'INVALID_CODE'; attemptsRemaining: number }
+  | { ok: false; reason: 'EXPIRED' | 'LOCKED' | 'INVALID' | 'NOT_TENANT' | 'UNAVAILABLE' };
+
+/** The emailed code is right: record an already-approved sign-in, which the page then turns into the authorization code. */
+export async function completeAlexaMfaSignIn(input: { challengeId: unknown; clientSecret: unknown; code: unknown; request: AlexaOAuthRequest }): Promise<AlexaMfaOutcome> {
+  const result = await verifyMfaChallenge({ challengeId: input.challengeId, clientSecret: input.clientSecret, code: input.code,
+    purpose: MFA_PURPOSE.ALEXA_SIGN_IN, bindingHash: alexaBinding(alexaRequestHash(input.request)) });
+  if (!result.ok) return result;
+  const rawIntent = randomSecret(32);
+  try {
+    const created = await serializableTransaction(async (tx) => {
+      await tx.$queryRaw`SELECT "id" FROM "CustomerAccount" WHERE "id" = ${result.accountId}::uuid FOR UPDATE`;
+      const memberships = await eligibleAlexaTenantMemberships(tx, result.accountId);
+      if (memberships.length === 0) return 'NOT_TENANT' as const;
+      const now = new Date();
+      await tx.alexaNativeConnectIntent.updateMany({ where: { customerAccountId: result.accountId, kind: 'SIGN_IN', consumedAt: null, revokedAt: null }, data: { revokedAt: now } });
+      await tx.alexaNativeConnectIntent.create({ data: {
+        customerAccountId: result.accountId, homeId: memberships[0].homeId, membershipId: memberships[0].id, intentHash: sha256(rawIntent), kind: 'SIGN_IN',
+        approvalNumber: null, approvedAt: now, oauthRequestHash: alexaRequestHash(input.request), expiresAt: new Date(now.getTime() + ALEXA_SIGN_IN_TTL_MS),
+      } });
+      return 'CREATED' as const;
+    }, 2);
+    if (created === 'NOT_TENANT') return { ok: false, reason: 'NOT_TENANT' };
+  } catch { return { ok: false, reason: 'UNAVAILABLE' }; }
+  return { ok: true, rawIntent };
 }
 
 async function findSignInIntent(rawIntent: string, request: AlexaOAuthRequest) {

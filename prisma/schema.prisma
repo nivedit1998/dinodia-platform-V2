@@ -406,6 +406,9 @@ model CustomerAccount {
   avatarIcon                String?        @db.VarChar(24)
   avatarColour              String?        @db.VarChar(16)
   avatarUpdatedAt           DateTime?
+  mfaEnabledAt              DateTime?
+  mfaPromptSnoozedUntil     DateTime?
+  mfaPromptDismissCount     Int            @default(0)
   createdAt                 DateTime       @default(now())
   updatedAt                 DateTime       @updatedAt
 
@@ -554,6 +557,9 @@ model AuthChallenge {
   deliveryStatus      String    @default("PENDING") @db.VarChar(24)
   deliveryAttemptedAt DateTime?
   supersededById      String?   @db.Uuid
+  clientSecretHash    String?   @db.VarChar(64)
+  bindingHash         String?   @db.VarChar(64)
+  resendCount         Int       @default(0)
   createdAt           DateTime  @default(now())
 
   customerAccount CustomerAccount? @relation(fields: [customerAccountId], references: [id], onDelete: Cascade)

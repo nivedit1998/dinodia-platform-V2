@@ -425,7 +425,7 @@ export async function dispatchInstallationRequestNotifications(now = new Date())
   counts.accessRemovalFailed += removal.failed;
   counts.accessRemovalSuppressed += removal.suppressed;
   counts.accessRemovalExpired += removal.expired;
-  const automationFailures = await dispatchTenantAutomationFailureNotifications(now);
+  const automationFailures = await dispatchTenantAutomationFailureNotifications();
   counts.automationFailureAccepted += automationFailures.accepted;
   counts.automationFailureDeferred += automationFailures.deferred;
   counts.automationFailureFailed += automationFailures.failed;
@@ -435,7 +435,7 @@ export async function dispatchInstallationRequestNotifications(now = new Date())
 }
 
 /** Automation failure notices are switched off; receipts queued before that are retired and never sent. */
-export async function dispatchTenantAutomationFailureNotifications(_now = new Date()) {
+export async function dispatchTenantAutomationFailureNotifications() {
   const retired = await prisma.nativeNotificationDeliveryReceipt.updateMany({ where: {
     family: 'TENANT_AUTOMATION_FAILURE', channel: 'PUSH', status: 'PENDING',
   }, data: { status: 'SUPPRESSED', lastErrorCode: 'NOTICE_DISABLED' } });

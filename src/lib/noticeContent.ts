@@ -5,7 +5,7 @@
  * The details a notice quotes (a person, a room, a Home, a device list) travel inside the encrypted outbox envelope and are
  * only decrypted at send time. Banners stay short enough for a lock screen; emails carry the full detail.
  */
-export type NoticeKind = 'ROOM_ACCESS_REQUEST' | 'ROOM_ACCESS_APPROVED' | 'ROOM_ACCESS_DECLINED' | 'ACCESS_CHANGED' | 'ALEXA_LINKED' | 'NEW_DEVICES';
+export type NoticeKind = 'ROOM_ACCESS_REQUEST' | 'ROOM_ACCESS_APPROVED' | 'ROOM_ACCESS_DECLINED' | 'ACCESS_CHANGED' | 'ALEXA_LINKED' | 'NEW_DEVICES' | 'MFA_CHANGED';
 
 export const NOTICE_EVENT_KIND: Readonly<Record<string, NoticeKind>> = {
   ROOM_ACCESS_REQUEST_NOTICE: 'ROOM_ACCESS_REQUEST',
@@ -17,6 +17,8 @@ export const NOTICE_EVENT_KIND: Readonly<Record<string, NoticeKind>> = {
   HOME_DEREGISTRATION_NOTICE: 'ACCESS_CHANGED',
   ALEXA_LINKED_NOTICE: 'ALEXA_LINKED',
   NEW_DEVICES_NOTICE: 'NEW_DEVICES',
+  MFA_ENABLED_NOTICE: 'MFA_CHANGED',
+  MFA_DISABLED_NOTICE: 'MFA_CHANGED',
 };
 
 export type NoticeDevice = { name: string; room: string };
@@ -41,7 +43,6 @@ const MAX_LIST = 12;
 
 function clean(value: unknown, fallback = ''): string {
   if (typeof value !== 'string') return fallback;
-  // eslint-disable-next-line no-control-regex
   const text = value.replace(/[\u0000-\u001f\u007f]/g, ' ').replace(/\s+/g, ' ').trim();
   return text ? text.slice(0, MAX_TEXT) : fallback;
 }
@@ -179,6 +180,22 @@ export function composeNotice(eventType: string, details: NoticeDetails = {}): N
       ],
       button: 'Open Dinodia' };
   }
+  if (kind === 'MFA_CHANGED') {
+    const on = eventType === 'MFA_ENABLED_NOTICE';
+    const facts: Array<[string, string]> = [];
+    if (when) facts.push([on ? 'Turned on' : 'Turned off', when]);
+    return { ...base, facts,
+      pushTitle: on ? 'Two-step verification is on' : 'Two-step verification is off',
+      pushBody: on ? 'Your account now asks for an emailed code when you sign in.' : 'Your account no longer asks for an emailed code. Wasn’t you? Open Dinodia to turn it back on.',
+      subject: on ? 'Two-step verification is now on for your account' : 'Two-step verification was turned off for your account',
+      heading: on ? 'Two-step verification is on' : 'Two-step verification is off',
+      paragraphs: on
+        ? ['Each time you sign in with your password, we will email you a 6-digit code to finish. This makes your account much harder to break into.',
+          'If you did not turn this on, please open Dinodia and change your password straight away.']
+        : ['Your account no longer asks for an emailed code when you sign in.',
+          'If this was not you, open Dinodia, change your password and turn two-step verification back on in Settings.'],
+      button: 'Open Dinodia' };
+  }
   // NEW_DEVICES: only devices Dinodia installed. Devices tenants add themselves are never included.
   const { lines, count, rooms } = deviceLines(details.devices);
   if (count === 0) return null;
@@ -206,33 +223,66 @@ function escapeHtml(value: string): string {
   return value.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;').replaceAll("'", '&#39;');
 }
 
-/** Plain-text and HTML bodies for one notice: a clean card, a small table of facts, an optional list, and one button. */
-export function noticeEmail(content: NoticeContent): { subject: string; text: string; html: string } {
-  const textParts = [content.heading, '', content.paragraphs[0]];
-  if (content.list.length) textParts.push('', ...content.list.map((line) => `• ${line}`));
-  if (content.paragraphs.length > 1) textParts.push('', ...content.paragraphs.slice(1).flatMap((paragraph, index) => (index ? ['', paragraph] : [paragraph])));
-  if (content.facts.length) textParts.push('', ...content.facts.map(([label, value]) => `${label}: ${value}`));
-  textParts.push('', `${content.button}: ${NOTICE_APP_LINK}`, '', 'Dinodia Smart Living');
+type CardParts = { heading: string; paragraphs: string[]; facts: Array<[string, string]>; list: string[]; code?: string; button?: string; footer: string };
+
+function renderCard(card: CardParts): { text: string; html: string } {
+  const textParts = [card.heading, '', card.paragraphs[0]];
+  if (card.code) textParts.push('', card.code);
+  if (card.list.length) textParts.push('', ...card.list.map((line) => `• ${line}`));
+  if (card.paragraphs.length > 1) textParts.push('', ...card.paragraphs.slice(1).flatMap((paragraph, index) => (index ? ['', paragraph] : [paragraph])));
+  if (card.facts.length) textParts.push('', ...card.facts.map(([label, value]) => `${label}: ${value}`));
+  if (card.button) textParts.push('', `${card.button}: ${NOTICE_APP_LINK}`);
+  textParts.push('', 'Dinodia Smart Living');
   const cell = 'padding-top:14px;font-size:16px;line-height:1.5;color:#3a3a3c;';
   const row = (value: string) => `<tr><td style="${cell}">${escapeHtml(value)}</td></tr>`;
-  const factsHtml = content.facts.length
+  const codeHtml = card.code
+    ? `<tr><td style="padding-top:18px;"><div style="background:#f2f4f7;border-radius:12px;padding:18px 0;text-align:center;font-size:34px;font-weight:700;letter-spacing:.32em;font-family:'SF Mono',Menlo,Consolas,monospace;color:#1c1c1e;">${escapeHtml(card.code)}</div></td></tr>`
+    : '';
+  const factsHtml = card.facts.length
     ? `<tr><td style="padding-top:18px;"><table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f2f4f7;border-radius:12px;padding:6px 16px;">`
-      + content.facts.map(([label, value]) => `<tr><td style="padding:8px 0;font-size:13px;color:#6c6c70;width:34%;vertical-align:top;">${escapeHtml(label)}</td><td style="padding:8px 0;font-size:15px;color:#1c1c1e;font-weight:600;vertical-align:top;">${escapeHtml(value)}</td></tr>`).join('')
+      + card.facts.map(([label, value]) => `<tr><td style="padding:8px 0;font-size:13px;color:#6c6c70;width:34%;vertical-align:top;">${escapeHtml(label)}</td><td style="padding:8px 0;font-size:15px;color:#1c1c1e;font-weight:600;vertical-align:top;">${escapeHtml(value)}</td></tr>`).join('')
       + `</table></td></tr>`
     : '';
-  const listHtml = content.list.length
+  const listHtml = card.list.length
     ? `<tr><td style="padding-top:12px;"><table role="presentation" width="100%" cellpadding="0" cellspacing="0">`
-      + content.list.map((line) => `<tr><td style="padding:6px 0;font-size:16px;color:#1c1c1e;border-bottom:1px solid #eceff3;">${escapeHtml(line)}</td></tr>`).join('')
+      + card.list.map((line) => `<tr><td style="padding:6px 0;font-size:16px;color:#1c1c1e;border-bottom:1px solid #eceff3;">${escapeHtml(line)}</td></tr>`).join('')
       + `</table></td></tr>`
+    : '';
+  const buttonHtml = card.button
+    ? `<tr><td style="padding-top:24px;"><a href="${NOTICE_APP_LINK}" style="display:inline-block;background:#0a84ff;color:#ffffff;text-decoration:none;font-weight:600;font-size:16px;padding:13px 24px;border-radius:12px;">${escapeHtml(card.button)}</a></td></tr>`
     : '';
   const html = `<!doctype html><html><body style="margin:0;padding:24px;background:#f2f4f7;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;color:#1c1c1e;">`
     + `<table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr><td align="center">`
     + `<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:480px;background:#ffffff;border-radius:16px;padding:32px;">`
     + `<tr><td style="font-size:13px;font-weight:600;letter-spacing:.04em;color:#0a84ff;text-transform:uppercase;">Dinodia Smart Living</td></tr>`
-    + `<tr><td style="padding-top:12px;font-size:22px;font-weight:700;line-height:1.3;">${escapeHtml(content.heading)}</td></tr>`
-    + row(content.paragraphs[0]) + listHtml + content.paragraphs.slice(1).map(row).join('') + factsHtml
-    + `<tr><td style="padding-top:24px;"><a href="${NOTICE_APP_LINK}" style="display:inline-block;background:#0a84ff;color:#ffffff;text-decoration:none;font-weight:600;font-size:16px;padding:13px 24px;border-radius:12px;">${escapeHtml(content.button)}</a></td></tr>`
-    + `<tr><td style="padding-top:28px;font-size:12px;line-height:1.5;color:#8e8e93;">You are receiving this because of activity on your Dinodia Smart Living account.</td></tr>`
+    + `<tr><td style="padding-top:12px;font-size:22px;font-weight:700;line-height:1.3;">${escapeHtml(card.heading)}</td></tr>`
+    + row(card.paragraphs[0]) + codeHtml + listHtml + card.paragraphs.slice(1).map(row).join('') + factsHtml + buttonHtml
+    + `<tr><td style="padding-top:28px;font-size:12px;line-height:1.5;color:#8e8e93;">${escapeHtml(card.footer)}</td></tr>`
     + `</table></td></tr></table></body></html>`;
-  return { subject: content.subject, text: textParts.join('\n'), html };
+  return { text: textParts.join('\n'), html };
+}
+
+/** Plain-text and HTML bodies for one notice: a clean card, a small table of facts, an optional list, and one button. */
+export function noticeEmail(content: NoticeContent): { subject: string; text: string; html: string } {
+  const card = renderCard({ heading: content.heading, paragraphs: content.paragraphs, facts: content.facts, list: content.list, button: content.button,
+    footer: 'You are receiving this because of activity on your Dinodia Smart Living account.' });
+  return { subject: content.subject, ...card };
+}
+
+export type MfaCodePurpose = 'SIGN_IN' | 'ALEXA_SIGN_IN' | 'ENABLE' | 'DISABLE';
+export const MFA_CODE_MINUTES = 10;
+
+/** The emailed sign-in code. Email only, never a banner: a code must not appear on a lock screen. */
+export function mfaCodeEmail(purpose: MfaCodePurpose, code: string): { subject: string; text: string; html: string } {
+  const what = {
+    SIGN_IN: { subject: 'Your Dinodia sign-in code', heading: 'Your sign-in code', lead: 'Use this code to finish signing in to Dinodia Smart Living.' },
+    ALEXA_SIGN_IN: { subject: 'Your Dinodia code to link Alexa', heading: 'Your Alexa linking code', lead: 'Use this code to finish linking Alexa to your Dinodia Smart Living account.' },
+    ENABLE: { subject: 'Your Dinodia code to turn on two-step verification', heading: 'Turn on two-step verification', lead: 'Use this code to turn on two-step verification for your Dinodia Smart Living account.' },
+    DISABLE: { subject: 'Your Dinodia code to turn off two-step verification', heading: 'Turn off two-step verification', lead: 'Use this code to turn off two-step verification for your Dinodia Smart Living account.' },
+  }[purpose];
+  const card = renderCard({ heading: what.heading, code, facts: [], list: [],
+    paragraphs: [what.lead, `The code works for ${MFA_CODE_MINUTES} minutes and can only be used once. Never share it with anyone. Dinodia will never ask you for it.`,
+      'If you did not try to do this, ignore this email and change your password in the Dinodia app.'],
+    footer: 'You are receiving this because someone entered your Dinodia Smart Living email address and password.' });
+  return { subject: what.subject, ...card };
 }

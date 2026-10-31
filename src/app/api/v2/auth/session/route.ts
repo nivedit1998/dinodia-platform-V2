@@ -1,27 +1,18 @@
 import crypto from 'node:crypto';
 import { NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
-import { boundedContractText, validateAccountSessionContext, validateCustomerSessionLoginRequest, validateCustomerSessionLogoutReceipt, validateCustomerSessionReceipt } from '@/lib/contracts/dinodiaV1';
+import { boundedContractText, validateAccountSessionContext, validateCustomerSessionLoginRequest, validateCustomerSessionLogoutReceipt } from '@/lib/contracts/dinodiaV1';
 import { nativeV1ErrorResponse } from '@/lib/contracts/nativeV1Error';
 import { recordFailedAuthentication, Stage1AuthError, cookieToken } from '@/lib/stage1Auth';
 import { verifyPassword } from '@/lib/passwords';
-import { constantTimeEqual, randomSecret, sha256 } from '@/lib/stage1Crypto';
+import { randomSecret, sha256 } from '@/lib/stage1Crypto';
 import { enforcePersistentRateLimit } from '@/lib/rateLimit';
 import { consumeInvitedTenantCredentialForLogin } from '@/lib/customerInvitationRegistration';
 import { serializableTransaction } from '@/lib/serializableTransaction';
+import { deviceThumbprint, finishCustomerSignIn, SESSION_INACTIVITY_MS, sessionCookie } from '@/lib/customerSignIn';
+import { accountMfaRequirement, deviceBinding, issueMfaChallenge, mfaEnforced, MFA_PURPOSE } from '@/lib/accountMfa';
 
 export const dynamic = 'force-dynamic';
-
-const SESSION_INACTIVITY_MS = 30 * 24 * 60 * 60 * 1000;
-const SESSION_ABSOLUTE_MS = 180 * 24 * 60 * 60 * 1000;
-
-function sessionCookie(raw: string, absoluteExpiresAt: Date, now: Date): string {
-  // The browser cookie may live through the absolute ceiling so successful
-  // account activity can move the server-side 30-day idle deadline. The
-  // server rejects an idle-expired token even while the cookie remains stored.
-  const maxAge = Math.max(0, Math.floor((absoluteExpiresAt.getTime() - now.getTime()) / 1000));
-  return `dinodia_customer_session=${encodeURIComponent(raw)}; HttpOnly; SameSite=Strict; Secure; Path=/; Max-Age=${maxAge}`;
-}
 
 /**
  * Restore the account-global Native V1 context. This endpoint deliberately
@@ -157,12 +148,16 @@ export async function POST(request: Request) {
     await enforcePersistentRateLimit(`customer-login:${sha256(email)}`, 8, 15 * 60 * 1000);
     try { crypto.createPublicKey(publicKey); } catch { throw new Stage1AuthError(400, 'trusted_device_key_invalid', 'The trusted-device public key is invalid'); }
     let account = await prisma.customerAccount.findUnique({ where: { emailNormalized: email }, select: { id: true, status: true, emailVerifiedAt: true, passwordHash: true, securityVersion: true } });
+    // Signing in with the emailed one-time credential already proves the mailbox, so no second emailed code is asked for (the same
+    // factor would add nothing).
+    let mailboxProvenByCredential = false;
     if (!account) {
       // A new tenant's email-delivered one-time credential proves possession
       // of the invited address. It creates only a gated account, never a Home
       // membership; password replacement, username choice and invitation
       // acceptance remain separate server-enforced steps.
       const invitedAccountId = await consumeInvitedTenantCredentialForLogin({ email, password });
+      if (invitedAccountId) mailboxProvenByCredential = true;
       if (invitedAccountId) account = await prisma.customerAccount.findUnique({ where: { id: invitedAccountId }, select: { id: true, status: true, emailVerifiedAt: true, passwordHash: true, securityVersion: true } });
     }
     if (!account || account.status !== 'ACTIVE' || !(await verifyPassword(password, account.passwordHash))) {
@@ -174,41 +169,21 @@ export async function POST(request: Request) {
     if (!account.emailVerifiedAt) {
       throw new Stage1AuthError(403, 'EMAIL_VERIFICATION_REQUIRED', 'Verify your email address before signing in');
     }
-    const thumbprint = crypto.createHash('sha256').update(crypto.createPublicKey(publicKey).export({ type: 'spki', format: 'der' })).digest('hex');
-    const rawSession = `dno-customer-session-${randomSecret(32)}`;
-    const session = await prisma.$transaction(async (tx) => {
-      const existing = await tx.trustedDevice.findUnique({ where: { customerAccountId_deviceInstallationId: { customerAccountId: account.id, deviceInstallationId } }, select: { id: true, sessionVersion: true, revokedAt: true, publicKeyThumbprint: true } });
-      if (existing?.revokedAt) throw new Stage1AuthError(403, 'trusted_device_revoked', 'This trusted device was removed; use the approved re-enrolment process');
-      if (existing && !constantTimeEqual(existing.publicKeyThumbprint, thumbprint)) throw new Stage1AuthError(409, 'trusted_device_identity_changed', 'This installation ID is already bound to another signing key');
-      const trusted = existing
-        ? await tx.trustedDevice.update({
-          where: { id: existing.id },
-          // Ordinary sign-in refreshes this device's use time only. It does not
-          // rotate its revocation generation or silently invalidate its other
-          // account sessions. Re-enrolment/key changes have a separate flow.
-          data: { deviceName, model: boundedContractText(input.model, 160) || null, osFamily: boundedContractText(input.osFamily, 80) || null, osVersion: boundedContractText(input.osVersion, 80) || null, lastUsedAt: new Date() },
-          select: { id: true, sessionVersion: true, revokedAt: true, publicKeyThumbprint: true },
-        })
-        : await tx.trustedDevice.create({
-          data: { customerAccountId: account.id, deviceInstallationId, publicKey, publicKeyThumbprint: thumbprint, deviceName, model: boundedContractText(input.model, 160) || null, osFamily: boundedContractText(input.osFamily, 80) || null, osVersion: boundedContractText(input.osVersion, 80) || null },
-          select: { id: true, sessionVersion: true, revokedAt: true, publicKeyThumbprint: true },
-        });
-      if (trusted.revokedAt) throw new Stage1AuthError(403, 'trusted_device_revoked', 'This trusted device was removed; use the approved re-enrolment process');
-      if (!constantTimeEqual(trusted.publicKeyThumbprint, thumbprint)) throw new Stage1AuthError(409, 'trusted_device_identity_changed', 'This installation ID is already bound to another signing key');
-      const issuedAt = new Date();
-      const absoluteExpiresAt = new Date(issuedAt.getTime() + SESSION_ABSOLUTE_MS);
-      const expiresAt = new Date(Math.min(issuedAt.getTime() + SESSION_INACTIVITY_MS, absoluteExpiresAt.getTime()));
-      const created = await tx.customerSession.create({ data: { customerAccountId: account.id, trustedDeviceId: trusted.id, sessionFamilyId: crypto.randomUUID(), refreshTokenHash: sha256(rawSession), securityVersion: account.securityVersion, trustedDeviceSessionVersion: trusted.sessionVersion, issuedAt, expiresAt, absoluteExpiresAt }, select: { id: true, expiresAt: true, absoluteExpiresAt: true } });
-      await tx.auditEvent.create({ data: { actorType: 'CUSTOMER', actorId: account.id, category: 'SECURITY', action: 'customer_login_succeeded', targetType: 'CustomerSession', targetId: created.id, metadata: { trustedDeviceId: trusted.id, outcome: 'succeeded' }, purgeAt: new Date(Date.now() + 365 * 24 * 60 * 60 * 1000) } });
-      return { ...created, trustedDeviceId: trusted.id };
-    });
-    const receipt = { ok: true, accountId: account.id, sessionId: session.id, trustedDeviceId: session.trustedDeviceId, expiresAt: session.expiresAt.toISOString() };
-    if (!validateCustomerSessionReceipt(receipt)) {
-      throw new Stage1AuthError(500, 'native_v1_contract_invalid', 'The customer session receipt failed contract validation');
+    // Two-step verification: required for homeowners and property managers, optional for tenants who turned it on. The password is
+    // right at this point, so telling this person a code is needed reveals nothing to a stranger.
+    if (mfaEnforced() && !mailboxProvenByCredential) {
+      const mfa = await accountMfaRequirement(prisma, account.id);
+      if (mfa.requirement !== 'NONE') {
+        if (request.headers.get('x-dinodia-mfa') !== '1') {
+          throw new Stage1AuthError(403, 'MFA_APP_UPDATE_REQUIRED', 'Please update the Dinodia app to sign in. Your account uses two-step verification.');
+        }
+        const issued = await issueMfaChallenge({ accountId: account.id, email, purpose: MFA_PURPOSE.SIGN_IN, bindingHash: deviceBinding(deviceInstallationId, deviceThumbprint(publicKey)) });
+        return NextResponse.json({ schemaVersion: 'dinodia.v1', ok: true, mfaRequired: true, challengeId: issued.challengeId, clientSecret: issued.clientSecret,
+          maskedEmail: issued.maskedEmail, expiresAt: issued.expiresAt.toISOString(), resendAvailableAt: issued.resendAvailableAt.toISOString(), codeLength: 6 },
+        { headers: { 'Cache-Control': 'no-store', Pragma: 'no-cache' } });
+      }
     }
-    const response = NextResponse.json(receipt, { headers: { 'Cache-Control': 'no-store', Pragma: 'no-cache' } });
-    response.headers.append('Set-Cookie', sessionCookie(rawSession, session.absoluteExpiresAt, new Date()));
-    return response;
+    return await finishCustomerSignIn(account, { deviceInstallationId, publicKey, deviceName, model: input.model, osFamily: input.osFamily, osVersion: input.osVersion });
   } catch (error) { return nativeV1ErrorResponse(error); }
 }
 

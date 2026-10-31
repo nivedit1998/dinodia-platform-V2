@@ -144,8 +144,64 @@ paths:
                 - { $ref: "./contract.json#/$defs/customerSessionLoginRequest" }
                 - { $ref: "#/components/schemas/CustomerMobileRefreshRequest" }
       responses:
-        "200": { description: Short-lived access and rotating refresh credentials bound to the same current account, installation and session family; no cookie is issued., content: { application/json: { schema: { $ref: "./contract.json#/$defs/mobileSessionReceipt" } } } }
+        "200": { description: Short-lived access and rotating refresh credentials bound to the same current account, installation and session family; no cookie is issued. When two-step verification applies and the app says it supports it (X-Dinodia-MFA: 1) the password step instead returns mfaRequired with an emailed-code challenge and issues nothing., content: { application/json: { schema: { oneOf: [{ $ref: "./contract.json#/$defs/mobileSessionReceipt" }, { $ref: "#/components/schemas/MfaRequiredResponse" }] } } } }
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+  /api/v2/auth/mfa/verify:
+    post:
+      summary: "Finish a sign-in with the emailed two-step verification code"
+      operationId: verifyTwoStepSignIn
+      tags: [Session]
+      security: []
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "#/components/schemas/MfaVerifyRequest" } } } }
+      responses:
+        "200": { description: The session cookie and receipt exactly as a password sign-in issues them., content: { application/json: { schema: { $ref: "./contract.json#/$defs/customerSessionReceipt" } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+  /api/v2/auth/mfa/resend:
+    post:
+      summary: "Email a fresh two-step verification code for the same sign-in"
+      operationId: resendTwoStepCode
+      tags: [Session]
+      security: []
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "#/components/schemas/MfaResendRequest" } } } }
+      responses:
+        "200": { description: A new code was emailed; the old one no longer works., content: { application/json: { schema: { $ref: "#/components/schemas/MfaResendReceipt" } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+  /api/v2/mobile/mfa/verify:
+    post:
+      summary: "Finish a native sign-in with the emailed two-step verification code"
+      operationId: verifyTwoStepMobileSignIn
+      tags: [Session]
+      security: []
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "#/components/schemas/MfaVerifyRequest" } } } }
+      responses:
+        "200": { description: Short-lived access and rotating refresh credentials for the same installation., content: { application/json: { schema: { $ref: "./contract.json#/$defs/mobileSessionReceipt" } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+  /api/v2/me/mfa:
+    get:
+      summary: "Two-step verification status: whether it is on, required and why, and whether to remind"
+      operationId: getTwoStepVerification
+      tags: [Account]
+      security: [{ CustomerSessionCookie: [] }, { MobileAccessBearer: [] }]
+      responses:
+        "200": { description: Status., content: { application/json: { schema: { $ref: "#/components/schemas/MfaStatus" } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+    post:
+      summary: "Turn two-step verification on or off with an emailed code, or put the reminder off"
+      operationId: changeTwoStepVerification
+      tags: [Account]
+      security: [{ CustomerSessionCookie: [] }, { MobileAccessBearer: [] }]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "#/components/schemas/MfaAction" } } } }
+      responses:
+        "200": { description: A new challenge (the start actions) or the updated status., content: { application/json: { schema: { oneOf: [{ $ref: "#/components/schemas/MfaChallenge" }, { $ref: "#/components/schemas/MfaStatus" }] } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
         "429": { $ref: "#/components/responses/RateLimited" }
   /api/v2/mobile/session/logout:
     post:
@@ -2892,6 +2948,79 @@ components:
       required: [refreshToken]
       properties:
         refreshToken: { type: string, pattern: "^dno-customer-session-[A-Za-z0-9_-]{32,160}$", writeOnly: true }
+      additionalProperties: false
+    MfaChallenge:
+      type: object
+      required: [schemaVersion, ok, challengeId, clientSecret, maskedEmail, expiresAt, resendAvailableAt, codeLength]
+      properties:
+        schemaVersion: { const: dinodia.v1 }
+        ok: { const: true }
+        challengeId: { type: string, format: uuid }
+        clientSecret: { type: string, writeOnly: true }
+        maskedEmail: { type: string }
+        expiresAt: { type: string, format: date-time }
+        resendAvailableAt: { type: string, format: date-time }
+        codeLength: { const: 6 }
+      additionalProperties: false
+    MfaRequiredResponse:
+      description: Returned by password sign-in instead of a session when a code is needed (mfaRequired is true).
+      allOf:
+        - { $ref: "#/components/schemas/MfaChallenge" }
+        - { type: object, required: [mfaRequired], properties: { mfaRequired: { const: true } } }
+    MfaVerifyRequest:
+      type: object
+      required: [challengeId, clientSecret, code, deviceInstallationId, publicKey, deviceName]
+      properties:
+        challengeId: { type: string, format: uuid }
+        clientSecret: { type: string, writeOnly: true }
+        code: { type: string, pattern: "^[0-9]{6}$", writeOnly: true }
+        deviceInstallationId: { type: string }
+        publicKey: { type: string }
+        deviceName: { type: string }
+        model: { type: string }
+        osFamily: { type: string }
+        osVersion: { type: string }
+      additionalProperties: false
+    MfaResendRequest:
+      type: object
+      required: [challengeId, clientSecret]
+      properties:
+        challengeId: { type: string, format: uuid }
+        clientSecret: { type: string, writeOnly: true }
+      additionalProperties: false
+    MfaResendReceipt:
+      type: object
+      required: [schemaVersion, ok, maskedEmail, expiresAt, resendAvailableAt]
+      properties:
+        schemaVersion: { const: dinodia.v1 }
+        ok: { const: true }
+        maskedEmail: { type: string }
+        expiresAt: { type: string, format: date-time }
+        resendAvailableAt: { type: string, format: date-time }
+      additionalProperties: false
+    MfaStatus:
+      type: object
+      required: [schemaVersion, ok, available, requirement, reason, enabled, canTurnOff, maskedEmail, promptDue]
+      properties:
+        schemaVersion: { const: dinodia.v1 }
+        ok: { const: true }
+        available: { type: boolean }
+        requirement: { enum: [REQUIRED, ENABLED, NONE] }
+        reason: { enum: [OWNER, PROPERTY_MANAGER, OPT_IN, null] }
+        enabled: { type: boolean }
+        canTurnOff: { type: boolean }
+        maskedEmail: { type: string }
+        promptDue: { type: boolean }
+      additionalProperties: false
+    MfaAction:
+      type: object
+      required: [action]
+      properties:
+        action: { enum: [enable_start, enable_confirm, disable_start, disable_confirm, snooze_prompt] }
+        password: { type: string, writeOnly: true }
+        challengeId: { type: string, format: uuid }
+        clientSecret: { type: string, writeOnly: true }
+        code: { type: string, pattern: "^[0-9]{6}$", writeOnly: true }
       additionalProperties: false
     HubLanEndpointObservation:
       $ref: "./contract.json#/$defs/lanEndpointObservation"

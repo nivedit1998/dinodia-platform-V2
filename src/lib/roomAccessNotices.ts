@@ -9,10 +9,12 @@ export const ROOM_ACCESS_APPROVED_NOTICE = 'ROOM_ACCESS_APPROVED_NOTICE';
 export const ROOM_ACCESS_DECLINED_NOTICE = 'ROOM_ACCESS_DECLINED_NOTICE';
 export const ALEXA_LINKED_NOTICE = 'ALEXA_LINKED_NOTICE';
 export const NEW_DEVICES_NOTICE = 'NEW_DEVICES_NOTICE';
+export const MFA_ENABLED_NOTICE = 'MFA_ENABLED_NOTICE';
+export const MFA_DISABLED_NOTICE = 'MFA_DISABLED_NOTICE';
 /** Same independent, encrypted outbox the other access notices use, so one dispatcher delivers every kind. */
 export const ACCESS_NOTICE_AGGREGATE = 'HomeownerAccessRemovalNotice';
 /** Notice types added alongside the original removal notices; the dispatcher picks them up with the rest. */
-export const ACCOUNT_NOTICE_TYPES = [ROOM_ACCESS_REQUEST_NOTICE, ROOM_ACCESS_APPROVED_NOTICE, ROOM_ACCESS_DECLINED_NOTICE, ALEXA_LINKED_NOTICE, NEW_DEVICES_NOTICE] as const;
+export const ACCOUNT_NOTICE_TYPES = [ROOM_ACCESS_REQUEST_NOTICE, ROOM_ACCESS_APPROVED_NOTICE, ROOM_ACCESS_DECLINED_NOTICE, ALEXA_LINKED_NOTICE, NEW_DEVICES_NOTICE, MFA_ENABLED_NOTICE, MFA_DISABLED_NOTICE] as const;
 
 const APNS_TOKEN = /^(?:[A-Fa-f0-9]{2}){32,256}$/;
 const EMAIL = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -80,7 +82,7 @@ async function sealedEntries(tx: Prisma.TransactionClient, input: {
   return entries;
 }
 
-async function requestDetails(tx: Prisma.TransactionClient, homeId: string, requestId: string): Promise<NoticeDetails & { requesterAccountId: string | null }> {
+async function requestDetails(tx: Prisma.TransactionClient, homeId: string, requestId: string): Promise<NoticeDetails> {
   const [request, homeLabel] = await Promise.all([
     tx.areaAccessRequest.findUnique({ where: { id: requestId }, select: {
       createdAt: true, requesterAccountId: true, requesterEmailNormalized: true,
@@ -91,7 +93,7 @@ async function requestDetails(tx: Prisma.TransactionClient, homeId: string, requ
   ]);
   const email = request?.requester?.email ?? request?.requesterEmailNormalized ?? undefined;
   return {
-    homeLabel, requesterAccountId: request?.requesterAccountId ?? null,
+    homeLabel,
     roomName: request ? displayName(request.area.originalName, request.area.overrideName) : undefined,
     requesterName: request?.requester?.displayName || email, requesterEmail: email, at: request?.createdAt.toISOString(),
   };
@@ -105,7 +107,7 @@ async function requestDetails(tx: Prisma.TransactionClient, homeId: string, requ
 export async function queueRoomAccessRequestNotices(tx: Prisma.TransactionClient, input: { homeId: string; requestId: string; now: Date }) {
   const deciders = await tx.homeMembership.findMany({ where: { homeId: input.homeId, role: { in: ['OWNER', 'PROPERTY_MANAGER'] }, status: 'ACTIVE',
     customerAccount: { is: { status: 'ACTIVE' } } }, select: { customerAccountId: true } });
-  const { requesterAccountId: _unused, ...details } = await requestDetails(tx, input.homeId, input.requestId);
+  const details = await requestDetails(tx, input.homeId, input.requestId);
   const expiresAt = new Date(input.now.getTime() + REQUEST_NOTICE_MS);
   const entries: Prisma.NativeDomainOutboxCreateManyInput[] = [];
   for (const decider of deciders) {
@@ -117,7 +119,7 @@ export async function queueRoomAccessRequestNotices(tx: Prisma.TransactionClient
 }
 
 async function queueDecisionNotice(tx: Prisma.TransactionClient, type: string, keyPrefix: string, input: { homeId: string; requestId: string; requesterAccountId: string; now: Date }) {
-  const { requesterAccountId: _unused, ...details } = await requestDetails(tx, input.homeId, input.requestId);
+  const details = await requestDetails(tx, input.homeId, input.requestId);
   const entries = await sealedEntries(tx, { accountId: input.requesterAccountId, homeId: input.homeId, aggregateId: input.requestId,
     type, keyBase: `${keyPrefix}:${input.requestId}:${input.requesterAccountId}`, expiresAt: new Date(input.now.getTime() + NOTICE_MS),
     details: { homeLabel: details.homeLabel, roomName: details.roomName, at: input.now.toISOString() } });
@@ -187,4 +189,12 @@ export async function completionDetails(db: Prisma.TransactionClient, homeId: st
   ]);
   return { homeLabel, audience, devices: devices.map(({ name, room }) => ({ name, room })),
     reference: reference ?? request?.customerReference ?? undefined, at: request?.completedAt?.toISOString() };
+}
+
+/** Two-step verification was turned on or off: a confirmation by email and banner, so a stranger doing it is noticed. */
+export async function queueMfaChangedNotice(tx: Prisma.TransactionClient, input: { accountId: string; enabled: boolean; now: Date }) {
+  const entries = await sealedEntries(tx, { accountId: input.accountId, homeId: null, aggregateId: input.accountId, type: input.enabled ? MFA_ENABLED_NOTICE : MFA_DISABLED_NOTICE,
+    keyBase: `mfa-${input.enabled ? 'on' : 'off'}:${input.accountId}:${input.now.getTime()}`, expiresAt: new Date(input.now.getTime() + NOTICE_MS), details: { at: input.now.toISOString() } });
+  if (entries.length) await tx.nativeDomainOutbox.createMany({ data: entries, skipDuplicates: true });
+  return { queued: entries.length };
 }

@@ -2,11 +2,13 @@ import { NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
 import { serializableTransaction } from '@/lib/serializableTransaction';
 import {
-  alexaOAuthApprovalPage, alexaOAuthConfig, alexaOAuthRequestProblem, authorizationCodeChallenge, alexaOAuthEntryPage, alexaOAuthErrorPage, alexaOAuthWaitingPage,
+  alexaOAuthApprovalPage, alexaOAuthCodePage, alexaOAuthConfig, alexaOAuthRequestProblem, authorizationCodeChallenge, alexaOAuthEntryPage, alexaOAuthErrorPage, alexaOAuthWaitingPage,
   isAlexaOAuthEnabled, lockAndValidateAlexaConnectIntent, parseAlexaOAuthForm,
   parseAlexaOAuthRequest,
 } from '@/lib/nativeAlexaOAuth';
-import { alexaSignInStatus, completeAlexaSignIn, startAlexaSignIn, type AlexaSignInFailure } from '@/lib/alexa/signInLinking';
+import { alexaSignInStatus, completeAlexaMfaSignIn, completeAlexaSignIn, startAlexaSignIn, type AlexaSignInFailure } from '@/lib/alexa/signInLinking';
+import { resendMfaChallenge } from '@/lib/accountMfa';
+import { Stage1AuthError } from '@/lib/stage1Auth';
 import { randomSecret, sha256 } from '@/lib/stage1Crypto';
 
 export const dynamic = 'force-dynamic';
@@ -39,7 +41,7 @@ const OAUTH_KEYS = ['client_id', 'redirect_uri', 'response_type', 'state', 'scop
 async function handleSignInFamily(raw: string, config: NonNullable<ReturnType<typeof alexaOAuthConfig>>): Promise<Response> {
   if (Buffer.byteLength(raw, 'utf8') > 8192) return alexaOAuthErrorPage(400);
   const values = new URLSearchParams(raw);
-  const allowed = new Set([...OAUTH_KEYS, 'action', 'email', 'password', 'connect_intent']);
+  const allowed = new Set([...OAUTH_KEYS, 'action', 'email', 'password', 'connect_intent', 'mfa_challenge', 'mfa_secret', 'mfa_code']);
   if ([...values.keys()].some((key) => !allowed.has(key)) || [...new Set(values.keys())].some((key) => values.getAll(key).length !== 1)) return alexaOAuthErrorPage(400);
   const oauthValues = new URLSearchParams();
   for (const key of OAUTH_KEYS) for (const value of values.getAll(key)) oauthValues.append(key, value);
@@ -54,7 +56,43 @@ async function handleSignInFamily(raw: string, config: NonNullable<ReturnType<ty
       const notice = SIGN_IN_NOTICES[started.reason];
       return alexaOAuthEntryPage(oauth, notice.text, notice.status);
     }
+    if ('mfa' in started) return alexaOAuthCodePage(oauth, started.mfa);
     return alexaOAuthWaitingPage(oauth, started.rawIntent, started.approvalNumber);
+  }
+
+  if (action === 'mfa' || action === 'mfa_resend') {
+    if (values.has('email') || values.has('password') || values.has('connect_intent')) return alexaOAuthErrorPage(400);
+    const challengeId = values.get('mfa_challenge') ?? '';
+    const clientSecret = values.get('mfa_secret') ?? '';
+    const again = 'Please sign in again.';
+    if (action === 'mfa_resend') {
+      try {
+        const sent = await resendMfaChallenge({ challengeId, clientSecret });
+        return alexaOAuthCodePage(oauth, { challengeId, clientSecret, maskedEmail: sent.maskedEmail }, 'We have sent you a new code.');
+      } catch (error) {
+        const message = error instanceof Stage1AuthError && error.status === 429 ? error.message : `That code has expired. ${again}`;
+        return error instanceof Stage1AuthError && error.status === 429 && error.code !== 'mfa_resend_limit'
+          ? alexaOAuthCodePage(oauth, { challengeId, clientSecret, maskedEmail: 'your email' }, message, 429)
+          : alexaOAuthEntryPage(oauth, message);
+      }
+    }
+    const outcome = await completeAlexaMfaSignIn({ challengeId, clientSecret, code: values.get('mfa_code'), request: oauth });
+    if (!outcome.ok) {
+      if (outcome.reason === 'INVALID_CODE') {
+        return alexaOAuthCodePage(oauth, { challengeId, clientSecret, maskedEmail: 'your email' },
+          `That code isn’t right. You have ${outcome.attemptsRemaining} ${outcome.attemptsRemaining === 1 ? 'try' : 'tries'} left.`);
+      }
+      const text = outcome.reason === 'NOT_TENANT' ? SIGN_IN_NOTICES.NOT_TENANT.text
+        : outcome.reason === 'UNAVAILABLE' ? SIGN_IN_NOTICES.UNAVAILABLE.text
+          : outcome.reason === 'EXPIRED' ? `That code has expired. ${again}` : `That code can’t be used. ${again}`;
+      return alexaOAuthEntryPage(oauth, text);
+    }
+    const rawCode = await completeAlexaSignIn(outcome.rawIntent, oauth, config.clientId);
+    if (!rawCode) return alexaOAuthEntryPage(oauth, `That request has expired. ${again}`);
+    const callback = new URL(oauth.redirectUri);
+    callback.searchParams.set('code', rawCode);
+    callback.searchParams.set('state', oauth.state);
+    return NextResponse.redirect(callback, { status: 303, headers: { 'Cache-Control': 'no-store, private', Pragma: 'no-cache', 'Referrer-Policy': 'no-referrer' } });
   }
 
   const rawIntent = values.get('connect_intent') ?? '';

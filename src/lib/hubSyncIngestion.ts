@@ -724,7 +724,7 @@ async function applyHubSyncEventInner(tx: Prisma.TransactionClient, input: SyncE
       }
       return;
     }
-    const execution = await tx.nativeAutomationExecution.create({ data: {
+    await tx.nativeAutomationExecution.create({ data: {
       automationId: automation.id, homeId, idempotencyKey, status,
       startedAt: strictDate(payload.startedAt, now), completedAt: strictDate(payload.completedAt, now), safeOutcome,
       purgeAt: new Date(now.getTime() + 90 * 24 * 60 * 60 * 1000),

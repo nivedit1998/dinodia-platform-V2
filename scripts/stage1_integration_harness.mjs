@@ -54,6 +54,9 @@ let prisma;
 let seededWork;
 let sesServer;
 let sesShouldFail = false;
+let mfaEmailCount = 0;
+let lastMfaCode = '';
+const mfaEmailBodies = [];
 let lwaExchangeCount = 0;
 let alexaEventDeliveries = [];
 let alexaDiscoveryDeliveries = [];
@@ -948,6 +951,8 @@ async function startFakeSes() {
         return;
       }
       if (!sesShouldFail) {
+        const mfaCodeLine = body.includes('Dinodia will never ask you for it') ? body.match(/(?:\\n|\n)(\d{6})(?:\\n|\n)/)?.[1] : null;
+        if (mfaCodeLine) { mfaEmailCount += 1; lastMfaCode = mfaCodeLine; mfaEmailBodies.push(body); }
         if (body.includes('New Dinodia Smart Living installation request')) {
           installationOperationsEmailCount += 1;
           installationEmailBodies.push(body);
@@ -4239,6 +4244,176 @@ async function installationRequestRouteChecks(deliveryEnv) {
   fixture.stage8RequestIds = [createdId];
   fixture.stage8InstalledDeviceId = installedDevice.id;
   console.log('[stage8:integration] PASS: actual owner request is Home/Area-bound and idempotent; changed replay, wrong Home/Area and tenant are denied without extra rows; current manager sees and idempotently cancels an unstarted request; after disposable owner transfer the former requester sees no request data while the new owner retains it; the existing two-minute task sends one privacy-bounded operations email; staff work is assigned/retried once, cancellation after start and premature completion fail closed; a real disposable device record enables one idempotent completion, bounded event and current-entitlement email/push receipts');
+}
+
+async function twoStepVerificationChecks(deliveryEnv) {
+  const fixture = customerFixture;
+  const clientId = 'two-step-loopback-client';
+  const redirectUri = 'https://alexa.example.invalid/oauth/callback';
+  const scope = 'alexa::skills:account_linking';
+  const env = { ...deliveryEnv, DINODIA_MFA_ENFORCED: 'true', DINODIA_NATIVE_ALEXA_ENABLED: 'true',
+    DINODIA_ALEXA_OAUTH_CLIENT_ID: clientId, DINODIA_ALEXA_OAUTH_CLIENT_SECRET: 'two-step-disposable-client-secret-for-loopback',
+    DINODIA_ALEXA_OAUTH_REDIRECT_URIS: redirectUri, DINODIA_ALEXA_OAUTH_SCOPE: scope };
+  await stopPlatform();
+  await startPlatform(env);
+  const base = `http://127.0.0.1:${appPort}`;
+  const json = { 'content-type': 'application/json' };
+  const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  // The shared fixture tenant is also a homeowner somewhere (so correctly required); these scenarios need a tenant who is only a tenant.
+  const tenantSuffix = crypto.randomUUID();
+  const tenant = { email: `two-step-tenant-${tenantSuffix}@invalid.test`, password: `harness-tenant-${tenantSuffix}`, deviceInstallationId: `two-step-phone-${tenantSuffix}`, ...(() => { const pair = keyPair(); return { publicKey: pair.publicKey }; })() };
+  const tenantAccount = await prisma.customerAccount.create({ data: { displayName: 'Two-step tenant', username: `two-step-${tenantSuffix.slice(0, 8)}`, usernameNormalized: `two-step-${tenantSuffix.slice(0, 8)}`,
+    email: tenant.email, emailNormalized: tenant.email, emailVerifiedAt: new Date(), passwordHash: hashPassword(tenant.password) } });
+  const tenantMembership = await prisma.homeMembership.create({ data: { customerAccountId: tenantAccount.id, homeId: fixture.homeOneId, role: 'TENANT' } });
+  await prisma.tenantAreaGrant.create({ data: { membershipId: tenantMembership.id, areaId: fixture.areaOneId, homeId: fixture.homeOneId } });
+  await prisma.policyAcceptance.create({ data: { customerAccountId: tenantAccount.id, policyKind: 'DINODIA_NATIVE', policyVersion: deliveryEnv.DINODIA_NATIVE_POLICY_VERSION } });
+  const account = (kind) => kind === 'owner'
+    ? { email: fixture.propertyEmail, password: fixture.propertyPassword, deviceInstallationId: fixture.propertyInstallationId, publicKey: fixture.propertyPublicKey }
+    : kind === 'manager'
+      ? { email: fixture.managerEmail, password: fixture.managerPassword, deviceInstallationId: fixture.managerInstallationId, publicKey: fixture.managerPublicKey }
+      : tenant;
+  const device = { deviceName: 'Two-step test phone', model: 'integration-test', osFamily: 'test', osVersion: 'test' };
+  const login = (kind, headers = {}) => fetchJson(`${base}/api/v2/mobile/session`, { method: 'POST', headers: { ...json, ...headers },
+    body: JSON.stringify({ ...account(kind), ...device }) });
+  const startTwoStep = (kind) => login(kind, { 'x-dinodia-mfa': '1' });
+  const verify = (kind, challenge, code, overrides = {}) => fetchJson(`${base}/api/v2/mobile/mfa/verify`, { method: 'POST', headers: json,
+    body: JSON.stringify({ challengeId: challenge.challengeId, clientSecret: challenge.clientSecret, code, deviceInstallationId: account(kind).deviceInstallationId, publicKey: account(kind).publicKey, ...device, ...overrides }) });
+  const wrongCodeFor = (code) => (code === '000000' ? '111111' : '000000');
+  const sessions = (email) => prisma.customerSession.count({ where: { customerAccount: { emailNormalized: email.toLowerCase() } } });
+  try {
+    // ---- Homeowner: required. An old app is refused (never let through); the new app is asked for a code ----
+    const ownerSessionsBefore = await sessions(fixture.propertyEmail);
+    const oldApp = await login('owner');
+    if (oldApp.response.status !== 403 || oldApp.body.error?.code !== 'MFA_APP_UPDATE_REQUIRED' || await sessions(fixture.propertyEmail) !== ownerSessionsBefore) {
+      fail(`An app that cannot ask for the code was let through for a homeowner, or no session rule held (${oldApp.response.status}/${oldApp.body.error?.code})`);
+    }
+    const mailBefore = mfaEmailCount;
+    const first = await startTwoStep('owner');
+    if (first.response.status !== 200 || first.body.mfaRequired !== true || !uuid.test(first.body.challengeId) || !/^[A-Za-z0-9_-]{32,}$/.test(first.body.clientSecret)
+      || !/^.\*+@/.test(first.body.maskedEmail) || first.body.codeLength !== 6 || first.body.accessToken || first.body.refreshToken
+      || mfaEmailCount !== mailBefore + 1 || !/^\d{6}$/.test(lastMfaCode) || await sessions(fixture.propertyEmail) !== ownerSessionsBefore) {
+      fail(`Homeowner password sign-in did not stop at the code step without issuing a session (${first.response.status}/${JSON.stringify(first.body).slice(0, 160)})`);
+    }
+    const firstCode = lastMfaCode;
+    const row = await prisma.authChallenge.findUniqueOrThrow({ where: { id: first.body.challengeId } });
+    if (row.purpose !== 'MFA_SIGN_IN' || JSON.stringify(row).includes(firstCode) || JSON.stringify(row).includes(first.body.clientSecret) || row.tokenHash === firstCode
+      || row.expiresAt.getTime() - Date.now() > 10 * 60_000 + 5_000 || row.expiresAt.getTime() - Date.now() < 9 * 60_000) fail('The code or the app secret was stored in readable form, or the code lifetime is wrong');
+
+    // wrong code, wrong secret, wrong phone: none of them finish a sign-in
+    const wrong = await verify('owner', first.body, wrongCodeFor(firstCode));
+    const wrongSecret = await verify('owner', { ...first.body, clientSecret: `${first.body.clientSecret.slice(0, -1)}${first.body.clientSecret.endsWith('A') ? 'B' : 'A'}` }, firstCode);
+    const otherPhone = await verify('owner', first.body, firstCode, { deviceInstallationId: `${account('owner').deviceInstallationId}-other` });
+    if (wrong.response.status !== 401 || wrong.body.error?.code !== 'MFA_CODE_INVALID' || !wrong.body.error.message.includes('4 tries')
+      || wrongSecret.response.status !== 400 || wrongSecret.body.error?.code !== 'MFA_CHALLENGE_INVALID'
+      || otherPhone.response.status !== 400 || otherPhone.body.error?.code !== 'MFA_CHALLENGE_INVALID' || await sessions(fixture.propertyEmail) !== ownerSessionsBefore) {
+      fail(`The code step accepted or mis-reported a wrong code, a wrong app secret or a different phone (${wrong.response.status}/${wrongSecret.response.status}/${otherPhone.response.status})`);
+    }
+    const good = await verify('owner', first.body, firstCode);
+    const replay = await verify('owner', first.body, firstCode);
+    if (good.response.status !== 200 || !/^dno-customer-access-/.test(good.body.accessToken ?? '') || await sessions(fixture.propertyEmail) !== ownerSessionsBefore + 1
+      || replay.response.status !== 400 || replay.body.error?.code !== 'MFA_CHALLENGE_INVALID') fail(`The right code did not sign in exactly once (${good.response.status}/${replay.response.status})`);
+    const ownerStatus = await fetchJson(`${base}/api/v2/me/mfa`, { headers: { authorization: `Bearer ${good.body.accessToken}` } });
+    if (ownerStatus.body.requirement !== 'REQUIRED' || ownerStatus.body.reason !== 'OWNER' || ownerStatus.body.canTurnOff !== false || ownerStatus.body.available !== true || ownerStatus.body.promptDue !== false) fail('A homeowner was not shown as required with no way to turn it off');
+    const ownerOff = await fetchJson(`${base}/api/v2/me/mfa`, { method: 'POST', headers: { ...json, authorization: `Bearer ${good.body.accessToken}` }, body: JSON.stringify({ action: 'disable_start', password: fixture.propertyPassword }) });
+    if (ownerOff.response.status !== 403) fail(`A homeowner could start turning two-step verification off (${ownerOff.response.status})`);
+
+    // five wrong codes lock it, even for the right code afterwards
+    const locked = await startTwoStep('owner');
+    const lockedCode = lastMfaCode;
+    let lastWrong;
+    for (let attempt = 0; attempt < 5; attempt += 1) lastWrong = await verify('owner', locked.body, wrongCodeFor(lockedCode));
+    const afterLock = await verify('owner', locked.body, lockedCode);
+    if (lastWrong.response.status !== 429 || lastWrong.body.error?.code !== 'MFA_LOCKED' || afterLock.response.status === 200) fail(`Five wrong codes did not lock the sign-in (${lastWrong.response.status}/${afterLock.response.status})`);
+
+    // resend: too soon is refused, then a new code replaces the old one
+    const again = await startTwoStep('owner');
+    const oldCode = lastMfaCode;
+    const resendUrl = `${base}/api/v2/auth/mfa/resend`;
+    const tooSoon = await fetchJson(resendUrl, { method: 'POST', headers: json, body: JSON.stringify({ challengeId: again.body.challengeId, clientSecret: again.body.clientSecret }) });
+    if (tooSoon.response.status !== 429 || !/wait/i.test(tooSoon.body.error?.message ?? '')) fail(`A new code could be requested straight away (${tooSoon.response.status})`);
+    await prisma.authChallenge.update({ where: { id: again.body.challengeId }, data: { deliveryAttemptedAt: new Date(Date.now() - 60_000) } });
+    const mailBeforeResend = mfaEmailCount;
+    const resent = await fetchJson(resendUrl, { method: 'POST', headers: json, body: JSON.stringify({ challengeId: again.body.challengeId, clientSecret: again.body.clientSecret }) });
+    const newCode = lastMfaCode;
+    const oldNow = await verify('owner', again.body, oldCode === newCode ? wrongCodeFor(newCode) : oldCode);
+    const newNow = await verify('owner', again.body, newCode);
+    if (resent.response.status !== 200 || mfaEmailCount !== mailBeforeResend + 1 || oldNow.response.status === 200 || newNow.response.status !== 200) fail(`Resending a code did not replace the old one (${resent.response.status}/${oldNow.response.status}/${newNow.response.status})`);
+
+    // ---- Property manager: required too. If the email cannot be sent, nobody is signed in ----
+    const managerBefore = await sessions(fixture.managerEmail);
+    const managerStart = await startTwoStep('manager');
+    if (managerStart.body.mfaRequired !== true || await sessions(fixture.managerEmail) !== managerBefore) fail('A property manager was not asked for a code');
+    sesShouldFail = true;
+    const offline = await startTwoStep('manager');
+    sesShouldFail = false;
+    if (offline.response.status !== 503 || offline.body.error?.code !== 'MFA_EMAIL_UNAVAILABLE' || await sessions(fixture.managerEmail) !== managerBefore) fail(`A failed code email did not fail closed (${offline.response.status}/${offline.body.error?.code})`);
+
+    // ---- Tenant: optional. Reminder, turning on (with a code), asked from then on, turning off (password + code) ----
+    const tenantFirst = await login('tenant');
+    if (tenantFirst.response.status !== 200 || !tenantFirst.body.accessToken) fail(`A tenant who has not turned two-step verification on was asked for a code or could not sign in (${tenantFirst.response.status}/${JSON.stringify(tenantFirst.body).slice(0, 200)})`);
+    const tenantAuth = { authorization: `Bearer ${tenantFirst.body.accessToken}`, ...json };
+    const post = (payload) => fetchJson(`${base}/api/v2/me/mfa`, { method: 'POST', headers: tenantAuth, body: JSON.stringify(payload) });
+    const tenantStatus = await fetchJson(`${base}/api/v2/me/mfa`, { headers: tenantAuth });
+    if (tenantStatus.body.requirement !== 'NONE' || tenantStatus.body.promptDue !== true || tenantStatus.body.canTurnOff !== false) fail('A tenant was not shown the reminder to turn two-step verification on');
+    const snoozed = await post({ action: 'snooze_prompt' });
+    const snoozedRow = await prisma.customerAccount.findUniqueOrThrow({ where: { id: tenantAccount.id }, select: { mfaPromptSnoozedUntil: true, mfaPromptDismissCount: true } });
+    if (snoozed.body.promptDue !== false || !snoozedRow.mfaPromptSnoozedUntil || snoozedRow.mfaPromptSnoozedUntil.getTime() < Date.now() + 6 * 86_400_000 || snoozedRow.mfaPromptDismissCount !== 1) fail('"Not now" did not put the reminder off for a week');
+    const enableStart = await post({ action: 'enable_start' });
+    const enableCode = lastMfaCode;
+    const enableWrong = await post({ action: 'enable_confirm', challengeId: enableStart.body.challengeId, clientSecret: enableStart.body.clientSecret, code: wrongCodeFor(enableCode) });
+    const enableDone = await post({ action: 'enable_confirm', challengeId: enableStart.body.challengeId, clientSecret: enableStart.body.clientSecret, code: enableCode });
+    const enabledNotice = await prisma.nativeDomainOutbox.count({ where: { eventType: 'MFA_ENABLED_NOTICE' } });
+    if (enableStart.response.status !== 200 || enableWrong.response.status !== 401 || enableDone.response.status !== 200 || enableDone.body.requirement !== 'ENABLED'
+      || enableDone.body.reason !== 'OPT_IN' || enableDone.body.canTurnOff !== true || enabledNotice < 1) fail(`A tenant could not turn two-step verification on with a code (${enableStart.response.status}/${enableWrong.response.status}/${enableDone.response.status})`);
+    const tenantNeedsCode = await startTwoStep('tenant');
+    const tenantOldApp = await login('tenant');
+    if (tenantNeedsCode.body.mfaRequired !== true || tenantOldApp.response.status !== 403) fail('A tenant with two-step verification on was not asked for a code on the next sign-in');
+    const tenantIn = await verify('tenant', tenantNeedsCode.body, lastMfaCode);
+    if (tenantIn.response.status !== 200 || !tenantIn.body.accessToken) fail('A tenant could not finish signing in with the emailed code');
+
+    // ---- Alexa: a tenant with it on gets the emailed code instead of the phone number step ----
+    const oauth = { client_id: clientId, redirect_uri: redirectUri, response_type: 'code', state: 'two-step-state', scope,
+      code_challenge: crypto.createHash('sha256').update('two-step-verifier-value-that-is-long-enough-to-be-valid', 'ascii').digest('base64url'), code_challenge_method: 'S256' };
+    const authorizeUrl = `${base}/api/v2/alexa/oauth/authorize`;
+    const postForm = (fields) => fetchJsonLoopback(authorizeUrl, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams(fields).toString() });
+    const alexaMailBefore = mfaEmailCount;
+    const alexaStart = await postForm({ ...oauth, action: 'signin', email: tenant.email, password: tenant.password });
+    const alexaHtml = await alexaStart.response.text();
+    const alexaChallenge = alexaHtml.match(/name="mfa_challenge" value="([0-9a-f-]{36})"/)?.[1];
+    const alexaSecret = alexaHtml.match(/name="mfa_secret" value="([A-Za-z0-9_-]{32,})"/)?.[1];
+    if (!alexaHtml.includes('Check your email') || !alexaChallenge || !alexaSecret || alexaHtml.includes('class="number"') || mfaEmailCount !== alexaMailBefore + 1) fail('Alexa sign-in for a tenant with two-step verification did not ask for the emailed code');
+    const alexaCode = lastMfaCode;
+    const alexaWrong = await postForm({ ...oauth, action: 'mfa', mfa_challenge: alexaChallenge, mfa_secret: alexaSecret, mfa_code: wrongCodeFor(alexaCode) });
+    const alexaWrongHtml = await alexaWrong.response.text();
+    const alexaOtherRequest = await postForm({ ...oauth, state: 'a-different-request', action: 'mfa', mfa_challenge: alexaChallenge, mfa_secret: alexaSecret, mfa_code: alexaCode });
+    const alexaOtherHtml = await alexaOtherRequest.response.text();
+    if (!alexaWrongHtml.includes('isn’t right') || alexaWrong.response.status !== 200 || alexaOtherRequest.response.headers.get('location') || !alexaOtherHtml.includes('Please sign in again')) fail('Alexa accepted a wrong code or a code from a different Alexa request');
+    const alexaDone = await postForm({ ...oauth, action: 'mfa', mfa_challenge: alexaChallenge, mfa_secret: alexaSecret, mfa_code: alexaCode });
+    const callback = new URL(alexaDone.response.headers.get('location') ?? 'https://invalid.example/');
+    if (alexaDone.response.status !== 303 || callback.origin + callback.pathname !== redirectUri || !callback.searchParams.get('code') || callback.searchParams.get('state') !== 'two-step-state') fail(`Alexa did not hand back an authorization code after the right emailed code (${alexaDone.response.status})`);
+    const alexaReplay = await postForm({ ...oauth, action: 'mfa', mfa_challenge: alexaChallenge, mfa_secret: alexaSecret, mfa_code: alexaCode });
+    if (alexaReplay.response.headers.get('location')) fail('An emailed Alexa code could be used twice');
+
+    // turning it off needs the password and a code; then Alexa goes back to the phone number step
+    const tenantAuth2 = { authorization: `Bearer ${tenantIn.body.accessToken}`, ...json };
+    const post2 = (payload) => fetchJson(`${base}/api/v2/me/mfa`, { method: 'POST', headers: tenantAuth2, body: JSON.stringify(payload) });
+    const wrongPassword = await post2({ action: 'disable_start', password: `${tenant.password}-wrong` });
+    const disableStart = await post2({ action: 'disable_start', password: tenant.password });
+    const disableCode = lastMfaCode;
+    const disableDone = await post2({ action: 'disable_confirm', challengeId: disableStart.body.challengeId, clientSecret: disableStart.body.clientSecret, code: disableCode });
+    const disabledNotice = await prisma.nativeDomainOutbox.count({ where: { eventType: 'MFA_DISABLED_NOTICE' } });
+    if (wrongPassword.response.status !== 401 || disableStart.response.status !== 200 || disableDone.response.status !== 200 || disableDone.body.requirement !== 'NONE' || disabledNotice < 1) fail(`A tenant could not turn two-step verification off with their password and a code (${wrongPassword.response.status}/${disableStart.response.status}/${disableDone.response.status})`);
+    const alexaPhone = await postForm({ ...oauth, action: 'signin', email: tenant.email, password: tenant.password });
+    if (!(await alexaPhone.response.text()).includes('Approve on your phone')) fail('Alexa did not go back to the phone number step once two-step verification was off');
+    if (mfaEmailBodies.some((body) => /\bundefined\b|\bnull\b/.test(body))) fail('A code email contained a stray placeholder');
+    console.log('[two-step:integration] PASS: homeowners and property managers are asked for an emailed code (an app that cannot ask is refused, a failed email signs nobody in); codes are hashed, single-use, bound to the phone and the app secret, lock after five wrong tries and can be resent; tenants opt in and out with a code, get a week\'s reminder snooze and confirmation notices; Alexa uses the emailed code when it is on and the phone number step when it is off');
+  } finally {
+    await prisma.customerAccount.updateMany({ where: { id: tenantAccount.id }, data: { mfaEnabledAt: null, mfaPromptSnoozedUntil: null, mfaPromptDismissCount: 0 } });
+    await prisma.customerAccount.delete({ where: { id: tenantAccount.id } }).catch(() => undefined);
+    sesShouldFail = false;
+    await stopPlatform();
+    await startPlatform(deliveryEnv);
+  }
 }
 
 async function nativeAlexaOAuthChecks(deliveryEnv) {
@@ -13343,8 +13518,13 @@ try {
   const newAccountOnly = process.env.NEW_ACCOUNT_ONBOARDING_ONLY === '1';
   if (!roomPlaquesOnly && !stage5SyncRecoveryOnly && !stage9RemovalEncryptionOnly && !stage6InvitationLockOnly && !stage6TenantInvitationDecisionOnly && !sharedAvatarsOnly && !mobileRefreshOnly && !newAccountOnly
     && process.env.STAGE10_SKIP_ALEXA !== '1'
+    && process.env.TWO_STEP_ONLY !== '1'
     && (stage12AlexaOnly || (process.env.STAGE6_TRANSFER_ONLY !== '1' && process.env.STAGE6_TENANT_REMOVAL_ONLY !== '1'))) {
     await nativeAlexaOAuthChecks(deliveryEnv);
+  }
+  if (process.env.TWO_STEP_ONLY === '1' || (!roomPlaquesOnly && !stage5SyncRecoveryOnly && !stage9RemovalEncryptionOnly && !stage6InvitationLockOnly && !stage6TenantInvitationDecisionOnly && !sharedAvatarsOnly && !mobileRefreshOnly && !newAccountOnly
+    && process.env.STAGE6_TRANSFER_ONLY !== '1' && process.env.STAGE6_TENANT_REMOVAL_ONLY !== '1' && !stage12AlexaOnly)) {
+    await twoStepVerificationChecks(deliveryEnv);
   }
   if (roomPlaquesOnly) {
     console.log('[room-plaques:integration] Focused mode completed real authentication and plaque HTTP/database acceptance. Other harness scenarios were not run in this mode.');
@@ -13363,6 +13543,8 @@ try {
     await hubSyncConfigurationRefreshChecks();
     await hubSyncStreamReconciliationChecks();
     await boundedSyncBatchAcceptanceCheck();
+  } else if (process.env.TWO_STEP_ONLY === '1') {
+    // Focused: the two-step verification scenarios above are the whole run.
   } else if (stage12AlexaOnly) {
     // Focused development mode still runs the real disposable auth fixture
     // and actual OAuth routes, while the normal maintained package command

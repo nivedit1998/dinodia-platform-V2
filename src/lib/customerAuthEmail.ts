@@ -1,4 +1,5 @@
 import { SESv2Client, SendEmailCommand } from '@aws-sdk/client-sesv2';
+import { mfaCodeEmail, type MfaCodePurpose } from './noticeContent';
 
 const CANONICAL_ORIGIN = 'https://dinodia-platform-v2.vercel.app';
 
@@ -167,6 +168,33 @@ export async function sendRoomAccessVerificationCode(input: { email: string; cod
         },
       } },
     }));
+    if (!result.MessageId) throw new CustomerAuthEmailError('provider_not_accepted');
+    return 'ACCEPTED';
+  } catch (error) {
+    if (error instanceof CustomerAuthEmailError) throw error;
+    throw new CustomerAuthEmailError('provider_send_failed');
+  } finally {
+    client.destroy();
+  }
+}
+
+/** The two-step verification code: one email, sent straight away, fails closed (the caller refuses the sign-in if this throws). */
+export async function sendMfaCodeEmail(input: { email: string; code: string; purpose: MfaCodePurpose }): Promise<'ACCEPTED'> {
+  const { client, source } = configuredSesClient();
+  if (!/^\S+@\S+\.\S+$/.test(source) || source.length > 320
+    || !/^\S+@\S+\.\S+$/.test(input.email) || input.email.length > 320 || !/^\d{6}$/.test(input.code)) {
+    throw new CustomerAuthEmailError('invalid_message');
+  }
+  const mail = mfaCodeEmail(input.purpose, input.code);
+  try {
+    const result = await client.send(new SendEmailCommand({
+      FromEmailAddress: source,
+      Destination: { ToAddresses: [input.email] },
+      Content: { Simple: {
+        Subject: { Data: mail.subject, Charset: 'UTF-8' },
+        Body: { Text: { Data: mail.text, Charset: 'UTF-8' }, Html: { Data: mail.html, Charset: 'UTF-8' } },
+      } },
+    }), { abortSignal: AbortSignal.timeout(10_000) });
     if (!result.MessageId) throw new CustomerAuthEmailError('provider_not_accepted');
     return 'ACCEPTED';
   } catch (error) {

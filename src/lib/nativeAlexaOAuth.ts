@@ -158,7 +158,18 @@ function page(content: string, status = 200, script?: string): Response {
 
 export function alexaOAuthEntryPage(request: AlexaOAuthRequest, notice?: string, status = 200): Response {
   const message = notice ? `<p class="notice" role="alert">${escapeAlexaHtml(notice)}</p>` : '';
-  return page(`<section><p>DINODIA SMART LIVING</p><h1>Connect Dinodia to Alexa</h1><p>Sign in with the email and password you use in the Dinodia Smart Living app. You will then approve this on your phone. Alexa will only see the devices in the rooms you have access to as a tenant.</p>${message}<form method="post" autocomplete="on">${hiddenFields(request)}<input type="hidden" name="action" value="signin"><label for="email">Email</label><input id="email" name="email" type="email" required maxlength="320" autocomplete="email" autocapitalize="none" spellcheck="false" inputmode="email"><label for="password">Password</label><input id="password" name="password" type="password" required maxlength="1024" autocomplete="current-password"><button type="submit">Continue</button></form><p class="muted">Dinodia will never ask for your password anywhere else, and Alexa never sees it.</p></section>`, status);
+  return page(`<section><p>DINODIA SMART LIVING</p><h1>Connect Dinodia to Alexa</h1><p>Sign in with the email and password you use in the Dinodia Smart Living app. If you use two-step verification we will email you a code to finish, otherwise you will approve this on your phone. Alexa will only see the devices in the rooms you have access to as a tenant.</p>${message}<form method="post" autocomplete="on">${hiddenFields(request)}<input type="hidden" name="action" value="signin"><label for="email">Email</label><input id="email" name="email" type="email" required maxlength="320" autocomplete="email" autocapitalize="none" spellcheck="false" inputmode="email"><label for="password">Password</label><input id="password" name="password" type="password" required maxlength="1024" autocomplete="current-password"><button type="submit">Continue</button></form><p class="muted">Dinodia will never ask for your password anywhere else, and Alexa never sees it.</p></section>`, status);
+}
+
+/** Two-step verification on the Alexa page: the emailed code. The challenge and its secret ride in the form, never the password. */
+export function alexaOAuthCodePage(request: AlexaOAuthRequest, mfa: { challengeId: string; clientSecret: string; maskedEmail: string }, notice?: string, status = 200): Response {
+  const message = notice ? `<p class="notice" role="alert">${escapeAlexaHtml(notice)}</p>` : '';
+  const carried = `${hiddenFields(request)}<input type="hidden" name="mfa_challenge" value="${escapeAlexaHtml(mfa.challengeId)}"><input type="hidden" name="mfa_secret" value="${escapeAlexaHtml(mfa.clientSecret)}">`;
+  return page(`<section><p>DINODIA SMART LIVING</p><h1>Check your email</h1><p>We sent a 6-digit code to ${escapeAlexaHtml(mfa.maskedEmail)}. Enter it below to finish connecting Alexa.</p>${message}`
+    + `<form method="post" autocomplete="off">${carried}<input type="hidden" name="action" value="mfa"><label for="code">Code</label><input id="code" name="mfa_code" type="text" required maxlength="6" minlength="6" pattern="[0-9]{6}" inputmode="numeric" autocomplete="one-time-code" autofocus>`
+    + `<button type="submit">Connect Alexa</button></form>`
+    + `<form method="post">${carried}<input type="hidden" name="action" value="mfa_resend"><button type="submit" style="background:transparent;color:#1f5eff">Send a new code</button></form>`
+    + `<p class="muted">The code works for 10 minutes. If you did not ask for it, close this page. No access has been granted.</p></section>`, status);
 }
 
 export function alexaOAuthWaitingPage(request: AlexaOAuthRequest, connectIntent: string, approvalNumber: number): Response {
