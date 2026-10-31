@@ -291,7 +291,7 @@ export async function redeemOwnershipTransfer(input: { principal: { id: string; 
     const revokedMembershipIds = revokedMemberships.map((row) => row.id);
     for (const revoked of revokedMemberships) {
       await queueHomeownerAccessRemovalNotices(tx, { homeId: claim.homeId, membershipId: revoked.id,
-        customerAccountId: revoked.customerAccountId, revision: revoked.accessRevision + 1, kind: 'OWNERSHIP_TRANSFER', now });
+        customerAccountId: revoked.customerAccountId, revision: revoked.accessRevision + 1, kind: 'OWNERSHIP_TRANSFER', role: revoked.role, now });
     }
     await tx.homeMembership.updateMany({ where: { id: { in: memberships.filter((row) => row.customerAccountId !== account.id).map((row) => row.id) } },
       data: { status: 'REMOVED', removedAt: now, removalReason: 'ownership_transferred', accessRevision: { increment: 1 } } });

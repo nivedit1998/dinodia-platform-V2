@@ -2,6 +2,7 @@ import crypto from 'node:crypto';
 import type { Prisma } from '@prisma/client';
 import { decryptPlatformEnvelope, encryptPlatformEnvelope } from './hubOperatorCredentials';
 import { PlatformDataEncryptionKeyError } from './platformDataEncryptionKey';
+import { homeLabelFor } from './roomAccessNotices';
 
 const APNS_TOKEN = /^(?:[A-Fa-f0-9]{2}){32,256}$/;
 const EXPIRY_MS = 30 * 24 * 60 * 60 * 1000;
@@ -15,6 +16,8 @@ const EXPIRY_MS = 30 * 24 * 60 * 60 * 1000;
 export async function queueHomeownerAccessRemovalNotices(tx: Prisma.TransactionClient, input: {
   homeId: string; membershipId: string; customerAccountId: string; revision: number;
   kind: 'TENANT' | 'PROPERTY_MANAGER' | 'OWNERSHIP_TRANSFER' | 'FULL_HOME_DEREGISTRATION'; now: Date;
+  /** The role the person held, so a transfer notice can speak to a homeowner or a manager. */
+  role?: 'OWNER' | 'PROPERTY_MANAGER' | 'TENANT';
   onPhase?: (phase: 'load_targets' | 'encrypt_email' | 'encrypt_push' | 'enqueue') => void;
 }) {
   input.onPhase?.('load_targets');
@@ -29,10 +32,11 @@ export async function queueHomeownerAccessRemovalNotices(tx: Prisma.TransactionC
     : input.kind === 'PROPERTY_MANAGER' ? 'PROPERTY_MANAGER_ACCESS_REMOVAL_NOTICE'
       : input.kind === 'OWNERSHIP_TRANSFER' ? 'OWNERSHIP_TRANSFER_NOTICE' : 'HOME_DEREGISTRATION_NOTICE';
   const noticeId = crypto.randomUUID();
+  const details = { homeLabel: await homeLabelFor(tx, input.homeId), removal: input.kind, role: input.role, at: input.now.toISOString() };
   const entries: Prisma.NativeDomainOutboxCreateManyInput[] = [];
   if (account?.status === 'ACTIVE' && account.emailVerifiedAt && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(account.email)) {
     input.onPhase?.('encrypt_email');
-    const sealed = encryptPlatformEnvelope(JSON.stringify({ version: 1, channel: 'EMAIL', recipient: account.email }));
+    const sealed = encryptPlatformEnvelope(JSON.stringify({ version: 1, channel: 'EMAIL', recipient: account.email, details }));
     entries.push({ homeId: input.homeId, aggregateType: 'HomeownerAccessRemovalNotice', aggregateId: input.membershipId,
       eventType: type, idempotencyKey: `homeowner-removal:${input.membershipId}:${input.revision}:email`,
       payload: { noticeId, sealed }, expiresAt });
@@ -44,7 +48,7 @@ export async function queueHomeownerAccessRemovalNotices(tx: Prisma.TransactionC
       const token = decryptPlatformEnvelope(device.apnsTokenCiphertext);
       if (!APNS_TOKEN.test(token)) continue;
       const sealed = encryptPlatformEnvelope(JSON.stringify({ version: 1, channel: 'PUSH', deviceToken: token,
-        environment: device.apnsEnvironment, trustedDeviceId: device.id }));
+        environment: device.apnsEnvironment, trustedDeviceId: device.id, details }));
       entries.push({ homeId: input.homeId, aggregateType: 'HomeownerAccessRemovalNotice', aggregateId: input.membershipId,
         eventType: type, idempotencyKey: `homeowner-removal:${input.membershipId}:${input.revision}:push:${device.id}`,
         payload: { noticeId, sealed }, expiresAt });

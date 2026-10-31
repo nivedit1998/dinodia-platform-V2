@@ -3,6 +3,7 @@ import type { Prisma } from '@prisma/client';
 import { prisma } from './prisma';
 import { sha256 } from './stage1Crypto';
 import { Stage1AuthError } from './stage1Auth';
+import { NEW_DEVICES_OWNER_FAMILY, optionalFamilyEnabled, queueNewDevicesTenantNotices } from './roomAccessNotices';
 
 const CATEGORIES = new Set(['LIGHTING', 'HEATING', 'SECURITY', 'OTHER']);
 const KEY = /^[A-Za-z0-9._:-]{16,160}$/;
@@ -202,7 +203,11 @@ export async function completeInstallationRequest(input: { requestId: string; em
       const current = recipientsByAccount.get(recipient.customerAccountId);
       if (!current || recipient.role === 'OWNER') recipientsByAccount.set(recipient.customerAccountId, recipient);
     }
-    const deduplicatedRecipients = [...recipientsByAccount.values()];
+    // The homeowner can switch this optional notice off; a manager who asked for the work always hears it is finished.
+    const deduplicatedRecipients: Array<(typeof entitledRecipients)[number]> = [];
+    for (const recipient of recipientsByAccount.values()) {
+      if (recipient.role !== 'OWNER' || await optionalFamilyEnabled(tx, recipient.id, NEW_DEVICES_OWNER_FAMILY)) deduplicatedRecipients.push(recipient);
+    }
     const currentDevices = deduplicatedRecipients.length ? await tx.trustedDevice.findMany({ where: {
       customerAccountId: { in: deduplicatedRecipients.map((recipient) => recipient.customerAccountId) },
       revokedAt: null, apnsTokenCiphertext: { not: null }, apnsTokenDigest: { not: null },
@@ -246,6 +251,8 @@ export async function completeInstallationRequest(input: { requestId: string; em
         skipDuplicates: true,
       });
     }
+    // Tenants hear about the new devices in the rooms they can use (never devices another tenant added themselves).
+    await queueNewDevicesTenantNotices(tx, { homeId: request.homeId, requestId: request.id, reference: request.customerReference, now });
     const response = { ok: true, requestId: request.id, reference: request.customerReference, status: 'COMPLETED', revision: input.expectedRevision + 1, deviceId: device.id };
     await tx.idempotencyRecord.create({ data: { namespace, keyHash, actorId: input.employeeId, homeId: request.homeId, hubInstallationId: request.workItem.hubInstallationId, requestHash, responseStatus: 200, responseBody: response as Prisma.InputJsonValue, responseDigest: sha256(JSON.stringify(response)), expiresAt: new Date(now.getTime() + 24 * 60 * 60 * 1000) } });
     await tx.auditEvent.create({ data: { homeId: request.homeId, actorType: 'EMPLOYEE', actorId: input.employeeId, category: 'INSTALLATION', action: 'permanent_installation_work_completed', targetType: 'PermanentDeviceInstallationRequest', targetId: request.id, metadata: { workItemId: request.workItem.id, deviceId: device.id, outcome: 'completed' }, purgeAt: new Date(now.getTime() + 365 * 24 * 60 * 60 * 1000) } });

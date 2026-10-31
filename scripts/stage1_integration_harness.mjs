@@ -403,11 +403,11 @@ function loadInstallationPushDispatcher(platformDataEncryptionKey = '') {
       getPlatformDataEncryptionKey: () => isolatedPlatformKey,
       PlatformDataEncryptionKeyError: IsolatedPlatformDataEncryptionKeyError,
     };
-    if (specifier === './roomAccessNotices') {
-      const roomNotices = { exports: {} };
-      new Function('require', 'module', 'exports', ts.transpileModule(fs.readFileSync(path.join(root, 'src/lib/roomAccessNotices.ts'), 'utf8'),
-        { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, esModuleInterop: true } }).outputText)(localRequire, roomNotices, roomNotices.exports);
-      return roomNotices.exports;
+    if (['./roomAccessNotices', './noticeContent'].includes(specifier)) {
+      const local = { exports: {} };
+      new Function('require', 'module', 'exports', ts.transpileModule(fs.readFileSync(path.join(root, `src/lib/${specifier.slice(2)}.ts`), 'utf8'),
+        { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, esModuleInterop: true } }).outputText)(localRequire, local, local.exports);
+      return local.exports;
     }
     if (specifier === './apnsDelivery') return {
       readApnsConfig: () => null,
@@ -952,7 +952,7 @@ async function startFakeSes() {
           installationOperationsEmailCount += 1;
           installationEmailBodies.push(body);
         }
-        if (body.includes('Dinodia Smart Living installation request complete')) {
+        if (body.includes('Dinodia Smart Living installation request complete') || body.includes('Dinodia has finished installing')) {
           installationCompletionEmailCount += 1;
           installationEmailBodies.push(body);
         }

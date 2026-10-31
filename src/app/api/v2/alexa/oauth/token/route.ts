@@ -10,6 +10,7 @@ import {
 import { sha256 } from '@/lib/stage1Crypto';
 import { lockAndValidateAlexaSignInIntent } from '@/lib/alexa/signInLinking';
 import { ensureAutoScopes } from '@/lib/alexa/syncAlexa';
+import { queueAlexaLinkedNotice } from '@/lib/roomAccessNotices';
 
 export const dynamic = 'force-dynamic';
 
@@ -95,6 +96,8 @@ async function exchangeAuthorizationCode(input: { code: string; clientId: string
         revision: 1,
         autoScope: signIn,
       }, select: { id: true, customerAccountId: true, status: true, revokedAt: true, autoScope: true } });
+      // A brand-new link: confirm it to the account holder by banner and email, with how to undo it.
+      await queueAlexaLinkedNotice(tx, { accountId: code.customerAccountId, linkId: link.id, now });
     }
     if (signIn) {
       // Sign-in links follow the tenant's real access: every granted room in every tenant Home, kept in step automatically.

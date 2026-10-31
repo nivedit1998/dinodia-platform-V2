@@ -161,7 +161,7 @@ export async function deregisterFullHome(input: {
       if (membership.role === 'OWNER' || membership.role === 'PROPERTY_MANAGER') {
         await queueHomeownerAccessRemovalNotices(tx, { homeId, membershipId: membership.id,
           customerAccountId: membership.customerAccountId, revision: membership.accessRevision + 1,
-          kind: 'FULL_HOME_DEREGISTRATION', now });
+          kind: 'FULL_HOME_DEREGISTRATION', role: membership.role, now });
       }
     }
 

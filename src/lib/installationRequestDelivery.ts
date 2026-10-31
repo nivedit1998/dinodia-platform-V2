@@ -2,14 +2,15 @@ import { SESv2Client, SendEmailCommand } from '@aws-sdk/client-sesv2';
 import { prisma } from './prisma';
 import { decryptPlatformEnvelope } from './hubOperatorCredentials';
 import { getPlatformDataEncryptionKey, PlatformDataEncryptionKeyError } from './platformDataEncryptionKey';
-import { readApnsConfig, sendHomeAccessChangedPush, sendInstallationCompletePush, sendRoomAccessApprovedPush, sendRoomAccessRequestPush, type ApnsConfig, type ApnsEnvironment, type ApnsResult } from './apnsDelivery';
-import { ROOM_ACCESS_NOTICE_CONTENT, ROOM_ACCESS_NOTICE_TYPES, isRoomAccessNoticeType, roomAccessEmail } from './roomAccessNotices';
+import { readApnsConfig, sendAccountNoticePush, sendInstallationCompletePush, type ApnsConfig, type ApnsEnvironment, type ApnsResult } from './apnsDelivery';
+import { ACCOUNT_NOTICE_TYPES, completionDetails } from './roomAccessNotices';
+import { composeNotice, noticeEmail, type NoticeDetails } from './noticeContent';
 
 const PORTAL_QUEUE = 'https://dinodia-platform-v2.vercel.app/installer/installation-requests';
 const EMAIL = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const OUTBOX_LIMIT = 20;
 const RECEIPT_LIMIT = 20;
-const ACCESS_NOTICE_EVENT_TYPES = ['TENANT_ACCESS_REMOVAL_NOTICE', 'PROPERTY_MANAGER_ACCESS_REMOVAL_NOTICE', 'OWNERSHIP_TRANSFER_NOTICE', 'HOME_DEREGISTRATION_NOTICE', ...ROOM_ACCESS_NOTICE_TYPES];
+const ACCESS_NOTICE_EVENT_TYPES = ['TENANT_ACCESS_REMOVAL_NOTICE', 'PROPERTY_MANAGER_ACCESS_REMOVAL_NOTICE', 'OWNERSHIP_TRANSFER_NOTICE', 'HOME_DEREGISTRATION_NOTICE', ...ACCOUNT_NOTICE_TYPES];
 /** Automation notices were switched off by the owner; anything still waiting from before is retired, never sent. */
 const RETIRED_AUTOMATION_NOTICE_TYPE = 'TENANT_AUTOMATION_MANAGEMENT_NOTICE';
 
@@ -77,7 +78,7 @@ type InstallationPushReceipt = {
 /** Rechecks the exact current homeowner/requester authority before each generic device push. */
 export async function dispatchInstallationPushReceipts(
   now = new Date(),
-  dependencies: { config?: ApnsConfig | null; send?: (input: { config: ApnsConfig; environment: ApnsEnvironment; deviceToken: string; requestId: string; expiresAt: Date }) => Promise<ApnsResult> } = {},
+  dependencies: { config?: ApnsConfig | null; send?: (input: { config: ApnsConfig; environment: ApnsEnvironment; deviceToken: string; requestId: string; expiresAt: Date; alert?: { title: string; body: string } }) => Promise<ApnsResult> } = {},
 ) {
   const counts = { accepted: 0, deferred: 0, failed: 0, suppressed: 0, expired: 0 };
   const receipts = await prisma.nativeNotificationDeliveryReceipt.findMany({
@@ -142,7 +143,9 @@ export async function dispatchInstallationPushReceipts(
     }
     let result: ApnsResult;
     try {
-      result = await send({ config, environment: device.apnsEnvironment, deviceToken, requestId: request.id, expiresAt: receipt.expiresAt });
+      const announcement = composeNotice('NEW_DEVICES_NOTICE', await completionDetails(prisma as never, receipt.homeId, request.id, 'OWNER'));
+      result = await send({ config, environment: device.apnsEnvironment, deviceToken, requestId: request.id, expiresAt: receipt.expiresAt,
+        ...(announcement ? { alert: { title: announcement.pushTitle, body: announcement.pushBody } } : {}) });
     } catch { result = { outcome: 'RETRY' }; }
     const attempt = receipt.attemptCount + 1;
     if (result.outcome === 'INVALID_TOKEN') {
@@ -236,7 +239,9 @@ export async function dispatchHomeownerAccessRemovalNotices(now = new Date(), de
       && /^(?:[A-Fa-f0-9]{2}){32,256}$/.test(decoded.deviceToken)
       && (decoded.environment === 'DEVELOPMENT' || decoded.environment === 'PRODUCTION')
       && typeof decoded.trustedDeviceId === 'string' && /^[0-9a-f-]{36}$/i.test(decoded.trustedDeviceId);
-    if (!isEmail && !isPush) {
+    // Wording is assembled here, from the details sealed with the notice; a notice with nothing to say is retired unsent.
+    const content = composeNotice(row.eventType, (decoded.details && typeof decoded.details === 'object' ? decoded.details : {}) as NoticeDetails);
+    if ((!isEmail && !isPush) || !content) {
       await prisma.nativeDomainOutbox.updateMany({ where: { id: row.id, state: 'PENDING', attempts: row.attempts }, data: { state: 'FAILED' } });
       counts.suppressed += 1;
       continue;
@@ -258,23 +263,15 @@ export async function dispatchHomeownerAccessRemovalNotices(now = new Date(), de
     let invalidToken = false;
     try {
       if (isEmail) {
-        const room = isRoomAccessNoticeType(row.eventType) ? roomAccessEmail(row.eventType) : null;
+        const mail = noticeEmail(content);
         accepted = dependencies.sendEmail
           ? await dependencies.sendEmail({ recipient: decoded.recipient as string, noticeId })
-          : Boolean(configured && await (room
-            ? sendTextEmail(configured.client, configured.source, decoded.recipient as string, room.subject, room.text, room.html)
-            : sendTextEmail(configured.client, configured.source, decoded.recipient as string,
-              'Dinodia Smart Living access changed',
-              'Access to one of your Dinodia Smart Living homes has changed. Sign in to review your active homes. This message contains no property or device details.')));
+          : Boolean(configured && await sendTextEmail(configured.client, configured.source, decoded.recipient as string, mail.subject, mail.text, mail.html));
       } else {
         const result = dependencies.sendPush
           ? await dependencies.sendPush({ environment: decoded.environment as ApnsEnvironment, deviceToken: decoded.deviceToken as string, noticeId, expiresAt: row.expiresAt })
-          : isRoomAccessNoticeType(row.eventType)
-            ? await (row.eventType === 'ROOM_ACCESS_REQUEST_NOTICE' ? sendRoomAccessRequestPush : sendRoomAccessApprovedPush)({
-              config: apns!, environment: decoded.environment as ApnsEnvironment, deviceToken: decoded.deviceToken as string,
-              requestId: noticeId, expiresAt: row.expiresAt }, { title: ROOM_ACCESS_NOTICE_CONTENT[row.eventType].pushTitle, body: ROOM_ACCESS_NOTICE_CONTENT[row.eventType].pushBody })
-            : await sendHomeAccessChangedPush({ config: apns!, environment: decoded.environment as ApnsEnvironment,
-              deviceToken: decoded.deviceToken as string, requestId: noticeId, expiresAt: row.expiresAt });
+          : await sendAccountNoticePush({ config: apns!, environment: decoded.environment as ApnsEnvironment, deviceToken: decoded.deviceToken as string,
+            requestId: noticeId, expiresAt: row.expiresAt }, { title: content.pushTitle, body: content.pushBody }, content.kind);
         accepted = result.outcome === 'ACCEPTED';
         invalidToken = result.outcome === 'INVALID_TOKEN';
       }
@@ -404,9 +401,13 @@ export async function dispatchInstallationRequestNotifications(now = new Date())
     }
     const claimed = await prisma.nativeNotificationDeliveryReceipt.updateMany({ where: { id: receipt.id, status: 'PENDING', attemptCount: receipt.attemptCount }, data: { attemptCount: { increment: 1 } } });
     if (claimed.count !== 1) continue;
-    const accepted = await sendTextEmail(configured.client, configured.source, current.customerAccount.email,
-      'Dinodia Smart Living installation request complete',
-      `The permanent-device installation request for your Home is complete.\nReference: ${request.customerReference}\n\nOpen the Dinodia Smart Living app or sign in to the canonical account portal to view your Home. This message contains no device, tenant or commissioning details. Provider acceptance does not confirm inbox delivery.`);
+    const announcement = composeNotice('NEW_DEVICES_NOTICE', await completionDetails(prisma as never, receipt.homeId, match[1], 'OWNER', request.customerReference));
+    const mail = announcement ? noticeEmail(announcement) : null;
+    const accepted = mail
+      ? await sendTextEmail(configured.client, configured.source, current.customerAccount.email, mail.subject, mail.text, mail.html)
+      : await sendTextEmail(configured.client, configured.source, current.customerAccount.email,
+        'Dinodia Smart Living installation request complete',
+        `The permanent-device installation request for your Home is complete.\nReference: ${request.customerReference}\n\nOpen the Dinodia Smart Living app to view your Home.`);
     await prisma.nativeNotificationDeliveryReceipt.updateMany({ where: { id: receipt.id, status: 'PENDING', attemptCount: receipt.attemptCount + 1 }, data: accepted
       ? { status: 'SENT', lastErrorCode: null }
       : { status: receipt.attemptCount + 1 >= 8 ? 'FAILED' : 'PENDING', deliverAfter: nextAttempt(now, receipt.attemptCount + 1), lastErrorCode: 'PROVIDER_NOT_ACCEPTED' } });

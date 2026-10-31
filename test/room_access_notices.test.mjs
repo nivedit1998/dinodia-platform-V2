@@ -16,16 +16,21 @@ const notices = load('src/lib/roomAccessNotices.ts', {
   './hubOperatorCredentials': { encryptPlatformEnvelope: (value) => { sealedCalls.push(value); return { sealed: true }; }, decryptPlatformEnvelope: () => 'ab'.repeat(32) },
   './platformDataEncryptionKey': { PlatformDataEncryptionKeyError: class extends Error {} },
 });
-const { queueRoomAccessRequestNotices, queueRoomAccessApprovedNotice, roomAccessEmail, ROOM_ACCESS_NOTICE_CONTENT, ROOM_ACCESS_NOTICE_TYPES } = notices;
+const { queueRoomAccessRequestNotices, queueRoomAccessApprovedNotice, queueRoomAccessDeclinedNotice, queueAlexaLinkedNotice, queueNewDevicesTenantNotices } = notices;
 const now = new Date('2026-10-31T12:00:00Z');
 
-function fakeTx({ deciders = [], accounts = {}, devices = {} }) {
+function fakeTx({ deciders = [], accounts = {}, devices = {}, prefs = {}, installed = [] }) {
   const created = [];
   return { created,
     homeMembership: { findMany: async (args) => { created.push(['deciders', args.where]); return deciders; } },
     customerAccount: { findUnique: async ({ where }) => accounts[where.id] ?? null },
     trustedDevice: { findMany: async ({ where }) => devices[where.customerAccountId] ?? [] },
-    nativeDomainOutbox: { createMany: async (args) => { created.push(['createMany', args]); } } };
+    nativeDomainOutbox: { createMany: async (args) => { created.push(['createMany', args]); } },
+    home: { findUnique: async () => ({ addressLine1: '12 High Street', city: 'London' }) },
+    areaAccessRequest: { findUnique: async () => ({ createdAt: now, requesterAccountId: 'tenant', requesterEmailNormalized: 'priya@example.com',
+      area: { originalName: 'Living Room', overrideName: null }, requester: { displayName: 'Priya Shah', email: 'priya@example.com' } }) },
+    memberPreferenceDocument: { findUnique: async ({ where }) => prefs[where.membershipId_kind.membershipId] ?? null },
+    nativeDevice: { findMany: async () => installed } };
 }
 const goodAccount = (email) => ({ email, emailVerifiedAt: now, status: 'ACTIVE' });
 
@@ -55,13 +60,46 @@ test('an approval notifies only the requester, and unverified or inactive accoun
   assert.equal((await queueRoomAccessApprovedNotice(none, { homeId: 'home', requestId: 'req', requesterAccountId: 's', now })).queued, 0);
 });
 
-test('banner and email wording is short, friendly, names nobody, and the email links into the app', () => {
-  for (const type of ROOM_ACCESS_NOTICE_TYPES) {
-    const content = ROOM_ACCESS_NOTICE_CONTENT[type];
-    assert.ok(content.pushTitle.length <= 30 && content.pushBody.length <= 90, `${type} banner fits a lock screen`);
-    const email = roomAccessEmail(type);
-    assert.ok(email.text.includes('https://dinodia-platform-v2.vercel.app/app') && email.html.includes('href="https://dinodia-platform-v2.vercel.app/app"'));
-    assert.ok(email.html.startsWith('<!doctype html>') && email.html.includes(content.button));
-    assert.ok(!/postcode|@|password|code/i.test(email.text.replace('https://dinodia-platform-v2.vercel.app/app', '')), `${type} email carries no personal data or credentials`);
-  }
+test('the sealed envelope carries the details, and the outbox row itself shows none of them', async () => {
+  const tx = fakeTx({ deciders: [{ customerAccountId: 'owner' }], accounts: { owner: goodAccount('owner@example.com') } });
+  sealedCalls.length = 0;
+  await queueRoomAccessRequestNotices(tx, { homeId: 'home', requestId: 'req', now });
+  const sealed = JSON.parse(sealedCalls[0]);
+  assert.deepEqual(sealed.details, { homeLabel: '12 High Street, London', roomName: 'Living Room', requesterName: 'Priya Shah', requesterEmail: 'priya@example.com', at: now.toISOString() });
+  const row = tx.created.find(([n]) => n === 'createMany')[1].data[0];
+  assert.ok(!JSON.stringify(row).includes('Priya') && !JSON.stringify(row).includes('Living Room'));
+});
+
+test('a declined request tells the requester; Alexa linking tells the account holder', async () => {
+  const tx = fakeTx({ accounts: { tenant: goodAccount('tenant@example.com') }, devices: { tenant: [{ id: 'd1', apnsTokenCiphertext: '{}', apnsEnvironment: 'DEVELOPMENT' }] } });
+  assert.equal((await queueRoomAccessDeclinedNotice(tx, { homeId: 'home', requestId: 'req', requesterAccountId: 'tenant', now })).queued, 2);
+  assert.ok(tx.created.find(([n]) => n === 'createMany')[1].data.every((row) => row.eventType === 'ROOM_ACCESS_DECLINED_NOTICE'));
+  const alexa = fakeTx({ accounts: { tenant: goodAccount('tenant@example.com') } });
+  assert.equal((await queueAlexaLinkedNotice(alexa, { accountId: 'tenant', linkId: 'link-1', now })).queued, 1);
+  const row = alexa.created.find(([n]) => n === 'createMany')[1].data[0];
+  assert.equal(row.idempotencyKey, 'alexa-linked:link-1:email');
+  assert.equal(row.homeId, null);
+});
+
+test('new devices: a tenant hears only about Dinodia devices in a room they can use, and only if the optional notice is on', async () => {
+  const installed = [
+    { customerLabel: 'Ceiling light', originalName: 'x', overrideName: null, assignments: [{ areaId: 'kitchen', area: { originalName: 'Kitchen', overrideName: null } }] },
+    { customerLabel: null, originalName: 'Heater', overrideName: 'Bathroom heater', assignments: [{ areaId: 'bath', area: { originalName: 'Bathroom', overrideName: null } }] },
+  ];
+  const tenants = [
+    { id: 'm-kitchen', customerAccountId: 'a-kitchen', tenantAreaGrants: [{ areaId: 'kitchen' }] },
+    { id: 'm-none', customerAccountId: 'a-none', tenantAreaGrants: [{ areaId: 'garden' }] },
+    { id: 'm-off', customerAccountId: 'a-off', tenantAreaGrants: [{ areaId: 'kitchen' }] },
+  ];
+  const tx = fakeTx({ accounts: { 'a-kitchen': goodAccount('k@example.com'), 'a-none': goodAccount('n@example.com'), 'a-off': goodAccount('o@example.com') },
+    prefs: { 'm-off': { document: { version: 1, enabledFamilies: ['access_request_decisions'] } } }, installed });
+  tx.homeMembership.findMany = async () => tenants;
+  sealedCalls.length = 0;
+  const result = await queueNewDevicesTenantNotices(tx, { homeId: 'home', requestId: 'req', reference: 'DIN-1', now });
+  assert.equal(result.queued, 1);
+  const sealed = JSON.parse(sealedCalls[0]);
+  assert.deepEqual(sealed.details.devices, [{ name: 'Ceiling light', room: 'Kitchen' }]);
+  assert.equal(sealed.details.audience, 'TENANT');
+  const rows = tx.created.find(([n]) => n === 'createMany')[1].data;
+  assert.deepEqual(rows.map((row) => row.idempotencyKey), ['new-devices:req:a-kitchen:email']);
 });

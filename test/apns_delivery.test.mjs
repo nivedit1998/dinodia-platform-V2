@@ -41,7 +41,7 @@ test('APNs configuration fails closed unless a valid P-256 key and team/key IDs 
   assert.equal(readApnsConfig({ APNS_TEAM_ID: 'ABCDEFGHIJ', APNS_KEY_ID: 'KLMNOPQRST', APNS_AUTH_KEY_P8: pem })?.teamId, 'ABCDEFGHIJ');
 });
 
-test('completion push uses only the generic V2 alert, environment-specific host and bounded idempotency headers', async () => {
+test('completion push sends the supplied banner (or a friendly default) tagged for the app, to the environment-specific host with bounded idempotency headers', async () => {
   const pair = testKey();
   const requestId = '1b5701f4-e4ef-4a11-a62a-8a912ad10f19';
   const token = 'ab'.repeat(32);
@@ -58,7 +58,7 @@ test('completion push uses only the generic V2 alert, environment-specific host 
   assert.equal(captured.headers['apns-push-type'], 'alert');
   assert.equal(captured.headers['apns-collapse-id'], requestId);
   assert.equal(captured.headers['apns-expiration'], String(Math.floor(expiresAt.getTime() / 1000)));
-  assert.deepEqual(JSON.parse(captured.body), { aps: { alert: { title: 'Installation update', body: 'A permanent-device installation request is complete.' }, sound: 'default' } });
+  assert.deepEqual(JSON.parse(captured.body), { aps: { alert: { title: 'New devices installed', body: 'Dinodia has finished installing your devices. Tap to see what’s new.' }, sound: 'default' }, dinodiaNotice: 'NEW_DEVICES' });
   assert.equal(captured.body.includes(token), false);
   assert.equal(captured.body.includes(requestId), false);
   assert.match(captured.headers.authorization, /^bearer [A-Za-z0-9_.-]+$/);

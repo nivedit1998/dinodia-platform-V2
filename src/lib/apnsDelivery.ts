@@ -72,11 +72,12 @@ async function postHttp2(input: ApnsRequest): Promise<ApnsResponse> {
   });
 }
 
-/** Sends only a generic, non-household-specific completion alert. The token is never logged or returned. */
+/** The "new devices installed" banner for the homeowner. The token is never logged or returned. */
 export async function sendInstallationCompletePush(input: {
   config: ApnsConfig; environment: ApnsEnvironment; deviceToken: string; requestId: string; expiresAt: Date;
+  alert?: { title: string; body: string };
 }, poster: ApnsPoster = postHttp2): Promise<ApnsResult> {
-  return sendBoundedApnsAlert(input, { title: 'Installation update', body: 'A permanent-device installation request is complete.' }, poster);
+  return sendBoundedApnsAlert(input, input.alert ?? { title: 'New devices installed', body: 'Dinodia has finished installing your devices. Tap to see what’s new.' }, poster, { dinodiaNotice: 'NEW_DEVICES' });
 }
 
 /** Generic, content-minimal security alert; no home name, address or target identity is sent. */
@@ -90,21 +91,14 @@ export async function sendHomeAccessChangedPush(input: {
 export async function sendAlexaLinkApprovalPush(input: {
   config: ApnsConfig; environment: ApnsEnvironment; deviceToken: string; requestId: string; expiresAt: Date;
 }, poster: ApnsPoster = postHttp2): Promise<ApnsResult> {
-  return sendBoundedApnsAlert(input, { title: 'Approve Alexa sign-in?', body: 'Someone is linking Alexa to your Dinodia account. Open the app to approve or decline.' }, poster);
+  return sendBoundedApnsAlert(input, { title: 'Approve Alexa sign-in?', body: 'Open Dinodia and choose the number shown on your Alexa sign-in screen. If this isn’t you, tap Decline.' }, poster);
 }
 
-/** Banner for the people who can decide a new room request. Names no person, room or address. */
-export async function sendRoomAccessRequestPush(input: {
+/** A banner about access, Alexa or new devices. `kind` lets the app refresh the right screen when it arrives or is tapped. */
+export async function sendAccountNoticePush(input: {
   config: ApnsConfig; environment: ApnsEnvironment; deviceToken: string; requestId: string; expiresAt: Date;
-}, alert: { title: string; body: string }, poster: ApnsPoster = postHttp2): Promise<ApnsResult> {
-  return sendBoundedApnsAlert(input, alert, poster, { dinodiaNotice: 'ROOM_ACCESS_REQUEST' });
-}
-
-/** Banner telling a requester their room access was approved. */
-export async function sendRoomAccessApprovedPush(input: {
-  config: ApnsConfig; environment: ApnsEnvironment; deviceToken: string; requestId: string; expiresAt: Date;
-}, alert: { title: string; body: string }, poster: ApnsPoster = postHttp2): Promise<ApnsResult> {
-  return sendBoundedApnsAlert(input, alert, poster, { dinodiaNotice: 'ROOM_ACCESS_APPROVED' });
+}, alert: { title: string; body: string }, kind: string, poster: ApnsPoster = postHttp2): Promise<ApnsResult> {
+  return sendBoundedApnsAlert(input, alert, poster, { dinodiaNotice: kind });
 }
 
 async function sendBoundedApnsAlert(input: {

@@ -9,7 +9,7 @@ import { enforcePersistentRateLimit } from './rateLimit';
 import { sendRoomAccessVerificationCode } from './customerAuthEmail';
 import { sendCustomerInvitationEmail } from './customerInvitationEmail';
 import { hashPassword } from './passwords';
-import { queueRoomAccessApprovedNotice, queueRoomAccessRequestNotices } from './roomAccessNotices';
+import { queueRoomAccessApprovedNotice, queueRoomAccessDeclinedNotice, queueRoomAccessRequestNotices } from './roomAccessNotices';
 import { dispatchHomeownerAccessRemovalNotices } from './installationRequestDelivery';
 import { consumeStepUpInTransaction } from './sensitiveOperationStepUp';
 
@@ -499,6 +499,11 @@ export async function decideHomeRoomAccessRequest(input: { requestId: string; ho
     // An existing account was granted the room right now: tell them by email and push (a new account already receives its invitation email).
     if (input.decision === 'APPROVE' && membershipId && requesterAccountId) {
       await queueRoomAccessApprovedNotice(tx, { homeId: input.homeId, requestId: request.id, requesterAccountId, now });
+      approvedNoticeQueued = true;
+    }
+    // A declined request from a known account: they hear so too, rather than waiting.
+    if (input.decision === 'REJECT' && request.requesterAccountId) {
+      await queueRoomAccessDeclinedNotice(tx, { homeId: input.homeId, requestId: request.id, requesterAccountId: request.requesterAccountId, now });
       approvedNoticeQueued = true;
     }
     await tx.auditEvent.create({ data: { homeId: input.homeId, actorType: 'CUSTOMER', actorId: input.customer.id, category: 'ACCESS', action: input.decision === 'APPROVE' ? 'room_access_approved' : 'room_access_rejected', targetType: 'AreaAccessRequest', targetId: request.id, metadata: { areaId: request.areaId, requesterAccountId: request.requesterAccountId }, occurredAt: now, purgeAt: new Date(now.getTime() + 365 * 24 * 60 * 60 * 1000) } });
