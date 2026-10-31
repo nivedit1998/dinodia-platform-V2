@@ -6207,11 +6207,10 @@ async function tenantMembershipRemovalChecks() {
     || Number(hub.store.getSyncOutbox()?.configurationAppliedRevision || 0) < Number(staleOwnerAck.body.cloudRevision)
     || hub.store.getDevice(ownerRemovalDevice.osDeviceId)
     || hub.store.getPlatform()?.cloudConfiguration?.memberships?.some((item) => item.id === ownerRemovalMembership.id)
-    // Final homeowner removal deletes the disposable account and revokes its
-    // access-token session, so this exact route correctly returns 401. The
-    // non-final membership-removal case above separately asserts 404 after
-    // the surviving account loses that Home relationship.
-    || ownerCloudAccessDenied.response.status !== 401 || !ownerPolicyAuditIsBound
+    // Final homeowner removal keeps the tenant's account (they land on the
+    // no-homes page) but their access to the removed Home is gone, so this
+    // exact route is refused with 403.
+    || ownerCloudAccessDenied.response.status !== 403 || !ownerPolicyAuditIsBound
     || ownerHubAfterSync?.cleanupState !== 'ACKNOWLEDGED') {
     fail(`Actual homeowner removal did not complete only after durable local device/policy application and signed acknowledgement (${JSON.stringify({ membership: ownerMembershipAfterSync,
       device: ownerDeviceAfterSync, acknowledged: ownerHubAfterSync?.acknowledgedCloudRevision, desired: ownerHubAfterSync?.cloudConfigurationRevision,
@@ -7072,7 +7071,7 @@ async function homeownerRemovalEncryptionConfigurationChecks(deliveryEnv) {
   // Reuse the exact settled operation identity and proof after restoring the
   // supported key representation. This proves failure did not consume proof
   // or create a conflicting receipt; it also exercises orphan cleanup.
-  // The removed tenant's Alexa link is deleted with the orphaned account, so the final DeleteReport must be parked first.
+  // The removed tenant keeps their account (and so their Alexa link) after losing their last Home.
   const removalAlexaEndpoint = `dos_stage9removal${crypto.randomBytes(8).toString('hex')}`;
   const removalAlexaLink = await prisma.alexaNativeLink.create({ data: { customerAccountId: tenant.id, providerSubjectHash: sha256(`stage9-removal-${tenant.id}`),
     status: 'ACTIVE', autoScope: true, refreshTokenCiphertext: '{"stage9":"opaque"}', encryptionKeyVersion: 1, announcedEndpointIds: [removalAlexaEndpoint] }, select: { id: true } });
@@ -7083,12 +7082,12 @@ async function homeownerRemovalEncryptionConfigurationChecks(deliveryEnv) {
   });
   const committedReplay = await fetchJson(removalPath, { method: 'DELETE', headers: ownerHeaders, body: JSON.stringify(requestBody) });
   const removedAccount = await prisma.customerAccount.findUnique({ where: { id: tenant.id }, select: { id: true } });
-  const parkedAlexaRemoval = await prisma.nativeDomainOutbox.findUnique({ where: { idempotencyKey: `alexa-account-removal:${removalAlexaLink.id}` }, select: { state: true, payload: true } });
-  if (committedRemoval.response.status !== 200 || removedAccount || await prisma.alexaNativeLink.count({ where: { id: removalAlexaLink.id } }) !== 0
-    || parkedAlexaRemoval?.state !== 'PENDING' || !parkedAlexaRemoval.payload?.endpointIds?.includes(removalAlexaEndpoint)) {
-    fail(`Tenant removal that deleted the account did not park the final Alexa DeleteReport (${committedRemoval.response.status}; ${parkedAlexaRemoval?.state ?? 'no row'})`);
+  // The account is kept (no homes left is a normal state), so its Alexa link stays and the sweep reports the removal.
+  if (committedRemoval.response.status !== 200 || !removedAccount || await prisma.alexaNativeLink.count({ where: { id: removalAlexaLink.id } }) !== 1
+    || await prisma.nativeDomainOutbox.count({ where: { idempotencyKey: `alexa-account-removal:${removalAlexaLink.id}` } }) !== 0) {
+    fail(`Owner removal of a tenant's last Home must keep their account and Alexa link (${committedRemoval.response.status}; account=${Boolean(removedAccount)})`);
   }
-  await prisma.nativeDomainOutbox.deleteMany({ where: { idempotencyKey: `alexa-account-removal:${removalAlexaLink.id}` } });
+  await prisma.alexaNativeLink.delete({ where: { id: removalAlexaLink.id } });
   const removedMembership = await prisma.homeMembership.findUnique({ where: { id: membership.id }, select: { status: true } });
   const removedDevice = await prisma.nativeDevice.findUnique({ where: { id: tenantDevice.id }, select: { id: true } });
   const notice = await prisma.nativeDomainOutbox.findUnique({ where: { idempotencyKey: emailNoticeKey }, select: { state: true, payload: true } });
@@ -7122,7 +7121,7 @@ async function homeownerRemovalEncryptionConfigurationChecks(deliveryEnv) {
     || committedReceipt.response.status !== 200 || committedReceipt.body?.status !== 'COMMITTED'
     || committedReceipt.body?.receipt?.state !== 'REMOVED' || committedReceipt.body?.receipt?.idempotentReplay !== true
     || committedReplay.response.status !== 200 || committedReplay.body?.idempotentReplay !== true
-    || removedAccount || removedMembership || removedDevice || notice?.state !== 'PENDING'
+    || !removedAccount || removedMembership?.status !== 'REMOVED' || removedDevice || notice?.state !== 'PENDING'
     || !openedNotice || openedNotice.version !== 1 || openedNotice.channel !== 'EMAIL' || openedNotice.recipient !== tenantEmail
     || JSON.stringify(notice?.payload ?? {}).includes(tenantEmail) || tombstones.length !== 2 || successfulAuditCount !== 1
     || homeAfter.managementRevision !== homeBefore.managementRevision + 1
@@ -7130,10 +7129,10 @@ async function homeownerRemovalEncryptionConfigurationChecks(deliveryEnv) {
     || JSON.stringify(propertyDeviceIdsAfter) !== JSON.stringify(propertyDeviceIdsBefore)
     || removalList.response.status !== 200
     || (Array.isArray(removalList.body?.tenants) && removedStillListed)) {
-    fail(`Valid-config exact retry did not commit orphan cleanup, encrypted notice, durable tombstones and an exact receipt without touching property inventory (${JSON.stringify({
+    fail(`Valid-config exact retry did not commit the removal (tenant account kept), encrypted notice, durable tombstones and an exact receipt without touching property inventory (${JSON.stringify({
       status: committedRemoval.response.status, state: committedRemoval.body?.state, hub: committedRemoval.body?.hubEnforcement,
-      receipt: committedReceipt.body?.status, replay: committedReplay.body?.idempotentReplay === true, accountDeleted: !removedAccount,
-      membershipRemoved: !removedMembership, privateDeviceRemoved: !removedDevice, noticeQueued: notice?.state === 'PENDING',
+      receipt: committedReceipt.body?.status, replay: committedReplay.body?.idempotentReplay === true, accountKept: Boolean(removedAccount),
+      membershipRemoved: removedMembership?.status === 'REMOVED', privateDeviceRemoved: !removedDevice, noticeQueued: notice?.state === 'PENDING',
       encryptedEmailRoundTrip: openedNotice?.recipient === tenantEmail, noticeHasPlaintext: JSON.stringify(notice?.payload ?? {}).includes(tenantEmail),
       tombstones: tombstones.length, audits: successfulAuditCount, areasPreserved: JSON.stringify(areaIdsAfter) === JSON.stringify(areaIdsBefore),
       propertyDevicesPreserved: JSON.stringify(propertyDeviceIdsAfter) === JSON.stringify(propertyDeviceIdsBefore),
@@ -10363,13 +10362,13 @@ async function pendingInvitationRouteChecks(deliveryEnv) {
   ]);
   if (tenantBRemoval.response.status !== 200 || tenantBRemovalReceipt.response.status !== 200
     || tenantBRemovalReceipt.body?.status !== 'COMMITTED' || tenantBRemovalReceipt.body?.receipt?.idempotentReplay !== true
-    || finalTenantAccount !== null || !finalTenantNotice || finalTenantNotice.state !== 'PENDING'
+    || finalTenantAccount === null || !finalTenantNotice || finalTenantNotice.state !== 'PENDING'
     || JSON.stringify(finalTenantNotice.payload).includes(removalTenantB.email) || finalTenantPrivateData[0]
     || finalTenantPrivateData[1] !== 0 || finalTenantPrivateData[2] !== 0) {
-    fail(`Final-relationship removal did not delete the disposable account while preserving only encrypted notice delivery (${JSON.stringify({ status: tenantBRemoval.response.status,
-      accountDeleted: finalTenantAccount === null, noticeQueued: Boolean(finalTenantNotice), noticeState: finalTenantNotice?.state })})`);
+    fail(`Final-relationship removal did not keep the disposable tenant account while delivering the encrypted notice (${JSON.stringify({ status: tenantBRemoval.response.status,
+      accountKept: finalTenantAccount !== null, noticeQueued: Boolean(finalTenantNotice), noticeState: finalTenantNotice?.state })})`);
   }
-  console.log('[stage9:integration] PASS: final-relationship tenant removal rolls back completely beyond the transaction deadline; exact same-key/body retry with fresh proof commits once, preserves a recoverable receipt and applies orphan-account policy');
+  console.log('[stage9:integration] PASS: final-relationship tenant removal rolls back completely beyond the transaction deadline; exact same-key/body retry with fresh proof commits once, preserves a recoverable receipt and keeps the tenant account');
   const removalNoticeKeys = [
     `homeowner-removal:${managerAMembership.id}:${managerAMembership.accessRevision + 1}:email`,
     `homeowner-removal:${removalTenantMembershipA.id}:${tenantTargetBefore.accessRevision + 1}:email`,

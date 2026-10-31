@@ -8,7 +8,6 @@ import { currentCustomerPolicy } from '@/lib/customerPolicyConfig';
 import { operationDigest, targetDigest } from '@/lib/sensitiveOperationStepUp';
 import { serializableTransaction } from '@/lib/serializableTransaction';
 import { sha256 } from '@/lib/stage1Crypto';
-import { cleanupCustomerAccountIfOrphaned } from '@/lib/customerRelationshipCleanup';
 import { queueHomeownerAccessRemovalNotices } from '@/lib/homeownerAccessRemovalNotices';
 import { deleteTenantPrivateDeviceCloudData } from '@/lib/nativeTenantDeviceCleanup';
 import { retireNativeAutomations } from '@/lib/nativeAutomations/lifecycle';
@@ -166,8 +165,9 @@ export async function DELETE(request: Request, context: { params: Promise<{ home
       await tx.memberPreferenceDocument.deleteMany({ where: { membershipId: tenantId } });
       await tx.alexaNativeEndpointProjection.deleteMany({ where: { homeId, membershipId: tenantId } });
       await tx.alexaNativeHomeScope.deleteMany({ where: { homeId, membershipId: tenantId } });
-      phase = 'orphan_account_cleanup';
-      await cleanupCustomerAccountIfOrphaned(tx, target.customerAccountId, now, 'owner_removed_tenant', 'HOME_TENANT_REMOVAL_ACCOUNT_CLEANUP');
+      // The tenant's account is deliberately kept even when this was their last Home: removing access to one property must not
+      // erase their identity. They land on the "no homes" page and can be invited or scan a room code again; only their own
+      // Delete My Account (or the last-relationship consent flow) deletes it.
       phase = 'write_audit_and_receipt';
       await tx.auditEvent.create({ data: { homeId, actorType: 'CUSTOMER', actorId: selected.id, category: 'ACCESS', action: 'home_tenant_membership_removed',
         targetType: 'HomeMembership', targetId: tenantId, metadata: { outcome: 'removed', nextAccessRevision, pendingHubCleanup: true,
