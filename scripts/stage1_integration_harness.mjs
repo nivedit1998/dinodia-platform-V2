@@ -408,6 +408,12 @@ function loadInstallationPushDispatcher(platformDataEncryptionKey = '') {
       getPlatformDataEncryptionKey: () => isolatedPlatformKey,
       PlatformDataEncryptionKeyError: IsolatedPlatformDataEncryptionKeyError,
     };
+    if (specifier === './roomAccessNotices') {
+      const roomNotices = { exports: {} };
+      new Function('require', 'module', 'exports', ts.transpileModule(fs.readFileSync(path.join(root, 'src/lib/roomAccessNotices.ts'), 'utf8'),
+        { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, esModuleInterop: true } }).outputText)(localRequire, roomNotices, roomNotices.exports);
+      return roomNotices.exports;
+    }
     if (specifier === './nativeAutomations/notificationPolicy') return notificationPolicy;
     if (specifier === './nativeAutomations/failureNotifications') return failureNotifications;
     if (specifier === './apnsDelivery') return {
@@ -9767,6 +9773,15 @@ async function pendingInvitationRouteChecks(deliveryEnv) {
     prisma.auditEvent.count({ where: { targetId: roomFreshRequest.body.requestId, action: 'room_access_approved' } }),
   ]);
   const roomRequesterCurrent = await prisma.customerAccount.findUniqueOrThrow({ where: { id: account.id }, select: { displayName: true } });
+  // Notices: the deciders were told about the new request, and the requester (an existing account) about the approval, once each.
+  const requestNotices = await prisma.nativeDomainOutbox.findMany({ where: { aggregateType: 'HomeownerAccessRemovalNotice', eventType: 'ROOM_ACCESS_REQUEST_NOTICE', idempotencyKey: { startsWith: `room-access-request:${roomFreshRequest.body.requestId}:` } }, select: { idempotencyKey: true, payload: true } });
+  const approvedNotices = await prisma.nativeDomainOutbox.findMany({ where: { aggregateType: 'HomeownerAccessRemovalNotice', eventType: 'ROOM_ACCESS_APPROVED_NOTICE', idempotencyKey: { startsWith: `room-access-approved:${roomFreshRequest.body.requestId}:` } }, select: { idempotencyKey: true, payload: true } });
+  if (requestNotices.length < 1 || requestNotices.some((row) => !row.idempotencyKey.includes(':email') && !row.idempotencyKey.includes(':push:'))
+    || approvedNotices.length !== 1 || approvedNotices[0].idempotencyKey !== `room-access-approved:${roomFreshRequest.body.requestId}:${account.id}:email`
+    || JSON.stringify([...requestNotices, ...approvedNotices]).includes(account.email ?? '@@none@@')) {
+    fail(`A new room request must queue notices for its deciders and an approval one notice for the requester without plaintext addresses (${requestNotices.length}/${approvedNotices.length})`);
+  }
+  console.log('[room-access:integration] PASS: a new room request queues email/push notices for its deciders and an approval queues one for the requester, sealed, once each');
   const activeRoomGrants = afterRoomDecision[1].tenantAreaGrants;
   const unauthRoomDecision = await fetchJson(`${base}/api/v2/homes/${inviter.homeId}/room-access-requests/${roomFreshRequest.body.requestId}/decision`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: roomDecisionBody });
   const roomResultChecks = {

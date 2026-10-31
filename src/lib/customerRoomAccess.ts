@@ -9,6 +9,8 @@ import { enforcePersistentRateLimit } from './rateLimit';
 import { sendRoomAccessVerificationCode } from './customerAuthEmail';
 import { sendCustomerInvitationEmail } from './customerInvitationEmail';
 import { hashPassword } from './passwords';
+import { queueRoomAccessApprovedNotice, queueRoomAccessRequestNotices } from './roomAccessNotices';
+import { dispatchHomeownerAccessRemovalNotices } from './installationRequestDelivery';
 import { consumeStepUpInTransaction } from './sensitiveOperationStepUp';
 
 type Tx = Prisma.TransactionClient;
@@ -86,6 +88,11 @@ async function lockAndRevalidateAccountSession(tx: Tx, principal: CustomerAccoun
   const acceptance = await tx.policyAcceptance.findUnique({ where: { customerAccountId_policyKind_policyVersion: { customerAccountId: account.id, policyKind: 'DINODIA_NATIVE', policyVersion: policy.version } }, select: { id: true } });
   if (!acceptance) throw new Stage1AuthError(403, 'customer_policy_acceptance_required', 'Accept the current Dinodia policy before continuing');
   return { account, session, device, now };
+}
+
+/** Best effort right after a commit so a banner arrives in seconds; the two-minute operations tick is the safety net. */
+async function deliverRoomAccessNoticesNow(): Promise<void> {
+  try { await dispatchHomeownerAccessRemovalNotices(); } catch { /* the scheduled dispatcher retries */ }
 }
 
 export async function previewCustomerRoomQr(reference: string) {
@@ -260,6 +267,7 @@ export async function verifyProspectiveRoomAccess(input: { requestId: unknown; c
       requesterEmailNormalized: verifiedEmail, requesterEmailHash: roomRequest.requesterEmailHash,
       emailVerifiedAt: now, status: 'PENDING', expiresAt: new Date(now.getTime() + REQUEST_MS),
     }, select: { id: true, expiresAt: true, updatedAt: true } });
+    await queueRoomAccessRequestNotices(tx, { homeId: roomRequest.homeId, requestId: accessRequest.id, now });
     const changed = await tx.roomAccessEmailAttempt.updateMany({ where: { id: requestId, state: 'PENDING', expiresAt: { gt: now }, verifiedAt: null }, data: { state: 'VERIFIED', verifiedAt: now, areaAccessRequestId: accessRequest.id, requesterEmailNormalized: null } });
     if (changed.count !== 1) throw new Stage1AuthError(409, 'REVISION_CONFLICT', 'This Room email attempt changed. Scan the current QR and retry.');
     await tx.authChallenge.update({ where: { id: challengeId }, data: { consumedAt: now, approvedAt: now, targetEmail: null } });
@@ -267,6 +275,7 @@ export async function verifyProspectiveRoomAccess(input: { requestId: unknown; c
     return { kind: 'VERIFIED' as const, requestId: accessRequest.id, expiresAt: accessRequest.expiresAt, revision: accessRequest.updatedAt, replay: false };
   });
   if (outcome.kind !== 'VERIFIED') throw new Stage1AuthError(409, 'REVISION_CONFLICT', 'The code is invalid, expired or the Room QR changed');
+  if (!outcome.replay) await deliverRoomAccessNoticesNow();
   return { schemaVersion: 'dinodia.v1' as const, ok: true as const, state: 'PENDING' as const, requestId: outcome.requestId, expiresAt: iso(outcome.expiresAt), revision: iso(outcome.revision), idempotentReplay: outcome.replay };
 }
 
@@ -280,7 +289,8 @@ export async function requestCustomerRoomAccess(input: {
   const found = await resolveRoomQr(input.reference);
   const namespace = 'customer-room-access-request:v1';
   const requestHash = bodyDigest({ referenceHash: sha256(input.reference), generation: input.expectedGeneration, accountId: input.customer.id });
-  return prisma.$transaction(async (tx) => {
+  let notifiedNewRequest = false;
+  const result = await prisma.$transaction(async (tx) => {
     // Account-row locking serializes this account's scans. READ COMMITTED is
     // deliberate here: after a queued caller acquires the lock, its next read
     // must see the previous commit so it coalesces instead of creating a
@@ -321,12 +331,16 @@ export async function requestCustomerRoomAccess(input: {
         emailVerifiedAt: account.emailVerifiedAt, status: 'PENDING', expiresAt: new Date(now.getTime() + REQUEST_MS),
       }, select: { id: true, expiresAt: true, updatedAt: true } });
       requestId = created.id; expiresAt = created.expiresAt; revision = created.updatedAt;
+      await queueRoomAccessRequestNotices(tx, { homeId: qr.area.home.id, requestId, now });
+      notifiedNewRequest = true;
     }
     const receipt = { schemaVersion: 'dinodia.v1', ok: true, requestId, areaLabel: qr.area.originalName, state: 'PENDING', expiresAt: iso(expiresAt), revision: iso(revision), coalesced, idempotentReplay: false };
     await remember(tx, { namespace, accountId: account.id, homeId: qr.area.home.id, key: input.idempotencyKey, requestHash, body: receipt, status: coalesced ? 200 : 201, now });
     if (!coalesced) await tx.auditEvent.create({ data: { homeId: qr.area.home.id, actorType: 'CUSTOMER', actorId: account.id, category: 'ACCESS', action: 'room_access_requested', targetType: 'AreaAccessRequest', targetId: requestId, metadata: { areaId: qr.areaId, qrGeneration: qr.generation }, occurredAt: now, purgeAt: new Date(now.getTime() + 365 * 24 * 60 * 60 * 1000) } });
     return receipt;
   }, { isolationLevel: 'ReadCommitted' });
+  if (notifiedNewRequest) await deliverRoomAccessNoticesNow();
+  return result;
 }
 
 export async function readCustomerRoomAccessRequest(requestId: string, accountId: string) {
@@ -383,6 +397,7 @@ export async function listHomeRoomAccessRequests(input: { homeId: string; custom
 export async function decideHomeRoomAccessRequest(input: { requestId: string; homeId: string; customer: CustomerAccountSessionPrincipal; decision: 'APPROVE'|'REJECT'; expectedRevision: string; idempotencyKey: string; proof: string }) {
   const namespace = `home-room-access-decision:v1:${input.homeId}`;
   const requestHash = bodyDigest({ requestId: input.requestId, homeId: input.homeId, decision: input.decision, expectedRevision: input.expectedRevision, accountId: input.customer.id });
+  let approvedNoticeQueued = false;
   const outcome = await serializableTransaction(async (tx) => {
     await lockAndRevalidateAccountSession(tx, input.customer);
     // The route passes the account ID after authenticating; a fresh membership
@@ -481,11 +496,17 @@ export async function decideHomeRoomAccessRequest(input: { requestId: string; ho
       ...(requesterAccountId ? { requesterAccountId } : {}), ...(onboardingInvitationId ? { onboardingInvitationId, onboardingEmailStatus: 'PENDING' } : {}),
     } });
     if (update.count !== 1) throw new Stage1AuthError(409, 'REVISION_CONFLICT', 'This Room request changed. Refresh and retry.');
+    // An existing account was granted the room right now: tell them by email and push (a new account already receives its invitation email).
+    if (input.decision === 'APPROVE' && membershipId && requesterAccountId) {
+      await queueRoomAccessApprovedNotice(tx, { homeId: input.homeId, requestId: request.id, requesterAccountId, now });
+      approvedNoticeQueued = true;
+    }
     await tx.auditEvent.create({ data: { homeId: input.homeId, actorType: 'CUSTOMER', actorId: input.customer.id, category: 'ACCESS', action: input.decision === 'APPROVE' ? 'room_access_approved' : 'room_access_rejected', targetType: 'AreaAccessRequest', targetId: request.id, metadata: { areaId: request.areaId, requesterAccountId: request.requesterAccountId }, occurredAt: now, purgeAt: new Date(now.getTime() + 365 * 24 * 60 * 60 * 1000) } });
     const receipt = { schemaVersion: 'dinodia.v1' as const, ok: true as const, requestId: request.id, state, membershipId, idempotentReplay: false };
     if (!delivery) await remember(tx, { namespace, accountId: input.customer.id, homeId: input.homeId, key: input.idempotencyKey, requestHash, body: receipt, status: 200, now });
     return { receipt, delivery, remember: delivery ? { namespace, accountId: input.customer.id, homeId: input.homeId, key: input.idempotencyKey, requestHash, receipt } : undefined };
   });
+  if (approvedNoticeQueued) await deliverRoomAccessNoticesNow();
   if (outcome.delivery) {
     try {
       await sendCustomerInvitationEmail({ email: outcome.delivery.email, invitationId: outcome.delivery.invitationId, role: 'TENANT', postcode: outcome.delivery.postcode, expiresAt: outcome.delivery.expiresAt, temporaryPassword: outcome.delivery.temporaryPassword });

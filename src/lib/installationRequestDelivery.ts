@@ -2,14 +2,16 @@ import { SESv2Client, SendEmailCommand } from '@aws-sdk/client-sesv2';
 import { prisma } from './prisma';
 import { decryptPlatformEnvelope } from './hubOperatorCredentials';
 import { getPlatformDataEncryptionKey, PlatformDataEncryptionKeyError } from './platformDataEncryptionKey';
-import { readApnsConfig, sendHomeAccessChangedPush, sendInstallationCompletePush, sendTenantAutomationFailurePush, sendTenantAutomationManagementPush, type ApnsConfig, type ApnsEnvironment, type ApnsResult } from './apnsDelivery';
+import { readApnsConfig, sendHomeAccessChangedPush, sendInstallationCompletePush, sendRoomAccessApprovedPush, sendRoomAccessRequestPush, sendTenantAutomationFailurePush, sendTenantAutomationManagementPush, type ApnsConfig, type ApnsEnvironment, type ApnsResult } from './apnsDelivery';
 import { nextAllowedAutomationNotificationAt } from './nativeAutomations/notificationPolicy';
 import { isAutomationFailureDeviceToken } from './nativeAutomations/failureNotifications';
+import { ROOM_ACCESS_NOTICE_CONTENT, ROOM_ACCESS_NOTICE_TYPES, isRoomAccessNoticeType, roomAccessEmail } from './roomAccessNotices';
 
 const PORTAL_QUEUE = 'https://dinodia-platform-v2.vercel.app/installer/installation-requests';
 const EMAIL = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const OUTBOX_LIMIT = 20;
 const RECEIPT_LIMIT = 20;
+const ACCESS_NOTICE_EVENT_TYPES = ['TENANT_ACCESS_REMOVAL_NOTICE', 'PROPERTY_MANAGER_ACCESS_REMOVAL_NOTICE', 'OWNERSHIP_TRANSFER_NOTICE', 'HOME_DEREGISTRATION_NOTICE', 'TENANT_AUTOMATION_MANAGEMENT_NOTICE', ...ROOM_ACCESS_NOTICE_TYPES];
 
 type DeliveryCounts = {
   operationsAccepted: number;
@@ -51,14 +53,14 @@ function configuration(): { client: SESv2Client; source: string; operationsAddre
     operationsAddress: EMAIL.test(operationsAddress) && operationsAddress.length <= 320 ? operationsAddress : null };
 }
 
-async function sendTextEmail(client: SESv2Client, source: string, recipient: string, subject: string, body: string): Promise<boolean> {
+async function sendTextEmail(client: SESv2Client, source: string, recipient: string, subject: string, body: string, html?: string): Promise<boolean> {
   try {
     const result = await client.send(new SendEmailCommand({
       FromEmailAddress: source,
       Destination: { ToAddresses: [recipient] },
       Content: { Simple: {
         Subject: { Data: subject, Charset: 'UTF-8' },
-        Body: { Text: { Data: body, Charset: 'UTF-8' } },
+        Body: { Text: { Data: body, Charset: 'UTF-8' }, ...(html ? { Html: { Data: html, Charset: 'UTF-8' } } : {}) },
       } },
     }), { abortSignal: AbortSignal.timeout(10_000) });
     return Boolean(result.MessageId);
@@ -188,18 +190,18 @@ export async function dispatchHomeownerAccessRemovalNotices(now = new Date(), de
   const counts = { accepted: 0, deferred: 0, failed: 0, suppressed: 0, expired: 0 };
   const stale = new Date(now.getTime() - 5 * 60_000);
   await prisma.nativeDomainOutbox.updateMany({ where: { aggregateType: 'HomeownerAccessRemovalNotice',
-    eventType: { in: ['TENANT_ACCESS_REMOVAL_NOTICE', 'PROPERTY_MANAGER_ACCESS_REMOVAL_NOTICE', 'OWNERSHIP_TRANSFER_NOTICE', 'HOME_DEREGISTRATION_NOTICE', 'TENANT_AUTOMATION_MANAGEMENT_NOTICE'] }, state: 'PROCESSING',
+    eventType: { in: ACCESS_NOTICE_EVENT_TYPES }, state: 'PROCESSING',
     updatedAt: { lt: stale }, expiresAt: { gt: now }, attempts: { lt: 8 } }, data: { state: 'PENDING', nextAttemptAt: now } });
   await prisma.nativeDomainOutbox.updateMany({ where: { aggregateType: 'HomeownerAccessRemovalNotice',
-    eventType: { in: ['TENANT_ACCESS_REMOVAL_NOTICE', 'PROPERTY_MANAGER_ACCESS_REMOVAL_NOTICE', 'OWNERSHIP_TRANSFER_NOTICE', 'HOME_DEREGISTRATION_NOTICE', 'TENANT_AUTOMATION_MANAGEMENT_NOTICE'] }, state: 'PROCESSING',
+    eventType: { in: ACCESS_NOTICE_EVENT_TYPES }, state: 'PROCESSING',
     attempts: { gte: 8 }, expiresAt: { gt: now } }, data: { state: 'FAILED' } });
   const abandonedExpired = await prisma.nativeDomainOutbox.updateMany({ where: { aggregateType: 'HomeownerAccessRemovalNotice',
-    eventType: { in: ['TENANT_ACCESS_REMOVAL_NOTICE', 'PROPERTY_MANAGER_ACCESS_REMOVAL_NOTICE', 'OWNERSHIP_TRANSFER_NOTICE', 'HOME_DEREGISTRATION_NOTICE', 'TENANT_AUTOMATION_MANAGEMENT_NOTICE'] }, state: 'PROCESSING', expiresAt: { lte: now } }, data: { state: 'EXPIRED' } });
+    eventType: { in: ACCESS_NOTICE_EVENT_TYPES }, state: 'PROCESSING', expiresAt: { lte: now } }, data: { state: 'EXPIRED' } });
   const expired = await prisma.nativeDomainOutbox.updateMany({ where: { aggregateType: 'HomeownerAccessRemovalNotice',
-    eventType: { in: ['TENANT_ACCESS_REMOVAL_NOTICE', 'PROPERTY_MANAGER_ACCESS_REMOVAL_NOTICE', 'OWNERSHIP_TRANSFER_NOTICE', 'HOME_DEREGISTRATION_NOTICE', 'TENANT_AUTOMATION_MANAGEMENT_NOTICE'] }, state: 'PENDING', expiresAt: { lte: now } }, data: { state: 'EXPIRED' } });
+    eventType: { in: ACCESS_NOTICE_EVENT_TYPES }, state: 'PENDING', expiresAt: { lte: now } }, data: { state: 'EXPIRED' } });
   counts.expired += expired.count + abandonedExpired.count;
   const rows = await prisma.nativeDomainOutbox.findMany({ where: { aggregateType: 'HomeownerAccessRemovalNotice',
-    eventType: { in: ['TENANT_ACCESS_REMOVAL_NOTICE', 'PROPERTY_MANAGER_ACCESS_REMOVAL_NOTICE', 'OWNERSHIP_TRANSFER_NOTICE', 'HOME_DEREGISTRATION_NOTICE', 'TENANT_AUTOMATION_MANAGEMENT_NOTICE'] }, state: 'PENDING',
+    eventType: { in: ACCESS_NOTICE_EVENT_TYPES }, state: 'PENDING',
     nextAttemptAt: { lte: now }, expiresAt: { gt: now }, attempts: { lt: 8 } },
     orderBy: [{ nextAttemptAt: 'asc' }, { createdAt: 'asc' }, { id: 'asc' }], take: RECEIPT_LIMIT,
     select: { id: true, eventType: true, expiresAt: true, attempts: true, payload: true } });
@@ -253,17 +255,24 @@ export async function dispatchHomeownerAccessRemovalNotices(now = new Date(), de
     let invalidToken = false;
     try {
       if (isEmail) {
+        const room = isRoomAccessNoticeType(row.eventType) ? roomAccessEmail(row.eventType) : null;
         accepted = dependencies.sendEmail
           ? await dependencies.sendEmail({ recipient: decoded.recipient as string, noticeId })
-          : Boolean(configured && await sendTextEmail(configured.client, configured.source, decoded.recipient as string,
-            row.eventType === 'TENANT_AUTOMATION_MANAGEMENT_NOTICE' ? 'A Home automation was updated' : 'Dinodia Smart Living access changed',
-            row.eventType === 'TENANT_AUTOMATION_MANAGEMENT_NOTICE'
-              ? 'A property manager changed an automation. Sign in to review its current status. This message contains no Home, rule or device details.'
-              : 'Access to one of your Dinodia Smart Living homes has changed. Sign in to review your active homes. This message contains no property or device details.'));
+          : Boolean(configured && await (room
+            ? sendTextEmail(configured.client, configured.source, decoded.recipient as string, room.subject, room.text, room.html)
+            : sendTextEmail(configured.client, configured.source, decoded.recipient as string,
+              row.eventType === 'TENANT_AUTOMATION_MANAGEMENT_NOTICE' ? 'A Home automation was updated' : 'Dinodia Smart Living access changed',
+              row.eventType === 'TENANT_AUTOMATION_MANAGEMENT_NOTICE'
+                ? 'A property manager changed an automation. Sign in to review its current status. This message contains no Home, rule or device details.'
+                : 'Access to one of your Dinodia Smart Living homes has changed. Sign in to review your active homes. This message contains no property or device details.')));
       } else {
         const result = dependencies.sendPush
           ? await dependencies.sendPush({ environment: decoded.environment as ApnsEnvironment, deviceToken: decoded.deviceToken as string, noticeId, expiresAt: row.expiresAt })
-          : row.eventType === 'TENANT_AUTOMATION_MANAGEMENT_NOTICE'
+          : isRoomAccessNoticeType(row.eventType)
+            ? await (row.eventType === 'ROOM_ACCESS_REQUEST_NOTICE' ? sendRoomAccessRequestPush : sendRoomAccessApprovedPush)({
+              config: apns!, environment: decoded.environment as ApnsEnvironment, deviceToken: decoded.deviceToken as string,
+              requestId: noticeId, expiresAt: row.expiresAt }, { title: ROOM_ACCESS_NOTICE_CONTENT[row.eventType].pushTitle, body: ROOM_ACCESS_NOTICE_CONTENT[row.eventType].pushBody })
+            : row.eventType === 'TENANT_AUTOMATION_MANAGEMENT_NOTICE'
             ? await sendTenantAutomationManagementPush({ config: apns!, environment: decoded.environment as ApnsEnvironment,
               deviceToken: decoded.deviceToken as string, requestId: noticeId, expiresAt: row.expiresAt })
             : await sendHomeAccessChangedPush({ config: apns!, environment: decoded.environment as ApnsEnvironment,

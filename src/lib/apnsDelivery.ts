@@ -107,9 +107,23 @@ export async function sendTenantAutomationFailurePush(input: {
   return sendBoundedApnsAlert(input, { title: 'Automation update', body: 'An automation did not complete as expected. Sign in to review its status.' }, poster);
 }
 
+/** Banner for the people who can decide a new room request. Names no person, room or address. */
+export async function sendRoomAccessRequestPush(input: {
+  config: ApnsConfig; environment: ApnsEnvironment; deviceToken: string; requestId: string; expiresAt: Date;
+}, alert: { title: string; body: string }, poster: ApnsPoster = postHttp2): Promise<ApnsResult> {
+  return sendBoundedApnsAlert(input, alert, poster, { dinodiaNotice: 'ROOM_ACCESS_REQUEST' });
+}
+
+/** Banner telling a requester their room access was approved. */
+export async function sendRoomAccessApprovedPush(input: {
+  config: ApnsConfig; environment: ApnsEnvironment; deviceToken: string; requestId: string; expiresAt: Date;
+}, alert: { title: string; body: string }, poster: ApnsPoster = postHttp2): Promise<ApnsResult> {
+  return sendBoundedApnsAlert(input, alert, poster, { dinodiaNotice: 'ROOM_ACCESS_APPROVED' });
+}
+
 async function sendBoundedApnsAlert(input: {
   config: ApnsConfig; environment: ApnsEnvironment; deviceToken: string; requestId: string; expiresAt: Date;
-}, alert: { title: string; body: string }, poster: ApnsPoster): Promise<ApnsResult> {
+}, alert: { title: string; body: string }, poster: ApnsPoster, extra: Record<string, string> = {}): Promise<ApnsResult> {
   if (!TOKEN_PATTERN.test(input.deviceToken) || !/^[0-9a-f-]{36}$/i.test(input.requestId)
     || !Number.isFinite(input.expiresAt.getTime())) return { outcome: 'FAILED' };
   const host = input.environment === 'DEVELOPMENT' ? 'api.sandbox.push.apple.com' : 'api.push.apple.com';
@@ -125,7 +139,7 @@ async function sendBoundedApnsAlert(input: {
         'apns-expiration': String(Math.floor(input.expiresAt.getTime() / 1000)),
         'apns-collapse-id': input.requestId,
       },
-      body: JSON.stringify({ aps: { alert, sound: 'default' } }),
+      body: JSON.stringify({ aps: { alert, sound: 'default' }, ...extra }),
     });
   } catch { return { outcome: 'RETRY' }; }
   if (response.status === 200) return { outcome: 'ACCEPTED' };
