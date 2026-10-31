@@ -46,7 +46,9 @@ export async function POST(request: Request) {
     const body = await request.json().catch(() => null) as Record<string, unknown> | null;
     if (!body || Array.isArray(body) || typeof body.action !== 'string') throw new Stage1AuthError(400, 'VALIDATION_FAILED', 'An action is required');
     if (!mfaEnforced()) throw new Stage1AuthError(404, 'FEATURE_NOT_ENABLED', 'Two-step verification is not available yet');
-    const binding = sessionBinding(principal.sessionId);
+    // The session family, not the single session: the phone's access token is renewed behind the scenes (which issues a new session id),
+    // and a code asked for a minute ago must still work.
+    const binding = sessionBinding(principal.sessionFamilyId);
     const requirement = await accountMfaRequirement(prisma, principal.id);
 
     if (body.action === 'snooze_prompt') {

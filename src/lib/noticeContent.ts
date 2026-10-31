@@ -281,7 +281,7 @@ export function mfaCodeEmail(purpose: MfaCodePurpose, code: string): { subject: 
     DISABLE: { subject: 'Your Dinodia code to turn off two-step verification', heading: 'Turn off two-step verification', lead: 'Use this code to turn off two-step verification for your Dinodia Smart Living account.' },
   }[purpose];
   const card = renderCard({ heading: what.heading, code, facts: [], list: [],
-    paragraphs: [what.lead, `The code works for ${MFA_CODE_MINUTES} minutes and can only be used once. Never share it with anyone. Dinodia will never ask you for it.`,
+    paragraphs: [what.lead, `The code works for ${MFA_CODE_MINUTES} minutes and can only be used once. If you asked for more than one code, use the newest email: earlier codes stop working. Never share it with anyone. Dinodia will never ask you for it.`,
       'If you did not try to do this, ignore this email and change your password in the Dinodia app.'],
     footer: 'You are receiving this because someone entered your Dinodia Smart Living email address and password.' });
   return { subject: what.subject, ...card };

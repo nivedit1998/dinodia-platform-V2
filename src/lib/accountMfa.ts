@@ -27,7 +27,10 @@ const CODE_TTL_MS = MFA_CODE_MINUTES * 60 * 1000;
 export const MFA_MAX_ATTEMPTS = 5;
 export const MFA_RESEND_COOLDOWN_MS = 30_000;
 const MAX_RESENDS = 3;
-const ISSUE_LIMIT = 5;
+/** Codes per hour per account and kind of step: a sign-in is never blocked because someone was trying out the settings screen. */
+const SIGN_IN_ISSUE_LIMIT = 8;
+const SETTINGS_ISSUE_LIMIT = 6;
+const issueLimit = (purpose: string) => (purpose === 'MFA_ENABLE' || purpose === 'MFA_DISABLE' ? SETTINGS_ISSUE_LIMIT : SIGN_IN_ISSUE_LIMIT);
 const ISSUE_WINDOW_MS = 60 * 60 * 1000;
 const SNOOZE_MS = 7 * 24 * 60 * 60 * 1000;
 export const MFA_PROMPT_MAX_DISMISSALS = 3;
@@ -86,7 +89,7 @@ const newCode = () => String(crypto.randomInt(0, 1_000_000)).padStart(6, '0');
 
 /** Start a challenge and email the code. Fails closed: if the email cannot be sent the challenge is discarded and nothing proceeds. */
 export async function issueMfaChallenge(input: { accountId: string; email: string; purpose: MfaPurpose; bindingHash: string }): Promise<MfaChallengeIssue> {
-  try { await enforcePersistentRateLimit(`mfa-issue:${input.accountId}`, ISSUE_LIMIT, ISSUE_WINDOW_MS); }
+  try { await enforcePersistentRateLimit(`mfa-issue:${input.purpose}:${input.accountId}`, issueLimit(input.purpose), ISSUE_WINDOW_MS); }
   catch (error) {
     if (error instanceof Stage1AuthError && error.status === 429) throw new Stage1AuthError(429, 'mfa_rate_limited', 'Too many codes were requested. Please wait a little while and try again.');
     throw error;
@@ -97,8 +100,11 @@ export async function issueMfaChallenge(input: { accountId: string; email: strin
   const clientSecret = randomSecret(32);
   const expiresAt = new Date(now.getTime() + CODE_TTL_MS);
   await prisma.$transaction(async (tx) => {
-    await tx.authChallenge.updateMany({ where: { customerAccountId: input.accountId, purpose: input.purpose, bindingHash: input.bindingHash, consumedAt: null, revokedAt: null, expiresAt: { gt: now } },
-      data: { revokedAt: now } });
+    // Asking again replaces the earlier code, so only the newest email's code ever works. A sign-in is replaced per phone (two phones
+    // can sign in at once); turning it on or off is one thing per account, whichever session asks.
+    const settingsStep = input.purpose === MFA_PURPOSE.ENABLE || input.purpose === MFA_PURPOSE.DISABLE;
+    await tx.authChallenge.updateMany({ where: { customerAccountId: input.accountId, purpose: input.purpose, ...(settingsStep ? {} : { bindingHash: input.bindingHash }),
+      consumedAt: null, revokedAt: null, expiresAt: { gt: now } }, data: { revokedAt: now } });
     await tx.authChallenge.create({ data: { id, customerAccountId: input.accountId, purpose: input.purpose, targetEmail: input.email, tokenHash: codeDigest(id, code),
       clientSecretHash: sha256(clientSecret), bindingHash: input.bindingHash, expiresAt, deliveryStatus: 'PENDING' } });
   });
@@ -128,7 +134,7 @@ export async function resendMfaChallenge(input: { challengeId: unknown; clientSe
   if (challenge.resendCount >= MAX_RESENDS) throw new Stage1AuthError(429, 'mfa_resend_limit', 'You have asked for too many codes. Please start again.');
   const waitUntil = (challenge.deliveryAttemptedAt?.getTime() ?? 0) + MFA_RESEND_COOLDOWN_MS;
   if (waitUntil > now.getTime()) throw new Stage1AuthError(429, 'mfa_resend_too_soon', `Please wait ${Math.max(1, Math.ceil((waitUntil - now.getTime()) / 1000))} seconds before asking for another code.`);
-  try { await enforcePersistentRateLimit(`mfa-issue:${challenge.customerAccountId}`, ISSUE_LIMIT * 2, ISSUE_WINDOW_MS); }
+  try { await enforcePersistentRateLimit(`mfa-issue:${challenge.purpose}:${challenge.customerAccountId}`, issueLimit(challenge.purpose) * 2, ISSUE_WINDOW_MS); }
   catch (error) {
     if (error instanceof Stage1AuthError && error.status === 429) throw new Stage1AuthError(429, 'mfa_rate_limited', 'Too many codes were requested. Please wait a little while and try again.');
     throw error;

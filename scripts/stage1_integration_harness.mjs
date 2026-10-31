@@ -4358,8 +4358,13 @@ async function twoStepVerificationChecks(deliveryEnv) {
     const snoozed = await post({ action: 'snooze_prompt' });
     const snoozedRow = await prisma.customerAccount.findUniqueOrThrow({ where: { id: tenantAccount.id }, select: { mfaPromptSnoozedUntil: true, mfaPromptDismissCount: true } });
     if (snoozed.body.promptDue !== false || !snoozedRow.mfaPromptSnoozedUntil || snoozedRow.mfaPromptSnoozedUntil.getTime() < Date.now() + 6 * 86_400_000 || snoozedRow.mfaPromptDismissCount !== 1) fail('"Not now" did not put the reminder off for a week');
+    // Asking twice (a second tap, a second email) leaves only the newest code working.
+    const firstEnable = await post({ action: 'enable_start' });
+    const firstEnableCode = lastMfaCode;
     const enableStart = await post({ action: 'enable_start' });
     const enableCode = lastMfaCode;
+    const staleEnable = await post({ action: 'enable_confirm', challengeId: firstEnable.body.challengeId, clientSecret: firstEnable.body.clientSecret, code: firstEnableCode });
+    if (firstEnable.response.status !== 200 || staleEnable.response.status !== 400 || staleEnable.body.error?.code !== 'MFA_CHALLENGE_INVALID') fail(`An older emailed code still worked after a newer one was requested (${staleEnable.response.status}/${staleEnable.body.error?.code})`);
     const enableWrong = await post({ action: 'enable_confirm', challengeId: enableStart.body.challengeId, clientSecret: enableStart.body.clientSecret, code: wrongCodeFor(enableCode) });
     const enableDone = await post({ action: 'enable_confirm', challengeId: enableStart.body.challengeId, clientSecret: enableStart.body.clientSecret, code: enableCode });
     const enabledNotice = await prisma.nativeDomainOutbox.count({ where: { eventType: 'MFA_ENABLED_NOTICE' } });

@@ -88,7 +88,7 @@ test('the two-step code email says what the code is for, warns not to share it, 
     const mail = mfaCodeEmail(purpose, '482913');
     assert.ok(mail.subject.includes('code'), `${purpose} subject: ${mail.subject}`);
     assert.ok(mail.text.includes('\n482913\n') && mail.html.includes('>482913<'), 'the code stands alone on its own line and in a large block');
-    assert.ok(mail.text.includes('10 minutes') && mail.text.includes('Never share it') && mail.text.includes('change your password'));
+    assert.ok(mail.text.includes('use the newest email') && mail.text.includes('10 minutes') && mail.text.includes('Never share it') && mail.text.includes('change your password'));
     assert.ok(!mail.html.includes('href='), 'a code email has no link to click');
   }
   assert.ok(mfaCodeEmail('ALEXA_SIGN_IN', '000000').text.includes('Alexa'));
