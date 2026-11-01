@@ -30,3 +30,8 @@ test('a hub still reporting a removed device is acknowledged instead of stalling
   assert.match(ingestion, /if \(device\.lifecycle === 'REMOVED'\) return;\n    if \(\['RETIRED', 'REMOVED', 'REMOVAL_PENDING'\]\.includes\(device\.lifecycle\)\) invalid\('hub_sync_device_retired'/);
   assert.match(ingestion, /if \(device\.lifecycle === 'REMOVED'\) return;\n    if \(\['RETIRED', 'REMOVED', 'REMOVAL_PENDING'\]\.includes\(device\.lifecycle\)\) invalid\('hub_sync_catalog_device_retired'/);
 });
+
+test('an incident notice from before a radio was registered again is ignored instead of stalling the queue', () => {
+  const ingestion = fs.readFileSync('src/lib/hubSyncIngestion.ts', 'utf8');
+  assert.match(ingestion, /occurredAt < device\.installedAt\.getTime\(\)\) return;\n      deviceId = device\.id;/);
+});

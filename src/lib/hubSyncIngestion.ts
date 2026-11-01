@@ -749,8 +749,11 @@ async function applyHubSyncEventInner(tx: Prisma.TransactionClient, input: SyncE
     const sourceKind = String(payload.kind);
     let deviceId: string | null = null;
     if (payload.osDeviceId !== null) {
-      const device = await tx.nativeDevice.findUnique({ where: { hubInstallationId_osDeviceId: { hubInstallationId, osDeviceId: String(payload.osDeviceId) } }, select: { id: true, homeId: true } });
+      const device = await tx.nativeDevice.findUnique({ where: { hubInstallationId_osDeviceId: { hubInstallationId, osDeviceId: String(payload.osDeviceId) } }, select: { id: true, homeId: true, installedAt: true } });
       if (!device || device.homeId !== homeId) invalid('hub_sync_incident_device_invalid', 'The incident device is not part of this enrolled home');
+      // A notice about an earlier registration of the same radio (it was removed and paired again since) describes a device that no longer exists.
+      const occurredAt = Date.parse(String(payload.occurredAt || ''));
+      if (device.installedAt && Number.isFinite(occurredAt) && occurredAt < device.installedAt.getTime()) return;
       deviceId = device.id;
     }
     // Device outages have exactly one source: their device. Its enrolled Hub
