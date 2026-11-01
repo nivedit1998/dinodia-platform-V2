@@ -1,6 +1,7 @@
 // A Hub may re-publish a device's control catalogue at the SAME revision and digest when the only
-// change is that owner-approved controls became schedulable (automatable false → true). Every
-// other difference must keep raising `hub_sync_catalog_conflict`. Self-contained on purpose.
+// change is that owner-approved controls became schedulable (automatable false → true), or that the
+// controls' display `group` (which embeds the device's current name) changed because the device was
+// renamed. Every other difference must keep raising `hub_sync_catalog_conflict`. Self-contained on purpose.
 
 const APPROVED_ROLES = new Set(['target_temperature', 'operating_mode', 'power', 'brightness']);
 const VALUE_TYPES = new Set(['boolean', 'number', 'option']);
@@ -41,4 +42,29 @@ export function isAutomationEligibilityUpgrade(prior: unknown, next: unknown): b
     upgraded += 1;
   }
   return upgraded > 0;
+}
+
+function withoutGroup(control: Record<string, unknown>): Record<string, unknown> {
+  const rest = { ...control };
+  delete rest.group;
+  return rest;
+}
+
+/**
+ * The control `group` is display text built from the device's name ("Room 1 Light 0"). Renaming a device after its catalogue was
+ * published changes it without changing the descriptor, so the Hub legitimately re-sends the same revision and digest. Accept that
+ * (and nothing else): same controls in the same order, identical in every field except `group`.
+ */
+export function isGroupDisplayChange(prior: unknown, next: unknown): boolean {
+  if (!Array.isArray(prior) || !Array.isArray(next) || prior.length !== next.length || prior.length === 0) return false;
+  let changed = 0;
+  for (let index = 0; index < prior.length; index += 1) {
+    const before = prior[index]; const after = next[index];
+    if (!before || typeof before !== 'object' || Array.isArray(before) || !after || typeof after !== 'object' || Array.isArray(after)) return false;
+    const left = before as Record<string, unknown>; const right = after as Record<string, unknown>;
+    if (left.controlId !== right.controlId || typeof right.group !== 'string' || right.group.length === 0 || right.group.length > 200) return false;
+    if (canonical(withoutGroup(left)) !== canonical(withoutGroup(right))) return false;
+    if (left.group !== right.group) changed += 1;
+  }
+  return changed > 0;
 }

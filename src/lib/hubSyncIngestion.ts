@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import type { Prisma } from '@prisma/client';
 import { Stage1AuthError } from './stage1Auth';
 import { canonicalSyncJson, type HubSyncEvent } from './hubSyncEnvelope';
-import { isAutomationEligibilityUpgrade } from './catalogAutomationEligibility';
+import { isAutomationEligibilityUpgrade, isGroupDisplayChange } from './catalogAutomationEligibility';
 import { suspendAutomationsForDeviceChange } from './nativeAutomations/revalidation';
 import { retireNativeAutomations } from './nativeAutomations/lifecycle';
 import { currentCustomerPolicy } from './customerPolicyConfig';
@@ -336,6 +336,14 @@ async function applyHubSyncEventInner(tx: Prisma.TransactionClient, input: SyncE
       if (priorCatalog.descriptorDigest === payload.descriptorDigest && canonicalSyncJson(priorCatalog.controls) !== canonicalSyncJson(controls)
         && isAutomationEligibilityUpgrade(priorCatalog.controls, controls)) {
         // Same revision and digest; only owner-approved controls became schedulable.
+        await tx.nativeDevice.update({ where: { id: device.id }, data: {
+          capabilitySummary: { ...summary, controlCatalog: { revision, descriptorDigest: payload.descriptorDigest, controls } } as Prisma.InputJsonValue,
+        } });
+        return;
+      }
+      if (priorCatalog.descriptorDigest === payload.descriptorDigest && canonicalSyncJson(priorCatalog.controls) !== canonicalSyncJson(controls)
+        && isGroupDisplayChange(priorCatalog.controls, controls)) {
+        // Same revision and digest; only the display group changed because the device was renamed.
         await tx.nativeDevice.update({ where: { id: device.id }, data: {
           capabilitySummary: { ...summary, controlCatalog: { revision, descriptorDigest: payload.descriptorDigest, controls } } as Prisma.InputJsonValue,
         } });

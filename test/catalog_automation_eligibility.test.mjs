@@ -13,7 +13,7 @@ function loadTypeScript(relative) {
   new Function('require', 'module', 'exports', output)(require, module, module.exports);
   return module.exports;
 }
-const { isAutomationEligibilityUpgrade } = loadTypeScript('src/lib/catalogAutomationEligibility.ts');
+const { isAutomationEligibilityUpgrade, isGroupDisplayChange } = loadTypeScript('src/lib/catalogAutomationEligibility.ts');
 
 const setpoint = { schemaVersion: 1, deviceId: 'zigbee:trv', surfaceId: 's1', controlId: 'ctrl_setpoint', label: 'Occupied Heating Setpoint', group: 'Climate',
   sortOrder: 0, valueType: 'number', interactionKind: 'thermostat', semanticRole: 'target_temperature', readable: true, writable: true, automatable: false,
@@ -58,5 +58,25 @@ test('rejects every other difference', () => {
 test('the ingestion handler uses the rule only on the same-revision branch', () => {
   const source = fs.readFileSync(path.join(root, 'src/lib/hubSyncIngestion.ts'), 'utf8');
   assert.match(source, /isAutomationEligibilityUpgrade\(priorCatalog\.controls, controls\)/);
+  assert.match(source, /hub_sync_catalog_conflict/, 'other same-revision changes still conflict');
+});
+
+test('a rename changes only the display group: accepted at the same revision, and nothing else is', () => {
+  const light = { ...setpoint, controlId: 'ctrl_power', label: 'State', group: 'Automatically Generated Definition 0', semanticRole: 'power', valueType: 'boolean', interactionKind: 'toggle', constraints: undefined };
+  const other = { ...calibration, group: 'Automatically Generated Definition 0' };
+  const renamed = (control) => ({ ...control, group: 'Room 1 Light 0' });
+  assert.equal(isGroupDisplayChange([light, other], [renamed(light), renamed(other)]), true, 'rename of every control');
+  assert.equal(isGroupDisplayChange([light, other], [renamed(light), other]), true, 'one control regrouped');
+  assert.equal(isGroupDisplayChange([light], [light]), false, 'no change is not a change');
+  assert.equal(isGroupDisplayChange([light], [{ ...renamed(light), label: 'Power' }]), false, 'a label change still conflicts');
+  assert.equal(isGroupDisplayChange([light], [{ ...renamed(light), writable: false }]), false, 'a capability change still conflicts');
+  assert.equal(isGroupDisplayChange([light], [{ ...renamed(light), automatable: true }]), false, 'an eligibility change is handled by its own rule');
+  assert.equal(isGroupDisplayChange([light], [{ ...renamed(light), controlId: 'ctrl_other' }]), false, 'a different control id still conflicts');
+  assert.equal(isGroupDisplayChange([light, other], [renamed(light)]), false, 'a removed control still conflicts');
+  assert.equal(isGroupDisplayChange([light], [{ ...light, group: '' }]), false, 'an empty group is refused');
+  assert.equal(isGroupDisplayChange([light], [{ ...light, group: 'x'.repeat(201) }]), false, 'an oversized group is refused');
+  assert.equal(isGroupDisplayChange('nope', [light]), false, 'malformed prior');
+  const source = fs.readFileSync(path.join(root, 'src/lib/hubSyncIngestion.ts'), 'utf8');
+  assert.match(source, /isGroupDisplayChange\(priorCatalog\.controls, controls\)/);
   assert.match(source, /hub_sync_catalog_conflict/, 'other same-revision changes still conflict');
 });
