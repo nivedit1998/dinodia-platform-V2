@@ -837,6 +837,31 @@ test('account session fixture is multi-home, active, and rejects stale or mismat
   const duplicateHome = { ...value, memberships: [value.memberships[0], { ...value.memberships[1], homeId: value.memberships[0].homeId, homeMembershipId: 'membership:other' }] };
   assert.equal(native.validateAccountSessionContext(duplicateHome, Date.parse('2029-01-01T00:00:00Z')), false);
 });
+test('membership address label is optional, bounded, and built from the address given at setup', () => {
+  const now = Date.now();
+  const iso = (offsetMs) => new Date(now + offsetMs).toISOString();
+  const receipt = (label) => ({
+    schemaVersion: 'dinodia.v1', ok: true, accountId: 'account:one', sessionId: 'session:one', trustedDeviceId: 'trusted:one',
+    accessToken: `dno-customer-access-${'a'.repeat(40)}`, refreshToken: `dno-customer-session-${'b'.repeat(40)}`,
+    accessTokenExpiresAt: iso(10 * 60 * 1000), refreshTokenExpiresAt: iso(30 * 24 * 60 * 60 * 1000),
+    user: { accountId: 'account:one', displayName: 'Sam', username: 'sam', email: 'sam@example.test', emailVerifiedAt: iso(-1000) },
+    memberships: [{ accountId: 'account:one', homeId: 'home:one', homeMembershipId: 'membership:one', role: 'TENANT', status: 'active', areaIds: [], revision: 1, postcode: 'N1 1AA', ...(label === undefined ? {} : { addressLabel: label }) }],
+    nextAction: 'SELECT_HOME',
+  });
+  assert.equal(native.validateMobileCustomerSessionReceipt(receipt(undefined), now), true, 'older servers send no label');
+  assert.equal(native.validateMobileCustomerSessionReceipt(receipt('14 High Street'), now), true);
+  assert.equal(native.validateMobileCustomerSessionReceipt(receipt(null), now), true);
+  assert.equal(native.validateMobileCustomerSessionReceipt(receipt(''), now), false);
+  assert.equal(native.validateMobileCustomerSessionReceipt(receipt('x'.repeat(201)), now), false);
+  const labelModule = { exports: {} };
+  new Function('module', 'exports', ts.transpileModule(fs.readFileSync('src/lib/homeAddressLabel.ts', 'utf8'), { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText)(labelModule, labelModule.exports);
+  const { homeAddressLabel } = labelModule.exports;
+  assert.equal(homeAddressLabel({ addressLine1: '14 High Street', addressLine2: null }), '14 High Street');
+  assert.equal(homeAddressLabel({ addressLine1: '14  High Street ', addressLine2: ' Flat 2' }), 'Flat 2, 14 High Street');
+  assert.equal(homeAddressLabel({ addressLine1: null, addressLine2: null }), null);
+  assert.equal(homeAddressLabel({ addressLine1: '  ', addressLine2: '' }), null);
+  assert.equal(homeAddressLabel({ addressLine1: 'a'.repeat(300), addressLine2: null }).length, 200);
+});
 test('session receipt and selected-home bearer have separate strict, bounded contracts', () => {
   const receipt = JSON.parse(fs.readFileSync(path.join(root, 'fixtures/customer-session-receipt.json'), 'utf8'));
   const hubSession = JSON.parse(fs.readFileSync(path.join(root, 'fixtures/customer-hub-session-test-only.json'), 'utf8'));

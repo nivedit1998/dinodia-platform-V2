@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import { homeAddressLabel } from '@/lib/homeAddressLabel';
 import { prisma } from './prisma';
 import { Stage1AuthError } from './stage1Auth';
 import { randomSecret, sha256 } from './stage1Crypto';
@@ -40,7 +41,7 @@ export async function mobileAccountSummary(accountId: string) {
     prisma.homeMembership.findMany({
       where: { customerAccountId: accountId, status: 'ACTIVE' },
       orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
-      select: { id: true, homeId: true, role: true, accessRevision: true, home: { select: { postcode: true } }, tenantAreaGrants: { where: { revokedAt: null, area: { status: 'ACTIVE' } }, select: { areaId: true, homeId: true } } },
+      select: { id: true, homeId: true, role: true, accessRevision: true, home: { select: { postcode: true, addressLine1: true, addressLine2: true } }, tenantAreaGrants: { where: { revokedAt: null, area: { status: 'ACTIVE' } }, select: { areaId: true, homeId: true } } },
     }),
   ]);
   if (!account || account.status !== 'ACTIVE' || !account.emailVerifiedAt) throw new Stage1AuthError(401, 'customer_session_invalid', 'The customer account is no longer active');
@@ -52,7 +53,8 @@ export async function mobileAccountSummary(accountId: string) {
     homes.add(membership.homeId); membershipIds.add(membership.id);
     return { accountId, homeId: membership.homeId, homeMembershipId: membership.id, role: membership.role, status: 'active' as const,
       areaIds: membership.role === 'TENANT' ? membership.tenantAreaGrants.filter((grant) => grant.homeId === membership.homeId).map((grant) => grant.areaId) : [],
-      revision: membership.accessRevision, postcode: membership.home.postcode };
+      revision: membership.accessRevision, postcode: membership.home.postcode,
+      addressLabel: homeAddressLabel(membership.home) };
   });
   return {
     user: { accountId: account.id, displayName: account.displayName, username: account.username, email: account.email, emailVerifiedAt: account.emailVerifiedAt!.toISOString() },

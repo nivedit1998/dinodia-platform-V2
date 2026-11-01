@@ -16,7 +16,7 @@ export interface MembershipContext { accountId: OpaqueId; homeId: OpaqueId; home
 export interface AccountSessionContext { schemaVersion: typeof DINODIA_V1; accountId: OpaqueId; sessionId: OpaqueId; trustedDeviceId: OpaqueId; memberships: MembershipContext[]; expiresAt: string }
 export interface CustomerSessionLoginRequest { email: string; password: string; deviceInstallationId: OpaqueId; publicKey: string; deviceName: string; model?: string; osFamily?: string; osVersion?: string }
 export interface CustomerSessionReceipt { ok: true; accountId: OpaqueId; sessionId: OpaqueId; trustedDeviceId: OpaqueId; expiresAt: string }
-export interface MobileSessionMembership extends MembershipContext { postcode: string | null }
+export interface MobileSessionMembership extends MembershipContext { postcode: string | null; addressLabel?: string | null }
 export interface MobileSessionUser { accountId: OpaqueId; displayName: string; username: string; email: string; emailVerifiedAt: string }
 export interface MobileCustomerSessionReceipt {
   schemaVersion: typeof DINODIA_V1; ok: true; accountId: OpaqueId; sessionId: OpaqueId; trustedDeviceId: OpaqueId;
@@ -477,9 +477,10 @@ export function validateMobileCustomerSessionReceipt(value: unknown, now = Date.
   if (accessExpiry <= now || accessExpiry > now + 15 * 60 * 1000 + 2000 || refreshExpiry <= now || refreshExpiry > now + 180 * 24 * 60 * 60 * 1000 + 2000) return false;
   const homeIds = new Set<string>(); const membershipIds = new Set<string>();
   for (const membership of value.memberships) {
-    if (!object(membership) || !hasOnlyKeys(membership, ['accountId','homeId','homeMembershipId','role','status','areaIds','revision','postcode'])
+    if (!object(membership) || !hasOnlyKeys(membership, ['accountId','homeId','homeMembershipId','role','status','areaIds','revision','postcode','addressLabel'])
       || !validateMembership({ accountId: membership.accountId, homeId: membership.homeId, homeMembershipId: membership.homeMembershipId, role: membership.role, status: membership.status, areaIds: membership.areaIds, revision: membership.revision })
       || membership.accountId !== value.accountId || !(membership.postcode === null || nonEmptyText(membership.postcode, 32))
+      || !(membership.addressLabel === undefined || membership.addressLabel === null || nonEmptyText(membership.addressLabel, 200))
       || homeIds.has(String(membership.homeId)) || membershipIds.has(String(membership.homeMembershipId))) return false;
     homeIds.add(String(membership.homeId)); membershipIds.add(String(membership.homeMembershipId));
   }

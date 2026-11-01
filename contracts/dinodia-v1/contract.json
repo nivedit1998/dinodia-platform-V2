@@ -351,7 +351,8 @@
         "status": { "const": "active" },
         "areaIds": { "type": "array", "items": { "$ref": "#/$defs/id" }, "uniqueItems": true },
         "revision": { "type": "integer", "minimum": 0 },
-        "postcode": { "type": ["string", "null"], "maxLength": 32 }
+        "postcode": { "type": ["string", "null"], "maxLength": 32 },
+        "addressLabel": { "type": ["string", "null"], "maxLength": 200 }
       },
       "additionalProperties": false
     },
