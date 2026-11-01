@@ -19,3 +19,8 @@ test('registered radios in use or in another Home are still refused', () => {
   // The retiring happens before the new record is created, never after.
   assert.ok(source.indexOf('~retired~') < source.indexOf('tx.nativeDevice.create({ data: {\n        homeId: authority.home.id, hubInstallationId'));
 });
+
+test('registering an already-paired radio that was removed from this Home is allowed at session start', () => {
+  assert.match(source, /const removedHere = \(record: \{ homeId: string; lifecycle: string \}\) => record\.lifecycle === 'REMOVED' && record\.homeId === authority\.home\.id/);
+  assert.match(source, /existingDevice && !removedHere\(existingDevice\)/);
+});

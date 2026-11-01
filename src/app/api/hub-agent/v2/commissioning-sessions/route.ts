@@ -196,13 +196,18 @@ export async function POST(request: Request) {
         if (bound) fail(409, 'commissioning_idempotency_conflict', 'This commissioning operation key is already bound');
         assertCommissioningProtocolEnabled(hub, protocol, isStaff, operationKind as 'PAIR_NEW'|'REGISTER_EXISTING');
         if (registerExisting) {
-          const existingDevice = await tx.nativeDevice.findUnique({ where: { hubInstallationId_osDeviceId: { hubInstallationId: hub.installation.id, osDeviceId: String(body.targetOsDeviceId) } }, select: { id: true } });
+          const existingDevice = await tx.nativeDevice.findUnique({ where: { hubInstallationId_osDeviceId: { hubInstallationId: hub.installation.id, osDeviceId: String(body.targetOsDeviceId) } }, select: { id: true, homeId: true, lifecycle: true } });
           const sourceDeviceId = sha256(String(body.targetOsDeviceId).normalize('NFC').trim());
           const [sourceAlias, identityAlias] = await Promise.all([
             tx.nativeDeviceSourceAlias.findUnique({ where: { hubInstallationId_protocol_sourceDeviceId: { hubInstallationId: hub.installation.id, protocol: protocolName, sourceDeviceId } }, select: { id: true, deviceId: true } }),
             tx.nativeDeviceSourceAlias.findFirst({ where: { hubInstallationId: hub.installation.id, protocolIdentityHash: String(body.targetIdentityHash), retiredAt: null }, select: { id: true, deviceId: true } }),
           ]);
-          if (existingDevice || sourceAlias || identityAlias) fail(409, 'device_identity_conflict', 'This radio identity is already registered or bound to another property record');
+          // A radio removed from this same Home may be registered again (finalize archives the removed record).
+          const claimedBy = [sourceAlias?.deviceId, identityAlias?.deviceId].filter((id): id is string => !!id && id !== existingDevice?.id);
+          const claimants = claimedBy.length ? await tx.nativeDevice.findMany({ where: { id: { in: claimedBy } }, select: { homeId: true, lifecycle: true } }) : [];
+          const removedHere = (record: { homeId: string; lifecycle: string }) => record.lifecycle === 'REMOVED' && record.homeId === authority.home.id;
+          if (existingDevice && !removedHere(existingDevice) || claimants.length !== new Set(claimedBy).size || !claimants.every(removedHere)
+            || (sourceAlias || identityAlias) && !existingDevice && !claimants.length) fail(409, 'device_identity_conflict', 'This radio identity is already registered or bound to another property record');
         }
         const created = await tx.nativeCommissioningSession.create({ data: {
           id: sessionId, homeId: authority.home.id, hubInstallationId: hub.installation.id, ...actorWhere,
