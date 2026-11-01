@@ -24,3 +24,9 @@ test('registering an already-paired radio that was removed from this Home is all
   assert.match(source, /const removedHere = \(record: \{ homeId: string; lifecycle: string \}\) => record\.lifecycle === 'REMOVED' && record\.homeId === authority\.home\.id/);
   assert.match(source, /existingDevice && !removedHere\(existingDevice\)/);
 });
+
+test('a hub still reporting a removed device is acknowledged instead of stalling its queue', () => {
+  const ingestion = fs.readFileSync('src/lib/hubSyncIngestion.ts', 'utf8');
+  assert.match(ingestion, /if \(device\.lifecycle === 'REMOVED'\) return;\n    if \(\['RETIRED', 'REMOVED', 'REMOVAL_PENDING'\]\.includes\(device\.lifecycle\)\) invalid\('hub_sync_device_retired'/);
+  assert.match(ingestion, /if \(device\.lifecycle === 'REMOVED'\) return;\n    if \(\['RETIRED', 'REMOVED', 'REMOVAL_PENDING'\]\.includes\(device\.lifecycle\)\) invalid\('hub_sync_catalog_device_retired'/);
+});

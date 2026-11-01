@@ -230,6 +230,8 @@ async function applyHubSyncEventInner(tx: Prisma.TransactionClient, input: SyncE
     if (!device || device.homeId !== homeId || device.managementClass !== 'PROPERTY_DEVICE') invalid('hub_sync_device_uncommissioned', 'The device is not bound to a current permanent property record');
     if (device.lifecycle === 'RETIRED'
       && (device.capabilitySummary as Record<string, unknown> | null)?.logicalConversion) return;
+    // A removed device is never restored by inventory sync, but a hub still reporting it must not stall its whole queue.
+    if (device.lifecycle === 'REMOVED') return;
     if (['RETIRED', 'REMOVED', 'REMOVAL_PENDING'].includes(device.lifecycle)) invalid('hub_sync_device_retired', 'A removed device cannot be restored by inventory sync');
     const descriptorRevision = Number(payload.descriptorRevision);
     const descriptorDigest = String(payload.descriptorDigest);
@@ -319,6 +321,7 @@ async function applyHubSyncEventInner(tx: Prisma.TransactionClient, input: SyncE
     if (!device || device.homeId !== homeId || device.managementClass !== 'PROPERTY_DEVICE') invalid('hub_sync_catalog_device_invalid', 'The control catalogue does not belong to a current permanent property device');
     if (device.lifecycle === 'RETIRED'
       && (device.capabilitySummary as Record<string, unknown> | null)?.logicalConversion) return;
+    if (device.lifecycle === 'REMOVED') return;
     if (['RETIRED', 'REMOVED', 'REMOVAL_PENDING'].includes(device.lifecycle)) invalid('hub_sync_catalog_device_retired', 'A retired device catalogue cannot be restored');
     const revision = Number(payload.catalogRevision);
     if (revision !== device.descriptorRevision || payload.descriptorDigest !== device.descriptorDigest) invalid('hub_sync_catalog_revision_mismatch', 'The control catalogue does not match the current device descriptor');
