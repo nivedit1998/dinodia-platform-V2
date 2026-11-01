@@ -353,15 +353,31 @@ export async function POST(request: Request) {
       if (row.state !== 'READY' || row.closedAt || row.expiresAt <= new Date() || Number(body.expectedRevision) !== row.revision
         || row.requestedAreaId !== areaId || row.selectedCandidateRef !== body.candidateRef || row.selectedOsDeviceId !== device.osDeviceId
         || row.customerLabel !== device.customerLabel || row.catalogueStatus !== device.catalogueStatus || row.catalogueRevision !== device.descriptorRevision || row.catalogueDigest !== device.descriptorDigest) fail(409, 'commissioning_finalize_invalid', 'The device is not ready for ownership registration');
-      const preexisting = await tx.nativeDevice.findUnique({ where: { hubInstallationId_osDeviceId: { hubInstallationId: hub.installation.id, osDeviceId: device.osDeviceId } }, select: { id: true } });
-      if (preexisting) fail(409, 'device_identity_conflict', 'This radio identity is already registered; use the existing device recovery flow');
+      const preexisting = await tx.nativeDevice.findUnique({ where: { hubInstallationId_osDeviceId: { hubInstallationId: hub.installation.id, osDeviceId: device.osDeviceId } }, select: { id: true, homeId: true, lifecycle: true } });
+      // A radio that was removed from this same Home may be paired again: the removed record is archived under a retired name so the
+      // new device starts clean. Anything still in use, or belonging to another Home, stays a conflict.
+      if (preexisting && (preexisting.lifecycle !== 'REMOVED' || preexisting.homeId !== authority.home.id)) fail(409, 'device_identity_conflict', 'This radio identity is already registered; use the existing device recovery flow');
+      const removedBefore = preexisting ? [preexisting.id] : [];
       const sourceProtocol = protocol === 'ZIGBEE' ? 'zigbee' : 'matter';
       const sourceDeviceId = sha256(String(device.osDeviceId).normalize('NFC').trim());
       const [sourceAlias, identityAlias] = await Promise.all([
         tx.nativeDeviceSourceAlias.findUnique({ where: { hubInstallationId_protocol_sourceDeviceId: { hubInstallationId: hub.installation.id, protocol: sourceProtocol, sourceDeviceId } }, select: { id: true, deviceId: true } }),
         device.protocolIdentityHash ? tx.nativeDeviceSourceAlias.findFirst({ where: { hubInstallationId: hub.installation.id, protocolIdentityHash: String(device.protocolIdentityHash), retiredAt: null }, select: { id: true, deviceId: true } }) : Promise.resolve(null),
       ]);
-      if (sourceAlias || identityAlias) fail(409, 'device_identity_conflict', 'This radio identity is already bound to another canonical device');
+      const aliasOwners = [sourceAlias, identityAlias].filter((alias): alias is { id: string; deviceId: string } => !!alias);
+      if (aliasOwners.length) {
+        const owners = await tx.nativeDevice.findMany({ where: { id: { in: aliasOwners.map((alias) => alias.deviceId) } }, select: { id: true, homeId: true, lifecycle: true } });
+        if (owners.length !== new Set(aliasOwners.map((alias) => alias.deviceId)).size || owners.some((owner) => owner.lifecycle !== 'REMOVED' || owner.homeId !== authority.home.id)) fail(409, 'device_identity_conflict', 'This radio identity is already bound to another canonical device');
+        for (const owner of owners) if (!removedBefore.includes(owner.id)) removedBefore.push(owner.id);
+      }
+      if (removedBefore.length) {
+        // Free the radio identity: retired aliases go, and the removed record keeps its history under a name no radio can claim.
+        await tx.nativeDeviceSourceAlias.deleteMany({ where: { hubInstallationId: hub.installation.id, deviceId: { in: removedBefore } } });
+        for (const retiredId of removedBefore) {
+          const retired = await tx.nativeDevice.findUnique({ where: { id: retiredId }, select: { osDeviceId: true } });
+          if (retired && !retired.osDeviceId.includes('~retired~')) await tx.nativeDevice.update({ where: { id: retiredId }, data: { osDeviceId: `${retired.osDeviceId.slice(0, 120)}~retired~${retiredId.slice(0, 8)}` } });
+        }
+      }
       const now = new Date();
       const safeSummary = safeControlSummary(device.capabilitySummary) as Record<string, unknown>;
       if (isStateAnalyticsCategory(analyticsCategory)) await requireUniversalAnalyticsCompatibility(tx,{homeId:hub.installation.homeId,hubInstallationId:hub.installation.id,identity:hub.identity});

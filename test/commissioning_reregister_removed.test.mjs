@@ -1,0 +1,21 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+
+const source = fs.readFileSync('src/app/api/hub-agent/v2/commissioning-sessions/route.ts', 'utf8');
+
+test('a radio removed from the same Home can be registered again', () => {
+  assert.match(source, /preexisting\.lifecycle !== 'REMOVED' \|\| preexisting\.homeId !== authority\.home\.id/);
+  assert.match(source, /owner\.lifecycle !== 'REMOVED' \|\| owner\.homeId !== authority\.home\.id/);
+  assert.match(source, /nativeDeviceSourceAlias\.deleteMany\(\{ where: \{ hubInstallationId: hub\.installation\.id, deviceId: \{ in: removedBefore \}/);
+  assert.match(source, /~retired~/);
+});
+
+test('registered radios in use or in another Home are still refused', () => {
+  const guard = source.indexOf("preexisting.lifecycle !== 'REMOVED'");
+  const failure = source.indexOf("fail(409, 'device_identity_conflict'", guard);
+  assert.ok(guard > 0 && failure > guard && failure - guard < 160);
+  assert.match(source, /already bound to another canonical device/);
+  // The retiring happens before the new record is created, never after.
+  assert.ok(source.indexOf('~retired~') < source.indexOf('tx.nativeDevice.create({ data: {\n        homeId: authority.home.id, hubInstallationId'));
+});
