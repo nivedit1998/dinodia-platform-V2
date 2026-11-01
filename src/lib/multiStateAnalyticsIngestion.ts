@@ -28,8 +28,10 @@ export async function ingestMultiStateAnalytics(tx: Prisma.TransactionClient, in
   if (end>now || p.closedAt && new Date(String(p.closedAt))>now || day.getTime()<historyYearCutoff(now.getTime(),retention.timezone)
     || p.sourceGeneration!==input.identityGeneration) reject('hub_sync_state_coverage_invalid');
   const device=await tx.nativeDevice.findUnique({where:{hubInstallationId_osDeviceId:{hubInstallationId,osDeviceId:String(p.osDeviceId)}}});
-  if (!device || device.homeId!==homeId || device.managementClass!=='PROPERTY_DEVICE' || device.ownerMembershipId
-    || ['REMOVAL_PENDING','REMOVED'].includes(device.lifecycle)) reject('hub_sync_state_device_invalid');
+  // A removed device's last queued day is acknowledged and discarded; rejecting it would wedge the whole sync queue.
+  if (device && device.homeId===homeId && device.managementClass==='PROPERTY_DEVICE' && !device.ownerMembershipId
+    && ['REMOVAL_PENDING','REMOVED'].includes(device.lifecycle)) return;
+  if (!device || device.homeId!==homeId || device.managementClass!=='PROPERTY_DEVICE' || device.ownerMembershipId) reject('hub_sync_state_device_invalid');
   await tx.$queryRaw`SELECT id FROM "NativeDevice" WHERE id=${device.id}::uuid FOR UPDATE`;
   const area=await tx.area.findUnique({where:{homeId_osAreaId:{homeId,osAreaId:String(p.osAreaId)}}});
   if (!area || area.status!=='ACTIVE') reject('hub_sync_state_area_invalid');

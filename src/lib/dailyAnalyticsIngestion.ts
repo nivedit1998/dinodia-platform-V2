@@ -51,8 +51,12 @@ export async function ingestDailyAnalytics(tx: Prisma.TransactionClient, input: 
   const device = await tx.nativeDevice.findUnique({ where: { hubInstallationId_osDeviceId: {
     hubInstallationId, osDeviceId: String(p.osDeviceId),
   } } });
+  // A device the installer or owner has removed can still have its last day queued on the Hub. That day is acknowledged and
+  // discarded (the device is gone), exactly as usage buckets are. Rejecting it would wedge the whole sync queue behind it.
+  if (device && device.homeId === homeId && device.managementClass === 'PROPERTY_DEVICE' && !device.ownerMembershipId
+    && ['REMOVAL_PENDING', 'REMOVED'].includes(device.lifecycle)) return;
   if (!device || device.homeId !== homeId || device.managementClass !== 'PROPERTY_DEVICE'
-    || device.ownerMembershipId || ['REMOVAL_PENDING', 'REMOVED'].includes(device.lifecycle)) reject('hub_sync_daily_device_invalid');
+    || device.ownerMembershipId) reject('hub_sync_daily_device_invalid');
   const area = await tx.area.findUnique({ where: { homeId_osAreaId: { homeId, osAreaId: String(p.osAreaId) } } });
   if (!area || area.status !== 'ACTIVE') reject('hub_sync_daily_area_invalid');
   const assignment = await tx.deviceAreaAssignment.findFirst({ where: { homeId, deviceId: device.id, areaId: area.id,

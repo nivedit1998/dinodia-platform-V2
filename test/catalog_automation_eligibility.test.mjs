@@ -80,3 +80,13 @@ test('a rename changes only the display group: accepted at the same revision, an
   assert.match(source, /isGroupDisplayChange\(priorCatalog\.controls, controls\)/);
   assert.match(source, /hub_sync_catalog_conflict/, 'other same-revision changes still conflict');
 });
+
+test("a removed device's last queued analytics day is acknowledged and discarded, never rejected", () => {
+  const daily = fs.readFileSync(path.join(root, 'src/lib/dailyAnalyticsIngestion.ts'), 'utf8');
+  const state = fs.readFileSync(path.join(root, 'src/lib/multiStateAnalyticsIngestion.ts'), 'utf8');
+  assert.match(daily, /\['REMOVAL_PENDING', 'REMOVED'\]\.includes\(device\.lifecycle\)\) return;/);
+  assert.match(state, /\['REMOVAL_PENDING','REMOVED'\]\.includes\(device\.lifecycle\)\) return;/);
+  assert.doesNotMatch(daily, /REMOVED'\]\.includes\(device\.lifecycle\)\) reject/);
+  assert.doesNotMatch(state, /REMOVED'\]\.includes\(device\.lifecycle\)\) reject/);
+  assert.match(daily, /reject\('hub_sync_daily_device_invalid'\)/, 'unknown or foreign devices are still rejected');
+});
