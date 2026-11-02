@@ -1,0 +1,90 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import { createRequire } from 'node:module';
+const require = createRequire(import.meta.url), ts = require('typescript'), m = { exports: {} };
+new Function('require', 'module', 'exports', ts.transpileModule(fs.readFileSync('src/lib/tenantDeviceDashboard.ts', 'utf8'), {
+  compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
+}).outputText)(id => id.startsWith('.') ? {} : require(id), m, m.exports);
+const input = { accountId: 'account', sessionId: 'session', trustedDeviceId: 'phone', tokenHash: 'synthetic',
+  credentialKind: 'account_access', homeId: 'home', membershipId: 'tenant', hubInstallationId: 'hub' };
+function fixture(patch = {}, sessionActive = true, tileLabel = undefined) {
+  const room = { id: 'room', originalName: 'Living Room', overrideName: null, revision: 1 };
+  const device = { id: 'device', osDeviceId: 'radiator', originalName: 'Living Room Radiator', overrideName: null,
+    customerLabel: 'Radiator', inventoryRevision: 3, descriptorRevision: 1, managementClass: 'PROPERTY_DEVICE',
+    ownerMembershipId: null, lifecycle: 'INSTALLED', assignments: [{ area: room }], ...patch };
+  const db = {
+    homeMembership: { findFirst: async ({ where }) => {
+      assert.equal(where.role, 'TENANT'); assert.equal(where.customerAccountId, input.accountId);
+      return { id: 'tenant', homeId: 'home', accessRevision: 1, customerAccount: { id: 'account' },
+        home: { id: 'home', managementRevision: 1 }, tenantAreaGrants: [{ areaId: 'room', area: room }] };
+    } },
+    customerSession: { findFirst: async ({ where }) => { assert.equal(where.accessTokenHash, 'synthetic'); return sessionActive ? { id: 'session' } : null; } },
+    area: { findMany: async () => [room] }, tenantAreaGrant: { findMany: async () => [] },
+    nativeDevice: { findMany: async ({ where }) => {
+      if (where.lifecycle === 'REMOVAL_PENDING') return [];
+      assert.equal(where.homeId, 'home'); assert.equal(where.hubInstallationId, 'hub');
+      assert.deepEqual(where.OR[0].assignments.some.areaId.in, ['room']);
+      return [device];
+    } },
+    memberPreferenceDocument: { findUnique: async () => tileLabel === undefined ? null : ({ revision: 6,
+      updatedAt: new Date('2026-11-02T02:06:24Z'), document: { version: 1, tiles: [
+        { deviceId: 'device', size: 'STANDARD', position: 0, label: tileLabel },
+      ] } }) },
+    nativeTenantDeviceRecovery: { findMany: async () => [] }, hubInstallation: { findFirst: async () => null },
+  };
+  return db;
+}
+test('actual tenant projection supplies the source name for a property device without an override', async () => {
+  const view = await m.exports.readTenantDeviceDashboard(fixture(), input);
+  const row = view.deviceOverrides[0];
+  assert.equal(row.overrideName, 'Living Room Radiator');
+  assert.equal(row.customerLabel, null); assert.equal(row.canRename, false);
+  // The installed client reads this field first, then falls back to a generic descriptor label.
+  assert.equal(row.overrideName ?? row.customerLabel ?? 'Device', 'Living Room Radiator');
+});
+test('property custom names are preserved', async () => {
+  const view = await m.exports.readTenantDeviceDashboard(fixture({ overrideName: 'Sofa radiator' }), input);
+  assert.equal(view.deviceOverrides[0].overrideName, 'Sofa radiator');
+});
+test('private-device reset semantics and ownership remain unchanged', async () => {
+  const view = await m.exports.readTenantDeviceDashboard(fixture({ managementClass: 'TENANT_DEVICE', ownerMembershipId: 'tenant' }), input);
+  assert.equal(view.deviceOverrides[0].overrideName, null); assert.equal(view.deviceOverrides[0].canRename, true);
+  const foreign = await m.exports.readTenantDeviceDashboard(fixture({ managementClass: 'TENANT_DEVICE', ownerMembershipId: 'another-tenant' }), input);
+  assert.equal(foreign.deviceOverrides.length, 0);
+});
+test('revoked session is still denied before disclosure', async () => {
+  await assert.rejects(m.exports.readTenantDeviceDashboard(fixture({}, false), input), { code: 'SESSION_REVOKED' });
+});
+test('legacy saved Device placeholder must not mask the property canonical name', async () => {
+  const view = await m.exports.readTenantDeviceDashboard(fixture({}, true, 'Device'), input);
+  const tile = view.layout.document.tiles[0], device = view.deviceOverrides[0];
+  assert.equal(tile.label ?? device.overrideName ?? 'Device', 'Living Room Radiator');
+  assert.equal(tile.size, 'STANDARD'); assert.equal(tile.position, 0);
+});
+test('explicit custom tile aliases and private-device labels are preserved', async () => {
+  const custom = await m.exports.readTenantDeviceDashboard(fixture({}, true, 'Sofa heater'), input);
+  assert.equal(custom.layout.document.tiles[0].label, 'Sofa heater');
+  const own = await m.exports.readTenantDeviceDashboard(fixture({ managementClass: 'TENANT_DEVICE', ownerMembershipId: 'tenant' }, true, 'Device'), input);
+  assert.equal(own.layout.document.tiles[0].label, 'Device');
+});
+
+test('homeowner rename replaces a mirrored original-name tile label without changing layout', async () => {
+  const db = fixture({ originalName: 'Room 2 Radiator', overrideName: "Anchal's Radiator" }, true, 'Room 2 Radiator');
+  const stored = await db.memberPreferenceDocument.findUnique();
+  const snapshot = structuredClone(stored);
+  db.memberPreferenceDocument.findUnique = async () => stored;
+  const view = await m.exports.readTenantDeviceDashboard(db, input);
+  const tile = view.layout.document.tiles[0], device = view.deviceOverrides[0];
+  assert.equal(tile.label ?? device.overrideName, "Anchal's Radiator");
+  assert.equal(tile.size, 'STANDARD'); assert.equal(tile.position, 0);
+  assert.equal(view.layout.revision, 6);
+  assert.deepEqual(stored, snapshot, 'read normalization never mutates stored preferences');
+});
+test('mirrored-name normalization preserves private and distinct custom tile labels', async () => {
+  const privateView = await m.exports.readTenantDeviceDashboard(fixture({ managementClass: 'TENANT_DEVICE', ownerMembershipId: 'tenant',
+    originalName: 'Room 2 Radiator', overrideName: "Anchal's Radiator" }, true, 'Room 2 Radiator'), input);
+  assert.equal(privateView.layout.document.tiles[0].label, 'Room 2 Radiator');
+  const custom = await m.exports.readTenantDeviceDashboard(fixture({ originalName: 'Room 2 Radiator', overrideName: "Anchal's Radiator" }, true, 'Window heater'), input);
+  assert.equal(custom.layout.document.tiles[0].label, 'Window heater');
+});

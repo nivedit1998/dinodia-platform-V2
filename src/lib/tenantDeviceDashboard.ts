@@ -153,7 +153,10 @@ export async function readTenantDeviceDashboard(db: Prisma.TransactionClient, in
       managementClass: owner ? 'tenant_device' : 'property_device',
       ownerMembershipId: owner ? membership.id : null,
       areaIds,
-      overrideName: device.overrideName,
+      // Installed clients use this field as the property device's display name
+      // and do not receive originalName. Keep the source fallback here, after
+      // authority filtering; private devices retain nullable personal aliases.
+      overrideName: owner ? device.overrideName : device.overrideName ?? device.originalName,
       customerLabel: owner ? device.customerLabel : null,
       canManage: owner,
       canRename: owner,
@@ -189,8 +192,23 @@ export async function readTenantDeviceDashboard(db: Prisma.TransactionClient, in
   const storedLayout = layout?.document && typeof layout.document === 'object' && !Array.isArray(layout.document)
     ? layout.document as Record<string, unknown> : {};
   const storedTiles = Array.isArray(storedLayout.tiles) ? storedLayout.tiles : [];
+  const propertyNames = new Map(devices.filter(device => device.managementClass === 'PROPERTY_DEVICE')
+    .map(device => [device.id, { current: device.overrideName ?? device.originalName, original: device.originalName }]));
   const safeTiles = storedTiles.filter((tile): tile is Record<string, unknown> => Boolean(tile) && typeof tile === 'object' && !Array.isArray(tile))
-    .filter((tile) => typeof tile.deviceId === 'string' && visibleDeviceIds.has(tile.deviceId));
+    .filter((tile) => typeof tile.deviceId === 'string' && visibleDeviceIds.has(tile.deviceId))
+    .map(tile => {
+      // Older clients saved generic or source names as layout labels. A copy of
+      // the original name must not mask the homeowner's current property name.
+      // This response-only normalization preserves stored preferences, private
+      // device labels and distinct custom aliases.
+      const names = propertyNames.get(String(tile.deviceId));
+      if (names && names.current !== tile.label
+        && (tile.label === 'Device' || tile.label === names.original)) {
+        const { label: _placeholder, ...automatic } = tile;
+        return automatic;
+      }
+      return tile;
+    });
   const safeLayoutDocument = {
     version: 1,
     tiles: safeTiles,
