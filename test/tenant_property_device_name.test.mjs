@@ -68,3 +68,23 @@ test('explicit custom tile aliases and private-device labels are preserved', asy
   const own = await m.exports.readTenantDeviceDashboard(fixture({ managementClass: 'TENANT_DEVICE', ownerMembershipId: 'tenant' }, true, 'Device'), input);
   assert.equal(own.layout.document.tiles[0].label, 'Device');
 });
+
+test('homeowner rename replaces a mirrored original-name tile label without changing layout', async () => {
+  const db = fixture({ originalName: 'Room 2 Radiator', overrideName: "Anchal's Radiator" }, true, 'Room 2 Radiator');
+  const stored = await db.memberPreferenceDocument.findUnique();
+  const snapshot = structuredClone(stored);
+  db.memberPreferenceDocument.findUnique = async () => stored;
+  const view = await m.exports.readTenantDeviceDashboard(db, input);
+  const tile = view.layout.document.tiles[0], device = view.deviceOverrides[0];
+  assert.equal(tile.label ?? device.overrideName, "Anchal's Radiator");
+  assert.equal(tile.size, 'STANDARD'); assert.equal(tile.position, 0);
+  assert.equal(view.layout.revision, 6);
+  assert.deepEqual(stored, snapshot, 'read normalization never mutates stored preferences');
+});
+test('mirrored-name normalization preserves private and distinct custom tile labels', async () => {
+  const privateView = await m.exports.readTenantDeviceDashboard(fixture({ managementClass: 'TENANT_DEVICE', ownerMembershipId: 'tenant',
+    originalName: 'Room 2 Radiator', overrideName: "Anchal's Radiator" }, true, 'Room 2 Radiator'), input);
+  assert.equal(privateView.layout.document.tiles[0].label, 'Room 2 Radiator');
+  const custom = await m.exports.readTenantDeviceDashboard(fixture({ originalName: 'Room 2 Radiator', overrideName: "Anchal's Radiator" }, true, 'Window heater'), input);
+  assert.equal(custom.layout.document.tiles[0].label, 'Window heater');
+});
