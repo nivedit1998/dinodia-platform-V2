@@ -8,7 +8,7 @@ new Function('require', 'module', 'exports', ts.transpileModule(fs.readFileSync(
 }).outputText)(id => id.startsWith('.') ? {} : require(id), m, m.exports);
 const input = { accountId: 'account', sessionId: 'session', trustedDeviceId: 'phone', tokenHash: 'synthetic',
   credentialKind: 'account_access', homeId: 'home', membershipId: 'tenant', hubInstallationId: 'hub' };
-function fixture(patch = {}, sessionActive = true) {
+function fixture(patch = {}, sessionActive = true, tileLabel = undefined) {
   const room = { id: 'room', originalName: 'Living Room', overrideName: null, revision: 1 };
   const device = { id: 'device', osDeviceId: 'radiator', originalName: 'Living Room Radiator', overrideName: null,
     customerLabel: 'Radiator', inventoryRevision: 3, descriptorRevision: 1, managementClass: 'PROPERTY_DEVICE',
@@ -27,7 +27,10 @@ function fixture(patch = {}, sessionActive = true) {
       assert.deepEqual(where.OR[0].assignments.some.areaId.in, ['room']);
       return [device];
     } },
-    memberPreferenceDocument: { findUnique: async () => null },
+    memberPreferenceDocument: { findUnique: async () => tileLabel === undefined ? null : ({ revision: 6,
+      updatedAt: new Date('2026-11-02T02:06:24Z'), document: { version: 1, tiles: [
+        { deviceId: 'device', size: 'STANDARD', position: 0, label: tileLabel },
+      ] } }) },
     nativeTenantDeviceRecovery: { findMany: async () => [] }, hubInstallation: { findFirst: async () => null },
   };
   return db;
@@ -52,4 +55,16 @@ test('private-device reset semantics and ownership remain unchanged', async () =
 });
 test('revoked session is still denied before disclosure', async () => {
   await assert.rejects(m.exports.readTenantDeviceDashboard(fixture({}, false), input), { code: 'SESSION_REVOKED' });
+});
+test('legacy saved Device placeholder must not mask the property canonical name', async () => {
+  const view = await m.exports.readTenantDeviceDashboard(fixture({}, true, 'Device'), input);
+  const tile = view.layout.document.tiles[0], device = view.deviceOverrides[0];
+  assert.equal(tile.label ?? device.overrideName ?? 'Device', 'Living Room Radiator');
+  assert.equal(tile.size, 'STANDARD'); assert.equal(tile.position, 0);
+});
+test('explicit custom tile aliases and private-device labels are preserved', async () => {
+  const custom = await m.exports.readTenantDeviceDashboard(fixture({}, true, 'Sofa heater'), input);
+  assert.equal(custom.layout.document.tiles[0].label, 'Sofa heater');
+  const own = await m.exports.readTenantDeviceDashboard(fixture({ managementClass: 'TENANT_DEVICE', ownerMembershipId: 'tenant' }, true, 'Device'), input);
+  assert.equal(own.layout.document.tiles[0].label, 'Device');
 });

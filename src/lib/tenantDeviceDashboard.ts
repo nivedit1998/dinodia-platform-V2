@@ -192,8 +192,21 @@ export async function readTenantDeviceDashboard(db: Prisma.TransactionClient, in
   const storedLayout = layout?.document && typeof layout.document === 'object' && !Array.isArray(layout.document)
     ? layout.document as Record<string, unknown> : {};
   const storedTiles = Array.isArray(storedLayout.tiles) ? storedLayout.tiles : [];
+  const propertyNames = new Map(devices.filter(device => device.managementClass === 'PROPERTY_DEVICE')
+    .map(device => [device.id, device.overrideName ?? device.originalName]));
   const safeTiles = storedTiles.filter((tile): tile is Record<string, unknown> => Boolean(tile) && typeof tile === 'object' && !Array.isArray(tile))
-    .filter((tile) => typeof tile.deviceId === 'string' && visibleDeviceIds.has(tile.deviceId));
+    .filter((tile) => typeof tile.deviceId === 'string' && visibleDeviceIds.has(tile.deviceId))
+    .map(tile => {
+      // Older clients saved this generic fallback while a name was unavailable.
+      // Do not let it hide a now-known property name. Never alter stored preferences,
+      // private-device labels or distinct custom aliases.
+      const name = propertyNames.get(String(tile.deviceId));
+      if (tile.label === 'Device' && name && name !== 'Device') {
+        const { label: _placeholder, ...automatic } = tile;
+        return automatic;
+      }
+      return tile;
+    });
   const safeLayoutDocument = {
     version: 1,
     tiles: safeTiles,
