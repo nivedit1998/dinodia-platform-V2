@@ -16,7 +16,8 @@ const notices = load('src/lib/roomAccessNotices.ts', {
   './hubOperatorCredentials': { encryptPlatformEnvelope: (value) => { sealedCalls.push(value); return { sealed: true }; }, decryptPlatformEnvelope: () => 'ab'.repeat(32) },
   './platformDataEncryptionKey': { PlatformDataEncryptionKeyError: class extends Error {} },
 });
-const { queueRoomAccessRequestNotices, queueRoomAccessApprovedNotice, queueRoomAccessDeclinedNotice, queueAlexaLinkedNotice, queueNewDevicesTenantNotices } = notices;
+const { queueRoomAccessRequestNotices, queueRoomAccessApprovedNotice, queueRoomAccessDeclinedNotice, queueAlexaLinkedNotice, queueNewDevicesTenantNotices,
+  queueMembershipInvitationOutcomeNotices } = notices;
 const now = new Date('2026-10-31T12:00:00Z');
 
 function fakeTx({ deciders = [], accounts = {}, devices = {}, prefs = {}, installed = [] }) {
@@ -79,6 +80,39 @@ test('a declined request tells the requester; Alexa linking tells the account ho
   const row = alexa.created.find(([n]) => n === 'createMany')[1].data[0];
   assert.equal(row.idempotencyKey, 'alexa-linked:link-1:email');
   assert.equal(row.homeId, null);
+});
+
+test('invitation outcomes queue encrypted email only for active verified Home owners with stable keys', async () => {
+  const tx = fakeTx({ deciders: [
+    { customerAccountId: 'owner-1' }, { customerAccountId: 'owner-2' }, { customerAccountId: 'owner-1' },
+  ], accounts: {
+    'owner-1': goodAccount('owner1@example.com'),
+    'owner-2': goodAccount('owner2@example.com'),
+  } });
+  tx.trustedDevice.findMany = async () => { throw new Error('invitation outcome must not query push devices'); };
+  sealedCalls.length = 0;
+  const result = await queueMembershipInvitationOutcomeNotices(tx, { homeId: 'home', invitationId: 'invite-1',
+    inviteeName: 'Emily Rose', inviteeEmail: 'emily@example.com', invitedRole: 'TENANT', outcome: 'ACCEPTED', now });
+  assert.equal(result.queued, 2, 'duplicate owner memberships collapse to one email per account');
+  const ownerQuery = tx.created.find(([name]) => name === 'deciders')[1];
+  assert.equal(ownerQuery.role, 'OWNER');
+  assert.equal(ownerQuery.status, 'ACTIVE');
+  assert.deepEqual(ownerQuery.customerAccount.is, { status: 'ACTIVE' });
+  const rows = tx.created.find(([name]) => name === 'createMany')[1].data;
+  assert.deepEqual(rows.map((row) => row.idempotencyKey).sort(), [
+    'membership-invitation-outcome:invite-1:ACCEPTED:owner-1:email',
+    'membership-invitation-outcome:invite-1:ACCEPTED:owner-2:email',
+  ]);
+  assert.ok(rows.every((row) => row.eventType === 'MEMBERSHIP_INVITATION_ACCEPTED_NOTICE' && row.payload.sealed));
+  assert.ok(rows.every((row) => !JSON.stringify(row).includes('emily@example.com') && !JSON.stringify(row).includes('Emily Rose')));
+  assert.deepEqual(sealedCalls.map((value) => JSON.parse(value).details.invitationOutcome), ['ACCEPTED', 'ACCEPTED']);
+
+  const declinedTx = fakeTx({ deciders: [{ customerAccountId: 'owner-1' }],
+    accounts: { 'owner-1': goodAccount('owner1@example.com') } });
+  await queueMembershipInvitationOutcomeNotices(declinedTx, { homeId: 'home', invitationId: 'invite-2',
+    inviteeName: 'Emily Rose', inviteeEmail: 'emily@example.com', invitedRole: 'PROPERTY_MANAGER', outcome: 'DECLINED', now });
+  assert.equal(declinedTx.created.find(([name]) => name === 'createMany')[1].data[0].eventType,
+    'MEMBERSHIP_INVITATION_DECLINED_NOTICE');
 });
 
 test('new devices: a tenant hears only about Dinodia devices in a room they can use, and only if the optional notice is on', async () => {

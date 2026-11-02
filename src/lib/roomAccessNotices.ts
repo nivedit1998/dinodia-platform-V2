@@ -11,10 +11,13 @@ export const ALEXA_LINKED_NOTICE = 'ALEXA_LINKED_NOTICE';
 export const NEW_DEVICES_NOTICE = 'NEW_DEVICES_NOTICE';
 export const MFA_ENABLED_NOTICE = 'MFA_ENABLED_NOTICE';
 export const MFA_DISABLED_NOTICE = 'MFA_DISABLED_NOTICE';
+export const MEMBERSHIP_INVITATION_ACCEPTED_NOTICE = 'MEMBERSHIP_INVITATION_ACCEPTED_NOTICE';
+export const MEMBERSHIP_INVITATION_DECLINED_NOTICE = 'MEMBERSHIP_INVITATION_DECLINED_NOTICE';
 /** Same independent, encrypted outbox the other access notices use, so one dispatcher delivers every kind. */
 export const ACCESS_NOTICE_AGGREGATE = 'HomeownerAccessRemovalNotice';
 /** Notice types added alongside the original removal notices; the dispatcher picks them up with the rest. */
-export const ACCOUNT_NOTICE_TYPES = [ROOM_ACCESS_REQUEST_NOTICE, ROOM_ACCESS_APPROVED_NOTICE, ROOM_ACCESS_DECLINED_NOTICE, ALEXA_LINKED_NOTICE, NEW_DEVICES_NOTICE, MFA_ENABLED_NOTICE, MFA_DISABLED_NOTICE] as const;
+export const ACCOUNT_NOTICE_TYPES = [ROOM_ACCESS_REQUEST_NOTICE, ROOM_ACCESS_APPROVED_NOTICE, ROOM_ACCESS_DECLINED_NOTICE, ALEXA_LINKED_NOTICE, NEW_DEVICES_NOTICE, MFA_ENABLED_NOTICE, MFA_DISABLED_NOTICE,
+  MEMBERSHIP_INVITATION_ACCEPTED_NOTICE, MEMBERSHIP_INVITATION_DECLINED_NOTICE] as const;
 
 const APNS_TOKEN = /^(?:[A-Fa-f0-9]{2}){32,256}$/;
 const EMAIL = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -51,20 +54,23 @@ export async function optionalFamilyEnabled(tx: Pick<Prisma.TransactionClient, '
 
 async function sealedEntries(tx: Prisma.TransactionClient, input: {
   accountId: string; homeId: string | null; aggregateId: string; type: string; keyBase: string; expiresAt: Date; details: NoticeDetails;
+  channels?: { email?: boolean; push?: boolean };
 }): Promise<Prisma.NativeDomainOutboxCreateManyInput[]> {
+  const includeEmail = input.channels?.email !== false;
+  const includePush = input.channels?.push !== false;
   const [account, devices] = await Promise.all([
     tx.customerAccount.findUnique({ where: { id: input.accountId }, select: { email: true, emailVerifiedAt: true, status: true } }),
-    tx.trustedDevice.findMany({ where: { customerAccountId: input.accountId, revokedAt: null,
+    includePush ? tx.trustedDevice.findMany({ where: { customerAccountId: input.accountId, revokedAt: null,
       apnsTokenCiphertext: { not: null }, apnsTokenDigest: { not: null }, apnsEnvironment: { not: null }, apnsKeyVersion: 1 },
-      select: { id: true, apnsTokenCiphertext: true, apnsEnvironment: true } }),
+      select: { id: true, apnsTokenCiphertext: true, apnsEnvironment: true } }) : Promise.resolve([]),
   ]);
   const entries: Prisma.NativeDomainOutboxCreateManyInput[] = [];
-  if (account?.status === 'ACTIVE' && account.emailVerifiedAt && EMAIL.test(account.email) && account.email.length <= 320) {
+  if (includeEmail && account?.status === 'ACTIVE' && account.emailVerifiedAt && EMAIL.test(account.email) && account.email.length <= 320) {
     const sealed = encryptPlatformEnvelope(JSON.stringify({ version: 1, channel: 'EMAIL', recipient: account.email, details: input.details }));
     entries.push({ homeId: input.homeId, aggregateType: ACCESS_NOTICE_AGGREGATE, aggregateId: input.aggregateId, eventType: input.type,
       idempotencyKey: `${input.keyBase}:email`, payload: { noticeId: randomUUID(), sealed }, expiresAt: input.expiresAt });
   }
-  if (account?.status !== 'ACTIVE') return entries;
+  if (account?.status !== 'ACTIVE' || !includePush) return entries;
   for (const device of devices) {
     if (!device.apnsTokenCiphertext || !device.apnsEnvironment) continue;
     try {
@@ -80,6 +86,27 @@ async function sealedEntries(tx: Prisma.TransactionClient, input: {
     }
   }
   return entries;
+}
+
+/** A terminal invitation decision is emailed only to active, verified Home owners. The encrypted outbox is written in
+ * the same transaction as the decision; stable keys make transaction retries and decision replays harmless. */
+export async function queueMembershipInvitationOutcomeNotices(tx: Prisma.TransactionClient, input: {
+  homeId: string; invitationId: string; inviteeName: string; inviteeEmail: string;
+  invitedRole: 'PROPERTY_MANAGER' | 'TENANT'; outcome: 'ACCEPTED' | 'DECLINED'; now: Date;
+}) {
+  const owners = await tx.homeMembership.findMany({ where: { homeId: input.homeId, role: 'OWNER', status: 'ACTIVE',
+    customerAccount: { is: { status: 'ACTIVE' } } }, select: { customerAccountId: true } });
+  const homeLabel = await homeLabelFor(tx, input.homeId);
+  const type = input.outcome === 'ACCEPTED' ? MEMBERSHIP_INVITATION_ACCEPTED_NOTICE : MEMBERSHIP_INVITATION_DECLINED_NOTICE;
+  const entries: Prisma.NativeDomainOutboxCreateManyInput[] = [];
+  for (const ownerId of new Set(owners.map((owner) => owner.customerAccountId))) {
+    entries.push(...await sealedEntries(tx, { accountId: ownerId, homeId: input.homeId, aggregateId: input.invitationId, type,
+      keyBase: `membership-invitation-outcome:${input.invitationId}:${input.outcome}:${ownerId}`, expiresAt: new Date(input.now.getTime() + NOTICE_MS),
+      details: { homeLabel, inviteeName: input.inviteeName, inviteeEmail: input.inviteeEmail,
+        invitedRole: input.invitedRole, invitationOutcome: input.outcome, at: input.now.toISOString() }, channels: { email: true, push: false } }));
+  }
+  if (entries.length) await tx.nativeDomainOutbox.createMany({ data: entries, skipDuplicates: true });
+  return { queued: entries.length };
 }
 
 async function requestDetails(tx: Prisma.TransactionClient, homeId: string, requestId: string): Promise<NoticeDetails> {

@@ -19,6 +19,8 @@ const cases = {
   OWNERSHIP_TRANSFER_NOTICE: { homeLabel: home, removal: 'OWNERSHIP_TRANSFER', role: 'OWNER' },
   HOME_DEREGISTRATION_NOTICE: { homeLabel: home, removal: 'FULL_HOME_DEREGISTRATION', role: 'OWNER' },
   ALEXA_LINKED_NOTICE: { at: '2026-10-31T14:05:00Z' },
+  MEMBERSHIP_INVITATION_ACCEPTED_NOTICE: { homeLabel: home, inviteeName: 'Emily Rose', inviteeEmail: 'emily@example.com', invitedRole: 'TENANT', invitationOutcome: 'ACCEPTED' },
+  MEMBERSHIP_INVITATION_DECLINED_NOTICE: { homeLabel: home, inviteeName: 'Emily Rose', inviteeEmail: 'emily@example.com', invitedRole: 'PROPERTY_MANAGER', invitationOutcome: 'DECLINED' },
   NEW_DEVICES_NOTICE: { homeLabel: home, reference: 'DIN-ABC123', audience: 'OWNER', devices: [{ name: 'Ceiling light', room: 'Kitchen' }, { name: 'Radiator', room: 'Hall' }] },
 };
 
@@ -42,6 +44,19 @@ test('a room request names the person, their email, the room and the Home in the
   const mail = noticeEmail(content);
   for (const part of ['Priya Shah', 'priya@example.com', 'Living Room', home, '31 October 2026 at 14:05 UTC']) assert.ok(mail.text.includes(part), part);
   assert.equal(mail.subject, 'Priya Shah has asked for access to Living Room');
+});
+
+test('invitation outcome notices tell the homeowner which person accepted or declined and never claim access on decline', () => {
+  const accepted = composeNotice('MEMBERSHIP_INVITATION_ACCEPTED_NOTICE', cases.MEMBERSHIP_INVITATION_ACCEPTED_NOTICE);
+  assert.equal(accepted.pushTitle, 'Home invitation accepted');
+  assert.ok(accepted.paragraphs.join(' ').includes('Emily Rose'));
+  assert.ok(accepted.paragraphs.join(' ').includes('access is now active'));
+  assert.ok(noticeEmail(accepted).text.includes('emily@example.com'));
+
+  const declined = composeNotice('MEMBERSHIP_INVITATION_DECLINED_NOTICE', cases.MEMBERSHIP_INVITATION_DECLINED_NOTICE);
+  assert.equal(declined.pushTitle, 'Home invitation declined');
+  assert.ok(declined.paragraphs.join(' ').includes('No access was granted'));
+  assert.ok(noticeEmail(declined).text.includes('property manager'));
 });
 
 test('details are escaped in the HTML email and cannot inject markup', () => {

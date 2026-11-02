@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server';
 import { validateCustomerInvitationDecisionReceipt, validateCustomerInvitationDecisionRequest } from '@/lib/contracts/dinodiaV1';
 import { nativeV1ErrorResponse } from '@/lib/contracts/nativeV1Error';
 import { decideCustomerInvitation } from '@/lib/customerInvitation';
+import { dispatchHomeownerAccessRemovalNotices } from '@/lib/installationRequestDelivery';
 import { requireCustomerAccountSession, Stage1AuthError } from '@/lib/stage1Auth';
 
 export const dynamic = 'force-dynamic';
@@ -29,6 +30,9 @@ export async function POST(request: Request, context: { params: Promise<{ invita
     }, (nextPhase) => { phase = nextPhase; });
     phase = 'receipt_contract_validation';
     if (!validateCustomerInvitationDecisionReceipt(receipt, invitationId)) throw new Stage1AuthError(500, 'INTERNAL_ERROR', 'The invitation decision receipt failed validation');
+    // The encrypted outbox commit is authoritative; attempt prompt delivery after commit. The existing scheduled
+    // dispatcher retries if email configuration or the provider is temporarily unavailable.
+    try { await dispatchHomeownerAccessRemovalNotices(); } catch { /* scheduled dispatcher retries */ }
     return NextResponse.json(receipt, { headers: { 'Cache-Control': 'no-store', Pragma: 'no-cache' } });
   } catch (error) { return nativeV1ErrorResponse(error, { operation: 'customer_invitation_decision', phase, startedAt }); }
 }
