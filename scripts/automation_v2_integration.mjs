@@ -32,7 +32,7 @@ export async function automationV2Integration({prisma, fixture:f, base, fetchJso
     const listed=await request('/api/automations');assert.equal(listed.response.status,200,JSON.stringify(listed.body));
     const rootContract=JSON.parse(fs.readFileSync(new URL('../contracts/dinodia-v1/contract.json',import.meta.url)));
     const versioned=JSON.parse(fs.readFileSync(new URL('../contracts/dinodia-v1/schemas/automations-v2.schema.json',import.meta.url)));
-    const ajv=new Ajv2020({strict:false});ajv.addSchema(rootContract);ajv.addSchema(versioned);
+    const ajv=new Ajv2020({strict:false,formats:{'date-time':s=>/^\d{4}-\d{2}-\d{2}T.*Z$/.test(s)&&Number.isFinite(Date.parse(s))}});ajv.addSchema(rootContract);ajv.addSchema(versioned);
     const validateProjection=ajv.getSchema(versioned.$id+'#/$defs/projection');assert.equal(validateProjection(listed.body),true,JSON.stringify(validateProjection.errors));
     const item=listed.body.automations.find(r=>r.id===id);assert(item);assert.equal(item.trigger.kind,'DEVICE_STATE');assert.equal(item.trigger.configuration.deviceId,devices[0].id);assert(!JSON.stringify(item.trigger).includes('osDeviceId'));
     const legacy=await request('/api/automations','GET',undefined,{'x-dinodia-automations':''});assert.equal(legacy.response.status,200);assert.equal(legacy.body.automations.find(r=>r.id===id).trigger,null);
@@ -44,6 +44,9 @@ export async function automationV2Integration({prisma, fixture:f, base, fetchJso
     assert.equal(login.response.status,200);
     const proxy=await machineRequest({base,path:'/api/hub-agent/v2/tenant-automations',machineSecret:f.machineSecret,body:{serial:f.identityOneSerial,identityGeneration:f.identityOneGeneration,schemaVersion:'dinodia.v1',homeId:f.homeOneId,membershipId:f.tenantMembershipId,operation:'list',accountAccessToken:login.body.accessToken,automationContractVersion:2}});
     assert.equal(proxy.response.status,200,JSON.stringify(proxy.body));assert.equal(validateProjection(proxy.body),true,JSON.stringify(validateProjection.errors));assert.equal(proxy.body.automations.find(r=>r.id===id).trigger.kind,'DEVICE_STATE');
+    // Simulate the already-tested signed acknowledgement in this disposable fixture only.
+    const current=await prisma.hubInstallation.findUniqueOrThrow({where:{id:f.hubOneId},select:{cloudConfigurationRevision:true}});
+    await prisma.hubInstallation.update({where:{id:f.hubOneId},data:{acknowledgedCloudRevision:current.cloudConfigurationRevision}});
     const enable=await request(`/api/automations/${id}/enabled`,'POST',{enabled:true,expectedRevision:1},{'idempotency-key':crypto.randomUUID()});assert.equal(enable.response.status,200,JSON.stringify(enable.body));
     const beforeFlag=process.env.DINODIA_NATIVE_AUTOMATIONS_ENABLED;process.env.DINODIA_NATIVE_AUTOMATIONS_ENABLED='true';
     try {
