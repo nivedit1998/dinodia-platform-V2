@@ -221,7 +221,7 @@ async function applyHubSyncEventInner(tx: Prisma.TransactionClient, input: SyncE
     const osDeviceId = String(payload.osDeviceId);
     const device = await tx.nativeDevice.findUnique({ where: { hubInstallationId_osDeviceId: { hubInstallationId, osDeviceId } }, select: {
       id: true, homeId: true, managementClass: true, lifecycle: true, descriptorRevision: true, descriptorDigest: true, protocol: true, originalName: true,
-      capabilitySummary: true,
+      capabilitySummary: true, overrideName: true,
       assignments: { where: { validUntil: null }, select: { id: true, areaId: true, validFrom: true } },
     } });
     // OS discovery is not itself authority to decide whether an unknown device
@@ -258,8 +258,15 @@ async function applyHubSyncEventInner(tx: Prisma.TransactionClient, input: SyncE
       delete nextSummary.controlCatalog;
       delete nextSummary.alexaStateByControl;
     }
+    // Initial commissioning can seed the display override with the source name.
+    // Such a mirrored value must follow a later OS rename; a genuinely different
+    // customer alias remains an intentional overlay. Ordinary inventory is a no-op.
+    const sourceRenamed = String(payload.name) !== device.originalName;
+    const mirroredOverride = device.overrideName != null
+      && device.overrideName.normalize('NFC').trim() === device.originalName.normalize('NFC').trim();
     await tx.nativeDevice.update({ where: { id: device.id }, data: {
       originalName: String(payload.name), technicalLabel: String(payload.technicalLabel), protocol: String(payload.protocol),
+      ...(sourceRenamed && mirroredOverride ? { overrideName: null, inventoryRevision: { increment: 1 } } : {}),
       deviceType: String(payload.deviceType), descriptorRevision, descriptorDigest,
       capabilitySummary: nextSummary as Prisma.InputJsonValue,
       onlineState: payload.available === true ? 'ONLINE' : 'OFFLINE',
