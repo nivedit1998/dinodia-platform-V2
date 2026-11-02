@@ -1,3 +1,4 @@
+import { automationSources } from './triggerReferences';
 import type { Prisma } from '@prisma/client';
 import { automationDefinitionChecksum } from './validation';
 
@@ -15,9 +16,10 @@ export async function retireNativeAutomations(db: Prisma.TransactionClient, inpu
     homeId: input.homeId, status: { not: 'RETIRED' },
     ...(input.automationIds ? { id: { in: [...input.automationIds] } } : {}),
     ...(input.createdByMembershipId ? { createdByMembershipId: input.createdByMembershipId } : {}),
-    ...(input.losingAreaIds?.length ? { actions: { some: { homeId: input.homeId, areaId: { in: [...input.losingAreaIds] } } } } : {}),
-  }, select: { id: true, revision: true, propertyImpact: true } });
-  for (const row of rows) {
+
+  }, take: 100, select: { id: true, revision: true, propertyImpact: true, actions:{select:{areaId:true}},triggers:{select:{configuration:true}} } });
+  const affected = input.losingAreaIds?.length ? rows.filter(row=>(row.actions ?? []).some(action=>input.losingAreaIds!.includes(action.areaId)) || (row.triggers ?? []).some(trigger=>automationSources(trigger.configuration).some(source=>input.losingAreaIds!.includes(source.areaId)))) : rows;
+  for (const row of affected) {
     const revision = row.revision + 1;
     const updated = await db.nativeAutomation.updateMany({ where: { id: row.id, homeId: input.homeId, revision: row.revision, status: { not: 'RETIRED' } }, data: {
       status: 'RETIRED', name: 'Removed automation', revision,
@@ -31,5 +33,5 @@ export async function retireNativeAutomations(db: Prisma.TransactionClient, inpu
       category: 'ACCESS', action: 'native_automation_authority_withdrawn', targetType: 'NativeAutomation', targetId: row.id,
       metadata: { outcome: 'retired', revision, reason: input.reason, propertyImpact: row.propertyImpact }, purgeAt: new Date(now.getTime() + 365 * 24 * 60 * 60 * 1000) } });
   }
-  return { retiredCount: rows.length, propertyImpactCount: rows.filter((row) => row.propertyImpact).length };
+  return { retiredCount: affected.length, propertyImpactCount: affected.filter((row) => row.propertyImpact).length };
 }

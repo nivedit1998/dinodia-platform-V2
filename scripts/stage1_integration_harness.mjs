@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import { automationV2Integration } from './automation_v2_integration.mjs';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -466,6 +467,7 @@ function loadHubCloudConfigurationBuilder() {
   const compiled = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, esModuleInterop: true } }).outputText;
   const loaded = { exports: {} };
   const localRequire = (specifier) => specifier === './hubSyncEnvelope' ? envelope
+    : specifier === './nativeAutomations/triggerReferences' ? compile('src/lib/nativeAutomations/triggerReferences.ts')
     : specifier === './deletionReferences' ? compile('src/lib/deletionReferences.ts')
     : specifier === './dailyAnalyticsSchema' ? compile('src/lib/dailyAnalyticsSchema.ts')
     : specifier === './analyticsIntervals' ? analyticsIntervalDomain()
@@ -13461,7 +13463,10 @@ try {
   await customerAuthenticationLifecycleChecks(deliveryEnv);
   await emailFirstChecks();
   await customerAuthorizationChecks(deliveryEnv);
-  if (process.env.UNIVERSAL_STATE_ANALYTICS_ONLY === '1') {
+  if (process.env.AUTOMATIONS_ONLY === '1') {
+    await automationV2Integration({prisma,fixture:customerFixture,base:`http://127.0.0.1:${appPort}`,fetchJson,machineRequest,buildConfiguration:buildHubCloudConfiguration,osRoot});
+    verifyChildOutboundTargets();
+  } else if (process.env.UNIVERSAL_STATE_ANALYTICS_ONLY === '1') {
     await universalStateAnalyticsIntegration({prisma,fixture:customerFixture,osRoot,base:`http://127.0.0.1:${appPort}`,machineRequest,fetchJson});
     verifyChildOutboundTargets();
   } else if (process.env.CALENDAR_ANALYTICS_ONLY === '1') {

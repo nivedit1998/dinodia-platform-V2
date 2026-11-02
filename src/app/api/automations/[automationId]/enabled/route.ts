@@ -1,3 +1,4 @@
+import { automationContractVersion, sourceConfigurationForClient, automationSources } from '@/lib/nativeAutomations/triggerReferences';
 import { NextResponse } from 'next/server';
 import { Prisma } from '@prisma/client';
 import { nativeV1ErrorResponse } from '@/lib/contracts/nativeV1Error';
@@ -14,6 +15,7 @@ type Context = { params: Promise<{ automationId: string }> };
 
 export async function POST(request: Request, context: Context) {
   try {
+    const contractVersion = automationContractVersion(request);
     const principal = await requireCustomerSelectedHome(request);
     if (principal.role !== 'TENANT') throw new Stage1AuthError(403, 'home_membership_forbidden', 'Only the owning tenant can change this automation');
     const { automationId } = await context.params;
@@ -32,7 +34,7 @@ export async function POST(request: Request, context: Context) {
           tx.homeMembership.findFirst({ where: { id: principal.membershipId, customerAccountId: principal.id, homeId: principal.homeId, role: 'TENANT', status: 'ACTIVE', customerAccount: { status: 'ACTIVE' } }, select: { id: true, tenantAreaGrants: { where: { revokedAt: null, area: { status: 'ACTIVE' } }, select: { areaId: true } } } }),
           tx.home.findFirst({ where: { id: principal.homeId, lifecycle: 'ACTIVE', installationStatus: 'COMPLETE' }, select: { id: true, timezone: true, managementRevision: true, activeHubInstallationId: true } }),
           tx.hubInstallation.findFirst({ where: { id: principal.hubInstallationId, homeId: principal.homeId, lifecycleStatus: 'ACTIVE' }, select: { id: true, cloudConfigurationRevision: true, acknowledgedCloudRevision: true } }),
-          tx.nativeAutomation.findFirst({ where: { id: automationId, homeId: principal.homeId, createdByMembershipId: principal.membershipId, status: { not: 'RETIRED' } }, select: { id: true, name: true, status: true, revision: true, timezone: true, triggers: { take: 1, select: { id: true, configuration: true } }, actions: { orderBy: [{ sortOrder: 'asc' }, { id: 'asc' }], select: { id: true, deviceId: true, areaId: true, controlId: true, sortOrder: true, descriptorRevision: true, actionValue: true } } } }),
+          tx.nativeAutomation.findFirst({ where: { id: automationId, homeId: principal.homeId, createdByMembershipId: principal.membershipId, status: { not: 'RETIRED' } }, select: { id: true, name: true, status: true, revision: true, timezone: true, triggers: { take: 1, select: { id: true, kind: true, configuration: true } }, actions: { orderBy: [{ sortOrder: 'asc' }, { id: 'asc' }], select: { id: true, deviceId: true, areaId: true, controlId: true, sortOrder: true, descriptorRevision: true, actionValue: true } } } }),
         ]);
         if (!membership || !home || !hub || home.activeHubInstallationId !== hub.id || !row) throw new NativeAutomationError(404, 'AUTOMATION_NOT_FOUND', 'This automation is not available');
         if (Number(raw.expectedRevision) !== row.revision) throw new NativeAutomationError(409, 'AUTOMATION_REVISION_CONFLICT', 'This automation changed. Reload it before continuing');
@@ -43,9 +45,10 @@ export async function POST(request: Request, context: Context) {
           const trigger = row.triggers[0]?.configuration;
           if (!trigger || typeof trigger !== 'object' || Array.isArray(trigger)) throw new NativeAutomationError(409, 'AUTOMATION_TRIGGER_INVALID', 'This automation needs attention before it can be enabled');
           validatedDefinition = await validateNativeAutomationDefinition(tx, { homeId: home.id, membershipId: membership.id, grantedAreaIds: membership.tenantAreaGrants.map((grant) => grant.areaId), raw: {
-            name: row.name, trigger, actions: row.actions.map((action) => ({ deviceId: action.deviceId, areaId: action.areaId, controlId: action.controlId, targetValue: action.actionValue })),
-          } });
+            name: row.name, trigger: row.triggers[0]?.kind === 'DEVICE_STATE' ? sourceConfigurationForClient(trigger) : trigger, actions: row.actions.map((action) => ({ deviceId: action.deviceId, areaId: action.areaId, controlId: action.controlId, targetValue: action.actionValue })),
+          }, contractVersion });
           await assertNoNativeAutomationConflict(tx, { homeId: home.id, candidate: validatedDefinition, excludeAutomationId: row.id });
+          if (validatedDefinition.triggerKind === 'DEVICE_STATE') await tx.nativeAutomationTrigger.update({where:{id:row.triggers[0].id},data:{configuration:validatedDefinition.triggerConfiguration as Prisma.InputJsonValue,revision:{increment:1}}});
           const currentActions = new Map(row.actions.map((action) => [`${action.deviceId}:${action.controlId}`, action]));
           const validatedAt = new Date();
           for (const action of validatedDefinition.actions) {
@@ -61,7 +64,7 @@ export async function POST(request: Request, context: Context) {
         const status = enabled ? 'ACTIVE' : 'PAUSED';
         const definitionChecksum = enabled && validatedDefinition
           ? automationDefinitionChecksum({ name: validatedDefinition.name, timezone: home.timezone, minuteOfDay: validatedDefinition.minuteOfDay,
-            weekdays: validatedDefinition.weekdays, actions: validatedDefinition.actions.map(({ deviceId, areaId, controlId, descriptorRevision, targetValue, sortOrder }) =>
+            weekdays: validatedDefinition.weekdays, ...(validatedDefinition.triggerKind === 'DEVICE_STATE' ? {deviceTrigger:validatedDefinition.triggerConfiguration}:{}), actions: validatedDefinition.actions.map(({ deviceId, areaId, controlId, descriptorRevision, targetValue, sortOrder }) =>
               ({ deviceId, areaId, controlId, descriptorRevision, targetValue, sortOrder })) })
           : automationDefinitionChecksum({ id: row.id, revision, name: row.name, status, timezone: home.timezone ?? row.timezone,
             trigger: row.triggers[0]?.configuration ?? null, actions: row.actions.map((action) => ({ id: action.id, deviceId: action.deviceId, areaId: action.areaId, controlId: action.controlId, targetValue: action.actionValue })) });

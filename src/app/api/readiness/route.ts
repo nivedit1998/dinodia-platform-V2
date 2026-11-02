@@ -24,6 +24,8 @@ export async function GET() {
     const ready = logicalSchemaReady && (process.env.DINODIA_CALENDAR_ANALYTICS_ENABLED !== 'true' || calendarSchemaReady)
       && isSchemaReady(migration, Number(modelCount[0]?.count ?? 0), expectedMigrationChecksum);
     return Response.json({ ok: ready, ready, service: 'dinodia-platform-v2', build: safeBuildId(),
+      tenantAutomationContractVersion: ready ? 2 : null,
+      tenantAutomationsEnabled: process.env.DINODIA_NATIVE_AUTOMATIONS_ENABLED === 'true',
       logicalDevicesContractVersion: logicalSchemaReady ? 1 : null,
       logicalDevicesSchemaChecksum: logicalSchemaReady ? logicalChecksum : null,
       logicalDevicesEnabled: process.env.DINODIA_LOGICAL_DEVICES_ENABLED === 'true',

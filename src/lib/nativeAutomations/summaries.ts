@@ -1,10 +1,11 @@
+import { automationSources, sourceConfigurationForClient } from './triggerReferences';
 import { prisma } from '@/lib/prisma';
 import { NativeAutomationError } from './validation';
 
 async function selectedHub(homeId: string) {
   const home = await prisma.home.findUnique({ where: { id: homeId }, select: { managementRevision: true, timezone: true, activeHubInstallationId: true } });
   const hub = home?.activeHubInstallationId ? await prisma.hubInstallation.findFirst({ where: { id: home.activeHubInstallationId, homeId, lifecycleStatus: 'ACTIVE' }, select: {
-    id: true, cloudConfigurationRevision: true, acknowledgedCloudRevision: true, lastSuccessfulSyncAt: true,
+    id: true, cloudConfigurationRevision: true, acknowledgedCloudRevision: true, lastSuccessfulSyncAt: true, capabilitySummary: true,
   } }) : null;
   const cloudRevision = hub?.cloudConfigurationRevision ?? 0;
   const appliedRevision = hub?.acknowledgedCloudRevision ?? 0;
@@ -12,7 +13,8 @@ async function selectedHub(homeId: string) {
   return { home, hub, cloudRevision, appliedRevision, executionEnabled, applied: Boolean(hub && appliedRevision >= cloudRevision) };
 }
 
-function triggerSummary(trigger: { id: string; kind: string; configuration: unknown; revision: number } | undefined) {
+export function triggerSummary(trigger: { id: string; kind: string; configuration: unknown; revision: number } | undefined, contractVersion = 1) {
+  if (contractVersion === 2 && trigger?.kind === 'DEVICE_STATE') return { id: trigger.id, kind: trigger.kind, configuration: sourceConfigurationForClient(trigger.configuration), revision: trigger.revision };
   if (!trigger || trigger.kind !== 'SCHEDULE' || !trigger.configuration || typeof trigger.configuration !== 'object' || Array.isArray(trigger.configuration)) return null;
   const value = trigger.configuration as Record<string, unknown>;
   const minuteOfDay = Number(value.minuteOfDay);
@@ -42,7 +44,7 @@ function tenantOutcome(execution: { status: string; startedAt: Date; completedAt
   };
 }
 
-export async function listTenantAutomationSummaries(input: { homeId: string; membershipId: string }) {
+export async function listTenantAutomationSummaries(input: { homeId: string; membershipId: string; contractVersion?: number }) {
   const membership = await prisma.homeMembership.findFirst({ where: { id: input.membershipId, homeId: input.homeId, role: 'TENANT', status: 'ACTIVE' }, select: {
     id: true, accessRevision: true, tenantAreaGrants: { where: { revokedAt: null, area: { status: 'ACTIVE' } }, select: { areaId: true } },
   } });
@@ -56,7 +58,14 @@ export async function listTenantAutomationSummaries(input: { homeId: string; mem
       executions: { where: { purgeAt: { gt: new Date() } }, orderBy: { startedAt: 'desc' }, take: 1, select: { status: true, startedAt: true, completedAt: true, safeOutcome: true } },
     } }),
   ]);
-  const visibleRows = rows.filter((row) => row.status !== 'RETIRED' || !delivery.applied);
+  const granted = new Set(membership.tenantAreaGrants.map(grant => grant.areaId));
+  const referenced = [...new Set(rows.flatMap(row => automationSources(row.triggers[0]?.configuration).map(source => source.deviceId)))];
+  const currentSources = referenced.length ? await prisma.nativeDevice.findMany({where:{homeId:input.homeId,id:{in:referenced},lifecycle:'INSTALLED'},select:{id:true,managementClass:true,ownerMembershipId:true,descriptorRevision:true,assignments:{where:{validUntil:null,area:{status:'ACTIVE'}},select:{areaId:true}}}}) : [];
+  const visibleRows = rows.filter(row => (row.status !== 'RETIRED' || !delivery.applied) && automationSources(row.triggers[0]?.configuration).every(source => {
+    const d = currentSources.find(device => device.id === source.deviceId);
+    return granted.has(source.areaId) && d && d.assignments.some(a=>a.areaId===source.areaId)
+      && (d.managementClass==='PROPERTY_DEVICE' && d.ownerMembershipId===null || d.managementClass==='TENANT_DEVICE' && d.ownerMembershipId===membership.id);
+  }));
   return {
     ok: true,
     homeId: input.homeId,
@@ -65,13 +74,14 @@ export async function listTenantAutomationSummaries(input: { homeId: string; mem
     managementRevision: delivery.home?.managementRevision ?? 0,
     propertyTimeZone: delivery.home?.timezone ?? null,
     delivery: { state: !delivery.executionEnabled ? 'activation_disabled' : delivery.applied ? 'applied' : 'pending_delivery', cloudRevision: delivery.cloudRevision, appliedRevision: delivery.appliedRevision, lastSuccessfulSyncAt: delivery.hub?.lastSuccessfulSyncAt?.toISOString() ?? null },
+    ...(input.contractVersion === 2 ? {customTriggersAvailable: (delivery.hub?.capabilitySummary as Record<string,unknown> | null)?.nativeDeviceTriggersV2 === true} : {}),
     automations: visibleRows.map((row) => ({
       id: row.id, name: row.name, status: row.status === 'RETIRED' ? 'removal_pending'
         : row.status === 'NEEDS_ATTENTION' || row.actions.some((action) => action.needsAttention) ? 'needs_attention'
           : row.status === 'PAUSED' ? (delivery.applied ? 'disabled' : 'disabled_waiting_for_hub')
             : !delivery.executionEnabled ? 'waiting_for_activation' : delivery.applied ? 'active' : 'waiting_for_hub',
       revision: row.revision, definitionChecksum: row.definitionChecksum, timeZone: row.timezone,
-      trigger: triggerSummary(row.triggers[0]),
+      trigger: triggerSummary(row.triggers[0], input.contractVersion ?? 1),
       actions: row.status === 'RETIRED' ? [] : row.actions.flatMap((action) => membership.tenantAreaGrants.some((grant) => grant.areaId === action.areaId) ? [{
         id: action.id, deviceId: action.deviceId, areaId: action.areaId, controlId: action.controlId, sortOrder: action.sortOrder, descriptorRevision: action.descriptorRevision,
         targetValue: action.actionValue, needsAttention: action.needsAttention,
@@ -114,7 +124,7 @@ export async function listPropertyAutomationSummaries(input: { homeId: string; m
       // Keep property oversight useful without carrying that title across the
       // property/private boundary.
       name: row.status === 'RETIRED' ? 'Removal pending'
-        : row.actions.some((action) => action.device.managementClass === 'TENANT_DEVICE') ? 'Tenant automation' : row.name,
+        : row.actions.some((action) => action.device.managementClass === 'TENANT_DEVICE') || automationSources(row.triggers[0]?.configuration).some(source=>source.managementClass==='TENANT_DEVICE') ? 'Tenant automation' : row.name,
       status: row.status === 'RETIRED' ? 'removal_pending'
         : row.status === 'NEEDS_ATTENTION' || row.actions.some((action) => action.needsAttention) ? 'needs_attention'
           : row.status === 'PAUSED' ? (delivery.applied ? 'disabled' : 'disabled_waiting_for_hub')

@@ -1,3 +1,4 @@
+import { automationSources } from './triggerReferences';
 import type { Prisma } from '@prisma/client';
 import { automationDefinitionChecksum } from './validation';
 
@@ -11,15 +12,15 @@ export async function suspendAutomationsForDeviceChange(tx: Prisma.TransactionCl
 }) {
   const rows = await tx.nativeAutomation.findMany({ where: {
     homeId: input.homeId, status: 'ACTIVE',
-    actions: { some: { homeId: input.homeId, deviceId: input.deviceId,
-      ...(input.controlIds?.length ? { controlId: { in: [...input.controlIds] } } : {}) } },
-  }, select: { id: true, name: true, revision: true, timezone: true,
+
+  }, take:100, select: { id: true, name: true, revision: true, timezone: true,
     triggers: { orderBy: { id: 'asc' }, take: 1, select: { configuration: true } },
     actions: { orderBy: [{ sortOrder: 'asc' }, { id: 'asc' }], select: {
       id: true, deviceId: true, areaId: true, controlId: true, sortOrder: true, descriptorRevision: true, actionValue: true,
     } },
   } });
-  for (const row of rows) {
+  const affected = rows.filter(row=>(row.actions ?? []).some(action=>action.deviceId===input.deviceId && (!input.controlIds?.length || input.controlIds.includes(action.controlId))) || (row.triggers ?? []).some(trigger=>automationSources(trigger.configuration).some(source=>source.deviceId===input.deviceId && (!input.controlIds?.length || input.controlIds.includes(source.controlId)))));
+  for (const row of affected) {
     const revision = row.revision + 1;
     const checksum = automationDefinitionChecksum({ id: row.id, revision, name: row.name, status: 'NEEDS_ATTENTION',
       timezone: row.timezone, trigger: row.triggers[0]?.configuration ?? null,
@@ -33,6 +34,6 @@ export async function suspendAutomationsForDeviceChange(tx: Prisma.TransactionCl
       action: 'native_automation_needs_attention', targetType: 'NativeAutomation', targetId: row.id,
       metadata: { outcome: 'suspended', revision, reason: input.reason }, purgeAt: new Date(input.now.getTime() + 365 * 24 * 60 * 60 * 1000) } });
   }
-  if (rows.length) await tx.home.updateMany({ where: { id: input.homeId }, data: { managementRevision: { increment: 1 } } });
-  return rows.length;
+  if (affected.length) await tx.home.updateMany({ where: { id: input.homeId }, data: { managementRevision: { increment: 1 } } });
+  return affected.length;
 }

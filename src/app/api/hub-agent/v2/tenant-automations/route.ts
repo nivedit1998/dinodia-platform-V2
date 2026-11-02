@@ -13,7 +13,7 @@ const MAX_BODY_BYTES = 48 * 1024;
 type Body = Record<string, unknown>;
 
 function exactKeys(value: Body, keys: string[]) {
-  return Object.keys(value).sort().join('|') === [...keys].sort().join('|');
+  return (value.automationContractVersion === undefined || value.automationContractVersion === 2) && Object.keys(value).filter(key=>key!=='automationContractVersion').sort().join('|') === [...keys].sort().join('|');
 }
 
 async function readBoundedBody(request: Request): Promise<string> {
@@ -69,6 +69,7 @@ export async function POST(request: Request) {
     }
 
     const headers = new Headers({ authorization: `Bearer ${accessToken}`, 'x-dinodia-home-id': homeId, accept: 'application/json' });
+    if (body.automationContractVersion === 2) headers.set('x-dinodia-automations','2');
     const authorityRequest = new Request(new URL('/api/automations', request.url), { method: 'GET', headers });
     const selected = await requireCustomerSelectedHome(authorityRequest);
     if (selected.role !== 'TENANT' || selected.homeId !== homeId || selected.membershipId !== membershipId

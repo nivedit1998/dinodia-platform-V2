@@ -1,3 +1,4 @@
+import { automationContractVersion, sourceConfigurationForClient, automationSources } from '@/lib/nativeAutomations/triggerReferences';
 import { randomUUID } from 'node:crypto';
 import { NextResponse } from 'next/server';
 import { Prisma } from '@prisma/client';
@@ -20,9 +21,10 @@ function requestFailure(error: unknown) {
 
 export async function GET(request: Request) {
   try {
+    const contractVersion = automationContractVersion(request);
     const principal = await requireCustomerSelectedHome(request);
     if (principal.role !== 'TENANT') throw new Stage1AuthError(403, 'home_membership_forbidden', 'Tenant automation access is limited to the selected tenant membership');
-    const projection = await listTenantAutomationSummaries({ homeId: principal.homeId, membershipId: principal.membershipId });
+    const projection = await listTenantAutomationSummaries({ homeId: principal.homeId, membershipId: principal.membershipId, contractVersion });
     return NextResponse.json(projection, { headers: { 'Cache-Control': 'no-store', Pragma: 'no-cache' } });
   } catch (error) { return requestFailure(error); }
 }
@@ -35,6 +37,7 @@ async function boundedJson(request: Request): Promise<unknown> {
 
 export async function POST(request: Request) {
   try {
+    const contractVersion = automationContractVersion(request);
     const principal = await requireCustomerSelectedHome(request);
     if (principal.role !== 'TENANT') throw new Stage1AuthError(403, 'home_membership_forbidden', 'Only the selected tenant can create a tenant automation');
     const raw = await boundedJson(request);
@@ -58,11 +61,11 @@ export async function POST(request: Request) {
         try { new Intl.DateTimeFormat('en', { timeZone: home.timezone }); } catch { throw new NativeAutomationError(409, 'AUTOMATION_TRIGGER_INVALID', 'The Home time zone is not valid'); }
         const count = await tx.nativeAutomation.count({ where: { homeId: home.id, status: { not: 'RETIRED' } } });
         if (count >= 100) throw new NativeAutomationError(409, 'AUTOMATION_ACTIONS_INVALID', 'This Home has reached its automation limit');
-        const definition = await validateNativeAutomationDefinition(tx, { homeId: home.id, membershipId: membership.id, grantedAreaIds: membership.tenantAreaGrants.map((grant) => grant.areaId), raw, allowInitialState: true });
+        const definition = await validateNativeAutomationDefinition(tx, { homeId: home.id, membershipId: membership.id, grantedAreaIds: membership.tenantAreaGrants.map((grant) => grant.areaId), raw, allowInitialState: true, contractVersion });
         if (definition.initiallyEnabled) await assertNoNativeAutomationConflict(tx, { homeId: home.id, candidate: definition });
         const automationId = randomUUID();
         const triggerId = randomUUID();
-        const normalized = { name: definition.name, timezone: home.timezone, minuteOfDay: definition.minuteOfDay, weekdays: definition.weekdays,
+        const normalized = { name: definition.name, timezone: home.timezone, minuteOfDay: definition.minuteOfDay, weekdays: definition.weekdays, ...(definition.triggerKind === 'DEVICE_STATE' ? { deviceTrigger: definition.triggerConfiguration } : {}),
           actions: definition.actions.map(({ deviceId, areaId, controlId, descriptorRevision, targetValue, sortOrder }) => ({ deviceId, areaId, controlId, descriptorRevision, targetValue, sortOrder })) };
         const definitionChecksum = automationDefinitionChecksum(normalized);
         const nextManagementRevision = home.managementRevision + 1;
@@ -71,7 +74,7 @@ export async function POST(request: Request) {
         const created = await tx.nativeAutomation.create({ data: {
           id: automationId, homeId: home.id, createdByMembershipId: membership.id, name: definition.name, status: definition.initiallyEnabled ? 'ACTIVE' : 'PAUSED', revision: 1,
           propertyImpact: definition.actions.some((action) => action.managementClass === 'PROPERTY_DEVICE'),
-          definitionChecksum, timezone: home.timezone, enabledAt: definition.initiallyEnabled ? new Date() : null, triggers: { create: { id: triggerId, kind: 'SCHEDULE', configuration: { minuteOfDay: definition.minuteOfDay, weekdays: definition.weekdays } as Prisma.InputJsonValue, revision: 1 } },
+          definitionChecksum, timezone: home.timezone, enabledAt: definition.initiallyEnabled ? new Date() : null, triggers: { create: { id: triggerId, kind: definition.triggerKind, configuration: definition.triggerConfiguration as Prisma.InputJsonValue, revision: 1 } },
           actions: { create: definition.actions.map((action) => ({ homeId: home.id, deviceId: action.deviceId, areaId: action.areaId, controlId: action.controlId, sortOrder: action.sortOrder, descriptorRevision: action.descriptorRevision, actionValue: action.targetValue as Prisma.InputJsonValue, needsAttention: false, lastValidatedAt: new Date() })) },
         }, select: { id: true, revision: true } });
         if (!home.activeHubInstallationId) throw new NativeAutomationError(409, 'HUB_UNAVAILABLE', 'The selected Home has no current hub');
