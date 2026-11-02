@@ -4,6 +4,12 @@ import { NextResponse } from 'next/server';
 type BoundedFailure = { status?: unknown; code?: unknown; message?: unknown };
 
 const CODE_BY_STAGE1_ERROR: Record<string, string> = {
+  AUTOMATION_HUB_UPDATE_REQUIRED: 'FEATURE_NOT_ENABLED',
+  AUTOMATION_UPGRADE_REQUIRED: 'FEATURE_NOT_ENABLED',
+  AUTOMATION_CONTRACT_UNSUPPORTED: 'FEATURE_NOT_ENABLED',
+  AUTOMATION_CONDITIONS_INVALID: 'AUTOMATION_TRIGGER_INVALID',
+  AUTOMATION_SOURCE_UNAVAILABLE: 'AUTOMATION_CONTROL_UNAVAILABLE',
+  AUTOMATION_FEEDBACK_LOOP: 'AUTOMATION_CONFLICT',
   customer_session_required: 'AUTH_REQUIRED',
   customer_session_invalid: 'TOKEN_EXPIRED',
   customer_access_token_expired: 'CUSTOMER_ACCESS_EXPIRED',

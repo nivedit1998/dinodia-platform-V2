@@ -1,12 +1,13 @@
 import { createHash } from 'node:crypto';
 import type { Prisma } from '@prisma/client';
+import { automationSources, type AutomationSource } from './triggerReferences';
 
 export class NativeAutomationError extends Error {
   constructor(readonly status: number, readonly code: string, message: string) { super(message); }
 }
 
 type ActionInput = { deviceId: string; areaId: string; controlId: string; targetValue: Record<string, unknown> };
-type NormalizedDefinition = { name: string; minuteOfDay: number; weekdays: number[]; initiallyEnabled: boolean; actions: Array<ActionInput & { sortOrder: number; descriptorRevision: number; managementClass: string; osDeviceId: string; osAreaId: string }> };
+type NormalizedDefinition = { triggerKind: 'SCHEDULE' | 'DEVICE_STATE'; triggerConfiguration: Record<string, unknown>; name: string; minuteOfDay: number; weekdays: number[]; initiallyEnabled: boolean; actions: Array<ActionInput & { sortOrder: number; descriptorRevision: number; managementClass: string; osDeviceId: string; osAreaId: string }> };
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const APP_ONLY_ROLES = new Set(['security_lock', 'lock_state']);
 
@@ -49,19 +50,36 @@ function scheduleOverlaps(left: { minuteOfDay: number; weekdays: number[] }, rig
 }
 
 export async function validateNativeAutomationDefinition(tx: Prisma.TransactionClient, input: {
-  homeId: string; membershipId: string; grantedAreaIds: readonly string[]; raw: unknown; allowInitialState?: boolean;
+  homeId: string; membershipId: string; grantedAreaIds: readonly string[]; raw: unknown; allowInitialState?: boolean; contractVersion?: number;
 }): Promise<NormalizedDefinition> {
   const allowedKeys = input.allowInitialState ? ['name', 'trigger', 'actions', 'enabled'] : ['name', 'trigger', 'actions'];
   if (!plainObject(input.raw) || Object.keys(input.raw).some((key) => !allowedKeys.includes(key))) fail('AUTOMATION_INVALID', 'The automation details are incomplete');
   if (input.allowInitialState && input.raw.enabled !== undefined && typeof input.raw.enabled !== 'boolean') fail('AUTOMATION_INVALID', 'The automation enabled state is not valid');
   if (!validName(input.raw.name)) fail('AUTOMATION_INVALID', 'The automation name must be 1–60 characters');
-  if (!plainObject(input.raw.trigger) || Object.keys(input.raw.trigger).some((key) => !['minuteOfDay', 'weekdays'].includes(key))) fail('AUTOMATION_TRIGGER_INVALID', 'Choose one recurring time and weekdays');
-  const minuteOfDay = input.raw.trigger.minuteOfDay;
-  const weekdays = input.raw.trigger.weekdays;
-  if (!Number.isSafeInteger(minuteOfDay) || Number(minuteOfDay) < 0 || Number(minuteOfDay) > 1439
-    || !Array.isArray(weekdays) || weekdays.length < 1 || weekdays.length > 7
-    || weekdays.some((day) => !Number.isSafeInteger(day) || Number(day) < 1 || Number(day) > 7)
-    || new Set(weekdays).size !== weekdays.length) fail('AUTOMATION_TRIGGER_INVALID', 'Choose one valid local time and at least one weekday');
+  if (!plainObject(input.raw.trigger)) fail('AUTOMATION_TRIGGER_INVALID', 'Choose when this automation should run');
+  const custom = input.raw.trigger.kind === 'device_state';
+  let configuration: Record<string, unknown>;
+  let selectedHubId: string | null = null;
+  let minuteOfDay = 0;
+  let weekdays: number[] = [];
+  if (custom) {
+    if (input.contractVersion !== 2) fail('AUTOMATION_UPGRADE_REQUIRED', 'Update the app to edit custom triggers', 409);
+    const selectedHome = await tx.home.findUnique({where:{id:input.homeId},select:{activeHubInstallationId:true}});
+    selectedHubId = selectedHome?.activeHubInstallationId ?? null;
+    if (!selectedHubId) fail('AUTOMATION_HUB_UPDATE_REQUIRED','Your current Home hub is unavailable',409);
+    const hub = await tx.hubInstallation.findFirst({ where: { id:selectedHubId, homeId: input.homeId, lifecycleStatus: 'ACTIVE' }, select: { capabilitySummary: true } });
+    if (!plainObject(hub?.capabilitySummary) || hub.capabilitySummary.nativeDeviceTriggersV2 !== true) fail('AUTOMATION_HUB_UPDATE_REQUIRED', 'Update your Home hub before creating custom triggers', 409);
+    configuration = await validateDeviceTrigger(tx, {...input,hubInstallationId:selectedHubId}, input.raw.trigger);
+  } else {
+    if (Object.keys(input.raw.trigger).some(key => !['minuteOfDay','weekdays'].includes(key))) fail('AUTOMATION_TRIGGER_INVALID','Choose one recurring time and weekdays');
+    if (!Number.isSafeInteger(input.raw.trigger.minuteOfDay) || Number(input.raw.trigger.minuteOfDay) < 0 || Number(input.raw.trigger.minuteOfDay) > 1439
+      || !Array.isArray(input.raw.trigger.weekdays) || input.raw.trigger.weekdays.length < 1 || input.raw.trigger.weekdays.length > 7
+      || input.raw.trigger.weekdays.some((day) => !Number.isSafeInteger(day) || Number(day) < 1 || Number(day) > 7)
+      || new Set(input.raw.trigger.weekdays).size !== input.raw.trigger.weekdays.length) fail('AUTOMATION_TRIGGER_INVALID', 'Choose one valid local time and at least one weekday');
+    minuteOfDay = Number(input.raw.trigger.minuteOfDay);
+    weekdays = input.raw.trigger.weekdays as number[];
+    configuration = { minuteOfDay, weekdays: [...weekdays].sort((a,b) => a-b) };
+  }
   if (!Array.isArray(input.raw.actions) || input.raw.actions.length < 1 || input.raw.actions.length > 32) fail('AUTOMATION_ACTIONS_INVALID', 'Add between one and 32 device actions');
 
   const actions: NormalizedDefinition['actions'] = [];
@@ -75,7 +93,7 @@ export async function validateNativeAutomationDefinition(tx: Prisma.TransactionC
     if (uniqueTargets.has(uniqueTarget)) fail('AUTOMATION_ACTION_DUPLICATE', 'Choose each device control only once');
     uniqueTargets.add(uniqueTarget);
     const device = await tx.nativeDevice.findFirst({ where: {
-      id: action.deviceId, homeId: input.homeId, lifecycle: 'INSTALLED',
+      id: action.deviceId, homeId: input.homeId, lifecycle: 'INSTALLED', ...(custom ? {hubInstallationId:selectedHubId!}:{}),
       assignments: { some: { homeId: input.homeId, areaId: action.areaId, validUntil: null, area: { status: 'ACTIVE' } } },
       OR: [
         { managementClass: 'PROPERTY_DEVICE', ownerMembershipId: null },
@@ -92,19 +110,22 @@ export async function validateNativeAutomationDefinition(tx: Prisma.TransactionC
     if (APP_ONLY_ROLES.has(String(control.semanticRole)) || control.stepUpPolicy === 'required' || ['sensitive', 'critical'].includes(String(control.riskLevel))) {
       fail('AUTOMATION_CONTROL_APP_ONLY', 'This safety control needs an interactive action and cannot run on a schedule');
     }
+    if (custom && control.idempotency !== 'set_value') fail('AUTOMATION_CONTROL_UNAVAILABLE','Custom triggers require safe absolute actions');
     if (control.writable !== true || control.automatable !== true || !['set_value', 'invoke_once'].includes(String(control.idempotency)) || !targetMatches(control, action.targetValue)) {
       fail('AUTOMATION_CONTROL_UNAVAILABLE', 'This control or value cannot be used in an automation');
     }
     actions.push({ ...action, sortOrder, descriptorRevision: device.descriptorRevision, managementClass: device.managementClass,
       osDeviceId: device.osDeviceId, osAreaId: device.assignments[0].area.osAreaId });
   }
-  return { name: input.raw.name.normalize('NFC').trim(), minuteOfDay: Number(minuteOfDay), weekdays: [...weekdays as number[]].sort((a, b) => a - b),
+  if (custom && automationSources(configuration).some(source => actions.some(action => action.deviceId === source.deviceId && action.controlId === source.controlId))) fail('AUTOMATION_FEEDBACK_LOOP', 'Choose an action different from the trigger and condition readings');
+  return { triggerKind: custom ? 'DEVICE_STATE' : 'SCHEDULE', triggerConfiguration: configuration, name: input.raw.name.normalize('NFC').trim(), minuteOfDay: Number(minuteOfDay), weekdays: [...weekdays as number[]].sort((a, b) => a - b),
     initiallyEnabled: input.allowInitialState ? input.raw.enabled !== false : true, actions };
 }
 
 export async function assertNoNativeAutomationConflict(tx: Prisma.TransactionClient, input: {
   homeId: string; candidate: NormalizedDefinition; excludeAutomationId?: string;
 }) {
+  if (input.candidate.triggerKind === 'DEVICE_STATE') return;
   const existing = await tx.nativeAutomation.findMany({ where: { homeId: input.homeId, status: 'ACTIVE', ...(input.excludeAutomationId ? { id: { not: input.excludeAutomationId } } : {}) }, select: {
     id: true, timezone: true, triggers: { select: { configuration: true }, take: 1 }, actions: { select: { deviceId: true, controlId: true, actionValue: true, device: { select: { capabilitySummary: true } } } },
   } });
@@ -128,4 +149,51 @@ export async function assertNoNativeAutomationConflict(tx: Prisma.TransactionCli
 
 export function automationDefinitionChecksum(value: unknown): string {
   return createHash('sha256').update(canonical(value), 'utf8').digest('hex');
+}
+
+
+async function validateDeviceTrigger(tx: Prisma.TransactionClient, authority: { homeId: string; membershipId: string; grantedAreaIds: readonly string[]; hubInstallationId:string }, raw: Record<string, unknown>): Promise<Record<string, unknown>> {
+  const keys = ['kind','deviceId','areaId','controlId','operator','value','resetMargin','conditions'];
+  if (Object.keys(raw).some(k => !keys.includes(k)) || !['becomes','rises_above','falls_below'].includes(String(raw.operator))) fail('AUTOMATION_TRIGGER_INVALID', 'Choose a supported device change');
+  const resolve = async (r: Record<string, unknown>): Promise<{ source: AutomationSource; control: Record<string, unknown> }> => {
+    if (!UUID.test(String(r.deviceId)) || !UUID.test(String(r.areaId)) || !authority.grantedAreaIds.includes(String(r.areaId)) || typeof r.controlId !== 'string') fail('AUTOMATION_SCOPE_DENIED', 'This reading is not available in your rooms',403);
+    const device = await tx.nativeDevice.findFirst({ where: { id: String(r.deviceId), homeId: authority.homeId, hubInstallationId:authority.hubInstallationId, lifecycle: 'INSTALLED',
+      assignments: { some: { homeId: authority.homeId, areaId: String(r.areaId), validUntil: null, area: { status: 'ACTIVE' } } },
+      OR: [{ managementClass: 'PROPERTY_DEVICE', ownerMembershipId: null }, { managementClass: 'TENANT_DEVICE', ownerMembershipId: authority.membershipId }] },
+      select: { id:true,osDeviceId:true,managementClass:true,ownerMembershipId:true,descriptorRevision:true,capabilitySummary:true,assignments:{where:{areaId:String(r.areaId),validUntil:null},take:1,select:{area:{select:{osAreaId:true}}}} } });
+    const catalog = plainObject(device?.capabilitySummary) && plainObject(device.capabilitySummary.controlCatalog) ? device.capabilitySummary.controlCatalog : {};
+    const control = Array.isArray(catalog.controls) ? catalog.controls.find((c: unknown) => plainObject(c) && c.controlId === r.controlId) as Record<string, unknown> | undefined : undefined;
+    if (!device || !control || control.readable !== true || control.observable !== true || !['boolean','number','option'].includes(String(control.valueType)) || control.stepUpPolicy === 'required' || ['sensitive','critical'].includes(String(control.riskLevel)) || APP_ONLY_ROLES.has(String(control.semanticRole))) fail('AUTOMATION_SOURCE_UNAVAILABLE', 'This reading cannot be used in an automation');
+    if (Number(catalog.revision) !== device.descriptorRevision || Number(control.catalogRevision) !== device.descriptorRevision || !device.assignments[0]) fail('AUTOMATION_DESCRIPTOR_STALE', 'This device changed. Refresh and choose its reading again',409);
+    return { source: {deviceId:device.id,areaId:String(r.areaId),controlId:String(r.controlId),osDeviceId:device.osDeviceId,osAreaId:device.assignments[0].area.osAreaId,descriptorRevision:device.descriptorRevision,managementClass:device.managementClass,ownerMembershipId:device.ownerMembershipId}, control };
+  };
+  const checkValue = (control: Record<string, unknown>, value: unknown) => {
+    // A sensor threshold is not a writable setpoint: retain type/range/options,
+    // but do not force it onto the actuator's step grid.
+    const constraints = plainObject(control.constraints) ? {...control.constraints} : {};
+    delete constraints.step;
+    if (!targetMatches({...control,constraints},value)) fail('AUTOMATION_TRIGGER_INVALID','Choose a valid reading value');
+  };
+  const { source, control } = await resolve(raw);
+  checkValue(control,raw.value);
+  if (raw.operator !== 'becomes' && control.valueType !== 'number' || raw.operator === 'becomes' && control.valueType === 'number') fail('AUTOMATION_TRIGGER_INVALID','Choose a change supported by this reading');
+  const margin = raw.resetMargin ?? 0;
+  if (typeof margin !== 'number' || !Number.isFinite(margin) || margin < 0 || margin > 1000000) fail('AUTOMATION_TRIGGER_INVALID','The reset margin is invalid');
+  const group = raw.conditions ?? {mode:'all',items:[]};
+  if (!plainObject(group) || Object.keys(group).some(k=>!['mode','items'].includes(k)) || !['all','any'].includes(String(group.mode)) || !Array.isArray(group.items) || group.items.length>8) fail('AUTOMATION_CONDITIONS_INVALID','Choose up to eight conditions');
+  const items: Record<string, unknown>[] = [];
+  for (const item of group.items) {
+    if (!plainObject(item)) fail('AUTOMATION_CONDITIONS_INVALID','A condition is invalid');
+    if (item.kind === 'time_window') {
+      if (Object.keys(item).some(k=>!['kind','startMinute','endMinute','weekdays'].includes(k)) || !Number.isSafeInteger(item.startMinute) || Number(item.startMinute)<0 || Number(item.startMinute)>1439 || !Number.isSafeInteger(item.endMinute) || Number(item.endMinute)<0 || Number(item.endMinute)>1439 || item.startMinute===item.endMinute || !Array.isArray(item.weekdays) || !item.weekdays.length || item.weekdays.length>7 || item.weekdays.some(d=>!Number.isSafeInteger(d)||d<1||d>7) || new Set(item.weekdays).size!==item.weekdays.length) fail('AUTOMATION_CONDITIONS_INVALID','Choose a valid time window and days');
+      items.push(item); continue;
+    }
+    if (item.kind !== 'device_state' || Object.keys(item).some(k=>!['kind','deviceId','areaId','controlId','operator','value','upperValue'].includes(k)) || !['equals','not_equals','above','below','between'].includes(String(item.operator))) fail('AUTOMATION_CONDITIONS_INVALID','Choose a supported condition');
+    const resolved=await resolve(item);checkValue(resolved.control,item.value);
+    if (['above','below','between'].includes(String(item.operator)) && resolved.control.valueType!=='number') fail('AUTOMATION_CONDITIONS_INVALID','This condition requires a numeric reading');
+    if (item.operator==='between') {checkValue(resolved.control,item.upperValue);if(Number((item.value as Record<string,unknown>).number)>=Number((item.upperValue as Record<string,unknown>).number)) fail('AUTOMATION_CONDITIONS_INVALID','Choose an increasing range');}
+    else if (item.upperValue!==undefined) fail('AUTOMATION_CONDITIONS_INVALID','Unexpected upper value');
+    items.push({kind:'device_state',source:resolved.source,operator:item.operator,value:item.value,...(item.upperValue?{upperValue:item.upperValue}:{})});
+  }
+  return {kind:'device_state',source,operator:raw.operator,value:raw.value,resetMargin:margin,cooldownSeconds:30,conditions:{mode:group.mode,items}};
 }

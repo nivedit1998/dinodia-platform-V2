@@ -1,3 +1,5 @@
+import { listTenantAutomationSummaries } from '@/lib/nativeAutomations/summaries';
+import { automationContractVersion, sourceConfigurationForClient, automationSources } from '@/lib/nativeAutomations/triggerReferences';
 import { randomUUID } from 'node:crypto';
 import { NextResponse } from 'next/server';
 import { Prisma } from '@prisma/client';
@@ -24,6 +26,7 @@ async function body(request: Request): Promise<unknown> {
 
 export async function GET(request: Request, context: RouteContext) {
   try {
+    const contractVersion = automationContractVersion(request);
     const principal = await requireCustomerSelectedHome(request);
     if (principal.role !== 'TENANT') throw new Stage1AuthError(403, 'home_membership_forbidden', 'Tenant automation access is limited to the selected tenant membership');
     const { automationId } = await context.params;
@@ -32,13 +35,21 @@ export async function GET(request: Request, context: RouteContext) {
       triggers: { take: 1, orderBy: { id: 'asc' }, select: { id: true, kind: true, configuration: true, revision: true } },
       actions: { take: 32, orderBy: [{ sortOrder: 'asc' }, { id: 'asc' }], select: { id: true, deviceId: true, areaId: true, controlId: true, sortOrder: true, descriptorRevision: true, actionValue: true, needsAttention: true } },
     } });
+    if (row && automationSources(row.triggers[0]?.configuration).some(source => !principal.areaIds.includes(source.areaId))) throw new NativeAutomationError(404,'AUTOMATION_NOT_FOUND','This automation is not available');
     if (!row) throw new NativeAutomationError(404, 'AUTOMATION_NOT_FOUND', 'This automation is not available');
+    if (row.triggers[0]?.kind === 'DEVICE_STATE') {
+      if (contractVersion !== 2) throw new NativeAutomationError(409,'AUTOMATION_UPGRADE_REQUIRED','Update the app to view this custom trigger');
+      const projection = await listTenantAutomationSummaries({homeId:principal.homeId,membershipId:principal.membershipId,contractVersion:2});
+      if (!projection.automations.some(item=>item.id===row.id)) throw new NativeAutomationError(404,'AUTOMATION_NOT_FOUND','This automation is not available');
+      row.triggers = row.triggers.map(trigger=>({...trigger,configuration:sourceConfigurationForClient(trigger.configuration) as typeof trigger.configuration}));
+    }
     return NextResponse.json({ ok: true, automation: row }, { headers: { 'Cache-Control': 'no-store', Pragma: 'no-cache' } });
   } catch (error) { return failure(error); }
 }
 
 export async function PUT(request: Request, context: RouteContext) {
   try {
+    const contractVersion = automationContractVersion(request);
     const principal = await requireCustomerSelectedHome(request);
     if (principal.role !== 'TENANT') throw new Stage1AuthError(403, 'home_membership_forbidden', 'Only the owning tenant can edit an automation');
     const { automationId } = await context.params;
@@ -56,23 +67,24 @@ export async function PUT(request: Request, context: RouteContext) {
         const [membership, home, current] = await Promise.all([
           tx.homeMembership.findFirst({ where: { id: principal.membershipId, customerAccountId: principal.id, homeId: principal.homeId, role: 'TENANT', status: 'ACTIVE', customerAccount: { status: 'ACTIVE' } }, select: { id: true, tenantAreaGrants: { where: { revokedAt: null, area: { status: 'ACTIVE' } }, select: { areaId: true } } } }),
           tx.home.findFirst({ where: { id: principal.homeId, lifecycle: 'ACTIVE', installationStatus: 'COMPLETE' }, select: { id: true, timezone: true, managementRevision: true, activeHubInstallationId: true } }),
-          tx.nativeAutomation.findFirst({ where: { id: automationId, homeId: principal.homeId, createdByMembershipId: principal.membershipId, status: { not: 'RETIRED' } }, select: { id: true, name: true, status: true, revision: true, timezone: true, triggers: { take: 1, orderBy: { id: 'asc' }, select: { id: true, revision: true } }, actions: { select: { id: true, deviceId: true, controlId: true } } } }),
+          tx.nativeAutomation.findFirst({ where: { id: automationId, homeId: principal.homeId, createdByMembershipId: principal.membershipId, status: { not: 'RETIRED' } }, select: { id: true, name: true, status: true, revision: true, timezone: true, triggers: { take: 1, orderBy: { id: 'asc' }, select: { id: true, revision: true, kind: true } }, actions: { select: { id: true, deviceId: true, controlId: true } } } }),
         ]);
         if (!membership || !home || !current) throw new NativeAutomationError(404, 'AUTOMATION_NOT_FOUND', 'This automation is not available');
         if (!home.timezone) throw new NativeAutomationError(409, 'AUTOMATION_TRIGGER_INVALID', 'The Home time zone is not configured');
         if (current.revision !== raw.expectedRevision) throw new NativeAutomationError(409, 'AUTOMATION_REVISION_CONFLICT', 'This automation changed. Reload the latest version before saving');
-        const definition = await validateNativeAutomationDefinition(tx, { homeId: home.id, membershipId: membership.id, grantedAreaIds: membership.tenantAreaGrants.map((grant) => grant.areaId), raw: raw.definition });
+        if (typeof current !== 'undefined' && current.triggers[0]?.kind === 'DEVICE_STATE' && contractVersion !== 2) throw new NativeAutomationError(409,'AUTOMATION_UPGRADE_REQUIRED','Update the app to edit this custom trigger');
+        const definition = await validateNativeAutomationDefinition(tx, { homeId: home.id, membershipId: membership.id, grantedAreaIds: membership.tenantAreaGrants.map((grant) => grant.areaId), raw: raw.definition, contractVersion });
         if (current.status === 'ACTIVE') await assertNoNativeAutomationConflict(tx, { homeId: home.id, candidate: definition, excludeAutomationId: current.id });
         const revision = current.revision + 1;
         const nextStatus = current.status === 'NEEDS_ATTENTION' ? 'PAUSED' : current.status;
-        const definitionChecksum = automationDefinitionChecksum({ name: definition.name, timezone: home.timezone, minuteOfDay: definition.minuteOfDay, weekdays: definition.weekdays,
+        const definitionChecksum = automationDefinitionChecksum({ name: definition.name, timezone: home.timezone, minuteOfDay: definition.minuteOfDay, weekdays: definition.weekdays, ...(definition.triggerKind === 'DEVICE_STATE' ? { deviceTrigger: definition.triggerConfiguration } : {}),
           actions: definition.actions.map(({ deviceId, areaId, controlId, descriptorRevision, targetValue, sortOrder }) => ({ deviceId, areaId, controlId, descriptorRevision, targetValue, sortOrder })) });
         const changed = await tx.nativeAutomation.updateMany({ where: { id: current.id, homeId: home.id, revision: current.revision, status: { not: 'RETIRED' } }, data: { name: definition.name, timezone: home.timezone ?? current.timezone, status: nextStatus, enabledAt: nextStatus === 'ACTIVE' ? new Date() : null, revision, definitionChecksum,
           propertyImpact: definition.actions.some((action) => action.managementClass === 'PROPERTY_DEVICE') } });
         if (changed.count !== 1) throw new NativeAutomationError(409, 'AUTOMATION_REVISION_CONFLICT', 'This automation changed. Reload the latest version before saving');
         const priorTrigger = current.triggers[0];
-        if (priorTrigger) await tx.nativeAutomationTrigger.update({ where: { id: priorTrigger.id }, data: { kind: 'SCHEDULE', configuration: { minuteOfDay: definition.minuteOfDay, weekdays: definition.weekdays } as Prisma.InputJsonValue, revision: { increment: 1 } } });
-        else await tx.nativeAutomationTrigger.create({ data: { id: randomUUID(), automationId: current.id, kind: 'SCHEDULE', configuration: { minuteOfDay: definition.minuteOfDay, weekdays: definition.weekdays } as Prisma.InputJsonValue, revision: 1 } });
+        if (priorTrigger) await tx.nativeAutomationTrigger.update({ where: { id: priorTrigger.id }, data: { kind: definition.triggerKind, configuration: definition.triggerConfiguration as Prisma.InputJsonValue, revision: { increment: 1 } } });
+        else await tx.nativeAutomationTrigger.create({ data: { id: randomUUID(), automationId: current.id, kind: definition.triggerKind, configuration: definition.triggerConfiguration as Prisma.InputJsonValue, revision: 1 } });
         const remaining = new Map(current.actions.map((action) => [`${action.deviceId}:${action.controlId}`, action]));
         for (const action of definition.actions) {
           const key = `${action.deviceId}:${action.controlId}`;
@@ -96,6 +108,7 @@ export async function PUT(request: Request, context: RouteContext) {
 
 export async function DELETE(request: Request, context: RouteContext) {
   try {
+    const contractVersion = automationContractVersion(request);
     const principal = await requireCustomerSelectedHome(request);
     if (principal.role !== 'TENANT') throw new Stage1AuthError(403, 'home_membership_forbidden', 'Only the owning tenant can delete this automation');
     const { automationId } = await context.params;

@@ -1,3 +1,4 @@
+import { sourceConfigurationForClient } from './nativeAutomations/triggerReferences';
 import type { Prisma } from '@prisma/client';
 import { canonicalSyncJson, hashSyncConfiguration } from './hubSyncEnvelope';
 import { deletionReferencePrefix } from './deletionReferences';
@@ -34,7 +35,8 @@ export async function buildHubCloudConfiguration(db: Prisma.TransactionClient, i
     db.hubInstallation.findUnique({ where: { id: input.hubInstallationId }, select: { accessPolicyRevision: true, capabilitySummary: true, analyticsWriterEnabled: true, analyticsCollectionEnabled: true, manufacturingIdentity: { select: { identityGeneration: true } } } }),
   ]);
   if (!home) throw new Error('Hub home is no longer available');
-  const automations = automationActivationEnabled ? automationRows.filter((automation) => automation.status !== 'RETIRED') : [];
+  const supportsDeviceTriggers = !!hub && typeof hub.capabilitySummary === 'object' && !Array.isArray(hub.capabilitySummary) && (hub.capabilitySummary as Record<string,unknown>)?.nativeDeviceTriggersV2 === true;
+  const automations = automationActivationEnabled ? automationRows.filter(automation => automation.status !== 'RETIRED' && (supportsDeviceTriggers || automation.triggers.every(t=>t.kind==='SCHEDULE'))) : [];
   const capabilitySummary = hub?.capabilitySummary && typeof hub.capabilitySummary === 'object' && !Array.isArray(hub.capabilitySummary)
     ? hub.capabilitySummary as Record<string, unknown> : {};
   const supportsTenantAutomationProjection = capabilitySummary.nativeTenantAutomationProjectionV1 === true;
@@ -48,7 +50,7 @@ export async function buildHubCloudConfiguration(db: Prisma.TransactionClient, i
   // Configuration construction is read-only. Activation/generation reconciliation
   // seeds intervals in the audited operator transaction, never on every sync.
   const tenantAutomationProjection = supportsTenantAutomationProjection ? {
-    version: 1,
+    version: supportsDeviceTriggers ? 2 : 1,
     executionEnabled: automationActivationEnabled,
     propertyTimeZone: home.timezone ?? null,
     automations: automationRows.map((automation) => {
@@ -63,7 +65,9 @@ export async function buildHubCloudConfiguration(db: Prisma.TransactionClient, i
       const validCounts = Number.isSafeInteger(actionCount) && Number(actionCount) >= 0 && Number(actionCount) <= 32
         && actionStatuses !== null && Object.values(actionStatuses).every((count) => count >= 0 && count <= Number(actionCount))
         && Object.values(actionStatuses).reduce((sum, count) => sum + count, 0) <= Number(actionCount);
-      const trigger = automation.triggers.length === 1 && automation.triggers[0].kind === 'SCHEDULE'
+      const trigger = supportsDeviceTriggers && automation.triggers[0]?.kind === 'DEVICE_STATE'
+        ? {id:automation.triggers[0].id,kind:'DEVICE_STATE',revision:automation.triggers[0].revision,configuration:sourceConfigurationForClient(automation.triggers[0].configuration)}
+        : automation.triggers.length === 1 && automation.triggers[0].kind === 'SCHEDULE'
         && automation.triggers[0].configuration && typeof automation.triggers[0].configuration === 'object' && !Array.isArray(automation.triggers[0].configuration)
         ? (() => {
           const configuration = automation.triggers[0].configuration as Record<string, unknown>;
