@@ -5,7 +5,7 @@
  * The details a notice quotes (a person, a room, a Home, a device list) travel inside the encrypted outbox envelope and are
  * only decrypted at send time. Banners stay short enough for a lock screen; emails carry the full detail.
  */
-export type NoticeKind = 'ROOM_ACCESS_REQUEST' | 'ROOM_ACCESS_APPROVED' | 'ROOM_ACCESS_DECLINED' | 'ACCESS_CHANGED' | 'ALEXA_LINKED' | 'NEW_DEVICES' | 'MFA_CHANGED';
+export type NoticeKind = 'ROOM_ACCESS_REQUEST' | 'ROOM_ACCESS_APPROVED' | 'ROOM_ACCESS_DECLINED' | 'ACCESS_CHANGED' | 'ALEXA_LINKED' | 'NEW_DEVICES' | 'MFA_CHANGED' | 'MEMBERSHIP_INVITATION_OUTCOME';
 
 export const NOTICE_EVENT_KIND: Readonly<Record<string, NoticeKind>> = {
   ROOM_ACCESS_REQUEST_NOTICE: 'ROOM_ACCESS_REQUEST',
@@ -19,6 +19,8 @@ export const NOTICE_EVENT_KIND: Readonly<Record<string, NoticeKind>> = {
   NEW_DEVICES_NOTICE: 'NEW_DEVICES',
   MFA_ENABLED_NOTICE: 'MFA_CHANGED',
   MFA_DISABLED_NOTICE: 'MFA_CHANGED',
+  MEMBERSHIP_INVITATION_ACCEPTED_NOTICE: 'MEMBERSHIP_INVITATION_OUTCOME',
+  MEMBERSHIP_INVITATION_DECLINED_NOTICE: 'MEMBERSHIP_INVITATION_OUTCOME',
 };
 
 export type NoticeDevice = { name: string; room: string };
@@ -30,6 +32,8 @@ export type NoticeDetails = {
   removal?: 'TENANT' | 'PROPERTY_MANAGER' | 'OWNERSHIP_TRANSFER' | 'FULL_HOME_DEREGISTRATION'; role?: 'OWNER' | 'PROPERTY_MANAGER' | 'TENANT';
   /** NEW_DEVICES only. */
   devices?: NoticeDevice[]; reference?: string; audience?: 'OWNER' | 'TENANT';
+  /** MEMBERSHIP_INVITATION_OUTCOME only. */
+  inviteeName?: string; inviteeEmail?: string; invitedRole?: 'PROPERTY_MANAGER' | 'TENANT'; invitationOutcome?: 'ACCEPTED' | 'DECLINED';
 };
 
 export type NoticeContent = {
@@ -194,6 +198,24 @@ export function composeNotice(eventType: string, details: NoticeDetails = {}): N
           'If you did not turn this on, please open Dinodia and change your password straight away.']
         : ['Your account no longer asks for an emailed code when you sign in.',
           'If this was not you, open Dinodia, change your password and turn two-step verification back on in Settings.'],
+      button: 'Open Dinodia' };
+  }
+  if (kind === 'MEMBERSHIP_INVITATION_OUTCOME') {
+    const accepted = eventType === 'MEMBERSHIP_INVITATION_ACCEPTED_NOTICE';
+    const person = clean(details.inviteeName, clean(details.inviteeEmail, 'The invited person')).slice(0, 48);
+    const email = clean(details.inviteeEmail);
+    const role = details.invitedRole === 'PROPERTY_MANAGER' ? 'property manager' : 'tenant';
+    return { ...base, facts: [['Person', person], ...(email && email !== person ? [['Email', email] as [string, string]] : []),
+      ['Role', role], ['Decision', accepted ? 'Accepted' : 'Declined'], ['Home', home]],
+      pushTitle: accepted ? 'Home invitation accepted' : 'Home invitation declined',
+      pushBody: accepted ? `${person} accepted the Home invitation.` : `${person} declined the Home invitation.`,
+      subject: accepted ? `${person} accepted your Home invitation` : `${person} declined your Home invitation`,
+      heading: accepted ? 'Your invitation was accepted' : 'Your invitation was declined',
+      paragraphs: accepted
+        ? [`${person}${email && email !== person ? ` (${email})` : ''} accepted the invitation to join ${home} as a ${role}. Their Home access is now active for the access you selected.`,
+          'Open Dinodia to review the current Home members and room access.']
+        : [`${person}${email && email !== person ? ` (${email})` : ''} declined the invitation to join ${home} as a ${role}. No access was granted.`,
+          'You can send a new invitation later if their plans change.'],
       button: 'Open Dinodia' };
   }
   // NEW_DEVICES: only devices Dinodia installed. Devices tenants add themselves are never included.

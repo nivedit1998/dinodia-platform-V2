@@ -26,7 +26,7 @@ export default function CustomerAuthCompletionPage() {
     const invalid: Outcome = { tone: "problem", title: "This link isn't valid", detail: "Open the Dinodia app and ask for a new one.", opensApp: true };
     if (invitationId && fragment.size === 1 && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(invitationId)) {
       // A reminder only: opening it grants nothing. The invitation is accepted inside the app.
-      setOutcome({ tone: "done", title: "You're invited", detail: "Open the Dinodia app and enter the email this was sent to.", opensApp: true });
+      setOutcome({ tone: "done", title: "You're invited", detail: "Open Dinodia and sign in with this email address. Then choose the Home under invitations and accept it. You won’t get access until you accept.", opensApp: true });
       return;
     }
     if (!challengeId || !/^[0-9a-f-]{36}$/i.test(challengeId)) {

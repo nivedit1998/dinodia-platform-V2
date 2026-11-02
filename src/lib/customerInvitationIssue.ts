@@ -12,7 +12,7 @@ const IDEMPOTENCY_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 type Role = 'PROPERTY_MANAGER' | 'TENANT';
 type Input = { homeId: string; email: string; role: Role; areaIds: string[]; expectedManagementRevision: number; resendInvitationId: string | null; idempotencyKey: string };
 type SafeReceipt = { schemaVersion: 'dinodia.v1'; ok: true; invitationId: string; homeId: string; role: Role; state: 'PENDING'|'REVOKED'; expiresAt: string; emailSubmission: 'PENDING'|'ACCEPTED'|'NOT_SENT'|'FAILED'; idempotentReplay: boolean };
-type IssueResult = { status: number; body: SafeReceipt; delivery?: { email: string; postcode: string; expiresAt: Date; temporaryPassword: string | null } };
+type IssueResult = { status: number; body: SafeReceipt; delivery?: { email: string; postcode: string; expiresAt: Date; temporaryPassword: string | null; inviterName: string } };
 
 function isPostgresLockTimeout(error: unknown): boolean {
   const record = typeof error === 'object' && error !== null
@@ -91,7 +91,7 @@ export async function issueCustomerMembershipInvitation(
 
     setPhase('authority_revalidation');
     const [account, session, device, home, membership, acceptance] = await Promise.all([
-      tx.customerAccount.findUnique({ where: { id: customer.id }, select: { id: true, emailNormalized: true, emailVerifiedAt: true, status: true, mustChangePassword: true, securityVersion: true } }),
+      tx.customerAccount.findUnique({ where: { id: customer.id }, select: { id: true, displayName: true, emailNormalized: true, emailVerifiedAt: true, status: true, mustChangePassword: true, securityVersion: true } }),
       tx.customerSession.findUnique({ where: { id: customer.sessionId }, select: { id: true, customerAccountId: true, trustedDeviceId: true, refreshTokenHash: true, accessTokenHash: true, accessTokenExpiresAt: true, securityVersion: true, trustedDeviceSessionVersion: true, revokedAt: true, expiresAt: true, absoluteExpiresAt: true } }),
       tx.trustedDevice.findUnique({ where: { id: customer.trustedDeviceId }, select: { id: true, customerAccountId: true, sessionVersion: true, revokedAt: true } }),
       tx.home.findUnique({ where: { id: input.homeId }, select: { id: true, postcode: true, lifecycle: true, installationStatus: true, managementRevision: true } }),
@@ -155,7 +155,8 @@ export async function issueCustomerMembershipInvitation(
     setPhase('receipt_and_audit');
     await tx.idempotencyRecord.create({ data: { namespace: 'customer-membership-invitation:v1', keyHash, actorId: customer.id, homeId: input.homeId, requestHash, responseStatus: 202, responseBody: body as Prisma.InputJsonValue, responseDigest: sha256(JSON.stringify(body)), expiresAt: new Date(now.getTime() + IDEMPOTENCY_TTL_MS) } });
     await tx.auditEvent.create({ data: { homeId: input.homeId, actorType: 'CUSTOMER', actorId: customer.id, category: 'ACCESS', action: 'membership_invitation_issued', targetType: 'MembershipInvitation', targetId: invitation.id, metadata: { role: input.role, areaCount: areaIds.length, replacement: Boolean(replacement) }, occurredAt: now, purgeAt: new Date(now.getTime() + 365 * 24 * 60 * 60 * 1000) } });
-    return { status: 202, body, delivery: { email: normalizedEmail, postcode: home.postcode ?? '', expiresAt, temporaryPassword: !target && input.role === 'TENANT' ? generatedTemporaryPassword : null } };
+    return { status: 202, body, delivery: { email: normalizedEmail, postcode: home.postcode ?? '', expiresAt,
+      temporaryPassword: !target && input.role === 'TENANT' ? generatedTemporaryPassword : null, inviterName: account.displayName } };
     }, 2, { maxWaitMs: 2000, timeoutMs: 8000 });
   } catch (error) {
     if (isPostgresLockTimeout(error)) {
@@ -168,7 +169,8 @@ export async function issueCustomerMembershipInvitation(
   if (!result.delivery) return result;
   try {
     setPhase('email_submission');
-    await sendCustomerInvitationEmail({ email: result.delivery.email, invitationId: result.body.invitationId, role: result.body.role, postcode: result.delivery.postcode, expiresAt: result.delivery.expiresAt, temporaryPassword: result.delivery.temporaryPassword });
+    await sendCustomerInvitationEmail({ email: result.delivery.email, invitationId: result.body.invitationId, role: result.body.role,
+      postcode: result.delivery.postcode, expiresAt: result.delivery.expiresAt, temporaryPassword: result.delivery.temporaryPassword, inviterName: result.delivery.inviterName });
     const body = { ...result.body, emailSubmission: 'ACCEPTED' as const };
     setPhase('email_receipt_finalize');
     await prisma.idempotencyRecord.update({ where: { namespace_keyHash: { namespace: 'customer-membership-invitation:v1', keyHash } }, data: { responseStatus: 201, responseBody: body as Prisma.InputJsonValue, responseDigest: sha256(JSON.stringify(body)) } });

@@ -1,5 +1,6 @@
 import { Stage1AuthError } from './stage1Auth';
 import { isRetryableSerializationConflict, serializableTransaction } from './serializableTransaction';
+import { queueMembershipInvitationOutcomeNotices } from './roomAccessNotices';
 
 type DecisionInput = {
   invitationId: string; decision: 'ACCEPT'|'DECLINE'; expectedUpdatedAt: string;
@@ -51,7 +52,7 @@ export async function decideCustomerInvitation(input: DecisionInput, onPhase?: (
     setPhase('authority_revalidation');
     const now = new Date();
     const [account, session, device, invitation] = await Promise.all([
-      tx.customerAccount.findUnique({ where: { id: input.accountId }, select: { id: true, emailNormalized: true, emailVerifiedAt: true, status: true, mustChangePassword: true, securityVersion: true } }),
+      tx.customerAccount.findUnique({ where: { id: input.accountId }, select: { id: true, displayName: true, email: true, emailNormalized: true, emailVerifiedAt: true, status: true, mustChangePassword: true, securityVersion: true } }),
       tx.customerSession.findUnique({ where: { id: input.sessionId }, select: { id: true, customerAccountId: true, trustedDeviceId: true, refreshTokenHash: true, accessTokenHash: true, accessTokenExpiresAt: true, securityVersion: true, trustedDeviceSessionVersion: true, revokedAt: true, expiresAt: true, absoluteExpiresAt: true } }),
       tx.trustedDevice.findUnique({ where: { id: input.trustedDeviceId }, select: { id: true, customerAccountId: true, sessionVersion: true, revokedAt: true } }),
       tx.membershipInvitation.findUnique({ where: { id: input.invitationId }, select: {
@@ -98,6 +99,9 @@ export async function decideCustomerInvitation(input: DecisionInput, onPhase?: (
       setPhase('decline_commit');
       await tx.membershipInvitation.update({ where: { id: invitation.id }, data: { state: 'DECLINED', declinedAt: now, targetAccountId: account.id } });
       await tx.auditEvent.create({ data: { homeId: invitation.homeId, actorType: 'CUSTOMER', actorId: account.id, category: 'ACCESS', action: 'membership_invitation_declined', targetType: 'MembershipInvitation', targetId: invitation.id, metadata: { role: invitation.role }, occurredAt: now, purgeAt: new Date(now.getTime() + 365 * 24 * 60 * 60 * 1000) } });
+      await queueMembershipInvitationOutcomeNotices(tx, { homeId: invitation.homeId, invitationId: invitation.id,
+        inviteeName: account.displayName, inviteeEmail: account.email, invitedRole: invitation.role,
+        outcome: 'DECLINED', now });
       return { schemaVersion: 'dinodia.v1' as const, ok: true as const, invitationId: invitation.id,
         decision: input.decision, state: stateForDecision, homeMembershipId: null, idempotentReplay: false };
     }
@@ -133,6 +137,9 @@ export async function decideCustomerInvitation(input: DecisionInput, onPhase?: (
     }
     await tx.membershipInvitation.update({ where: { id: invitation.id }, data: { state: 'ACCEPTED', acceptedAt: now, targetAccountId: account.id } });
     await tx.auditEvent.create({ data: { homeId: invitation.homeId, actorType: 'CUSTOMER', actorId: account.id, category: 'ACCESS', action: 'membership_invitation_accepted', targetType: 'MembershipInvitation', targetId: invitation.id, metadata: { role: invitation.role, areaGrantCount: invitedAreaIds.length, managementRevision: nextPolicyRevision }, occurredAt: now, purgeAt: new Date(now.getTime() + 365 * 24 * 60 * 60 * 1000) } });
+    await queueMembershipInvitationOutcomeNotices(tx, { homeId: invitation.homeId, invitationId: invitation.id,
+      inviteeName: account.displayName, inviteeEmail: account.email, invitedRole: invitation.role,
+      outcome: 'ACCEPTED', now });
     return { schemaVersion: 'dinodia.v1' as const, ok: true as const, invitationId: invitation.id,
       decision: input.decision, state: stateForDecision, homeMembershipId: membership.id, idempotentReplay: false };
   }, 3, { maxWaitMs: 2000, timeoutMs: 8000 });
