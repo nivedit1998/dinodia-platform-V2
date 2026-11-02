@@ -153,7 +153,10 @@ export async function readTenantDeviceDashboard(db: Prisma.TransactionClient, in
       managementClass: owner ? 'tenant_device' : 'property_device',
       ownerMembershipId: owner ? membership.id : null,
       areaIds,
-      overrideName: device.overrideName,
+      // Installed clients use this field as the property device's display name
+      // and do not receive originalName. Keep the source fallback here, after
+      // authority filtering; private devices retain nullable personal aliases.
+      overrideName: owner ? device.overrideName : device.overrideName ?? device.originalName,
       customerLabel: owner ? device.customerLabel : null,
       canManage: owner,
       canRename: owner,
