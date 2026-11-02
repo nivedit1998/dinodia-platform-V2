@@ -1,7 +1,7 @@
 import test from 'node:test';import assert from 'node:assert/strict';import fs from 'node:fs';import Ajv2020 from 'ajv/dist/2020.js';
 const base=JSON.parse(fs.readFileSync('contracts/dinodia-v1/contract.json'));
-const schema=JSON.parse(fs.readFileSync('contracts/dinodia-v1/schemas/automations-v2.schema.json'));
-const fixture=JSON.parse(fs.readFileSync('contracts/dinodia-v1/fixtures/automation-device-trigger-v2.json'));
+const schema=JSON.parse(fs.readFileSync('contracts/dinodia-automations-v2/schemas/automations-v2.schema.json'));
+const fixture=JSON.parse(fs.readFileSync('contracts/dinodia-automations-v2/fixtures/automation-device-trigger-v2.json'));
 const ajv=new Ajv2020({strict:false});ajv.addSchema(base);ajv.addSchema(schema);
 const v2=ajv.getSchema(schema.$id+'#/$defs/definition'),v1=ajv.getSchema(base.$id+'#/$defs/tenantAutomationCreateDefinition');
 test('negotiated V2 accepts custom definitions and the unchanged V1 schedule contract rejects them',()=>{
@@ -11,6 +11,6 @@ test('negotiated V2 accepts custom definitions and the unchanged V1 schedule con
  assert.equal(v1(old),true);assert.equal(v2(old),true);
 });
 test('V2 fixture/schema copies are identical in the actual Hub and iOS consumers',()=>{
- for(const root of [process.env.DINODIA_OS_ROOT+'/test/fixtures/contracts/dinodia-v1',process.env.DINODIA_IOS_ROOT+'/DinodiaTests/Fixtures/DinodiaV1',process.env.DINODIA_IOS_ROOT+'/Dinodia/DebugFixtures/DinodiaV1'])
-  for(const relative of ['schemas/automations-v2.schema.json','fixtures/automation-device-trigger-v2.json'])assert.deepEqual(fs.readFileSync(root+'/'+relative),fs.readFileSync('contracts/dinodia-v1/'+relative));
+ for(const root of [process.env.DINODIA_OS_ROOT+'/test/fixtures/contracts/dinodia-automations-v2',process.env.DINODIA_IOS_ROOT+'/DinodiaTests/Fixtures/DinodiaAutomationsV2',process.env.DINODIA_IOS_ROOT+'/Dinodia/DebugFixtures/DinodiaAutomationsV2'])
+  for(const relative of ['schemas/automations-v2.schema.json','fixtures/automation-device-trigger-v2.json'])assert.deepEqual(fs.readFileSync(root+'/'+relative),fs.readFileSync('contracts/dinodia-automations-v2/'+relative));
 });

@@ -31,7 +31,7 @@ export async function automationV2Integration({prisma, fixture:f, base, fetchJso
     assert.equal(row.status,'PAUSED');assert.equal(row.triggers[0].kind,'DEVICE_STATE');assert.equal(row.triggers[0].configuration.source.osDeviceId,devices[0].osDeviceId);
     const listed=await request('/api/automations');assert.equal(listed.response.status,200,JSON.stringify(listed.body));
     const rootContract=JSON.parse(fs.readFileSync(new URL('../contracts/dinodia-v1/contract.json',import.meta.url)));
-    const versioned=JSON.parse(fs.readFileSync(new URL('../contracts/dinodia-v1/schemas/automations-v2.schema.json',import.meta.url)));
+    const versioned=JSON.parse(fs.readFileSync(new URL('../contracts/dinodia-automations-v2/schemas/automations-v2.schema.json',import.meta.url)));
     const ajv=new Ajv2020({strict:false,formats:{'date-time':s=>/^\d{4}-\d{2}-\d{2}T.*Z$/.test(s)&&Number.isFinite(Date.parse(s))}});ajv.addSchema(rootContract);ajv.addSchema(versioned);
     const validateProjection=ajv.getSchema(versioned.$id+'#/$defs/projection');assert.equal(validateProjection(listed.body),true,JSON.stringify(validateProjection.errors));
     const item=listed.body.automations.find(r=>r.id===id);assert(item);assert.equal(item.trigger.kind,'DEVICE_STATE');assert.equal(item.trigger.configuration.deviceId,devices[0].id);assert(!JSON.stringify(item.trigger).includes('osDeviceId'));
