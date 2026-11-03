@@ -5,6 +5,38 @@ export const EPHEMERAL_RETENTION_MAX_BATCHES = 100;
 export const CRON_RUN_RETENTION_DAYS = 7;
 const MAX_RUNTIME_MS = 15_000;
 
+// Sync receipts support exact duplicate/lost-response recovery for seven days.
+// Their expiry predicate is indexed; bounded SKIP LOCKED batches keep a late
+// daily run from turning into one unbounded delete transaction.
+export async function cleanExpiredHubSyncReceipts(
+  db: Pick<PrismaClient, '$executeRaw' | '$queryRaw'>,
+  now: Date,
+  monotonicNow: () => number = () => performance.now(),
+) {
+  if (!Number.isFinite(now.getTime())) throw new Error('Invalid receipt retention cutoff');
+  const deadline = monotonicNow() + MAX_RUNTIME_MS;
+  let deleted = 0;
+  for (let batch = 0; batch < EPHEMERAL_RETENTION_MAX_BATCHES; batch += 1) {
+    if (monotonicNow() >= deadline) break;
+    const count = Number(await db.$executeRaw`
+      WITH doomed AS (
+        SELECT "id" FROM public."HubSyncReceipt" WHERE "expiresAt" <= ${now}
+        ORDER BY "expiresAt", "id" LIMIT ${EPHEMERAL_RETENTION_BATCH_SIZE}
+        FOR UPDATE SKIP LOCKED
+      ) DELETE FROM public."HubSyncReceipt" AS target USING doomed WHERE target."id" = doomed."id"`);
+    deleted += count;
+    if (count < EPHEMERAL_RETENTION_BATCH_SIZE) break;
+  }
+  const remaining = await db.$queryRaw<{ present: boolean }[]>`
+    SELECT EXISTS(SELECT 1 FROM public."HubSyncReceipt" WHERE "expiresAt" <= ${now}) AS present`;
+  return {
+    checkedThrough: now.toISOString(), deleted, backlogRemains: remaining[0]?.present === true,
+    batchSize: EPHEMERAL_RETENTION_BATCH_SIZE,
+    maxRowsPerRun: EPHEMERAL_RETENTION_BATCH_SIZE * EPHEMERAL_RETENTION_MAX_BATCHES,
+    timeBudgetMs: MAX_RUNTIME_MS,
+  };
+}
+
 // Reuse the daily maintenance dispatcher. These are transport security receipts
 // and completed scheduler logs, never household history or deletion tombstones.
 export async function cleanEphemeralRecords(
