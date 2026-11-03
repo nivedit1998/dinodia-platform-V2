@@ -50,7 +50,7 @@ export async function authenticateHub(request: Request, rawBody: string, options
   const nonce = String(request.headers.get('x-dinodia-hub-nonce') ?? '');
   const bodyHash = sha256(rawBody);
   try {
-    await prisma.replayNonce.create({ data: { principalKind: 'HUB', principalId: identity.id, nonceHash: sha256(nonce), requestDigest: bodyHash, expiresAt: new Date(Date.now() + 10 * 60 * 1000) } });
+    await prisma.replayNonce.create({ data: { principalKind: 'HUB', principalId: identity.id, nonceHash: sha256(nonce), requestDigest: bodyHash, expiresAt: new Date(Date.now() + 10 * 60 * 1000) }, select: { id: true } });
   } catch {
     throw new Stage1AuthError(401, 'hub_nonce_replayed', 'The hub request has already been used');
   }

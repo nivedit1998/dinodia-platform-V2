@@ -156,7 +156,14 @@ export async function POST(request: Request) {
             throw new Stage1AuthError(409, envelope.events.length === 0 ? 'hub_sync_installation_area_required' : 'hub_sync_installation_area_only', 'An ownerless or in-progress installation may synchronize only bounded installer events');
           }
 
-          const priorRange = await tx.hubSyncReceipt.findFirst({ where: { hubInstallationId: current.id, streamId: envelope.streamId, fromSequence: from, toSequence: to } });
+          // Legacy receipts can contain a large obsolete configuration. Strip it
+          // inside Postgres: only retry metadata crosses the database connection.
+          const [priorRange] = await tx.$queryRaw<Array<{ bodyHash: string; response: Record<string, unknown> }>>`
+            SELECT "bodyHash", "response" - 'configuration' AS "response"
+            FROM "HubSyncReceipt"
+            WHERE "hubInstallationId" = ${current.id}::uuid AND "streamId" = ${envelope.streamId}
+              AND "fromSequence" = ${from} AND "toSequence" = ${to}
+            LIMIT 1`;
           if (priorRange) {
             if (priorRange.bodyHash !== bodyHash) {
               return { __hubSyncConflict: true, homeId: current.homeId, hubInstallationId: current.id } as Record<string, unknown>;
@@ -370,7 +377,7 @@ export async function POST(request: Request) {
               capabilitySummary: envelope.runtime.capabilities as Prisma.InputJsonValue,
             } });
             if (advanced.count !== 1) throw new Stage1AuthError(409, 'hub_sync_cursor_race', 'A concurrent sync batch advanced the hub cursor');
-            await tx.hubSyncReceipt.create({ data: { hubInstallationId: current.id, streamId: envelope.streamId, fromSequence: from, toSequence: to, bodyHash, response, acceptedAt: now, expiresAt: new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000) } });
+            await tx.hubSyncReceipt.create({ data: { hubInstallationId: current.id, streamId: envelope.streamId, fromSequence: from, toSequence: to, bodyHash, response: Object.fromEntries(Object.entries(response).filter(([key]) => key !== 'configuration')), acceptedAt: now, expiresAt: new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000) }, select: { id: true } });
           } else {
             await tx.hubInstallation.update({ where: { id: current.id }, data: {
               acknowledgedCloudRevision: Number(envelope.acknowledgedCloudRevision), lastSuccessfulSyncAt: now,
@@ -378,7 +385,7 @@ export async function POST(request: Request) {
               lastQueueDepth: envelope.queueDepth, lastSyncErrorCode: null,
               ...syncStatusUpdate,
               runtimeVersion: String(envelope.runtime.version).slice(0, 120), capabilitySummary: envelope.runtime.capabilities as Prisma.InputJsonValue,
-            } });
+            }, select: { id: true } });
           }
           await acknowledgeAppliedTenantPolicy(tx, {
             homeId: current.homeId, hubInstallationId: current.id,
