@@ -41,11 +41,13 @@ export async function buildHubCloudConfiguration(db: Prisma.TransactionClient, i
     ? hub.capabilitySummary as Record<string, unknown> : {};
   const supportsTenantAutomationProjection = capabilitySummary.nativeTenantAutomationProjectionV1 === true;
   const history = capabilitySummary.nativeDailyAnalyticsV1 === true && await calendarSchemaPresent(db)
-    ? await db.nativeAnalyticsRetention.findUnique({where:{hubInstallationId:input.hubInstallationId}}):null;
+    ? await db.nativeAnalyticsRetention.findUnique({where:{hubInstallationId:input.hubInstallationId}, select:{homeId:true,timezone:true,writerEnabled:true,writerFrom:true,prunedThrough:true}}):null;
   if(history && (history.homeId!==input.homeId||history.timezone!==home.timezone)) throw new Error('Analytics timezone requires prospective reconciliation');
   const analyticsIntervals = capabilitySummary.nativeUniversalAnalyticsV2 === true ? await db.nativeAnalyticsInterval.findMany({
     where: { homeId: input.homeId, hubInstallationId: input.hubInstallationId, validUntil: null,
       sourceGeneration: hub?.manufacturingIdentity?.identityGeneration ?? -1 }, take: 2000,
+    select: { id: true, deviceId: true, revision: true, validFrom: true, sourceGeneration: true,
+      selectedControlId: true, analyticsPolicyVersion: true, authorizedControls: true },
   }) : [];
   // Configuration construction is read-only. Activation/generation reconciliation
   // seeds intervals in the audited operator transaction, never on every sync.

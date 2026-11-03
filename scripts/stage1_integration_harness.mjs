@@ -3747,6 +3747,13 @@ async function customerAuthorizationChecks(deliveryEnv) {
   const receiptCountAfterRetry = await prisma.hubSyncReceipt.count({ where: { hubInstallationId: hubOne.id, streamId: syncBatch.streamId, fromSequence: syncBatch.fromSequence, toSequence: syncBatch.toSequence } });
   const areaAfterRetry = await prisma.area.findUniqueOrThrow({ where: { homeId_osAreaId: { homeId: homeOne.id, osAreaId: syncAreaId } }, select: { id: true, originalName: true, updatedAt: true } });
   if (exactRetry.response.status !== 200 || receiptCountAfterRetry !== 1 || areaAfterRetry.id !== acceptedArea.id || areaAfterRetry.updatedAt.getTime() !== acceptedArea.updatedAt.getTime()) fail('An exact sync retry was not idempotent at the receipt and projection boundaries');
+  const compactReceipt = await prisma.hubSyncReceipt.findFirstOrThrow({ where: { hubInstallationId: hubOne.id, streamId: syncBatch.streamId, fromSequence: syncBatch.fromSequence, toSequence: syncBatch.toSequence }, select: { id: true, response: true } });
+  assert.equal(Object.hasOwn(compactReceipt.response, 'configuration'), false, 'new receipts must not retain a replaceable configuration snapshot');
+  assert.ok(acceptedSync.configuration && exactRetry.body.configuration, 'wire responses must remain full and legacy-compatible');
+  // Emulate a receipt written by the deployed predecessor. The next policy-change
+  // retry exercises Postgres JSON projection against both receipt generations.
+  await prisma.hubSyncReceipt.update({ where: { id: compactReceipt.id }, data: { response: { ...compactReceipt.response, configuration: exactRetry.body.configuration } } });
+  console.log('[stage5:integration] PASS: new receipts are compact; legacy full receipt seeded for current-policy retry');
   const priorCloudRevision = Number(exactRetry.body.cloudRevision);
   await prisma.area.update({ where: { id: acceptedArea.id }, data: { overrideName: 'Cloud-authoritative retry revision', revision: { increment: 1 } } });
   const areaAtPolicyChange = await prisma.area.findUniqueOrThrow({ where: { id: acceptedArea.id }, select: { updatedAt: true } });
