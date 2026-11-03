@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "migration": "20261103010000_native_operations_due_gate",
+  "policy": "Build/release contract only. A change to any gate-sensitive dispatcher/callee/schema requires review of the SQL predicate and task/outbox/receipt inventory before updating fingerprints. No runtime discovery.",
+  "sha256": {
+    "src/app/api/cron/native-operations/route.ts": "84d857b2d60ccb1ec6527e400fa7df63b764fd81e3f9b5474b4a3ccefd025613",
+    "src/lib/nativeOperations.ts": "edfb503d95a788696c0576049c64fd13806da202918441402c978f223faadf0c",
+    "src/lib/hubOperatorCredentials.ts": "ad4f0df046aba480dec813b9193a121d95ff1f367ac06533ad4d8712cea4b35f",
+    "src/lib/stage1ClaimContract.ts": "05e9beac3c619e6b88f72c85f2c3de83d87f0e478d3ecfb64e9f64353b9c3968",
+    "src/lib/supportNotifications.ts": "a9e513310001cef6812c5c6ff7b3d44b11c9ea265deab9945241e1361f4dd101",
+    "src/lib/installationRequestDelivery.ts": "9c01e1ba0997e4fd683bf697d92cf8aefac5c36bb27cb91e8dcec3786ff31a64",
+    "src/lib/homeDeregistrationCleanup.ts": "ba6874306f8bb09772b9a3a883f19036476995a68431cb813fff83562ecee41b",
+    "src/lib/customerRelationshipCleanup.ts": "e4b39b15c41bd9a08103d47e42657a58a29d85bc5e4697943e08b43ea9eb5824",
+    "src/lib/nativeAlexaEvents.ts": "3e5396fda8cf6b5387be4d7cb5bc5078293db8661b6ee709a252f3b703e426ce",
+    "src/lib/nativeAlexaGrant.ts": "78695f7a652309330055715bd8e5244f29143ee76532938ed88e3cc10caa3c8d",
+    "src/lib/nativeAlexaExecution.ts": "63e32091e3f8fc5623bba1de22bccf269067c66d8b6afd7b09e7b6681db4fea0",
+    "src/lib/nativeAlexaDiscovery.ts": "406b5cdfe0ca5ebf0cb4b27b3ccbb746cc20682905bcf9ae6667c80ffed96c1f",
+    "src/lib/alexa/syncAlexa.ts": "520eab5be79ffa3aa2610a0fc3c0192fb56a1ccc5843218dd81d09aaffe4a539",
+    "src/lib/alexa/projection.ts": "b134d7409a97accb8ca117e9d4f224d1ab52b23463b0281769a26ffdbf95d0e2",
+    "src/lib/alexa/accountRemovalReport.ts": "93da6a37879ef51a8dba47f458bdfebacca3f6f9ecad3591c6eb4e7d1d61d035",
+    "src/lib/alexa/endpointBuilder.ts": "51af4b5b0bcbece21232d9376262263825d3f2f0fbfbd38f4a1535bc8722ab2d",
+    "src/lib/alexa/friendlyName.ts": "2289a89195f4350b550eaec62a4895850b81dbfadd7d2a90e95a0b82867ad93a",
+    "src/lib/alexa/stateReport.ts": "3d24b5dbe46e0c0ed9f433b9ec6c42022d4ed686098c398698e0fe208fe5dfa6",
+    "src/lib/apnsDelivery.ts": "b7f7014f3006417fd5f09f2927f877ee3b1075be7ca715aa282c8abb1d05b014",
+    "src/lib/roomAccessNotices.ts": "0e9270ea56a7b66e2cc62dcdb3bc1fbd08a01aa140b1e7528a29e62a12e44c96",
+    "src/lib/noticeContent.ts": "a93009f0057ea3941cefb4688699d3adebacfc72d4ad670cf683a00242e9dc14",
+    "src/lib/serializableTransaction.ts": "68617b2e4be2e144a93847a0739980ce045e18809dd4f5f610f4979d367e3b19",
+    "src/lib/customerPolicyConfig.ts": "9335a72002b1cd816b2fedcaaea72434b3a554033840de690bc02bac9a372678",
+    "src/app/api/hub-agent/v2/commissioning-sessions/route.ts": "949b63f3dbb640915e3c46aedd18a4c7bba75ca8fb2d32f63a71a5968b47d201",
+    "prisma/schema.prisma": "13b82ad4278a2be4a5eb7d166783821c23b048d0326d25966955bd6156f7d536"
+  }
+}

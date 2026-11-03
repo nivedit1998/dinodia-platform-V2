@@ -1072,6 +1072,8 @@ model HubCredentialVersion {
 
   @@unique([hubInstallationId, purpose, version], name: "HubCredentialVersion_hub_purpose_version_key")
   @@index([hubInstallationId, purpose, state])
+  @@index([purpose, state, issuedAt], map: "HubCredentialVersion_due_rotation_idx")
+  @@index([purpose, state, graceUntil], map: "HubCredentialVersion_due_grace_idx")
 }
 
 model HubProvisioningAttempt {
@@ -1376,6 +1378,7 @@ model HomeClaimReservation {
   @@unique([id, claimReferenceId, customerAccountId])
   @@index([claimReferenceId, state, expiresAt])
   @@index([customerAccountId, state])
+  @@index([state, expiresAt], map: "HomeClaimReservation_due_idx")
 }
 
 model PendingHomeSetup {
@@ -1755,6 +1758,7 @@ model SupportAccessRequest {
   @@index([homeId, status])
   @@index([requestedByEmployeeId, status])
   @@index([codeHash, codeExpiresAt])
+  @@index([status, codeExpiresAt], map: "SupportAccessRequest_due_idx")
 }
 
 model SupportSession {
@@ -1782,6 +1786,7 @@ model SupportSession {
   @@unique([id, homeId])
   @@index([ticketId, status])
   @@index([hubInstallationId, status, expiresAt])
+  @@index([status, expiresAt], map: "SupportSession_due_idx")
 }
 
 // Durable, privacy-scoped customer notification records for support access.
@@ -2285,6 +2290,7 @@ model AlexaNativeLink {
   oauthFamilies   AlexaOAuthTokenFamily[]
 
   @@index([customerAccountId, status])
+  @@index([status, autoScope, revokedAt], map: "AlexaNativeLink_due_idx")
 }
 
 model AlexaNativeHomeScope {
@@ -2554,6 +2560,7 @@ model NativeNotificationDeliveryReceipt {
 
   @@index([customerAccountId, status, deliverAfter])
   @@index([homeId, expiresAt])
+  @@index([status, deliverAfter])
 }
 
 model NativeDeviceOutageIncident {
