@@ -183,10 +183,11 @@ test('native task registry dispatches business operations and daily lease cleanu
   const { nativeTaskRegistry, runNativeOperations, runNativeMaintenance } = loadTypeScriptModule('src/lib/nativeOperations.ts', {
     './prisma': { prisma: {
       nativeBackgroundTaskState: { updateMany: async (input) => { cleanupCalls.push(input); return { count: 3 }; } },
-      hubSyncReceipt: { deleteMany: async (input) => { receiptCleanupCalls.push(input); return { count: 2 }; } },
       nativeDomainOutbox: { deleteMany: async (input) => { deregistrationReceiptCleanupCalls.push(input); return { count: 1 }; } },
-      $executeRaw: async () => 0,
-      $queryRaw: async () => [{ scanned: 0n, invalidPartitions: 0n, onSeconds: 0n, offSeconds: 0n, unknownSeconds: 0n }],
+      $executeRaw: async (sql) => { if (sql.join('').includes('HubSyncReceipt')) { receiptCleanupCalls.push(sql.join('')); return 2; } return 0; },
+      $queryRaw: async (sql) => sql.join('').includes('SELECT EXISTS(SELECT 1 FROM public."HubSyncReceipt"')
+        ? [{ present: false }]
+        : [{ scanned: 0n, invalidPartitions: 0n, onSeconds: 0n, offSeconds: 0n, unknownSeconds: 0n }],
       nativeDeviceUsageBucket: { findFirst: async () => null },
       nativeAnalyticsUnallocated: { findFirst: async () => null },
       nativeTemperatureSample: { findFirst: async () => null, count: async () => 0 },
@@ -226,9 +227,17 @@ test('native task registry dispatches business operations and daily lease cleanu
   assert.equal(maintenance.analyticsAndStorageMaintenance.status, 'OK');
   assert.equal(maintenance.expiredDispatcherLeases, 3);
   assert.equal(maintenance.expiredSyncReceipts, 2);
+  assert.equal(maintenance.expiredSyncReceiptBacklogRemains, false);
   assert.equal(maintenance.expiredDeregistrationCleanupReceipts, 1);
   assert.deepEqual(cleanupCalls, [{ where: { taskId: { not: 'expired_dispatch_lease_cleanup' }, leaseExpiresAt: { lte: now } }, data: { leaseOwner: null, leaseExpiresAt: null } }]);
-  assert.deepEqual(receiptCleanupCalls, [{ where: { expiresAt: { lte: now } } }]);
+  assert.equal(receiptCleanupCalls.length, 1);
+  assert.match(receiptCleanupCalls[0], /FROM public\."HubSyncReceipt" WHERE "expiresAt" <=/);
+  assert.match(receiptCleanupCalls[0], /LIMIT/);
+  assert.match(receiptCleanupCalls[0], /FOR UPDATE SKIP LOCKED/);
+  assert.deepEqual(maintenance.taskCursors.expired_dispatch_lease_cleanup.syncReceiptCleanup, {
+    checkedThrough: now.toISOString(), deleted: 2, backlogRemains: false,
+    batchSize: 1000, maxRowsPerRun: 100000, timeBudgetMs: 15000,
+  });
   assert.deepEqual(deregistrationReceiptCleanupCalls, [{ where: { aggregateType: 'FullHomeDeregistrationAccountCleanup',
     eventType: 'FULL_HOME_ACCOUNT_CLEANUP', state: { in: ['DELIVERED', 'FAILED', 'CANCELLED'] }, expiresAt: { lte: now } } }]);
 });

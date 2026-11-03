@@ -7,7 +7,7 @@ import { createPropertySupportNotifications } from './supportNotifications';
 import { dispatchInstallationRequestNotifications } from './installationRequestDelivery';
 import { resumeHomeDeregistrationAccountCleanup, type HomeDeregistrationCleanupResult } from './homeDeregistrationCleanup';
 import { dispatchNativeAlexaChangeReports, dispatchAlexaDiscoveryReports, dispatchAlexaAccountRemovalReports } from './nativeAlexaEvents';
-import { cleanEphemeralRecords } from './nativeEphemeralRetention';
+import { cleanEphemeralRecords, cleanExpiredHubSyncReceipts } from './nativeEphemeralRetention';
 
 export const NATIVE_OPERATION_BATCH_LIMIT = 100;
 export const NATIVE_DISPATCH_LEASE_MS = 120_000;
@@ -160,13 +160,18 @@ export async function runNativeMaintenance(now = new Date()) {
       where: { taskId: { not: 'expired_dispatch_lease_cleanup' }, leaseExpiresAt: { lte: now } },
       data: { leaseOwner: null, leaseExpiresAt: null },
     });
-    const receipts = await prisma.hubSyncReceipt.deleteMany({ where: { expiresAt: { lte: now } } });
+    const receipts = await cleanExpiredHubSyncReceipts(prisma, now);
     const deregistrationCleanup = await prisma.nativeDomainOutbox.deleteMany({ where: {
       aggregateType: 'FullHomeDeregistrationAccountCleanup', eventType: 'FULL_HOME_ACCOUNT_CLEANUP',
       state: { in: ['DELIVERED', 'FAILED', 'CANCELLED'] }, expiresAt: { lte: now },
     } });
-    Object.assign(result, { expiredDispatcherLeases: leases.count, expiredSyncReceipts: receipts.count,
+    Object.assign(result, { expiredDispatcherLeases: leases.count, expiredSyncReceipts: receipts.deleted,
+      expiredSyncReceiptBacklogRemains: receipts.backlogRemains,
       expiredDeregistrationCleanupReceipts: deregistrationCleanup.count });
+    (result as { taskCursors?: Record<string, unknown> }).taskCursors = {
+      ...((result as { taskCursors?: Record<string, unknown> }).taskCursors ?? {}),
+      expired_dispatch_lease_cleanup: { syncReceiptCleanup: receipts },
+    };
   });
 
   await isolate('retentionCleanup', async () => {

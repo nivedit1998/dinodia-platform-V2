@@ -4,7 +4,7 @@
   "policy": "Build/release contract only. A change to any gate-sensitive dispatcher/callee/schema requires review of the SQL predicate and task/outbox/receipt inventory before updating fingerprints. No runtime discovery.",
   "sha256": {
     "src/app/api/cron/native-operations/route.ts": "84d857b2d60ccb1ec6527e400fa7df63b764fd81e3f9b5474b4a3ccefd025613",
-    "src/lib/nativeOperations.ts": "edfb503d95a788696c0576049c64fd13806da202918441402c978f223faadf0c",
+    "src/lib/nativeOperations.ts": "144f31280b6b8c6a59962deeb3f85baec648d48970c7e399bfb40c098b619800",
     "src/lib/hubOperatorCredentials.ts": "ad4f0df046aba480dec813b9193a121d95ff1f367ac06533ad4d8712cea4b35f",
     "src/lib/stage1ClaimContract.ts": "05e9beac3c619e6b88f72c85f2c3de83d87f0e478d3ecfb64e9f64353b9c3968",
     "src/lib/supportNotifications.ts": "a9e513310001cef6812c5c6ff7b3d44b11c9ea265deab9945241e1361f4dd101",
